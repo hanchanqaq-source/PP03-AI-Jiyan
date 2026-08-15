@@ -139,6 +139,40 @@ cd frontend && npm install && npm run dev
 # 浏览器打开 http://localhost:5899
 ```
 
+### Windows 本地启动（PP03 首版）
+
+PP03 在保留原有 Vibe-Research 工具的基础上，新增「投研首页、市场资讯、行业研究、持仓分析」四个一级入口。推荐使用 PowerShell 分别启动后端和前端：
+
+```powershell
+# 终端 1：后端（http://127.0.0.1:8900）
+cd backend
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8900
+
+# 终端 2：前端（http://127.0.0.1:5899）
+cd frontend
+npm install
+npm run dev -- --host 127.0.0.1
+```
+
+- 标签关注项按页面独立保存在浏览器 `localStorage`，刷新和服务重启后仍可恢复；首页和行业研究互不覆盖。
+- 基金持仓单独保存在 `~/.vibe-research/fund-portfolio.json`，与原有股票持仓文件隔离；可用 `VR_DATA_DIR` 指定其他本地目录。
+- 官方净值、盘中估算、历史净值分开显示。未接入可靠来源时明确显示“暂无可靠数据”，不会用示例数字冒充真实行情。
+- 行业报告内的框架性文案和演示模板会标记“开发占位数据”；它们用于展示信息结构，不代表已核验的投资事实。
+
+Windows 验证命令：
+
+```powershell
+cd frontend
+npm run test:run
+npm run test:legacy
+npm run build
+
+cd ..\backend
+.\.venv\Scripts\python.exe -m pytest -m "not live" -q
+```
+
 ## 接入 AI
 
 在「接入 AI」页配置一次，全站的「问 AI / 复盘 / 今日要点」就都用你自己的模型。**分析都由你的模型给出，本产品不校准、无倾向。** 三种方式：

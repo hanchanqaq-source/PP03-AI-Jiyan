@@ -2,6 +2,8 @@
 鉴权中间件 / 持仓 CRUD 与坏文件降级 / 估值脏数据防护 / 涨停池脏数值 /
 空结果不缓存 / akshare 缺失降级 / 无 index 工具调用归位 / CLI 流式超时。
 """
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -232,7 +234,7 @@ def test_stream_tool_calls_without_index(monkeypatch):
 def test_run_cli_stream_timeout(monkeypatch):
     monkeypatch.setattr(cli_runtime, "_CLI_TIMEOUT_S", 1)
     monkeypatch.setitem(cli_runtime._CLI_DEFS, "fake", {
-        "bins": ["python3"],
+        "bins": [sys.executable],
         "delivery": "stdin",
         "build_args": lambda _: ["-c", "import time\nprint('x', flush=True)\ntime.sleep(30)"],
         "env": {},

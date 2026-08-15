@@ -1,4 +1,4 @@
-import { createBrowserRouter, Navigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, type RouteObject } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
 import { DailyReview } from "@/pages/DailyReview";
 import { Intel } from "@/pages/Intel";
@@ -11,12 +11,20 @@ import { Watchlist } from "@/pages/Watchlist";
 import { MyReports } from "@/pages/MyReports";
 import { Notes } from "@/pages/Notes";
 import { Settings } from "@/pages/Settings";
+import { ResearchHome } from "@/pages/ResearchHome";
+import { MarketNews } from "@/pages/MarketNews";
+import { IndustryResearch } from "@/pages/IndustryResearch";
+import { PortfolioAnalysis } from "@/pages/PortfolioAnalysis";
 
-export const router = createBrowserRouter([
+export const APP_ROUTES: RouteObject[] = [
   {
     element: <Layout />,
     children: [
-      { path: "/", element: <Navigate to="/daily-review" replace /> },
+      { path: "/", element: <Navigate to="/research-home" replace /> },
+      { path: "/research-home", element: <ResearchHome /> },
+      { path: "/market-news", element: <MarketNews /> },
+      { path: "/industry-research", element: <IndustryResearch /> },
+      { path: "/portfolio-analysis", element: <PortfolioAnalysis /> },
       { path: "/daily-review", element: <DailyReview /> },
       { path: "/intel", element: <Intel /> },
       { path: "/sectors", element: <Sectors /> },
@@ -30,4 +38,6 @@ export const router = createBrowserRouter([
       { path: "/settings", element: <Settings /> },
     ],
   },
-]);
+];
+
+export const router = createBrowserRouter(APP_ROUTES);

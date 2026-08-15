@@ -15,7 +15,7 @@ import os
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import astock
 import chat as chat_layer
@@ -24,6 +24,7 @@ import debate as debate_layer
 import gstock
 import newsradar
 import portfolio as pf
+import fund_portfolio as fpf
 import market
 import myreports as mr
 import reflection as reflect_layer
@@ -218,6 +219,61 @@ def portfolio_add(h: HoldingIn):
 @app.delete("/api/portfolio/holding")
 def portfolio_remove(code: str = Query(...)):
     return {"data": pf.remove_holding(code.strip())}
+
+
+class FundHoldingIn(BaseModel):
+    code: str = Field(pattern=r"^\d{6}$")
+    name: str = Field(min_length=1, max_length=100)
+    amount: float = Field(ge=0)
+    shares: float = Field(ge=0)
+    cost: float = Field(ge=0)
+    buy_date: str
+    notes: str = Field(default="", max_length=1000)
+    tag_ids: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("name", "notes")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("buy_date")
+    @classmethod
+    def _date_format(cls, value: str) -> str:
+        from datetime import date
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            raise ValueError("买入日期格式应为 YYYY-MM-DD") from None
+        return value
+
+    @field_validator("tag_ids")
+    @classmethod
+    def _tag_ids(cls, value: list[str]) -> list[str]:
+        clean = [item.strip() for item in value]
+        if any(not item for item in clean):
+            raise ValueError("标签 ID 不能为空")
+        return list(dict.fromkeys(clean))
+
+
+@app.get("/api/fund-portfolio")
+def fund_portfolio_get():
+    return {"data": fpf.list_fund_holdings()}
+
+
+@app.post("/api/fund-portfolio/holding")
+def fund_portfolio_upsert(holding: FundHoldingIn):
+    try:
+        return {"data": fpf.upsert_fund_holding(holding.model_dump())}
+    except fpf.FundPortfolioCorrupt as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.delete("/api/fund-portfolio/holding")
+def fund_portfolio_delete(code: str = Query(..., pattern=r"^\d{6}$")):
+    try:
+        return {"data": fpf.delete_fund_holding(code)}
+    except fpf.FundPortfolioCorrupt as error:
+        raise HTTPException(409, str(error)) from error
 
 
 # ---- 我的研报（用户上传自己的研报，存本地、不上传、不进开源仓库）----

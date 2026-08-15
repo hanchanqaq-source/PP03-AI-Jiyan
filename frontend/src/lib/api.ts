@@ -165,7 +165,7 @@ export interface TurnoverStock {
 export interface TurnoverTop { stocks: TurnoverStock[]; updated: string }
 
 export interface RadarItem {
-  title: string; url: string; time: string; source: string; summary?: string; zh?: string;
+  title: string; url: string; time: string; ts?: number; source: string; summary?: string; zh?: string;
 }
 export interface Industry {
   key: string; name: string; accent: string; total: number; items: RadarItem[];
@@ -189,6 +189,35 @@ export interface PortfolioData {
   closed: ClosedPosition[];
   realized_pnl: number;
   updated: string; last_refresh: string | null;
+}
+
+export interface FundHolding {
+  code: string;
+  name: string;
+  amount: number;
+  shares: number;
+  cost: number;
+  buy_date: string;
+  notes: string;
+  tag_ids: string[];
+  official_nav: number | null;
+  official_nav_date: string | null;
+  intraday_estimate: number | null;
+  estimate_updated_at: string | null;
+  estimate_confidence: string | null;
+  holding_disclosure_date: string | null;
+  top10_coverage: number | null;
+  historical_nav: number | null;
+}
+
+export type FundHoldingInput = Pick<FundHolding,
+  "code" | "name" | "amount" | "shares" | "cost" | "buy_date" | "notes" | "tag_ids"
+>;
+
+export interface FundPortfolioData {
+  holdings: FundHolding[];
+  total_amount: number;
+  updated: string | null;
 }
 
 // 资金面 / 筹码 / 信号（v3.3 并入，均为「用户查的那只股」的公开数据）
@@ -261,6 +290,9 @@ export const api = {
   closePosition: (code: string, date: string, price: number, shares: number, cost: number) =>
     request<PortfolioData>("/portfolio/close", "POST", { code, date, price, shares, cost }),
   removeClosed: (index: number) => request<PortfolioData>(`/portfolio/close?index=${index}`, "DELETE"),
+  fundPortfolio: () => get<FundPortfolioData>("/fund-portfolio"),
+  upsertFundHolding: (holding: FundHoldingInput) => request<FundPortfolioData>("/fund-portfolio/holding", "POST", holding),
+  deleteFundHolding: (code: string) => request<FundPortfolioData>(`/fund-portfolio/holding?code=${encodeURIComponent(code)}`, "DELETE"),
   valuation: (code: string) => get<Valuation>(`/valuation?code=${code}`),
   percentile: (code: string) => get<ValPercentile>(`/valuation/percentile?code=${code}`),
   financials: (code: string) => get<Financials>(`/financials?code=${code}`),

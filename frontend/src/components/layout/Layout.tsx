@@ -4,6 +4,7 @@ import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, LineChart, Github, UserRound,
   Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords,
+  House, BookOpenText, Newspaper,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
@@ -19,7 +20,14 @@ const REPO_URL = "https://github.com/simonlin1212/Vibe-Research";
 const X_URL = "https://x.com/linsizhen";
 const MAIL_URL = "mailto:simonlin0423@gmail.com";
 
-const NAV = [
+const PRIMARY_NAV = [
+  { to: "/research-home", icon: House, label: "01 投研首页" },
+  { to: "/market-news", icon: Newspaper, label: "02 市场资讯" },
+  { to: "/industry-research", icon: BookOpenText, label: "03 行业研究" },
+  { to: "/portfolio-analysis", icon: Wallet, label: "04 持仓分析" },
+];
+
+const LEGACY_NAV = [
   { to: "/daily-review", icon: Activity, label: "每日复盘" },
   { to: "/intel", icon: Radar, label: "资讯雷达" },
   { to: "/sectors", icon: LayoutGrid, label: "板块中心" },
@@ -60,7 +68,7 @@ export function Layout() {
       )}>
         {/* Brand */}
         <div className={cn("border-b border-border/50", collapsed ? "flex justify-center p-3" : "p-4")}>
-          <Link to="/daily-review" className={cn("flex items-center", collapsed ? "justify-center" : "gap-2")}>
+          <Link to="/research-home" className={cn("flex items-center", collapsed ? "justify-center" : "gap-2")}>
             <LineChart className="h-6 w-6 shrink-0 text-primary text-glow" />
             {!collapsed && (
               <span className="text-lg font-extrabold tracking-tight">
@@ -73,7 +81,24 @@ export function Layout() {
 
         {/* Nav */}
         <nav className={cn("flex-1 space-y-1 overflow-auto", collapsed ? "p-1.5" : "p-2.5")}>
-          {NAV.map(({ to, icon: Icon, label }) => {
+          {PRIMARY_NAV.map(({ to, icon: Icon, label }) => {
+            const active = pathname === to;
+            return (
+              <Link key={to} to={to} title={collapsed ? label : undefined}
+                className={cn(
+                  "flex items-center rounded-lg text-sm transition-colors",
+                  collapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
+                  active ? "bg-primary/15 font-medium text-primary shadow-glow" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                )}>
+                <Icon className="h-4 w-4 shrink-0" />{!collapsed && label}
+              </Link>
+            );
+          })}
+
+          {!collapsed && <p className="px-3 pb-1 pt-4 text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground/60">原有工具</p>}
+          {collapsed && <div className="my-2 border-t border-border/50" />}
+
+          {LEGACY_NAV.map(({ to, icon: Icon, label }) => {
             const active = pathname === to;
             return (
               <div key={to}>
