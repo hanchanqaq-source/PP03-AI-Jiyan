@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 import requests
 
 from fund_data.providers.akshare_provider import AkshareEastmoneyProvider
+from fund_data.providers.cninfo_industry import CninfoIndustryProvider
+from fund_data.providers.base import ProviderUnavailable
 from fund_data.providers.eastmoney_direct import EastmoneyDirectProvider
 from fund_data.providers.tencent_quote import TencentQuoteProvider
 
@@ -197,3 +201,104 @@ def test_tencent_provider_normalizes_quote_fallback_without_inventing_industry()
         "change_pct": -0.5, "industry": None,
     }}
     assert result.source_name == "腾讯证券行情"
+
+
+def cninfo_row(
+    code: str,
+    standard_code: str,
+    standard: str,
+    primary: str | None,
+    secondary: str | None,
+    detail: str | None,
+    fine: str | None,
+    changed_at: str,
+) -> dict:
+    return {
+        "SECCODE": code,
+        "SECNAME": f"证券{code}",
+        "VARYDATE": changed_at,
+        "F001V": standard_code,
+        "F002V": standard,
+        "F003V": f"industry-{code}",
+        "F004V": primary,
+        "F005V": secondary,
+        "F006V": detail,
+        "F007V": fine,
+    }
+
+
+class FakeTokenFactory:
+    def __init__(self, tokens: list[str]):
+        self.tokens = iter(tokens)
+        self.thread_ids: list[int] = []
+
+    def __call__(self) -> str:
+        self.thread_ids.append(threading.get_ident())
+        return next(self.tokens)
+
+
+class FakeCninfoPost:
+    def __init__(self, payloads: dict[str, list[dict] | Exception]):
+        self.payloads = payloads
+
+    def __call__(self, _url: str, *, params: dict, headers: dict, timeout: float):
+        assert headers["Accept-Enckey"]
+        assert timeout == 15
+        payload = self.payloads[params["scode"]]
+        if isinstance(payload, Exception):
+            raise payload
+        return FakeResponse(payload={"records": payload})
+
+
+def test_cninfo_provider_prefers_current_sw_latest_record_and_keeps_partial_failures():
+    token_factory = FakeTokenFactory(["token-a", "token-b"])
+    provider = CninfoIndustryProvider(
+        token_factory=token_factory,
+        post=FakeCninfoPost({
+            "300308": [
+                cninfo_row("300308", "008003", "申银万国行业分类标准", "电子", "半导体", "旧分类", "旧分类", "2025-12-31"),
+                cninfo_row("300308", "008002", "巨潮行业分类标准", "信息技术", "通信", "通信设备", "光模块", "2026-07-01"),
+                cninfo_row("300308", "008003", "申银万国行业分类标准", "电子", "半导体", "半导体设备", "半导体设备", "2026-06-30"),
+            ],
+            "688256": RuntimeError("temporary upstream failure"),
+        }),
+        max_workers=2,
+    )
+
+    result = provider.fetch("stock_industry_classification", codes=["688256", "300308", "300308"])
+
+    assert result.data["requested_codes"] == ["300308", "688256"]
+    assert result.data["failed_codes"] == ["688256"]
+    assert result.data["classifications"]["300308"] == {
+        "stock_code": "300308",
+        "stock_name": "证券300308",
+        "primary_industry": "电子",
+        "secondary_industry": "半导体",
+        "detail_industry": "半导体设备",
+        "fine_industry": "半导体设备",
+        "classification_standard": "申银万国行业分类标准",
+        "classification_code": "008003",
+        "classification_industry_code": "industry-300308",
+        "classification_changed_at": "2026-06-30",
+        "source_name": "巨潮资讯上市公司行业归属",
+        "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
+    }
+    assert token_factory.thread_ids == [threading.get_ident(), threading.get_ident()]
+
+
+def test_cninfo_provider_reports_total_failure_instead_of_inventing_classification():
+    provider = CninfoIndustryProvider(
+        token_factory=FakeTokenFactory(["token-a"]),
+        post=FakeCninfoPost({"300308": RuntimeError("offline")}),
+        max_workers=1,
+    )
+
+    with pytest.raises(ProviderUnavailable, match="未返回任何可核验股票记录"):
+        provider.fetch("stock_industry_classification", codes=["300308"])
+
+
+def test_cninfo_provider_rejects_unsupported_capability():
+    provider = CninfoIndustryProvider(token_factory=FakeTokenFactory([]), post=FakeCninfoPost({}))
+
+    with pytest.raises(ProviderUnavailable, match="不支持能力"):
+        provider.fetch("stock_snapshot", codes=["300308"])
