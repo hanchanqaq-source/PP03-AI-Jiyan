@@ -24,7 +24,7 @@ describe("PP03 core pages", () => {
     localStorage.clear();
     vi.restoreAllMocks();
     vi.spyOn(api, "radar").mockResolvedValue(radar);
-    vi.spyOn(api, "fundPortfolio").mockResolvedValue({ holdings: [], total_amount: 0, updated: null });
+    vi.spyOn(api, "fundPortfolio").mockResolvedValue({ schema_version: 2, holdings: [], total_cost: 0, updated: null, migration: null, data_status: "ok" });
   });
 
   it("switches market news content with the active top tag", async () => {

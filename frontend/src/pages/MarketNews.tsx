@@ -27,7 +27,7 @@ export function MarketNews() {
     api.fundPortfolio().then(setPortfolio).catch(() => {});
   }, []);
 
-  const holdingTagIds = useMemo(() => Array.from(new Set(portfolio?.holdings.flatMap((holding) => holding.tag_ids) || [])), [portfolio]);
+  const holdingTagIds = useMemo(() => Array.from(new Set(portfolio?.holdings.flatMap((holding) => holding.custom_tag_ids) || [])), [portfolio]);
   const events = useMemo(() => radar && tags.activeTag ? normalizeRadar(radar, {
     tagId: tags.activeTag.id, days, category, holdingTagIds,
   }) : [], [category, days, holdingTagIds, radar, tags.activeTag]);

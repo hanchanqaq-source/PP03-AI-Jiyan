@@ -1,6 +1,26 @@
 // Vibe-Research 后端 API 客户端。/api → vite 代理到本地 FastAPI（默认 8900）。
 // 后端未启动或数据源异常时抛 ApiError，页面据此优雅降级。
 
+import type {
+  DataSection,
+  FundAnalysis,
+  FundHoldingInput,
+  FundPortfolioAnalysisData,
+  FundPortfolioData,
+  FundSearchResult,
+} from "@/features/fund-portfolio/types";
+
+export type {
+  DataMeta,
+  DataSection,
+  FundAnalysis,
+  FundHolding,
+  FundHoldingInput,
+  FundPortfolioAnalysisData,
+  FundPortfolioData,
+  FundSearchResult,
+} from "@/features/fund-portfolio/types";
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -191,35 +211,6 @@ export interface PortfolioData {
   updated: string; last_refresh: string | null;
 }
 
-export interface FundHolding {
-  code: string;
-  name: string;
-  amount: number;
-  shares: number;
-  cost: number;
-  buy_date: string;
-  notes: string;
-  tag_ids: string[];
-  official_nav: number | null;
-  official_nav_date: string | null;
-  intraday_estimate: number | null;
-  estimate_updated_at: string | null;
-  estimate_confidence: string | null;
-  holding_disclosure_date: string | null;
-  top10_coverage: number | null;
-  historical_nav: number | null;
-}
-
-export type FundHoldingInput = Pick<FundHolding,
-  "code" | "name" | "amount" | "shares" | "cost" | "buy_date" | "notes" | "tag_ids"
->;
-
-export interface FundPortfolioData {
-  holdings: FundHolding[];
-  total_amount: number;
-  updated: string | null;
-}
-
 // 资金面 / 筹码 / 信号（v3.3 并入，均为「用户查的那只股」的公开数据）
 export interface MarginRow { date: string; rzye: number; rzmre: number; rzche: number; rqye: number; rqmcl: number; rzrqye: number }
 export interface BlockTradeRow { date: string; price: number; close: number; premium_pct: number; vol: number; amount: number; buyer: string; seller: string }
@@ -293,6 +284,10 @@ export const api = {
   fundPortfolio: () => get<FundPortfolioData>("/fund-portfolio"),
   upsertFundHolding: (holding: FundHoldingInput) => request<FundPortfolioData>("/fund-portfolio/holding", "POST", holding),
   deleteFundHolding: (code: string) => request<FundPortfolioData>(`/fund-portfolio/holding?code=${encodeURIComponent(code)}`, "DELETE"),
+  fundPortfolioAnalysis: () => get<FundPortfolioAnalysisData>("/fund-portfolio/analysis"),
+  searchFunds: (query: string) => get<DataSection<FundSearchResult[]>>(`/funds/search?q=${encodeURIComponent(query)}`),
+  fundAnalysis: (code: string) => get<FundAnalysis>(`/funds/${encodeURIComponent(code)}/analysis`),
+  refreshFund: (code: string) => request<FundAnalysis>(`/funds/${encodeURIComponent(code)}/refresh`, "POST"),
   valuation: (code: string) => get<Valuation>(`/valuation?code=${code}`),
   percentile: (code: string) => get<ValPercentile>(`/valuation/percentile?code=${code}`),
   financials: (code: string) => get<Financials>(`/financials?code=${code}`),

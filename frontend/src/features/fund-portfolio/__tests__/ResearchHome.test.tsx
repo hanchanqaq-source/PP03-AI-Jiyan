@@ -7,7 +7,7 @@ describe("ResearchHome", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.restoreAllMocks();
-    vi.spyOn(api, "fundPortfolio").mockResolvedValue({ holdings: [], total_amount: 0, updated: null });
+    vi.spyOn(api, "fundPortfolio").mockResolvedValue({ schema_version: 2, holdings: [], total_cost: 0, updated: null, migration: null, data_status: "ok" });
     vi.spyOn(api, "radar").mockResolvedValue({
       generated_at: null, recent_days: 7, industries: [],
       stats: { industries: 0, total_sources: 0 },

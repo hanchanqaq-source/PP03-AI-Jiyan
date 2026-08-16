@@ -7,7 +7,9 @@ import { getTag } from "@/features/tags/catalog";
 import { loadPageTagState } from "@/features/tags/preferences";
 import { normalizeRadar } from "@/features/news/normalize";
 
-const EMPTY_PORTFOLIO: FundPortfolioData = { holdings: [], total_amount: 0, updated: null };
+const EMPTY_PORTFOLIO: FundPortfolioData = {
+  schema_version: 2, holdings: [], total_cost: 0, updated: null, migration: null, data_status: "ok",
+};
 
 export function ResearchHome() {
   const [portfolio, setPortfolio] = useState<FundPortfolioData>(EMPTY_PORTFOLIO);
@@ -20,7 +22,7 @@ export function ResearchHome() {
     api.radar().then(setRadar).catch(() => {});
   }, []);
 
-  const holdingTagIds = Array.from(new Set(portfolio.holdings.flatMap((holding) => holding.tag_ids)));
+  const holdingTagIds = Array.from(new Set(portfolio.holdings.flatMap((holding) => holding.custom_tag_ids)));
   const news = radar ? normalizeRadar(radar, {
     tagId: marketTags.activeId, days: 3, holdingTagIds,
   }).filter((event) => event.holdingRelated).slice(0, 4) : [];
@@ -28,7 +30,7 @@ export function ResearchHome() {
 
   const blocks = [
     { title: "今日持仓变化", icon: Wallet, content: "暂无可靠数据", note: "尚未接入可靠盘中估算源" },
-    { title: "持仓总览", icon: PieChart, content: `¥${portfolio.total_amount.toLocaleString("zh-CN")}`, note: `${portfolio.holdings.length} 只手动录入基金` },
+    { title: "持仓总览", icon: PieChart, content: `¥${portfolio.total_cost.toLocaleString("zh-CN")}`, note: `${portfolio.holdings.length} 只本地持仓基金` },
     { title: "重要行业变化", icon: Radar, content: radar?.generated_at ? `资讯更新于 ${radar.generated_at}` : "暂无可靠数据", note: "按关注标签跟踪，不预测涨跌" },
   ];
 
