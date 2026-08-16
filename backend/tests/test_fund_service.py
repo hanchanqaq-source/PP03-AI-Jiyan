@@ -206,3 +206,73 @@ def test_portfolio_analysis_calculates_cost_value_overlap_and_date_warning(tmp_p
     assert result["overview"]["return_rate"] == 10.0
     assert result["overlap"][0]["stock_code"] == "600000"
     assert result["industry_concentration"]["unknown_pct"] == 40.0
+
+
+def test_quick_portfolio_revalues_inferred_shares_with_latest_official_nav(tmp_path):
+    clock = Clock()
+    provider = FakeProvider("primary", 10, payloads={
+        "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
+        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+    })
+    service = make_service(tmp_path, clock, [provider])
+
+    result = service.get_portfolio_analysis([{
+        "code": "000001",
+        "input_mode": "amount_pnl",
+        "amount_snapshot": 1000,
+        "cumulative_pnl_snapshot": 100,
+        "snapshot_at": "2026-08-15T10:00:00+08:00",
+        "shares": 800,
+        "shares_source": "inferred",
+        "basis_nav": 1.25,
+        "basis_nav_date": "2026-08-14",
+        "avg_cost": None,
+        "avg_unit_cost": None,
+        "buy_date": "",
+        "notes": "",
+        "custom_tag_ids": [],
+    }])
+
+    position = result["holdings"][0]["position"]
+    assert position["user_amount_snapshot"] == 1000
+    assert position["official_market_value"] == 880
+    assert position["position_value"] == 880
+    assert position["position_value_basis"] == "official_nav_from_inferred_shares"
+    assert position["reference_total_cost"] == 900
+    assert result["overview"]["total_holding_value"] == 880
+    assert result["overview"]["market_value"] == 880
+    assert result["holdings"][0]["weight_pct"] == 100
+    assert result["overview"]["latest_nav_date"] == "2026-08-14"
+
+
+def test_quick_portfolio_falls_back_to_snapshot_only_without_reliable_inferred_shares(tmp_path):
+    clock = Clock()
+    provider = FakeProvider("primary", 10, payloads={
+        "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
+        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+    })
+    service = make_service(tmp_path, clock, [provider])
+    holdings = [
+        {
+            "code": "000001", "input_mode": "amount_pnl", "amount_snapshot": 1000,
+            "cumulative_pnl_snapshot": None, "snapshot_at": "2026-08-15T10:00:00+08:00",
+            "shares": 800, "shares_source": "inferred", "avg_cost": None, "avg_unit_cost": None,
+            "buy_date": "", "notes": "", "custom_tag_ids": [],
+        },
+        {
+            "code": "000002", "input_mode": "amount_pnl", "amount_snapshot": 1200,
+            "cumulative_pnl_snapshot": None, "snapshot_at": "2026-08-15T11:00:00+08:00",
+            "shares": None, "shares_source": None, "avg_cost": None, "avg_unit_cost": None,
+            "buy_date": "", "notes": "", "custom_tag_ids": [],
+        },
+    ]
+
+    result = service.get_portfolio_analysis(holdings)
+
+    assert result["overview"]["total_holding_value"] == 2080
+    assert result["holdings"][0]["weight_pct"] == pytest.approx(42.3077, abs=1e-4)
+    assert result["holdings"][1]["weight_pct"] == pytest.approx(57.6923, abs=1e-4)
+    assert result["holdings"][1]["position"]["position_value_basis"] == "user_amount_snapshot"
+    assert result["overview"]["profit_loss"] is None
+    assert result["overview"]["return_rate"] is None
+    assert result["overview"]["pnl_complete"] is False

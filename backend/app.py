@@ -10,12 +10,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import astock
 import chat as chat_layer
@@ -224,9 +225,13 @@ def portfolio_remove(code: str = Query(...)):
 
 class FundHoldingIn(BaseModel):
     code: str = Field(pattern=r"^\d{6}$")
-    shares: float = Field(gt=0)
-    avg_cost: float = Field(ge=0)
-    buy_date: str
+    input_mode: str = Field(default="shares_cost", pattern=r"^(amount_pnl|shares_cost)$")
+    amount_snapshot: float | None = Field(default=None, allow_inf_nan=False)
+    cumulative_pnl_snapshot: float | None = Field(default=None, allow_inf_nan=False)
+    shares: float | None = Field(default=None, allow_inf_nan=False)
+    avg_unit_cost: float | None = Field(default=None, allow_inf_nan=False)
+    avg_cost: float | None = Field(default=None, allow_inf_nan=False)
+    buy_date: str = ""
     notes: str = Field(default="", max_length=1000)
     custom_tag_ids: list[str] = Field(default_factory=list, max_length=50)
     verification_status: str = Field(default="verified", pattern=r"^(verified|manual_unverified)$")
@@ -247,6 +252,8 @@ class FundHoldingIn(BaseModel):
     @classmethod
     def _date_format(cls, value: str) -> str:
         from datetime import date
+        if not value:
+            return ""
         try:
             date.fromisoformat(value)
         except ValueError:
@@ -267,6 +274,26 @@ class FundHoldingIn(BaseModel):
         if info.data.get("verification_status") == "manual_unverified" and not value:
             raise ValueError("手动录入模式必须填写基金名称")
         return value
+
+    @model_validator(mode="after")
+    def _mode_fields(self):
+        if self.input_mode == "amount_pnl":
+            if self.amount_snapshot is None or not math.isfinite(self.amount_snapshot) or self.amount_snapshot <= 0:
+                raise ValueError("快速模式的当前持有金额必须大于 0")
+            if self.cumulative_pnl_snapshot is not None and not math.isfinite(self.cumulative_pnl_snapshot):
+                raise ValueError("当前累计盈亏必须是有限数")
+            return self
+
+        if self.shares is None or not math.isfinite(self.shares) or self.shares <= 0:
+            raise ValueError("精确模式的持有份额必须大于 0")
+        unit_cost = self.avg_unit_cost if self.avg_unit_cost is not None else self.avg_cost
+        if unit_cost is None or not math.isfinite(unit_cost) or unit_cost < 0:
+            raise ValueError("精确模式的平均单位成本必须大于等于 0")
+        if not self.buy_date:
+            raise ValueError("精确模式必须填写买入日期")
+        self.avg_unit_cost = unit_cost
+        self.avg_cost = unit_cost
+        return self
 
 
 @app.get("/api/funds/search")
@@ -305,6 +332,42 @@ def fund_portfolio_analysis():
 def fund_portfolio_upsert(holding: FundHoldingIn):
     try:
         payload = holding.model_dump(exclude={"replace"})
+        if holding.input_mode == "amount_pnl":
+            payload.update({
+                "shares": None,
+                "shares_source": None,
+                "basis_nav": None,
+                "basis_nav_date": None,
+                "shares_inference_note": None,
+            })
+            try:
+                analysis = fund_service.get_service().get_fund_analysis(holding.code)
+                latest_section = analysis.get("latest_nav") or {}
+                latest = latest_section.get("data") or {}
+                meta = latest_section.get("meta") or {}
+                nav = latest.get("unit_nav")
+                nav_date = latest.get("nav_date")
+                reliable = (
+                    meta.get("status") == "official"
+                    and not meta.get("is_stale", False)
+                    and isinstance(nav, (int, float))
+                    and math.isfinite(nav)
+                    and nav > 0
+                    and bool(nav_date)
+                )
+                if reliable:
+                    payload.update({
+                        "shares": holding.amount_snapshot / nav,
+                        "shares_source": "inferred",
+                        "basis_nav": nav,
+                        "basis_nav_date": nav_date,
+                        "shares_inference_note": f"按用户录入金额快照与 {nav_date} 正式净值推算，非用户确认份额",
+                    })
+            except Exception:
+                # Quick entry must remain writable when public NAV lookup is unavailable.
+                pass
+        else:
+            payload["shares_source"] = "user"
         return {"data": fpf.upsert_fund_holding(payload, replace=holding.replace)}
     except fpf.FundAlreadyExists as error:
         raise HTTPException(409, str(error)) from error

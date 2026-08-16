@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
@@ -28,6 +29,35 @@ class FakeFundService:
     def get_portfolio_analysis(self, holdings, force_refresh=False):
         self.calls.append(("portfolio", holdings, force_refresh))
         return {"overview": {"fund_count": len(holdings)}, "holdings": holdings, "overlap": []}
+
+
+class NoNavFundService(FakeFundService):
+    def get_fund_analysis(self, code, force_refresh=False):
+        self.calls.append(("analysis", code, force_refresh))
+        return {
+            "code": code,
+            "profile": {"data": {"name": "测试基金"}, "meta": {"status": "disclosed"}},
+            "latest_nav": {
+                "data": None,
+                "meta": {"status": "unavailable", "is_stale": False, "message": "暂无官方净值"},
+            },
+        }
+
+
+def _quick_payload(**changes):
+    payload = {
+        "code": "000001",
+        "input_mode": "amount_pnl",
+        "amount_snapshot": 1000,
+        "cumulative_pnl_snapshot": 100,
+        "notes": "快速录入",
+        "custom_tag_ids": [],
+        "verification_status": "verified",
+        "manual_name": None,
+        "replace": False,
+    }
+    payload.update(changes)
+    return payload
 
 
 def test_fund_search_and_analysis_are_read_only_for_user_portfolio(tmp_path, monkeypatch):
@@ -71,3 +101,86 @@ def test_portfolio_analysis_uses_migrated_user_truth_without_returning_500(tmp_p
 def test_fund_api_rejects_invalid_or_empty_queries():
     assert client.get("/api/funds/search?q=").status_code == 422
     assert client.get("/api/funds/not-a-code/analysis").status_code == 422
+
+
+def test_quick_holding_saves_without_nav_and_does_not_require_shares(tmp_path, monkeypatch):
+    fake = NoNavFundService()
+    user_file = tmp_path / "fund-portfolio.json"
+    monkeypatch.setattr(fp, "FUND_FILE", str(user_file))
+    monkeypatch.setattr(app_module.fund_service, "get_service", lambda: fake)
+
+    response = client.post("/api/fund-portfolio/holding", json=_quick_payload())
+
+    assert response.status_code == 200
+    holding = response.json()["data"]["holdings"][0]
+    assert holding["input_mode"] == "amount_pnl"
+    assert holding["amount_snapshot"] == 1000
+    assert holding["cumulative_pnl_snapshot"] == 100
+    assert holding["shares"] is None
+    assert holding["shares_source"] is None
+    assert holding["basis_nav"] is None
+    assert holding["snapshot_at"]
+
+
+def test_quick_holding_infers_shares_from_reliable_official_nav_with_provenance(tmp_path, monkeypatch):
+    fake = FakeFundService()
+    user_file = tmp_path / "fund-portfolio.json"
+    monkeypatch.setattr(fp, "FUND_FILE", str(user_file))
+    monkeypatch.setattr(app_module.fund_service, "get_service", lambda: fake)
+
+    response = client.post("/api/fund-portfolio/holding", json=_quick_payload())
+
+    assert response.status_code == 200
+    holding = response.json()["data"]["holdings"][0]
+    assert holding["shares"] == pytest.approx(833.3333333333)
+    assert holding["shares_source"] == "inferred"
+    assert holding["basis_nav"] == 1.2
+    assert holding["basis_nav_date"] == "2026-08-14"
+    assert holding["shares_inference_note"] == "按用户录入金额快照与 2026-08-14 正式净值推算，非用户确认份额"
+
+
+def test_exact_user_shares_override_inference_but_keep_snapshot(tmp_path, monkeypatch):
+    fake = FakeFundService()
+    user_file = tmp_path / "fund-portfolio.json"
+    monkeypatch.setattr(fp, "FUND_FILE", str(user_file))
+    monkeypatch.setattr(app_module.fund_service, "get_service", lambda: fake)
+    assert client.post("/api/fund-portfolio/holding", json=_quick_payload()).status_code == 200
+
+    response = client.post("/api/fund-portfolio/holding", json={
+        "code": "000001",
+        "input_mode": "shares_cost",
+        "shares": 820,
+        "avg_unit_cost": 1.1,
+        "buy_date": "2026-08-01",
+        "notes": "真实份额",
+        "custom_tag_ids": [],
+        "verification_status": "verified",
+        "manual_name": None,
+        "replace": True,
+    })
+
+    assert response.status_code == 200
+    holding = response.json()["data"]["holdings"][0]
+    assert holding["input_mode"] == "shares_cost"
+    assert holding["shares"] == 820
+    assert holding["shares_source"] == "user"
+    assert holding["basis_nav"] is None
+    assert holding["amount_snapshot"] == 1000
+    assert holding["cumulative_pnl_snapshot"] == 100
+
+
+@pytest.mark.parametrize("changes", [
+    {"amount_snapshot": 0},
+    {"amount_snapshot": -1},
+    {"amount_snapshot": "NaN"},
+    {"cumulative_pnl_snapshot": "Infinity"},
+])
+def test_quick_holding_rejects_non_positive_or_non_finite_numbers(tmp_path, monkeypatch, changes):
+    user_file = tmp_path / "fund-portfolio.json"
+    monkeypatch.setattr(fp, "FUND_FILE", str(user_file))
+    monkeypatch.setattr(app_module.fund_service, "get_service", lambda: FakeFundService())
+
+    response = client.post("/api/fund-portfolio/holding", json=_quick_payload(**changes))
+
+    assert response.status_code == 422
+    assert not user_file.exists()

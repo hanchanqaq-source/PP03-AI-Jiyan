@@ -32,6 +32,80 @@ def test_position_does_not_invent_return_when_cost_is_zero_or_unconfirmed():
     }
 
 
+def test_quick_position_uses_inferred_shares_and_latest_official_nav_without_overwriting_snapshot():
+    result = calculate_position(
+        input_mode="amount_pnl",
+        amount_snapshot=1000,
+        cumulative_pnl_snapshot=100,
+        shares=800,
+        shares_source="inferred",
+        avg_cost=None,
+        official_nav=1.4,
+        intraday_change_pct=2,
+    )
+
+    assert result["user_amount_snapshot"] == 1000
+    assert result["user_cumulative_pnl_snapshot"] == 100
+    assert result["official_market_value"] == 1120
+    assert result["position_value"] == 1120
+    assert result["position_value_basis"] == "official_nav_from_inferred_shares"
+    assert result["reference_total_cost"] == 900
+    assert result["profit_loss"] == 100
+    assert result["return_rate"] == pytest.approx(11.1111, abs=1e-4)
+    assert result["today_estimated_profit_loss"] == 22.4
+    assert result["intraday_market_value"] == 1142.4
+
+
+def test_quick_position_falls_back_to_amount_snapshot_when_reliable_shares_are_unavailable():
+    result = calculate_position(
+        input_mode="amount_pnl",
+        amount_snapshot=1000,
+        cumulative_pnl_snapshot=None,
+        shares=None,
+        shares_source=None,
+        avg_cost=None,
+        official_nav=1.4,
+    )
+
+    assert result["official_market_value"] is None
+    assert result["position_value"] == 1000
+    assert result["position_value_basis"] == "user_amount_snapshot"
+    assert result["reference_total_cost"] is None
+    assert result["profit_loss"] is None
+    assert result["return_rate"] is None
+
+
+def test_quick_position_does_not_calculate_return_for_non_positive_reference_cost():
+    result = calculate_position(
+        input_mode="amount_pnl",
+        amount_snapshot=100,
+        cumulative_pnl_snapshot=100,
+        shares=None,
+        shares_source=None,
+        avg_cost=None,
+        official_nav=None,
+    )
+
+    assert result["reference_total_cost"] is None
+    assert result["profit_loss"] == 100
+    assert result["return_rate"] is None
+
+
+def test_latest_official_nav_revalues_inferred_shares_while_snapshot_stays_fixed():
+    initial = calculate_position(
+        input_mode="amount_pnl", amount_snapshot=1000, cumulative_pnl_snapshot=None,
+        shares=800, shares_source="inferred", avg_cost=None, official_nav=1.25,
+    )
+    refreshed = calculate_position(
+        input_mode="amount_pnl", amount_snapshot=1000, cumulative_pnl_snapshot=None,
+        shares=800, shares_source="inferred", avg_cost=None, official_nav=1.4,
+    )
+
+    assert initial["user_amount_snapshot"] == refreshed["user_amount_snapshot"] == 1000
+    assert initial["position_value"] == 1000
+    assert refreshed["position_value"] == 1120
+
+
 def test_performance_calculates_drawdown_and_annualized_volatility_from_nav():
     history = [
         {"date": "2026-01-02", "unit_nav": 1.0},

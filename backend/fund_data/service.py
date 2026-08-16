@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
@@ -295,10 +296,14 @@ class FundDataService:
         industry_inputs: list[dict[str, Any]] = []
         nav_dates: set[str] = set()
         total_cost = 0.0
-        total_market_value = 0.0
+        total_position_value = 0.0
         total_profit_loss = 0.0
         incomplete_cost = False
+        incomplete_pnl = False
         intraday_inputs: list[tuple[float, float]] = []
+        intraday_estimated_profit_loss = 0.0
+        estimable_count = 0
+        official_only_count = 0
         risk_flags: list[str] = []
 
         for holding in holdings:
@@ -306,24 +311,53 @@ class FundDataService:
             analysis = self.get_fund_analysis(code, force_refresh=force_refresh)
             profile = analysis.get("profile", {}).get("data") or {}
             latest = analysis.get("latest_nav", {}).get("data") or {}
-            position = calculate_position(
-                shares=float(holding.get("shares") or 0),
-                avg_cost=holding.get("avg_cost"),
-                official_nav=latest.get("unit_nav"),
+            latest_meta = analysis.get("latest_nav", {}).get("meta") or {}
+            nav_value = latest.get("unit_nav")
+            official_nav = nav_value if (
+                latest_meta.get("status") == "official"
+                and not latest_meta.get("is_stale", False)
+                and isinstance(nav_value, (int, float))
+                and math.isfinite(nav_value)
+                and nav_value > 0
+            ) else None
+            intraday = analysis.get("intraday_estimate", {}).get("data") or {}
+            intraday_change_pct = (
+                float(intraday["estimated_change_pct"])
+                if intraday.get("status") == "estimated" and isinstance(intraday.get("estimated_change_pct"), (int, float))
+                else None
             )
-            if position["total_cost"] is None:
+            position = calculate_position(
+                shares=holding.get("shares"),
+                avg_cost=holding.get("avg_cost"),
+                avg_unit_cost=holding.get("avg_unit_cost"),
+                official_nav=official_nav,
+                input_mode=holding.get("input_mode") or "shares_cost",
+                amount_snapshot=holding.get("amount_snapshot"),
+                cumulative_pnl_snapshot=holding.get("cumulative_pnl_snapshot"),
+                snapshot_at=holding.get("snapshot_at"),
+                shares_source=holding.get("shares_source") or ("user" if holding.get("shares") is not None else None),
+                intraday_change_pct=intraday_change_pct,
+            )
+            if position["reference_total_cost"] is None:
                 incomplete_cost = True
             else:
-                total_cost += float(position["total_cost"])
-            if position["market_value"] is not None:
-                total_market_value += float(position["market_value"])
+                total_cost += float(position["reference_total_cost"])
+            if position["position_value"] is not None:
+                total_position_value += float(position["position_value"])
             if position["profit_loss"] is not None:
                 total_profit_loss += float(position["profit_loss"])
-            if latest.get("nav_date"):
+            else:
+                incomplete_pnl = True
+            if official_nav is not None and latest.get("nav_date"):
                 nav_dates.add(str(latest["nav_date"]))
+            if position["today_estimated_profit_loss"] is not None:
+                intraday_estimated_profit_loss += float(position["today_estimated_profit_loss"])
+                estimable_count += 1
+            elif position["official_market_value"] is not None:
+                official_only_count += 1
 
             disclosed = analysis.get("holdings", {}).get("data") or {}
-            market_value = position.get("market_value")
+            market_value = position.get("position_value")
             name = profile.get("name") or holding.get("manual_name") or holding.get("legacy_name") or code
             if market_value is not None:
                 overlap_inputs.append({
@@ -336,7 +370,6 @@ class FundDataService:
                     "unidentified_disclosed_pct", "undisclosed_stock_pct", "non_stock_pct",
                 ))
                 industry_inputs.append({"market_value": market_value, "broad_exposure": broad_map, "unknown_pct": unknown})
-                intraday = analysis.get("intraday_estimate", {}).get("data") or {}
                 if intraday.get("status") == "estimated" and intraday.get("estimated_change_pct") is not None:
                     intraday_inputs.append((float(market_value), float(intraday["estimated_change_pct"])))
 
@@ -359,6 +392,10 @@ class FundDataService:
                 "analysis": analysis,
             })
 
+        for item in enriched:
+            value = item["position"].get("position_value")
+            item["weight_pct"] = round(float(value) / total_position_value * 100, 4) if value is not None and total_position_value else None
+
         overlap = calculate_overlap(overlap_inputs)
         concentration = calculate_industry_concentration(industry_inputs)
         if overlap:
@@ -372,7 +409,8 @@ class FundDataService:
         if incomplete_cost:
             risk_flags.append("部分旧持仓成本尚未确认，组合盈亏只计算已确认部分")
 
-        return_rate = total_profit_loss / total_cost * 100 if total_cost else None
+        overview_profit_loss = None if incomplete_pnl else total_profit_loss
+        return_rate = overview_profit_loss / total_cost * 100 if overview_profit_loss is not None and total_cost > 0 else None
         intraday_change = None
         intraday_message = "盘中估算暂不可用：当前基金类型或公开持仓不足以形成可靠估算"
         if enriched and len(intraday_inputs) == len([item for item in enriched if item["position"]["market_value"] is not None]):
@@ -384,14 +422,20 @@ class FundDataService:
             "overview": {
                 "fund_count": len(holdings),
                 "total_cost": round(total_cost, 4),
-                "market_value": round(total_market_value, 4),
-                "profit_loss": round(total_profit_loss, 4),
+                "market_value": round(total_position_value, 4),
+                "total_holding_value": round(total_position_value, 4),
+                "profit_loss": round(overview_profit_loss, 4) if overview_profit_loss is not None else None,
                 "return_rate": round(return_rate, 4) if return_rate is not None else None,
                 "intraday_change_pct": round(intraday_change, 4) if intraday_change is not None else None,
+                "intraday_estimated_profit_loss": round(intraday_estimated_profit_loss, 4) if estimable_count else None,
                 "intraday_message": intraday_message,
                 "nav_dates": sorted(nav_dates),
+                "latest_nav_date": max(nav_dates) if nav_dates else None,
                 "inconsistent_nav_dates": inconsistent_dates,
                 "cost_incomplete": incomplete_cost,
+                "pnl_complete": not incomplete_pnl,
+                "estimable_count": estimable_count,
+                "official_only_count": official_only_count,
                 "updated_at": self._now().isoformat(),
             },
             "holdings": enriched,

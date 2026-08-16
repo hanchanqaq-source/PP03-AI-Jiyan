@@ -11,16 +11,92 @@ def _round(value: float | None, digits: int = 4) -> float | None:
     return None if value is None else round(float(value), digits)
 
 
-def calculate_position(shares: float, avg_cost: float | None, official_nav: float | None) -> dict[str, float | None]:
-    market_value = None if official_nav is None else float(shares) * float(official_nav)
-    total_cost = None if avg_cost is None else float(shares) * float(avg_cost)
-    profit_loss = None if market_value is None or total_cost is None else market_value - total_cost
-    return_rate = None if profit_loss is None or not total_cost else profit_loss / total_cost * 100
+def calculate_position(
+    shares: float | None,
+    avg_cost: float | None,
+    official_nav: float | None,
+    *,
+    input_mode: str | None = None,
+    avg_unit_cost: float | None = None,
+    amount_snapshot: float | None = None,
+    cumulative_pnl_snapshot: float | None = None,
+    snapshot_at: str | None = None,
+    shares_source: str | None = None,
+    intraday_change_pct: float | None = None,
+) -> dict[str, Any]:
+    """Calculate explicit user-snapshot, official and intraday position values.
+
+    Calls without ``input_mode`` retain the schema-v2 response shape for existing
+    consumers. Schema-v3 callers receive provenance fields and compatibility aliases.
+    """
+    if input_mode is None:
+        market_value = None if official_nav is None else float(shares or 0) * float(official_nav)
+        total_cost = None if avg_cost is None else float(shares or 0) * float(avg_cost)
+        profit_loss = None if market_value is None or total_cost is None else market_value - total_cost
+        return_rate = None if profit_loss is None or not total_cost else profit_loss / total_cost * 100
+        return {
+            "total_cost": _round(total_cost),
+            "market_value": _round(market_value),
+            "profit_loss": _round(profit_loss),
+            "return_rate": _round(return_rate),
+        }
+
+    official_market_value: float | None = None
+    position_value: float | None = None
+    position_value_basis = "unavailable"
+    reference_total_cost: float | None = None
+    profit_loss: float | None = None
+    return_rate: float | None = None
+
+    if input_mode == "amount_pnl":
+        if shares_source == "inferred" and shares is not None and official_nav is not None:
+            official_market_value = float(shares) * float(official_nav)
+            position_value = official_market_value
+            position_value_basis = "official_nav_from_inferred_shares"
+        elif amount_snapshot is not None:
+            position_value = float(amount_snapshot)
+            position_value_basis = "user_amount_snapshot"
+
+        if amount_snapshot is not None and cumulative_pnl_snapshot is not None:
+            candidate_cost = float(amount_snapshot) - float(cumulative_pnl_snapshot)
+            reference_total_cost = candidate_cost if candidate_cost > 0 else None
+            profit_loss = float(cumulative_pnl_snapshot)
+            if reference_total_cost is not None:
+                return_rate = profit_loss / reference_total_cost * 100
+    else:
+        unit_cost = avg_unit_cost if avg_unit_cost is not None else avg_cost
+        if shares is not None and official_nav is not None:
+            official_market_value = float(shares) * float(official_nav)
+            position_value = official_market_value
+            position_value_basis = "official_nav_from_user_shares"
+        if shares is not None and unit_cost is not None:
+            reference_total_cost = float(shares) * float(unit_cost)
+        if official_market_value is not None and reference_total_cost is not None:
+            profit_loss = official_market_value - reference_total_cost
+            if reference_total_cost > 0:
+                return_rate = profit_loss / reference_total_cost * 100
+
+    today_estimated_profit_loss = None
+    intraday_market_value = None
+    if position_value is not None and intraday_change_pct is not None:
+        today_estimated_profit_loss = position_value * float(intraday_change_pct) / 100
+        intraday_market_value = position_value + today_estimated_profit_loss
+
     return {
-        "total_cost": _round(total_cost),
-        "market_value": _round(market_value),
+        "user_amount_snapshot": _round(amount_snapshot),
+        "user_cumulative_pnl_snapshot": _round(cumulative_pnl_snapshot),
+        "snapshot_at": snapshot_at,
+        "official_market_value": _round(official_market_value),
+        "intraday_market_value": _round(intraday_market_value),
+        "position_value": _round(position_value),
+        "position_value_basis": position_value_basis,
+        "reference_total_cost": _round(reference_total_cost),
+        "today_estimated_profit_loss": _round(today_estimated_profit_loss),
+        "intraday_change_pct": _round(intraday_change_pct),
         "profit_loss": _round(profit_loss),
         "return_rate": _round(return_rate),
+        "total_cost": _round(reference_total_cost),
+        "market_value": _round(position_value),
     }
 
 
