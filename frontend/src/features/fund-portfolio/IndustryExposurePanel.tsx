@@ -43,17 +43,20 @@ function isFundExposure(exposure: Props["exposure"]): exposure is FundIndustryEx
 }
 
 function portfolioLookthrough(exposure: PortfolioIndustryConcentration): LookthroughExposure {
+  const primary = exposure.primary || exposure.exposure || [];
+  const secondary = exposure.secondary || [];
+  const detail = exposure.detail || [];
   return {
-    status: exposure.primary.length || exposure.secondary.length || exposure.detail.length ? "disclosed" : "unavailable",
+    status: primary.length || secondary.length || detail.length ? "disclosed" : "unavailable",
     message: exposure.calculation_basis,
-    primary: exposure.primary,
-    secondary: exposure.secondary,
-    detail: exposure.detail,
-    identified_coverage_pct: exposure.identified_coverage_pct,
-    other_pct: exposure.other_pct,
-    unknown_pct: exposure.unknown_pct,
-    undisclosed_stock_pct: exposure.undisclosed_stock_pct,
-    non_stock_pct: exposure.non_stock_pct,
+    primary,
+    secondary,
+    detail,
+    identified_coverage_pct: exposure.identified_coverage_pct || 0,
+    other_pct: exposure.other_pct || 0,
+    unknown_pct: exposure.unknown_pct || 0,
+    undisclosed_stock_pct: exposure.undisclosed_stock_pct || 0,
+    non_stock_pct: exposure.non_stock_pct || 0,
     disclosure_date: null,
     source_name: "各基金股票行业穿透结果",
     source_reference: "",
@@ -84,7 +87,7 @@ export function IndustryExposurePanel({ title, exposure, officialAllocations, co
   const fundExposure = isFundExposure(exposure) ? exposure : null;
   const lookthrough = fundExposure?.lookthrough || (exposure ? portfolioLookthrough(exposure as PortfolioIndustryConcentration) : null);
   const rows: ExposureItem[] = lookthrough?.[layer] || [];
-  const tags: Array<IndustryChainTag | SystemTagExposure> = fundExposure?.industry_chain_tags || (exposure && "industry_chain_tags" in exposure ? exposure.industry_chain_tags : []);
+  const tags: Array<IndustryChainTag | SystemTagExposure> = fundExposure?.industry_chain_tags || (exposure && "industry_chain_tags" in exposure ? exposure.industry_chain_tags || [] : []);
   const officialGroups = useMemo<OfficialAllocationGroup[]>(() => {
     if (officialAllocations) return officialAllocations.filter((group) => group.allocation);
     return fundExposure?.official_allocation ? [{ allocation: fundExposure.official_allocation }] : [];

@@ -36,9 +36,15 @@ const analysis: FundAnalysis = {
   nav_history: { data: { points: [{ date: "2026-08-14", unit_nav: 1.348, cumulative_nav: 3.921, daily_change_pct: 0.37 }], latest: { unit_nav: 1.348, cumulative_nav: 3.921, nav_date: "2026-08-14" } }, meta: { ...meta, status: "official" } },
   performance: { returns: { "1m": 2, "3m": 3, "6m": 4, "1y": 5, "3y": 6 }, since_inception: 7, max_drawdown: -20, annualized_volatility: 25 },
   holdings: { data: { report_period: "2026-Q2", disclosure_date: "2026-06-30", public_date: null, is_top_ten: true, top10_coverage_pct: 43.72, holdings: [{ stock_code: "300308", stock_name: "中际旭创", weight_pct: 4.31, shares_10k: 20, market_value_10k: 11388 }] }, meta },
-  industry_exposure: { data: { primary: [{ name: "通信设备", weight_pct: 4.31 }], secondary: [{ name: "通信设备", weight_pct: 4.31 }], broad: [{ name: "科技", weight_pct: 4.31 }], system_tags: [{ id: "semiconductor", name: "半导体", weight_pct: 3 }], identified_coverage_pct: 4.31, unidentified_disclosed_pct: 39.41, undisclosed_stock_pct: 20, non_stock_pct: 36.28, calculation_basis: "公开持仓", industry_classification_source: "东方财富 f100" }, meta },
+  industry_exposure: { data: {
+    official_allocation: { exposure: [{ name: "制造业", display_name: "制造业（待穿透）", weight_pct: 86.67, requires_lookthrough: true }], stock_exposure_pct: 63.72, as_of_date: "2026-06-30", source_name: "基金官方行业配置", source_reference: "https://example.test/official" },
+    lookthrough: { status: "disclosed", message: "", disclosed_coverage_pct: 43.72, primary: [{ name: "电子", weight_pct: 35 }], secondary: [{ name: "半导体", weight_pct: 35 }], detail: [{ name: "半导体设备", weight_pct: 30 }], identified_coverage_pct: 35, other_pct: 1, unknown_pct: 7.72, undisclosed_stock_pct: 20, non_stock_pct: 36.28, disclosure_date: "2026-06-30", source_name: "巨潮资讯股票行业分类", source_reference: "https://example.test/lookthrough", classification_standard: "证监会行业分类", calculation_basis: "公开前十大持仓占基金净值比例；未披露部分未归一化" },
+    industry_chain_tags: [{ id: "semiconductor-equipment", name: "半导体设备", weight_pct: 30, evidence_level: "disclosed_stock_classification", source_name: "巨潮资讯股票行业分类" }],
+    other_constituents: [], unknown_constituents: [{ stock_code: "300308", stock_name: "中际旭创", weight_pct: 7.72, reason: "行业数据缺失" }],
+    primary: [{ name: "电子", weight_pct: 35 }], secondary: [{ name: "半导体", weight_pct: 35 }], broad: [], system_tags: [{ id: "semiconductor-equipment", name: "半导体设备", weight_pct: 30 }], identified_coverage_pct: 35, unidentified_disclosed_pct: 8.72, undisclosed_stock_pct: 20, non_stock_pct: 36.28, calculation_basis: "公开前十大持仓占基金净值比例；未披露部分未归一化", industry_classification_source: "巨潮资讯股票行业分类",
+  }, meta },
   intraday_estimate: { data: { status: "unavailable", message: "盘中估算暂不可用" }, meta: { ...meta, status: "unavailable" } },
-  data_quality: { profile: meta, latest_nav: meta, nav_history: meta, holdings: meta, industry_exposure: meta, intraday_estimate: meta, industry_allocation: meta },
+  data_quality: { profile: meta, latest_nav: meta, nav_history: meta, holdings: meta, industry_exposure: meta, intraday_estimate: meta, industry_allocation: meta, stock_industry_classification: { ...meta, source_name: "巨潮资讯股票行业分类", data_type: "stock_industry_classification" } },
 };
 
 it("shows five evidence regions, value provenance and complete data quality", () => {
@@ -47,8 +53,13 @@ it("shows five evidence regions, value provenance and complete data quality", ()
     expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
   }
   expect(screen.getByText("基金持仓来自定期报告披露，不代表基金当前实时持仓。")).toBeInTheDocument();
-  expect(screen.getByText("系统识别：")).toBeInTheDocument();
-  expect(screen.getByText("用户标签：")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "官方行业配置" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "重仓股穿透后的行业暴露" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "产业链 / 主题标签" })).toBeInTheDocument();
+  expect(screen.getByText("制造业（待穿透）")).toBeInTheDocument();
+  expect(screen.getByText("用户标签")).toBeInTheDocument();
+  expect(screen.getByText("基金名称未参与行业事实判断")).toBeInTheDocument();
+  expect(screen.getByText("stock_industry_classification")).toBeInTheDocument();
   expect(screen.getByText("官方净值来源")).toBeInTheDocument();
   for (const label of ["用户录入金额", "正式净值参考值", "盘中估算参考值", "持仓来源", "更新时间", "是否使用缓存", "缺失字段", "估算可信度"]) {
     expect(screen.getByText(label)).toBeInTheDocument();

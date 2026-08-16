@@ -2,6 +2,7 @@ import { Edit3, Trash2, X } from "lucide-react";
 import { getTag } from "@/features/tags/catalog";
 import { DataStatus } from "./DataStatus";
 import { dateTime, money, number, percent } from "./format";
+import { IndustryExposurePanel } from "./IndustryExposurePanel";
 import { NavChart } from "./NavChart";
 import type { FundAnalysis, FundHolding, PositionMetrics } from "./types";
 
@@ -112,21 +113,10 @@ export function FundDetailDrawer({ open, holding, analysis, position, onClose, o
             </div>
           </Section>
 
-          <Section title="行业暴露">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <p className="mb-2 text-xs font-medium"><span className="text-muted-foreground">系统识别：</span></p>
-                <div className="flex flex-wrap gap-2">{exposure?.system_tags.length ? exposure.system_tags.map((tag) => <span key={tag.id} className="rounded-full border border-primary/30 bg-primary/10 px-2 py-1 text-xs text-primary">{tag.name} {percent(tag.weight_pct)}</span>) : <span className="text-xs text-muted-foreground">暂无可靠数据</span>}</div>
-              </div>
-              <div>
-                <p className="mb-2 text-xs font-medium"><span className="text-muted-foreground">用户标签：</span></p>
-                <div className="flex flex-wrap gap-2">{userTags.length ? userTags.map((name) => <span key={name} className="rounded-full border border-border bg-muted/40 px-2 py-1 text-xs">{name}</span>) : <span className="text-xs text-muted-foreground">未添加</span>}</div>
-              </div>
-            </div>
-            <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2">
-              {(exposure?.primary || []).map((item) => <div key={item.name} className="flex justify-between rounded-lg border border-border/40 px-3 py-2"><span>{item.name}</span><span>{percent(item.weight_pct)}</span></div>)}
-            </div>
-            <p className="mt-3 text-[11px] text-muted-foreground">{exposure?.calculation_basis || "行业暴露暂不可用"} · 已识别 {percent(exposure?.identified_coverage_pct)} · 未识别 {percent(exposure?.unidentified_disclosed_pct)}</p>
+          <IndustryExposurePanel title="行业暴露" exposure={exposure || null} compact />
+
+          <Section title="用户标签">
+            <div className="flex flex-wrap gap-2">{userTags.length ? userTags.map((name) => <span key={name} className="rounded-full border border-border bg-muted/40 px-2 py-1 text-xs">{name}</span>) : <span className="text-xs text-muted-foreground">未添加</span>}</div>
           </Section>
 
           <Section title="数据质量">

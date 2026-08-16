@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { GlassCard } from "@/components/ui/GlassCard";
+import { IndustryExposurePanel } from "./IndustryExposurePanel";
 import { percent } from "./format";
 import type { FundPortfolioAnalysisData } from "./types";
 
@@ -9,13 +10,13 @@ export function PortfolioCombination({ data }: { data: FundPortfolioAnalysisData
   const concentration = data?.industry_concentration;
   const overlaps = data?.overlap || [];
   const shownOverlaps = expanded ? overlaps : overlaps.slice(0, 5);
-  const systemTags = useMemo(() => {
-    const tags = new Map<string, string>();
-    for (const holding of data?.holdings || []) {
-      for (const tag of holding.analysis?.industry_exposure.data?.system_tags || []) tags.set(tag.id, tag.name);
-    }
-    return [...tags.entries()].map(([id, name]) => ({ id, name }));
-  }, [data]);
+  const isSingleFund = data?.overview.fund_count === 1;
+  const singleExposure = isSingleFund ? data?.holdings[0]?.analysis?.industry_exposure.data || null : null;
+  const officialAllocations = (data?.holdings || []).map((holding) => ({
+    fundCode: holding.code,
+    fundName: holding.name,
+    allocation: holding.analysis?.industry_exposure.data?.official_allocation || null,
+  }));
 
   return (
     <div className="grid gap-4 xl:grid-cols-2">
@@ -41,22 +42,11 @@ export function PortfolioCombination({ data }: { data: FundPortfolioAnalysisData
         )}
       </GlassCard>
 
-      <GlassCard>
-        <h2 className="font-semibold">组合行业集中度</h2>
-        <p className="mt-1 text-xs text-muted-foreground">{concentration?.calculation_basis || "仅按已识别公开持仓计算"}</p>
-        <div className="mt-4 space-y-3">{concentration?.exposure.length ? concentration.exposure.map((item) => (
-          <div key={item.name}>
-            <div className="mb-1 flex justify-between text-xs"><span>{item.name}</span><span>{percent(item.weight_pct)}</span></div>
-            <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary" style={{ width: `${Math.min(100, Math.max(0, item.weight_pct))}%` }} /></div>
-          </div>
-        )) : <p className="rounded-xl border border-dashed border-border px-3 py-4 text-sm text-muted-foreground">组合行业暴露暂无可靠数据</p>}</div>
-        <div className="mt-4">
-          <div className="mb-1 flex justify-between text-xs text-warning"><span>未知部分</span><span>{percent(concentration?.unknown_pct)}</span></div>
-          <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-warning" style={{ width: `${Math.min(100, Math.max(0, concentration?.unknown_pct || 0))}%` }} /></div>
-        </div>
-        <div className="mt-4 flex flex-wrap gap-2">{systemTags.map((tag) => <span key={tag.id} className="rounded-full border border-primary/30 bg-primary/10 px-2 py-1 text-xs text-primary">{tag.name}</span>)}{!systemTags.length && <span className="text-xs text-muted-foreground">细分方向暂无可靠数据</span>}</div>
-        {!!data?.risk_flags.length && <div className="mt-4 space-y-1">{data.risk_flags.map((flag) => <p key={flag} className="rounded-lg border border-warning/25 bg-warning/5 p-2 text-xs text-warning">{flag}</p>)}</div>}
-      </GlassCard>
+      <IndustryExposurePanel
+        title={isSingleFund ? "该基金行业暴露" : "组合行业集中度"}
+        exposure={isSingleFund ? singleExposure : concentration || null}
+        officialAllocations={isSingleFund ? undefined : officialAllocations}
+      />
     </div>
   );
 }
