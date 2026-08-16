@@ -29,9 +29,9 @@ class _CninfoTokenFactory:
     def __call__(self) -> str:
         if self._runtime is None:
             from akshare.datasets import get_ths_js
-            from py_mini_racer import py_mini_racer
+            from py_mini_racer import MiniRacer
 
-            runtime = py_mini_racer.MiniRacer()
+            runtime = MiniRacer()
             js_path = Path(get_ths_js("cninfo.js"))
             runtime.eval(js_path.read_text(encoding="utf-8"))
             self._runtime = runtime

@@ -8,7 +8,7 @@ import pytest
 import requests
 
 from fund_data.providers.akshare_provider import AkshareEastmoneyProvider
-from fund_data.providers.cninfo_industry import CninfoIndustryProvider
+from fund_data.providers.cninfo_industry import CninfoIndustryProvider, _CninfoTokenFactory
 from fund_data.providers.base import ProviderUnavailable
 from fund_data.providers.eastmoney_direct import EastmoneyDirectProvider
 from fund_data.providers.tencent_quote import TencentQuoteProvider
@@ -248,6 +248,13 @@ class FakeCninfoPost:
         if isinstance(payload, Exception):
             raise payload
         return FakeResponse(payload={"records": payload})
+
+
+def test_cninfo_token_factory_uses_the_installed_public_mini_racer_runtime():
+    token = _CninfoTokenFactory()()
+
+    assert isinstance(token, str)
+    assert token.strip()
 
 
 def test_cninfo_provider_prefers_current_sw_latest_record_and_keeps_partial_failures():
