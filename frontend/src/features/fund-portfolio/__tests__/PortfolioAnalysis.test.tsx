@@ -19,7 +19,11 @@ const emptyAnalysis: FundPortfolioAnalysisData = {
     updated_at: "2026-08-16T12:00:00+08:00",
   },
   holdings: [], overlap: [],
-  industry_concentration: { exposure: [], identified_coverage_pct: 0, unknown_pct: 0, calculation_basis: "公开持仓" },
+  industry_concentration: {
+    primary: [], secondary: [], detail: [], exposure: [], industry_chain_tags: [],
+    identified_coverage_pct: 0, other_pct: 0, unknown_pct: 0,
+    undisclosed_stock_pct: 0, non_stock_pct: 0, calculation_basis: "公开持仓",
+  },
   risk_flags: [],
 };
 
