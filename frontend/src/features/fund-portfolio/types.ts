@@ -118,8 +118,18 @@ export interface FundAnalysis {
 }
 
 export interface FundHolding {
+  schema_version: 3;
   code: string;
-  shares: number;
+  input_mode: "amount_pnl" | "shares_cost";
+  amount_snapshot: number | null;
+  cumulative_pnl_snapshot: number | null;
+  snapshot_at: string | null;
+  shares: number | null;
+  shares_source: "user" | "inferred" | null;
+  basis_nav: number | null;
+  basis_nav_date: string | null;
+  shares_inference_note: string | null;
+  avg_unit_cost: number | null;
   avg_cost: number | null;
   buy_date: string;
   notes: string;
@@ -136,8 +146,12 @@ export interface FundHolding {
 
 export interface FundHoldingInput {
   code: string;
-  shares: number;
-  avg_cost: number;
+  input_mode: "amount_pnl" | "shares_cost";
+  amount_snapshot: number | null;
+  cumulative_pnl_snapshot: number | null;
+  shares: number | null;
+  avg_unit_cost: number | null;
+  avg_cost: number | null;
   buy_date: string;
   notes: string;
   custom_tag_ids: string[];
@@ -163,6 +177,16 @@ export interface FundPortfolioData {
 }
 
 export interface PositionMetrics {
+  user_amount_snapshot: number | null;
+  user_cumulative_pnl_snapshot: number | null;
+  snapshot_at: string | null;
+  official_market_value: number | null;
+  intraday_market_value: number | null;
+  position_value: number | null;
+  position_value_basis: "official_nav_from_inferred_shares" | "official_nav_from_user_shares" | "user_amount_snapshot" | "unavailable";
+  reference_total_cost: number | null;
+  today_estimated_profit_loss: number | null;
+  intraday_change_pct: number | null;
   total_cost: number | null;
   market_value: number | null;
   profit_loss: number | null;
@@ -175,6 +199,7 @@ export interface PortfolioHoldingAnalysis {
   fund_type: string | null;
   user_holding: FundHolding;
   position: PositionMetrics;
+  weight_pct: number | null;
   analysis: FundAnalysis | null;
 }
 
@@ -182,13 +207,19 @@ export interface PortfolioOverview {
   fund_count: number;
   total_cost: number;
   market_value: number;
-  profit_loss: number;
+  total_holding_value: number;
+  profit_loss: number | null;
   return_rate: number | null;
   intraday_change_pct: number | null;
+  intraday_estimated_profit_loss: number | null;
   intraday_message: string;
   nav_dates: string[];
+  latest_nav_date: string | null;
   inconsistent_nav_dates: boolean;
   cost_incomplete: boolean;
+  pnl_complete: boolean;
+  estimable_count: number;
+  official_only_count: number;
   updated_at: string;
 }
 

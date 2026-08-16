@@ -1,15 +1,18 @@
-import { X } from "lucide-react";
+import { Edit3, Trash2, X } from "lucide-react";
 import { getTag } from "@/features/tags/catalog";
 import { DataStatus } from "./DataStatus";
-import { dateTime, number, percent } from "./format";
+import { dateTime, money, number, percent } from "./format";
 import { NavChart } from "./NavChart";
-import type { FundAnalysis, FundHolding } from "./types";
+import type { FundAnalysis, FundHolding, PositionMetrics } from "./types";
 
 interface FundDetailDrawerProps {
   open: boolean;
   holding: FundHolding | null;
   analysis: FundAnalysis | null;
+  position?: PositionMetrics | null;
   onClose: () => void;
+  onEdit?: () => void;
+  onDelete?: () => void;
 }
 
 const periodLabels: Record<string, string> = {
@@ -25,7 +28,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetailDrawerProps) {
+export function FundDetailDrawer({ open, holding, analysis, position, onClose, onEdit = () => {}, onDelete = () => {} }: FundDetailDrawerProps) {
   if (!open || !holding) return null;
   const profile = analysis?.profile.data;
   const latest = analysis?.latest_nav.data;
@@ -33,6 +36,9 @@ export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetai
   const disclosed = analysis?.holdings.data;
   const exposure = analysis?.industry_exposure.data;
   const userTags = holding.custom_tag_ids.map((id) => getTag(id)?.name || id);
+  const quality = Object.values(analysis?.data_quality || {});
+  const missingFields = quality.filter((item) => ["error", "unavailable"].includes(item.status)).map((item) => item.data_type);
+  const usedCache = quality.some((item) => item.is_cached);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/65" onMouseDown={(event) => {
@@ -66,7 +72,7 @@ export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetai
             <div className="mt-3"><DataStatus meta={analysis?.profile.meta} /></div>
           </Section>
 
-          <Section title="净值与历史表现">
+          <Section title="净值与走势">
             <div className="mb-4 grid gap-3 sm:grid-cols-3">
               <div><p className="text-xs text-muted-foreground">最新单位净值</p><p className="mt-1 text-lg font-semibold">{number(latest?.unit_nav)}</p></div>
               <div><p className="text-xs text-muted-foreground">累计净值</p><p className="mt-1 text-lg font-semibold">{number(latest?.cumulative_nav)}</p></div>
@@ -82,7 +88,12 @@ export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetai
               ))}
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-muted-foreground">官方净值来源</span><DataStatus meta={analysis?.latest_nav.meta} />
+              <span className="text-muted-foreground">正式净值状态</span><DataStatus meta={analysis?.latest_nav.meta} />
+            </div>
+            <div className="mt-4 grid gap-2 text-xs sm:grid-cols-3">
+              <div className="rounded-xl border border-border/50 p-3"><p className="text-muted-foreground">用户录入金额</p><p className="mt-1 font-semibold">{money(position?.user_amount_snapshot ?? holding.amount_snapshot)}</p><p className="mt-1 text-[10px] text-muted-foreground">{dateTime(position?.snapshot_at ?? holding.snapshot_at)}</p></div>
+              <div className="rounded-xl border border-success/25 bg-success/5 p-3"><p className="text-muted-foreground">正式净值参考值</p><p className="mt-1 font-semibold">{money(position?.official_market_value)}</p></div>
+              <div className="rounded-xl border border-warning/25 bg-warning/5 p-3"><p className="text-muted-foreground">盘中估算参考值</p><p className="mt-1 font-semibold">{money(position?.intraday_market_value)}</p></div>
             </div>
           </Section>
 
@@ -101,7 +112,7 @@ export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetai
             </div>
           </Section>
 
-          <Section title="行业和产业链暴露">
+          <Section title="行业暴露">
             <div className="grid gap-4 sm:grid-cols-2">
               <div>
                 <p className="mb-2 text-xs font-medium"><span className="text-muted-foreground">系统识别：</span></p>
@@ -119,9 +130,13 @@ export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetai
           </Section>
 
           <Section title="数据质量">
-            <div className="mb-3 grid gap-2 text-xs sm:grid-cols-2">
-              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">主数据源是否可用</p><p className="mt-1 font-semibold">{Object.values(analysis?.data_quality || {}).some((item) => !item.fallback_used && !["error", "unavailable"].includes(item.status)) ? "是" : "否 / 未确认"}</p></div>
-              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">本次详情获取</p><p className="mt-1 font-semibold">{dateTime(analysis?.profile.meta.fetched_at)}</p></div>
+            <div className="mb-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">官方净值来源</p><p className="mt-1 font-semibold">{analysis?.latest_nav.meta.source_name || "暂无可靠数据"}</p></div>
+              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">持仓来源</p><p className="mt-1 font-semibold">{analysis?.holdings.meta.source_name || "暂无可靠数据"}</p></div>
+              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">更新时间</p><p className="mt-1 font-semibold">{dateTime(analysis?.profile.meta.fetched_at)}</p></div>
+              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">是否使用缓存</p><p className="mt-1 font-semibold">{usedCache ? "是" : "否"}</p></div>
+              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">缺失字段</p><p className="mt-1 font-semibold">{missingFields.length ? missingFields.join("、") : "无已知缺失"}</p></div>
+              <div className="rounded-lg border border-border/50 p-3"><p className="text-muted-foreground">估算可信度</p><p className="mt-1 font-semibold">{analysis?.intraday_estimate.data?.confidence || "暂无可靠数据"}</p></div>
             </div>
             <div className="space-y-2">{Object.entries(analysis?.data_quality || {}).map(([key, item]) => (
               <div key={key} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/40 px-3 py-2 text-xs">
@@ -130,6 +145,11 @@ export function FundDetailDrawer({ open, holding, analysis, onClose }: FundDetai
             ))}</div>
           </Section>
         </div>
+        <footer className="flex flex-wrap justify-end gap-2 border-t border-border/60 px-5 py-4">
+          <button onClick={onEdit} className="inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2 text-sm text-muted-foreground hover:border-primary/40 hover:text-foreground"><Edit3 className="h-4 w-4" />编辑持仓</button>
+          <button onClick={onDelete} className="inline-flex items-center gap-2 rounded-xl border border-destructive/35 px-4 py-2 text-sm text-destructive hover:bg-destructive/10"><Trash2 className="h-4 w-4" />删除持仓</button>
+          <button onClick={onClose} className="rounded-xl bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">关闭</button>
+        </footer>
       </aside>
     </div>
   );

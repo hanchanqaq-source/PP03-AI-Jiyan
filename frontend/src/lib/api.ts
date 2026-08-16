@@ -19,6 +19,7 @@ export type {
   FundPortfolioAnalysisData,
   FundPortfolioData,
   FundSearchResult,
+  PositionMetrics,
 } from "@/features/fund-portfolio/types";
 
 export class ApiError extends Error {
