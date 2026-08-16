@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fund_data.cache import FundCache
-from fund_data.calculations import calculate_intraday_estimate, calculate_performance
+from fund_data.calculations import (
+    calculate_industry_concentration,
+    calculate_intraday_estimate,
+    calculate_overlap,
+    calculate_performance,
+    calculate_position,
+)
 from fund_data.models import DataMeta, ProviderResult
 from fund_data.providers import AkshareDanjuanProvider, AkshareEastmoneyProvider, EastmoneyDirectProvider, TencentQuoteProvider
 from fund_data.providers.base import ProviderUnavailable
@@ -264,6 +270,117 @@ class FundDataService:
                 "industry_exposure": industry_exposure["meta"], "intraday_estimate": intraday["meta"],
                 "industry_allocation": allocation["meta"],
             },
+        }
+
+    def get_portfolio_analysis(self, holdings: list[dict[str, Any]], force_refresh: bool = False) -> dict[str, Any]:
+        enriched: list[dict[str, Any]] = []
+        overlap_inputs: list[dict[str, Any]] = []
+        industry_inputs: list[dict[str, Any]] = []
+        nav_dates: set[str] = set()
+        total_cost = 0.0
+        total_market_value = 0.0
+        total_profit_loss = 0.0
+        incomplete_cost = False
+        intraday_inputs: list[tuple[float, float]] = []
+        risk_flags: list[str] = []
+
+        for holding in holdings:
+            code = str(holding.get("code") or "")
+            analysis = self.get_fund_analysis(code, force_refresh=force_refresh)
+            profile = analysis.get("profile", {}).get("data") or {}
+            latest = analysis.get("latest_nav", {}).get("data") or {}
+            position = calculate_position(
+                shares=float(holding.get("shares") or 0),
+                avg_cost=holding.get("avg_cost"),
+                official_nav=latest.get("unit_nav"),
+            )
+            if position["total_cost"] is None:
+                incomplete_cost = True
+            else:
+                total_cost += float(position["total_cost"])
+            if position["market_value"] is not None:
+                total_market_value += float(position["market_value"])
+            if position["profit_loss"] is not None:
+                total_profit_loss += float(position["profit_loss"])
+            if latest.get("nav_date"):
+                nav_dates.add(str(latest["nav_date"]))
+
+            disclosed = analysis.get("holdings", {}).get("data") or {}
+            market_value = position.get("market_value")
+            name = profile.get("name") or holding.get("manual_name") or holding.get("legacy_name") or code
+            if market_value is not None:
+                overlap_inputs.append({
+                    "code": code, "name": name, "market_value": market_value,
+                    "holdings": disclosed.get("holdings") or [],
+                })
+                exposure = analysis.get("industry_exposure", {}).get("data") or {}
+                broad_map = {item["name"]: item["weight_pct"] for item in exposure.get("broad") or []}
+                unknown = sum(float(exposure.get(key) or 0) for key in (
+                    "unidentified_disclosed_pct", "undisclosed_stock_pct", "non_stock_pct",
+                ))
+                industry_inputs.append({"market_value": market_value, "broad_exposure": broad_map, "unknown_pct": unknown})
+                intraday = analysis.get("intraday_estimate", {}).get("data") or {}
+                if intraday.get("status") == "estimated" and intraday.get("estimated_change_pct") is not None:
+                    intraday_inputs.append((float(market_value), float(intraday["estimated_change_pct"])))
+
+            top10 = disclosed.get("top10_coverage_pct")
+            if isinstance(top10, (int, float)) and top10 < 30:
+                risk_flags.append(f"{name} 的前十大持仓覆盖比例较低（{top10:.2f}%）")
+            disclosure_date = disclosed.get("disclosure_date")
+            if disclosure_date:
+                try:
+                    if (self._now().date() - date.fromisoformat(disclosure_date)).days > 100:
+                        risk_flags.append(f"{name} 的公开持仓披露已超过一个季度")
+                except ValueError:
+                    pass
+            enriched.append({
+                "code": code,
+                "name": name,
+                "fund_type": profile.get("fund_type"),
+                "user_holding": holding,
+                "position": position,
+                "analysis": analysis,
+            })
+
+        overlap = calculate_overlap(overlap_inputs)
+        concentration = calculate_industry_concentration(industry_inputs)
+        if overlap:
+            risk_flags.append("多只基金公开持仓包含同一批股票；请查看重复持仓明细")
+        technology = next((item["weight_pct"] for item in concentration["exposure"] if item["name"] == "科技"), 0)
+        if technology >= 50:
+            risk_flags.append("组合对科技行业的公开持仓估算暴露较高")
+        inconsistent_dates = len(nav_dates) > 1
+        if inconsistent_dates:
+            risk_flags.append("组合净值数据日期不完全一致")
+        if incomplete_cost:
+            risk_flags.append("部分旧持仓成本尚未确认，组合盈亏只计算已确认部分")
+
+        return_rate = total_profit_loss / total_cost * 100 if total_cost else None
+        intraday_change = None
+        intraday_message = "盘中估算暂不可用：当前基金类型或公开持仓不足以形成可靠估算"
+        if enriched and len(intraday_inputs) == len([item for item in enriched if item["position"]["market_value"] is not None]):
+            denominator = sum(value for value, _ in intraday_inputs)
+            if denominator:
+                intraday_change = sum(value * change for value, change in intraday_inputs) / denominator
+                intraday_message = "这是估算，不是官方净值"
+        return {
+            "overview": {
+                "fund_count": len(holdings),
+                "total_cost": round(total_cost, 4),
+                "market_value": round(total_market_value, 4),
+                "profit_loss": round(total_profit_loss, 4),
+                "return_rate": round(return_rate, 4) if return_rate is not None else None,
+                "intraday_change_pct": round(intraday_change, 4) if intraday_change is not None else None,
+                "intraday_message": intraday_message,
+                "nav_dates": sorted(nav_dates),
+                "inconsistent_nav_dates": inconsistent_dates,
+                "cost_incomplete": incomplete_cost,
+                "updated_at": self._now().isoformat(),
+            },
+            "holdings": enriched,
+            "overlap": overlap,
+            "industry_concentration": concentration,
+            "risk_flags": list(dict.fromkeys(risk_flags)),
         }
 
 

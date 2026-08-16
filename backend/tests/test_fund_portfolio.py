@@ -1,4 +1,6 @@
-"""PP03 基金持仓：只使用测试临时目录，不接触用户真实数据。"""
+"""PP03 V0.2 fund holdings: every test uses an isolated temporary user file."""
+
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,46 +16,49 @@ client = TestClient(app_module.app)
 def isolated_fund_file(tmp_path, monkeypatch):
     path = tmp_path / "fund-portfolio.json"
     monkeypatch.setattr(fp, "FUND_FILE", str(path))
+    monkeypatch.setattr(fp, "_now", lambda: datetime(2026, 8, 16, 8, tzinfo=timezone.utc))
     return path
 
 
 def _payload(**changes):
     payload = {
         "code": "000001",
-        "name": "用户录入基金",
-        "amount": 1000,
         "shares": 500,
-        "cost": 2,
+        "avg_cost": 2,
         "buy_date": "2026-08-16",
         "notes": "长期观察",
-        "tag_ids": ["storage"],
+        "custom_tag_ids": ["storage"],
+        "verification_status": "verified",
+        "manual_name": None,
+        "replace": False,
     }
     payload.update(changes)
     return payload
 
 
-def test_fund_portfolio_roundtrip_keeps_truth_fields_separate(isolated_fund_file):
+def test_v2_roundtrip_saves_only_user_truth_fields(isolated_fund_file):
     response = client.post("/api/fund-portfolio/holding", json=_payload())
     assert response.status_code == 200
     holding = response.json()["data"]["holdings"][0]
-    assert holding["tag_ids"] == ["storage"]
-    assert holding["official_nav"] is None
-    assert holding["intraday_estimate"] is None
-    assert holding["historical_nav"] is None
-    assert isolated_fund_file.exists()
+    assert holding["code"] == "000001"
+    assert holding["shares"] == 500
+    assert holding["avg_cost"] == 2
+    assert holding["custom_tag_ids"] == ["storage"]
+    assert holding["cost_confirmation_required"] is False
+    assert "official_nav" not in holding
+    assert "fund_name" not in holding
+    assert response.json()["data"]["total_cost"] == 1000
     assert not Path(str(isolated_fund_file) + ".tmp").exists()
 
-    read_back = client.get("/api/fund-portfolio").json()["data"]
-    assert read_back["total_amount"] == 1000
-    assert read_back["holdings"][0]["name"] == "用户录入基金"
 
-
-def test_upsert_replaces_same_fund_code_instead_of_duplicating(isolated_fund_file):
-    client.post("/api/fund-portfolio/holding", json=_payload())
-    result = client.post("/api/fund-portfolio/holding", json=_payload(amount=1800, notes="更新记录")).json()["data"]
-    assert len(result["holdings"]) == 1
-    assert result["holdings"][0]["amount"] == 1800
-    assert result["holdings"][0]["notes"] == "更新记录"
+def test_duplicate_create_is_rejected_and_explicit_replace_edits_only_that_fund(isolated_fund_file):
+    assert client.post("/api/fund-portfolio/holding", json=_payload()).status_code == 200
+    duplicate = client.post("/api/fund-portfolio/holding", json=_payload(notes="不应覆盖"))
+    assert duplicate.status_code == 409
+    edited = client.post("/api/fund-portfolio/holding", json=_payload(notes="已确认更新", replace=True))
+    assert edited.status_code == 200
+    assert len(edited.json()["data"]["holdings"]) == 1
+    assert edited.json()["data"]["holdings"][0]["notes"] == "已确认更新"
 
 
 def test_delete_fund_holding(isolated_fund_file):
@@ -65,29 +70,51 @@ def test_delete_fund_holding(isolated_fund_file):
 
 @pytest.mark.parametrize("changes", [
     {"code": "abc"},
-    {"name": ""},
-    {"amount": -1},
     {"shares": -1},
+    {"avg_cost": -1},
     {"buy_date": "16/08/2026"},
-    {"tag_ids": ["storage", ""]},
+    {"custom_tag_ids": ["storage", ""]},
+    {"verification_status": "manual_unverified", "manual_name": ""},
 ])
-def test_invalid_fund_holding_is_rejected(isolated_fund_file, changes):
+def test_invalid_v2_holding_is_rejected(isolated_fund_file, changes):
     response = client.post("/api/fund-portfolio/holding", json=_payload(**changes))
     assert response.status_code in (400, 422)
     assert not isolated_fund_file.exists()
 
 
-def test_corrupt_fund_file_degrades_to_empty_without_fabricating_values(isolated_fund_file):
-    isolated_fund_file.write_text("{broken", encoding="utf-8")
-    data = client.get("/api/fund-portfolio").json()["data"]
-    assert data == {"holdings": [], "total_amount": 0, "updated": None}
+def test_v01_migration_backs_up_original_bytes_and_requires_cost_confirmation(isolated_fund_file):
+    original = (
+        '{"holdings":[{"code":"000001","name":"旧名称","amount":1000,'
+        '"shares":500,"cost":2,"buy_date":"2026-01-01","notes":"不能丢",'
+        '"tag_ids":["storage"]}],"updated":"2026-08-01 10:00"}'
+    ).encode("utf-8")
+    isolated_fund_file.write_bytes(original)
+    data = fp.list_fund_holdings()
+    backups = list(isolated_fund_file.parent.glob("fund-portfolio.v0.1-backup-*.json"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    holding = data["holdings"][0]
+    assert holding["code"] == "000001"
+    assert holding["shares"] == 500
+    assert holding["avg_cost"] is None
+    assert holding["legacy_cost"] == 2
+    assert holding["legacy_amount"] == 1000
+    assert holding["legacy_name"] == "旧名称"
+    assert holding["notes"] == "不能丢"
+    assert holding["custom_tag_ids"] == ["storage"]
+    assert holding["cost_confirmation_required"] is True
+    assert data["migration"]["cost_confirmation_required_count"] == 1
+    stored = isolated_fund_file.read_text(encoding="utf-8")
+    assert '"schema_version": 2' in stored
 
 
-def test_corrupt_fund_file_is_not_overwritten_by_a_new_record(isolated_fund_file):
+def test_corrupt_fund_file_degrades_to_empty_and_is_never_overwritten(isolated_fund_file):
     original = b"{broken-user-data"
     isolated_fund_file.write_bytes(original)
-
+    data = fp.list_fund_holdings()
     response = client.post("/api/fund-portfolio/holding", json=_payload())
-
+    assert data["holdings"] == []
+    assert data["data_status"] == "corrupt"
     assert response.status_code == 409
     assert isolated_fund_file.read_bytes() == original
+

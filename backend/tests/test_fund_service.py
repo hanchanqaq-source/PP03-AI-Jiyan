@@ -162,3 +162,24 @@ def test_analysis_computes_disclosed_industry_without_hiding_unknown_assets(tmp_
         {"id": "semiconductor", "name": "半导体", "weight_pct": 30.0},
     ]
     assert result["intraday_estimate"]["data"]["status"] == "estimated"
+
+
+def test_portfolio_analysis_calculates_cost_value_overlap_and_date_warning(tmp_path):
+    clock = Clock()
+    provider = FakeProvider("primary", 10, payloads={
+        "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
+        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+    })
+    service = make_service(tmp_path, clock, [provider])
+    holdings = [
+        {"code": "000001", "shares": 100, "avg_cost": 1.0, "buy_date": "2026-01-01", "notes": "", "custom_tag_ids": []},
+        {"code": "000002", "shares": 200, "avg_cost": 1.0, "buy_date": "2026-01-01", "notes": "", "custom_tag_ids": []},
+    ]
+    result = service.get_portfolio_analysis(holdings)
+    assert result["overview"]["fund_count"] == 2
+    assert result["overview"]["total_cost"] == 300.0
+    assert result["overview"]["market_value"] == 330.0
+    assert result["overview"]["profit_loss"] == 30.0
+    assert result["overview"]["return_rate"] == 10.0
+    assert result["overlap"][0]["stock_code"] == "600000"
+    assert result["industry_concentration"]["unknown_pct"] == 40.0
