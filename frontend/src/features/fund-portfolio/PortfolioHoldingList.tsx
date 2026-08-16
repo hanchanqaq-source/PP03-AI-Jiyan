@@ -34,7 +34,7 @@ function matches(item: PortfolioHoldingAnalysis, filter: Filter) {
   if (filter === "down") return (position.intraday_change_pct ?? 0) < 0;
   if (filter === "profit") return (position.profit_loss ?? 0) > 0;
   if (filter === "loss") return (position.profit_loss ?? 0) < 0;
-  if (filter === "pending") return position.profit_loss == null || position.position_value == null;
+  if (filter === "pending") return statusLabel(item) === "数据待补充" || position.profit_loss == null || position.position_value == null;
   return true;
 }
 

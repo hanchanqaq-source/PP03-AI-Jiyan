@@ -201,6 +201,8 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
     expect(within(growthRow!).getByTestId("today-pnl")).toHaveClass("text-danger");
     expect(within(valueRow!).getByTestId("cumulative-pnl")).toHaveClass("text-success");
 
+    await user.click(screen.getByRole("button", { name: "筛选数据待补充" }));
+    expect(screen.getAllByTestId("holding-row")).toHaveLength(2);
     await user.click(screen.getByRole("button", { name: "筛选亏损" }));
     expect(screen.queryByText("华夏成长混合")).not.toBeInTheDocument();
     expect(screen.getByText("测试价值基金")).toBeInTheDocument();
