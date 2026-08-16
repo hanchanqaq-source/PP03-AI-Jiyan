@@ -36,7 +36,6 @@ const exposure = {
   other_constituents: [{ stock_code: "600001", stock_name: "已分类证券", weight_pct: 2.0, reason: "缺少一级行业名称" }],
   unknown_constituents: [
     { stock_code: "688256", stock_name: "未知证券", weight_pct: 6.72, reason: "股票行业分类缺失或请求失败" },
-    { stock_code: "", stock_name: "未披露股票资产", weight_pct: 51.0, reason: "具体证券未披露" },
   ],
   primary: [{ name: "电子", weight_pct: 35.0 }],
   secondary: [{ name: "半导体", weight_pct: 35.0 }],
@@ -74,7 +73,7 @@ it("separates official, lookthrough and chain evidence and expands unresolved co
   expect(screen.getByText(/600001/)).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: /未知 6\.72%/ }));
   expect(screen.getByText(/688256/)).toBeInTheDocument();
-  expect(screen.getAllByText(/未披露股票资产/).length).toBeGreaterThan(1);
+  expect(screen.getByText("未披露股票资产 51.00%")).toBeInTheDocument();
   expect(screen.getByText("基金名称未参与行业事实判断")).toBeInTheDocument();
 });
 

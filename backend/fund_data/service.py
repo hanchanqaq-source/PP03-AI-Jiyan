@@ -240,13 +240,6 @@ class FundDataService:
         stock_exposure = float(allocation.get("stock_exposure_pct") or top10)
         undisclosed_stock = max(0.0, stock_exposure - top10)
         non_stock = max(0.0, 100.0 - stock_exposure)
-        if undisclosed_stock > 0:
-            unknown_constituents.append({
-                "stock_code": "",
-                "stock_name": "未披露股票资产",
-                "weight_pct": round(undisclosed_stock, 4),
-                "reason": "基金股票资产超过公开前十大持仓覆盖，具体证券未披露",
-            })
 
         official_rows = []
         for item in allocation.get("industries") or []:

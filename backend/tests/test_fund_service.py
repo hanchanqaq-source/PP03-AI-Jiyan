@@ -186,6 +186,10 @@ def test_analysis_computes_disclosed_industry_without_hiding_unknown_assets(tmp_
     assert exposure["lookthrough"]["unknown_pct"] == 0.0
     assert exposure["lookthrough"]["undisclosed_stock_pct"] == 20.0
     assert exposure["lookthrough"]["non_stock_pct"] == 20.0
+    assert all(
+        item["stock_name"] != "未披露股票资产"
+        for item in exposure["unknown_constituents"]
+    )
     assert exposure["industry_chain_tags"] == [
         {
             "id": "semiconductor-equipment", "name": "半导体设备", "weight_pct": 30.0,
