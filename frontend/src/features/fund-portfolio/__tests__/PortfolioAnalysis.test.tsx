@@ -216,6 +216,51 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
     await user.selectOptions(screen.getByLabelText("排序方式"), "fund_name");
   });
 
+  it("shows at most four sourced industry tags per dense holding row", async () => {
+    const taggedAnalysis = {
+      ...populatedAnalysis,
+      holdings: [
+        {
+          ...populatedAnalysis.holdings[0],
+          analysis: {
+            latest_nav: { data: null },
+            holdings: { meta: {} },
+            intraday_estimate: { data: null },
+            industry_exposure: {
+              data: {
+                industry_chain_tags: [
+                  { id: "semiconductor-equipment", name: "半导体设备", weight_pct: 30 },
+                  { id: "chip-design", name: "芯片设计", weight_pct: 20 },
+                  { id: "semiconductor", name: "半导体", weight_pct: 15 },
+                ],
+                lookthrough: {
+                  secondary: [{ name: "半导体", weight_pct: 35 }, { name: "软件", weight_pct: 10 }],
+                  primary: [{ name: "电子", weight_pct: 50 }],
+                },
+              },
+            },
+          } as never,
+        },
+        populatedAnalysis.holdings[1],
+      ],
+    };
+    vi.spyOn(api, "fundPortfolio").mockResolvedValue(savedPortfolio);
+    vi.spyOn(api, "fundPortfolioAnalysis").mockResolvedValue(taggedAnalysis);
+    render(<PortfolioAnalysis />);
+
+    const rows = await screen.findAllByTestId("holding-row");
+    const taggedRow = rows.find((row) => within(row).queryByText("华夏成长混合"));
+    const pendingRow = rows.find((row) => within(row).queryByText("测试价值基金"));
+    const first = within(taggedRow!);
+    expect(first.getByText("半导体设备")).toBeInTheDocument();
+    expect(first.getByText("芯片设计")).toBeInTheDocument();
+    expect(first.getByText("半导体")).toBeInTheDocument();
+    expect(first.getByText("软件")).toBeInTheDocument();
+    expect(first.getAllByTestId("system-industry-tag")).toHaveLength(4);
+    expect(first.queryByText("人工智能")).not.toBeInTheDocument();
+    expect(within(pendingRow!).getByText("行业待识别")).toBeInTheDocument();
+  });
+
   it("edits a quick holding and confirms deletion with an in-page modal", async () => {
     const user = userEvent.setup();
     vi.spyOn(api, "fundPortfolio").mockResolvedValue(savedPortfolio);

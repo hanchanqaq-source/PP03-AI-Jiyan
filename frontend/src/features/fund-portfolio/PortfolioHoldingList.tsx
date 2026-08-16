@@ -52,6 +52,21 @@ function movementTone(value: number | null | undefined) {
   return value > 0 ? "text-danger" : "text-success";
 }
 
+function systemIndustryTags(item: PortfolioHoldingAnalysis) {
+  const exposure = item.analysis?.industry_exposure.data;
+  const candidates = [
+    ...(exposure?.industry_chain_tags ?? []),
+    ...(exposure?.lookthrough?.secondary ?? []),
+    ...(exposure?.lookthrough?.primary ?? []),
+  ];
+  const unique = new Map<string, { name: string; weight_pct: number }>();
+  candidates.forEach((candidate) => {
+    const name = candidate.name.trim();
+    if (name && !unique.has(name)) unique.set(name, { name, weight_pct: candidate.weight_pct });
+  });
+  return [...unique.values()].slice(0, 4);
+}
+
 export function PortfolioHoldingList({ data, onDetail, onEdit, onDelete }: {
   data: FundPortfolioAnalysisData;
   onDetail: (item: PortfolioHoldingAnalysis) => void;
@@ -101,11 +116,17 @@ export function PortfolioHoldingList({ data, onDetail, onEdit, onDelete }: {
               const latest = item.analysis?.latest_nav.data;
               const officialNav = latest?.unit_nav ?? item.user_holding.basis_nav;
               const navDate = latest?.nav_date ?? item.user_holding.basis_nav_date;
+              const industryTags = systemIndustryTags(item);
               return (
-                <tr key={item.code} data-testid="holding-row" className="h-[72px] bg-slate-950/10 transition-colors hover:bg-blue-950/20">
+                <tr key={item.code} data-testid="holding-row" className="h-[88px] bg-slate-950/10 transition-colors hover:bg-blue-950/20">
                   <td className="px-4 py-2.5 align-middle">
                     <div className="flex items-center gap-2"><button onClick={() => onDetail(item)} className="truncate text-sm font-semibold hover:text-primary">{item.name}</button><span className="shrink-0 rounded-full border border-blue-400/20 bg-blue-400/5 px-1.5 py-0.5 text-[9px] text-blue-200/70">{statusLabel(item)}</span></div>
                     <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground"><span className="font-mono">{item.code}</span><span className="truncate">{item.fund_type || "类型待补充"}</span></div>
+                    <div className="mt-1 flex min-h-4 flex-wrap items-center gap-1">
+                      {industryTags.length ? industryTags.map((tag) => (
+                        <span key={tag.name} data-testid="system-industry-tag" title={`重仓股穿透 ${percent(tag.weight_pct)}`} className="rounded border border-cyan-400/20 bg-cyan-400/5 px-1.5 py-0.5 text-[9px] leading-none text-cyan-100/75">{tag.name}</span>
+                      )) : <span className="text-[9px] text-muted-foreground/70">行业待识别</span>}
+                    </div>
                   </td>
                   <td className="px-3 py-2.5 align-middle"><p className="text-sm font-semibold tabular-nums">{money(position.position_value)}</p><p className="mt-1 text-[11px] text-muted-foreground">占比 {percent(item.weight_pct)}</p></td>
                   <td className="px-3 py-2.5 align-middle"><p data-testid="today-pnl" className={`text-sm font-semibold tabular-nums ${movementTone(position.today_estimated_profit_loss)}`}>{money(position.today_estimated_profit_loss)}</p><p className={`mt-1 text-[11px] tabular-nums ${movementTone(position.intraday_change_pct)}`}>{percent(position.intraday_change_pct)}</p></td>
