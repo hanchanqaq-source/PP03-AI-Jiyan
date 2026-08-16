@@ -188,6 +188,7 @@ class FundDataService:
         other_primary = 0.0
         other_constituents: list[dict[str, Any]] = []
         unknown_constituents: list[dict[str, Any]] = []
+        holding_industry_evidence: list[dict[str, Any]] = []
         used_standards: set[str] = set()
 
         for holding in holdings.get("holdings") or []:
@@ -208,6 +209,19 @@ class FundDataService:
             standard = str(classification.get("classification_standard") or "").strip()
             if standard:
                 used_standards.add(standard)
+            holding_industry_evidence.append({
+                "stock_code": code,
+                "stock_name": name,
+                "weight_pct": round(weight, 4),
+                "primary_industry": str(classification.get("primary_industry") or ""),
+                "secondary_industry": str(classification.get("secondary_industry") or ""),
+                "detail_industry": str(classification.get("detail_industry") or ""),
+                "fine_industry": str(classification.get("fine_industry") or ""),
+                "classification_standard": standard,
+                "source_name": str(classification.get("source_name") or classification_meta.get("source_name") or ""),
+                "source_reference": str(classification.get("source_reference") or classification_meta.get("source_reference") or ""),
+                "holding_disclosure_date": holdings.get("disclosure_date"),
+            })
             for layer, field in (
                 ("primary", "primary_industry"),
                 ("secondary", "secondary_industry"),
@@ -302,6 +316,7 @@ class FundDataService:
             "official_allocation": official_allocation,
             "lookthrough": lookthrough,
             "industry_chain_tags": tag_rows,
+            "holding_industry_evidence": holding_industry_evidence,
             "other_constituents": other_constituents,
             "unknown_constituents": unknown_constituents,
             # Compatibility fields for existing clients during the V0.2-W1 transition.

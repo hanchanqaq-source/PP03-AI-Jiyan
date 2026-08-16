@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import newsradar
+
+
+class _Response:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _write_sources(path: Path, urls: list[str]) -> None:
+    path.write_text(json.dumps({
+        "fetch": {"recent_days": 7, "per_source": 6},
+        "redline_keywords": [],
+        "industries": [{"key": "semi", "name": "半导体", "accent": "#f59e0b"}],
+        "sources": [
+            {
+                "name": f"公开源 {index}",
+                "url": url,
+                "hint": "semi",
+                "language": "zh-CN",
+                "region": "CN",
+            }
+            for index, url in enumerate(urls, start=1)
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def _rss(title: str, link: str) -> bytes:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel><item>
+      <title>{title}</title><link>{link}</link>
+      <pubDate>Sun, 16 Aug 2026 02:35:00 GMT</pubDate>
+      <description>公开摘要内容</description>
+    </item></channel></rss>""".encode()
+
+
+def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://feed.example.test/rss"])
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("北方华创发布公开公告", "https://news.example.test/a")),
+    )
+
+    data = newsradar.fetch_radar()
+
+    item = data["industries"][0]["items"][0]
+    assert item["source_name"] == "公开源 1"
+    assert item["source_url"] == "https://feed.example.test/rss"
+    assert item["original_url"] == "https://news.example.test/a"
+    assert item["published_at"] == "2026-08-16T10:35:00+08:00"
+    assert item["fetched_at"].endswith("+08:00")
+    assert item["title"] == "北方华创发布公开公告"
+    assert item["summary_or_excerpt"] == "公开摘要内容"
+    assert item["language"] == "zh-CN"
+    assert item["region"] == "CN"
+    assert data["cache_status"] == "realtime"
+    assert data["source_statuses"] == [{
+        "source_name": "公开源 1",
+        "source_url": "https://feed.example.test/rss",
+        "status": "ok",
+        "item_count": 1,
+    }]
+
+
+def test_all_source_failure_keeps_last_valid_cache_bytes(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://failed.example.test/rss"])
+    old = {
+        "generated_at": "2026-08-15T09:00:00+08:00",
+        "recent_days": 7,
+        "industries": [{
+            "key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 1,
+            "items": [{"title": "最后一次有效资讯", "source_url": "https://failed.example.test/rss"}],
+        }],
+        "stats": {"industries": 1, "total_sources": 1, "failed_sources": 0},
+        "cache_status": "cache",
+    }
+    cache.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+    original_bytes = cache.read_bytes()
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(OSError("offline")))
+
+    data = newsradar.fetch_radar()
+
+    assert data["industries"][0]["items"][0]["title"] == "最后一次有效资讯"
+    assert data["cache_status"] == "stale"
+    assert data["stats"]["failed_sources"] == 1
+    assert data["source_statuses"][0]["status"] == "failed"
+    assert cache.read_bytes() == original_bytes
+
+
+def test_single_source_failure_returns_partial_success(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://good.example.test/rss", "https://failed.example.test/rss"])
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+
+    def fake_open(request, timeout):
+        if request.full_url == "https://good.example.test/rss":
+            return _Response(_rss("存储行业公开进展", "https://news.example.test/storage"))
+        raise OSError("offline")
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+
+    data = newsradar.fetch_radar()
+
+    assert [item["title"] for item in data["industries"][0]["items"]] == ["存储行业公开进展"]
+    assert data["cache_status"] == "partial"
+    assert data["stats"]["failed_sources"] == 1
+    assert [status["status"] for status in data["source_statuses"]] == ["ok", "failed"]
+    assert json.loads(cache.read_text(encoding="utf-8"))["cache_status"] == "partial"

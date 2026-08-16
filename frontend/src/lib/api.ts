@@ -9,6 +9,7 @@ import type {
   FundPortfolioData,
   FundSearchResult,
 } from "@/features/fund-portfolio/types";
+import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse } from "@/features/market-news/types";
 
 export type {
   DataMeta,
@@ -102,6 +103,17 @@ async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET
 }
 
 const get = <T>(path: string) => request<T>(path, "GET");
+
+function marketNewsPath(path: string, query: MarketNewsQuery): string {
+  const params = new URLSearchParams({
+    mode: query.mode,
+    category: query.category,
+    days: String(query.days),
+    sort: query.sort,
+  });
+  query.tag_ids.forEach((tagId) => params.append("tag_id", tagId));
+  return `${path}?${params.toString()}`;
+}
 
 export interface Quote {
   name: string; price: number; last_close: number; change_pct: number;
@@ -275,6 +287,9 @@ export const api = {
   hkCashflow: (symbol: string) => get<HkCashflow>(`/global/hk/cashflow?symbol=${encodeURIComponent(symbol)}`),
   radar: () => get<RadarData>("/radar"),
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
+  marketNewsEvents: (query: MarketNewsQuery) => get<MarketNewsResponse>(marketNewsPath("/market-news/events", query)),
+  marketNewsRefresh: (query: MarketNewsQuery) => request<MarketNewsResponse>(marketNewsPath("/market-news/refresh", query), "POST"),
+  marketNewsEvent: (eventId: string) => get<MarketNewsEvent>(`/market-news/events/${encodeURIComponent(eventId)}`),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),

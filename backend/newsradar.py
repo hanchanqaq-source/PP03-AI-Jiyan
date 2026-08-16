@@ -20,7 +20,7 @@ from email.utils import parsedate_to_datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCES_FILE = os.path.join(HERE, "news_sources.json")
-CACHE_DIR = os.path.join(HERE, ".cache")
+CACHE_DIR = os.environ.get("VR_NEWS_CACHE_DIR") or os.path.join(HERE, ".cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "radar.json")
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -54,8 +54,9 @@ def _parse_dt(s: str):
 
 
 def _fetch_source(src: dict, per: int, cutoff, redline: list[str]):
-    """抓单个 RSS 源；返回 items 列表，出错返回 None。"""
+    """抓单个 RSS 源；失败只返回来源级状态，不抛出整页异常。"""
     try:
+        fetched_at = datetime.now(BEIJING).isoformat(timespec="seconds")
         req = urllib.request.Request(src["url"], headers={
             "User-Agent": UA,
             "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*",
@@ -67,7 +68,13 @@ def _fetch_source(src: dict, per: int, cutoff, redline: list[str]):
         for n in [e for e in root.iter() if _local(e.tag) in ("item", "entry")]:
             if len(out) >= per:
                 break
-            d = {"title": "", "url": "", "time": "", "ts": 0, "summary": "", "source": src["name"]}
+            d = {
+                "title": "", "url": "", "time": "", "ts": 0, "summary": "", "source": src["name"],
+                "source_name": src["name"], "source_url": src["url"], "original_url": "",
+                "published_at": None, "fetched_at": fetched_at, "summary_or_excerpt": "",
+                "language": src.get("language") or "unknown", "region": src.get("region") or "unknown",
+                "data_status": "realtime",
+            }
             rawtime = ""
             for c in n:
                 t = _local(c.tag)
@@ -90,17 +97,37 @@ def _fetch_source(src: dict, per: int, cutoff, redline: list[str]):
                     continue
                 d["time"] = dt.astimezone(BEIJING).strftime("%m-%d %H:%M")
                 d["ts"] = int(dt.timestamp())
+                d["published_at"] = dt.astimezone(BEIJING).isoformat(timespec="seconds")
             else:
                 d["time"] = "—"
+            d["original_url"] = d["url"]
+            d["summary_or_excerpt"] = d["summary"]
             out.append(d)
-        return out
+        return {"status": "ok", "items": out}
     except Exception:
-        return None
+        return {"status": "failed", "items": []}
+
+
+def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -> list[dict]:
+    if not cache:
+        return []
+    industry = next((row for row in cache.get("industries") or [] if row.get("key") == industry_key), None)
+    if not industry:
+        return []
+    out = []
+    for item in industry.get("items") or []:
+        if item.get("source_url") == src["url"] or item.get("source_name") == src["name"] or item.get("source") == src["name"]:
+            copied = dict(item)
+            copied["data_status"] = "stale"
+            out.append(copied)
+    return out
 
 
 def fetch_radar() -> dict:
     """抓全部源，返回 12 赛道数据并落盘缓存。"""
-    cfg = json.load(open(SOURCES_FILE, encoding="utf-8"))
+    with open(SOURCES_FILE, encoding="utf-8") as source_file:
+        cfg = json.load(source_file)
+    previous = load_cache()
     days = cfg.get("fetch", {}).get("recent_days", 7)
     per = cfg.get("fetch", {}).get("per_source", 6)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -118,24 +145,51 @@ def fetch_radar() -> dict:
             tasks.append((i, s))
 
     with ThreadPoolExecutor(max_workers=40) as ex:
-        results = list(ex.map(lambda t: (t[0], _fetch_source(t[1], per, cutoff, redline)), tasks))
+        results = list(ex.map(lambda t: (t[0], t[1], _fetch_source(t[1], per, cutoff, redline)), tasks))
 
     failed = 0
-    for idx, items in results:
-        if items is None:
+    succeeded = 0
+    source_statuses = []
+    for idx, src, result in results:
+        items = result["items"]
+        source_statuses.append({
+            "source_name": src["name"],
+            "source_url": src["url"],
+            "status": result["status"],
+            "item_count": len(items),
+        })
+        if result["status"] == "failed":
             failed += 1
+            industries[idx]["items"].extend(_cached_items_for_source(previous, industries[idx]["key"], src))
             continue
+        succeeded += 1
         industries[idx]["items"].extend(items)
+
+    if succeeded == 0:
+        if previous:
+            fallback = json.loads(json.dumps(previous, ensure_ascii=False))
+            fallback["cache_status"] = "stale"
+            fallback["source_statuses"] = source_statuses
+            fallback.setdefault("stats", {})["failed_sources"] = failed
+            return fallback
+        fallback = skeleton()
+        fallback["cache_status"] = "source_failure"
+        fallback["source_statuses"] = source_statuses
+        fallback["stats"]["failed_sources"] = failed
+        return fallback
+
     for ind in industries:
         ind["items"].sort(key=lambda x: x.get("ts", 0), reverse=True)
 
     data = {
-        "generated_at": datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M"),
+        "generated_at": datetime.now(BEIJING).isoformat(timespec="seconds"),
         "recent_days": days,
         "industries": industries,
         "stats": {"industries": len(cfg["industries"]), "total_sources": len(cfg["sources"]), "failed_sources": failed},
+        "cache_status": "partial" if failed else "realtime",
+        "source_statuses": source_statuses,
     }
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
     tmp = CACHE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
@@ -146,7 +200,12 @@ def fetch_radar() -> dict:
 def load_cache():
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        generated_at = _parse_dt(str(data.get("generated_at") or ""))
+        recent_days = int(data.get("recent_days") or 7)
+        is_stale = bool(generated_at and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
+        data["cache_status"] = "stale" if is_stale else "cache"
+        return data
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
@@ -161,7 +220,9 @@ def skeleton() -> dict:
         "generated_at": None,
         "recent_days": cfg.get("fetch", {}).get("recent_days", 7),
         "industries": [{"key": i["key"], "name": i["name"], "accent": i["accent"], "total": byhint.get(i["key"], 0), "items": []} for i in cfg["industries"]],
-        "stats": {"industries": len(cfg["industries"]), "total_sources": len(cfg["sources"])},
+        "stats": {"industries": len(cfg["industries"]), "total_sources": len(cfg["sources"]), "failed_sources": 0},
+        "cache_status": "empty",
+        "source_statuses": [],
     }
 
 

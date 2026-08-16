@@ -11,10 +11,9 @@ const fallback = (): PageTagState => ({ ids: [...DEFAULT_TAG_IDS], activeId: DEF
 function normalize(value: unknown): PageTagState {
   if (!value || typeof value !== "object") return fallback();
   const raw = value as Partial<PageTagState>;
-  const ids = Array.isArray(raw.ids)
-    ? Array.from(new Set(raw.ids.filter((id): id is string => typeof id === "string" && !!getTag(id))))
-    : [];
-  if (ids.length === 0) return fallback();
+  if (!Array.isArray(raw.ids)) return fallback();
+  const ids = Array.from(new Set(raw.ids.filter((id): id is string => typeof id === "string" && !!getTag(id))));
+  if (ids.length === 0) return { ids: [], activeId: "" };
   const activeId = typeof raw.activeId === "string" && ids.includes(raw.activeId) ? raw.activeId : ids[0];
   return { ids, activeId };
 }

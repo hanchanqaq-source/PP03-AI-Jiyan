@@ -118,10 +118,24 @@ export interface IndustryChainTag extends SystemTagExposure {
   evidence_level: "disclosed_stock_classification";
   source_name: string;
 }
+export interface HoldingIndustryEvidence {
+  stock_code: string;
+  stock_name: string;
+  weight_pct: number;
+  primary_industry: string;
+  secondary_industry: string;
+  detail_industry: string;
+  fine_industry: string;
+  classification_standard: string;
+  source_name: string;
+  source_reference: string;
+  holding_disclosure_date: string | null;
+}
 export interface FundIndustryExposure {
   official_allocation: OfficialIndustryAllocation;
   lookthrough: LookthroughExposure;
   industry_chain_tags: IndustryChainTag[];
+  holding_industry_evidence?: HoldingIndustryEvidence[];
   other_constituents: ExposureConstituent[];
   unknown_constituents: ExposureConstituent[];
   primary: ExposureItem[];

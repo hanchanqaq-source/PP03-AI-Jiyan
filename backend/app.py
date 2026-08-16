@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +28,7 @@ import newsradar
 import portfolio as pf
 import fund_portfolio as fpf
 from fund_data import service as fund_service
+from news_intelligence import service as market_news_service
 import market
 import myreports as mr
 import reflection as reflect_layer
@@ -477,6 +479,58 @@ def radar_refresh():
         return {"data": newsradar.fetch_radar()}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"资讯雷达刷新失败：{e}") from e
+
+
+MarketNewsMode = Literal["my_focus", "my_holdings", "global_tech", "domestic_policy"]
+MarketNewsCategory = Literal["all", "policy", "industry", "company", "fund_notice", "deep_content"]
+MarketNewsSort = Literal["importance", "latest", "holding_relevance"]
+MarketNewsDays = int
+
+
+def _market_news_payload(
+    mode: MarketNewsMode,
+    tag_id: list[str],
+    category: MarketNewsCategory,
+    days: MarketNewsDays,
+    sort: MarketNewsSort,
+    refresh: bool,
+):
+    try:
+        return {"data": market_news_service.get_service().get_events(
+            mode=mode, tag_ids=tag_id, category=category, days=days, sort=sort, refresh=refresh,
+        )}
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/market-news/events")
+def market_news_events(
+    mode: MarketNewsMode = "my_focus",
+    tag_id: list[str] = Query(default=[]),
+    category: MarketNewsCategory = "all",
+    days: MarketNewsDays = 7,
+    sort: MarketNewsSort = "importance",
+):
+    return _market_news_payload(mode, tag_id, category, days, sort, False)
+
+
+@app.post("/api/market-news/refresh")
+def market_news_refresh(
+    mode: MarketNewsMode = "my_focus",
+    tag_id: list[str] = Query(default=[]),
+    category: MarketNewsCategory = "all",
+    days: MarketNewsDays = 7,
+    sort: MarketNewsSort = "importance",
+):
+    return _market_news_payload(mode, tag_id, category, days, sort, True)
+
+
+@app.get("/api/market-news/events/{event_id}")
+def market_news_event(event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$")):
+    event = market_news_service.get_service().get_event(event_id)
+    if event is None:
+        raise HTTPException(404, "资讯事件不存在或已不在当前缓存中")
+    return {"data": event}
 
 
 @app.get("/api/market/overview")

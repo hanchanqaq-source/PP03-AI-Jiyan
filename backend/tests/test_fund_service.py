@@ -200,6 +200,26 @@ def test_analysis_computes_disclosed_industry_without_hiding_unknown_assets(tmp_
             "evidence_level": "disclosed_stock_classification", "source_name": "巨潮资讯上市公司行业归属",
         },
     ]
+    assert exposure["holding_industry_evidence"] == [
+        {
+            "stock_code": "600000", "stock_name": "浦发银行", "weight_pct": 30.0,
+            "primary_industry": "金融", "secondary_industry": "银行",
+            "detail_industry": "股份制银行", "fine_industry": "股份制银行",
+            "classification_standard": "申银万国行业分类标准",
+            "source_name": "巨潮资讯上市公司行业归属",
+            "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
+            "holding_disclosure_date": "2026-06-30",
+        },
+        {
+            "stock_code": "688001", "stock_name": "测试芯片", "weight_pct": 30.0,
+            "primary_industry": "电子", "secondary_industry": "半导体",
+            "detail_industry": "半导体设备", "fine_industry": "半导体设备",
+            "classification_standard": "申银万国行业分类标准",
+            "source_name": "巨潮资讯上市公司行业归属",
+            "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
+            "holding_disclosure_date": "2026-06-30",
+        },
+    ]
     assert result["intraday_estimate"]["data"]["status"] == "estimated"
 
 
