@@ -70,6 +70,28 @@ SNAPSHOT = ({
     "600000": {"stock_code": "600000", "stock_name": "浦发银行", "change_pct": 1.0, "industry": "银行"},
     "688001": {"stock_code": "688001", "stock_name": "测试芯片", "change_pct": 2.0, "industry": "半导体"},
 }, "disclosed")
+CLASSIFICATIONS = ({
+    "classifications": {
+        "600000": {
+            "stock_code": "600000", "stock_name": "浦发银行",
+            "primary_industry": "金融", "secondary_industry": "银行",
+            "detail_industry": "股份制银行", "fine_industry": "股份制银行",
+            "classification_standard": "申银万国行业分类标准", "classification_code": "008003",
+            "classification_changed_at": "2026-06-30", "source_name": "巨潮资讯上市公司行业归属",
+            "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
+        },
+        "688001": {
+            "stock_code": "688001", "stock_name": "测试芯片",
+            "primary_industry": "电子", "secondary_industry": "半导体",
+            "detail_industry": "半导体设备", "fine_industry": "半导体设备",
+            "classification_standard": "申银万国行业分类标准", "classification_code": "008003",
+            "classification_changed_at": "2026-06-30", "source_name": "巨潮资讯上市公司行业归属",
+            "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
+        },
+    },
+    "failed_codes": [],
+    "requested_codes": ["600000", "688001"],
+}, "disclosed")
 INDUSTRY = ({
     "as_of_date": "2026-06-30", "stock_exposure_pct": 80.0,
     "industries": [{"name": "制造业", "weight_pct": 80.0, "market_value_10k": 1000.0}],
@@ -144,27 +166,39 @@ def test_analysis_computes_disclosed_industry_without_hiding_unknown_assets(tmp_
     clock = Clock()
     provider = FakeProvider("primary", 10, payloads={
         "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
-        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+        "stock_snapshot": SNAPSHOT, "stock_industry_classification": CLASSIFICATIONS,
+        "industry_allocation": INDUSTRY,
     })
 
     result = make_service(tmp_path, clock, [provider]).get_fund_analysis("000001")
 
     exposure = result["industry_exposure"]["data"]
-    assert exposure["broad"] == [
-        {"name": "科技", "weight_pct": 30.0},
+    assert exposure["lookthrough"]["primary"] == [
+        {"name": "电子", "weight_pct": 30.0},
         {"name": "金融", "weight_pct": 30.0},
     ]
-    assert exposure["identified_coverage_pct"] == 60.0
-    assert exposure["unidentified_disclosed_pct"] == 0.0
-    assert exposure["undisclosed_stock_pct"] == 20.0
-    assert exposure["non_stock_pct"] == 20.0
-    assert exposure["system_tags"] == [
-        {"id": "semiconductor", "name": "半导体", "weight_pct": 30.0},
+    assert exposure["lookthrough"]["secondary"] == [
+        {"name": "半导体", "weight_pct": 30.0},
+        {"name": "银行", "weight_pct": 30.0},
+    ]
+    assert exposure["lookthrough"]["identified_coverage_pct"] == 60.0
+    assert exposure["lookthrough"]["unknown_pct"] == 0.0
+    assert exposure["lookthrough"]["undisclosed_stock_pct"] == 20.0
+    assert exposure["lookthrough"]["non_stock_pct"] == 20.0
+    assert exposure["industry_chain_tags"] == [
+        {
+            "id": "semiconductor-equipment", "name": "半导体设备", "weight_pct": 30.0,
+            "evidence_level": "disclosed_stock_classification", "source_name": "巨潮资讯上市公司行业归属",
+        },
+        {
+            "id": "semiconductor", "name": "半导体", "weight_pct": 30.0,
+            "evidence_level": "disclosed_stock_classification", "source_name": "巨潮资讯上市公司行业归属",
+        },
     ]
     assert result["intraday_estimate"]["data"]["status"] == "estimated"
 
 
-def test_analysis_uses_official_fund_industry_allocation_when_stock_industries_are_missing(tmp_path):
+def test_analysis_separates_official_allocation_from_stock_lookthrough(tmp_path):
     clock = Clock()
     snapshot_without_industry = ({
         code: {**row, "industry": None}
@@ -172,26 +206,86 @@ def test_analysis_uses_official_fund_industry_allocation_when_stock_industries_a
     }, "disclosed")
     provider = FakeProvider("primary", 10, payloads={
         "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
-        "stock_snapshot": snapshot_without_industry, "industry_allocation": INDUSTRY,
+        "stock_snapshot": snapshot_without_industry,
+        "stock_industry_classification": CLASSIFICATIONS, "industry_allocation": INDUSTRY,
     })
 
     result = make_service(tmp_path, clock, [provider]).get_fund_analysis("000001")
 
     exposure = result["industry_exposure"]["data"]
-    assert exposure["primary"] == [{"name": "制造业", "weight_pct": 80.0}]
-    assert exposure["broad"] == [{"name": "其他", "weight_pct": 80.0}]
-    assert exposure["identified_coverage_pct"] == 80.0
-    assert exposure["unidentified_disclosed_pct"] == 0.0
-    assert exposure["undisclosed_stock_pct"] == 0.0
-    assert exposure["non_stock_pct"] == 20.0
-    assert exposure["calculation_basis"] == "东方财富公开行业配置（覆盖基金全部股票资产）"
+    assert exposure["official_allocation"] == {
+        "exposure": [{
+            "name": "制造业", "display_name": "制造业（待穿透）",
+            "weight_pct": 80.0, "requires_lookthrough": True,
+        }],
+        "stock_exposure_pct": 80.0,
+        "as_of_date": "2026-06-30",
+        "source_name": "primary",
+        "source_reference": "https://example.test/industry_allocation",
+    }
+    assert exposure["lookthrough"]["primary"] == [
+        {"name": "电子", "weight_pct": 30.0},
+        {"name": "金融", "weight_pct": 30.0},
+    ]
+    assert all(item["name"] != "其他" for item in exposure["lookthrough"]["primary"])
+    assert exposure["lookthrough"]["identified_coverage_pct"] == 60.0
+    assert exposure["lookthrough"]["undisclosed_stock_pct"] == 20.0
+    assert exposure["lookthrough"]["non_stock_pct"] == 20.0
+    assert result["data_quality"]["stock_industry_classification"]["data_type"] == "stock_industry_classification"
+
+
+def test_analysis_distinguishes_other_from_unknown_constituents(tmp_path):
+    clock = Clock()
+    partial = ({
+        **CLASSIFICATIONS[0],
+        "classifications": {
+            "600000": {**CLASSIFICATIONS[0]["classifications"]["600000"], "primary_industry": None},
+        },
+        "failed_codes": ["688001"],
+    }, "disclosed")
+    provider = FakeProvider("primary", 10, payloads={
+        "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
+        "stock_snapshot": SNAPSHOT, "stock_industry_classification": partial,
+        "industry_allocation": INDUSTRY,
+    })
+
+    exposure = make_service(tmp_path, clock, [provider]).get_fund_analysis("000001")["industry_exposure"]["data"]
+
+    assert exposure["lookthrough"]["other_pct"] == 30.0
+    assert exposure["lookthrough"]["unknown_pct"] == 30.0
+    assert exposure["other_constituents"] == [{
+        "stock_code": "600000", "stock_name": "浦发银行", "weight_pct": 30.0,
+        "reason": "已取得行业记录，但缺少一级行业名称",
+    }]
+    assert exposure["unknown_constituents"][0] == {
+        "stock_code": "688001", "stock_name": "测试芯片", "weight_pct": 30.0,
+        "reason": "股票行业分类缺失或请求失败",
+    }
+
+
+def test_analysis_keeps_official_evidence_separate_when_lookthrough_is_unavailable(tmp_path):
+    clock = Clock()
+    provider = FakeProvider("primary", 10, payloads={
+        "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
+        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+    }, failures={"stock_industry_classification"})
+
+    result = make_service(tmp_path, clock, [provider]).get_fund_analysis("000001")
+    exposure = result["industry_exposure"]["data"]
+
+    assert exposure["lookthrough"]["status"] == "unavailable"
+    assert exposure["lookthrough"]["message"] == "股票行业穿透暂不可用；官方行业配置不代替穿透结果"
+    assert exposure["lookthrough"]["primary"] == []
+    assert exposure["official_allocation"]["exposure"][0]["display_name"] == "制造业（待穿透）"
+    assert result["data_quality"]["stock_industry_classification"]["status"] == "error"
 
 
 def test_portfolio_analysis_calculates_cost_value_overlap_and_date_warning(tmp_path):
     clock = Clock()
     provider = FakeProvider("primary", 10, payloads={
         "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
-        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+        "stock_snapshot": SNAPSHOT, "stock_industry_classification": CLASSIFICATIONS,
+        "industry_allocation": INDUSTRY,
     })
     service = make_service(tmp_path, clock, [provider])
     holdings = [
@@ -212,7 +306,8 @@ def test_quick_portfolio_revalues_inferred_shares_with_latest_official_nav(tmp_p
     clock = Clock()
     provider = FakeProvider("primary", 10, payloads={
         "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
-        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+        "stock_snapshot": SNAPSHOT, "stock_industry_classification": CLASSIFICATIONS,
+        "industry_allocation": INDUSTRY,
     })
     service = make_service(tmp_path, clock, [provider])
 
@@ -249,7 +344,8 @@ def test_quick_portfolio_falls_back_to_snapshot_only_without_reliable_inferred_s
     clock = Clock()
     provider = FakeProvider("primary", 10, payloads={
         "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
-        "stock_snapshot": SNAPSHOT, "industry_allocation": INDUSTRY,
+        "stock_snapshot": SNAPSHOT, "stock_industry_classification": CLASSIFICATIONS,
+        "industry_allocation": INDUSTRY,
     })
     service = make_service(tmp_path, clock, [provider])
     holdings = [

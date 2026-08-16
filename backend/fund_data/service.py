@@ -17,7 +17,13 @@ from fund_data.calculations import (
     calculate_position,
 )
 from fund_data.models import DataMeta, ProviderResult
-from fund_data.providers import AkshareDanjuanProvider, AkshareEastmoneyProvider, EastmoneyDirectProvider, TencentQuoteProvider
+from fund_data.providers import (
+    AkshareDanjuanProvider,
+    AkshareEastmoneyProvider,
+    CninfoIndustryProvider,
+    EastmoneyDirectProvider,
+    TencentQuoteProvider,
+)
 from fund_data.providers.base import ProviderUnavailable
 
 BEIJING = timezone(timedelta(hours=8))
@@ -27,6 +33,7 @@ TTL = {
     "nav_history": 12 * 3600,
     "holdings": 24 * 3600,
     "industry_allocation": 24 * 3600,
+    "stock_industry_classification": 24 * 3600,
     "stock_snapshot": 60,
 }
 
@@ -35,31 +42,34 @@ def _default_data_dir() -> str:
     return os.environ.get("VR_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".vibe-research")
 
 
-def _broad_industry(industry: str) -> str:
-    rules = [
-        ("科技", ("半导体", "电子", "计算机", "通信", "软件", "互联网")),
-        ("医疗", ("医药", "医疗", "生物")),
-        ("消费", ("食品", "饮料", "家电", "消费", "零售", "纺织", "美容", "汽车")),
-        ("金融", ("银行", "保险", "证券", "非银", "金融")),
-        ("新能源", ("电池", "光伏", "新能源", "电力设备", "风电")),
-        ("周期资源", ("有色", "煤炭", "石油", "钢铁", "化工", "建材", "采掘")),
-    ]
-    for broad, keywords in rules:
-        if any(keyword in industry for keyword in keywords):
-            return broad
-    return "其他"
+CHAIN_TAG_RULES = [
+    ("storage", "存储", ("存储", "DRAM", "NAND", "HBM")),
+    ("semiconductor-equipment", "半导体设备", ("半导体设备",)),
+    ("chip-design", "芯片设计", ("数字芯片设计", "集成电路设计")),
+    ("software", "软件", ("软件开发", "IT服务", "IT 服务")),
+    ("consumer-electronics", "消费电子", ("消费电子",)),
+    ("robotics", "机器人", ("机器人", "自动化设备")),
+    ("semiconductor", "半导体", ("半导体", "数字芯片设计", "集成电路设计")),
+]
 
 
-def _system_tags(industry: str, stock_name: str) -> list[tuple[str, str]]:
-    text = f"{industry} {stock_name}"
-    rules = [
-        ("storage", "存储", ("存储", "DRAM", "NAND", "HBM")),
-        ("semiconductor-equipment", "半导体设备", ("半导体设备",)),
-        ("consumer-electronics", "消费电子", ("消费电子",)),
-        ("robotics", "机器人", ("机器人", "减速器", "伺服")),
-        ("semiconductor", "半导体", ("半导体", "芯片", "集成电路")),
+def _industry_chain_tags(classification: dict[str, Any]) -> list[tuple[str, str]]:
+    text = " ".join(str(classification.get(key) or "") for key in (
+        "primary_industry", "secondary_industry", "detail_industry", "fine_industry",
+    ))
+    return [
+        (tag_id, name)
+        for tag_id, name, terms in CHAIN_TAG_RULES
+        if any(term in text for term in terms)
     ]
-    return [(tag_id, name) for tag_id, name, keywords in rules if any(keyword in text for keyword in keywords)]
+
+
+def _official_requires_lookthrough(name: str) -> bool:
+    broad_categories = (
+        "制造业", "采矿业", "建筑业", "金融业", "房地产业", "批发和零售业",
+        "信息传输、软件和信息技术服务业", "交通运输、仓储和邮政业",
+    )
+    return any(category in name for category in broad_categories)
 
 
 class FundDataService:
@@ -71,7 +81,10 @@ class FundDataService:
     ):
         self._now = now or (lambda: datetime.now(BEIJING))
         self.providers = sorted(
-            providers or [EastmoneyDirectProvider(), TencentQuoteProvider(), AkshareEastmoneyProvider(), AkshareDanjuanProvider()],
+            providers or [
+                CninfoIndustryProvider(), EastmoneyDirectProvider(), TencentQuoteProvider(),
+                AkshareEastmoneyProvider(), AkshareDanjuanProvider(),
+            ],
             key=lambda provider: getattr(provider, "priority", 100),
         )
         self.cache = cache or FundCache(Path(_default_data_dir()) / "fund-cache" / "v1", now=self._now)
@@ -153,60 +166,164 @@ class FundDataService:
             return self._unavailable("fund_search", "请输入基金代码或名称")
         return self._fetch("search", cache_key=query.lower(), force_refresh=force_refresh, query=query)
 
-    def _industry_exposure(self, holdings: dict[str, Any], snapshots: dict[str, Any], allocation: dict[str, Any] | None) -> dict[str, Any]:
-        secondary: dict[str, float] = {}
-        broad: dict[str, float] = {}
+    def _industry_exposure(
+        self,
+        holdings: dict[str, Any],
+        classifications_section: dict[str, Any],
+        allocation_section: dict[str, Any],
+    ) -> dict[str, Any]:
+        classification_data = classifications_section.get("data") or {}
+        classifications = classification_data.get("classifications") or {}
+        classification_meta = classifications_section.get("meta") or {}
+        allocation = allocation_section.get("data") or {}
+        allocation_meta = allocation_section.get("meta") or {}
+
+        layer_totals: dict[str, dict[str, float]] = {
+            "primary": {}, "secondary": {}, "detail": {},
+        }
         tags: dict[tuple[str, str], float] = {}
+        tag_sources: dict[tuple[str, str], str] = {}
         identified = 0.0
+        unknown = 0.0
+        other_primary = 0.0
+        other_constituents: list[dict[str, Any]] = []
+        unknown_constituents: list[dict[str, Any]] = []
+        used_standards: set[str] = set()
+
         for holding in holdings.get("holdings") or []:
-            snapshot = snapshots.get(holding.get("stock_code")) or {}
-            industry = str(snapshot.get("industry") or "").strip()
+            code = str(holding.get("stock_code") or "").zfill(6)
+            name = str(holding.get("stock_name") or code)
             weight = float(holding.get("weight_pct") or 0)
-            if not industry:
+            classification = classifications.get(code)
+            if not classification:
+                unknown += weight
+                unknown_constituents.append({
+                    "stock_code": code,
+                    "stock_name": name,
+                    "weight_pct": round(weight, 4),
+                    "reason": "股票行业分类缺失或请求失败",
+                })
                 continue
             identified += weight
-            secondary[industry] = secondary.get(industry, 0) + weight
-            broad_name = _broad_industry(industry)
-            broad[broad_name] = broad.get(broad_name, 0) + weight
-            for tag in _system_tags(industry, str(holding.get("stock_name") or "")):
-                tags[tag] = tags.get(tag, 0) + weight
-        allocation_rows = (allocation or {}).get("industries") or []
-        using_allocation = identified <= 0 and bool(allocation_rows)
-        if using_allocation:
-            for item in allocation_rows:
-                industry = str(item.get("name") or "").strip()
-                weight = float(item.get("weight_pct") or 0)
-                if not industry or weight <= 0:
-                    continue
-                identified += weight
-                secondary[industry] = secondary.get(industry, 0) + weight
-                broad_name = _broad_industry(industry)
-                broad[broad_name] = broad.get(broad_name, 0) + weight
-                for tag in _system_tags(industry, ""):
-                    tags[tag] = tags.get(tag, 0) + weight
+            standard = str(classification.get("classification_standard") or "").strip()
+            if standard:
+                used_standards.add(standard)
+            for layer, field in (
+                ("primary", "primary_industry"),
+                ("secondary", "secondary_industry"),
+                ("detail", "detail_industry"),
+            ):
+                industry = str(classification.get(field) or "").strip()
+                if industry:
+                    values = layer_totals[layer]
+                    values[industry] = values.get(industry, 0.0) + weight
+            if not str(classification.get("primary_industry") or "").strip():
+                other_primary += weight
+                other_constituents.append({
+                    "stock_code": code,
+                    "stock_name": name,
+                    "weight_pct": round(weight, 4),
+                    "reason": "已取得行业记录，但缺少一级行业名称",
+                })
+            for tag in _industry_chain_tags(classification):
+                tags[tag] = tags.get(tag, 0.0) + weight
+                tag_sources.setdefault(tag, str(classification.get("source_name") or classification_meta.get("source_name") or ""))
+
+        def rows(values: dict[str, float]) -> list[dict[str, Any]]:
+            return [
+                {"name": name, "weight_pct": round(weight, 4)}
+                for name, weight in sorted(values.items(), key=lambda item: (-item[1], item[0]))
+                if weight > 0
+            ]
+
         top10 = float(holdings.get("top10_coverage_pct") or 0)
-        stock_exposure = float((allocation or {}).get("stock_exposure_pct") or top10)
-        non_stock = max(0.0, 100 - stock_exposure)
-        undisclosed_stock = max(0.0, stock_exposure - identified) if using_allocation else max(0.0, stock_exposure - top10)
-        unidentified = 0.0 if using_allocation else max(0.0, top10 - identified)
-        rows = lambda values: [
-            {"name": name, "weight_pct": round(weight, 4)}
-            for name, weight in sorted(values.items(), key=lambda item: (-item[1], item[0]))
+        stock_exposure = float(allocation.get("stock_exposure_pct") or top10)
+        undisclosed_stock = max(0.0, stock_exposure - top10)
+        non_stock = max(0.0, 100.0 - stock_exposure)
+        if undisclosed_stock > 0:
+            unknown_constituents.append({
+                "stock_code": "",
+                "stock_name": "未披露股票资产",
+                "weight_pct": round(undisclosed_stock, 4),
+                "reason": "基金股票资产超过公开前十大持仓覆盖，具体证券未披露",
+            })
+
+        official_rows = []
+        for item in allocation.get("industries") or []:
+            name = str(item.get("name") or "").strip()
+            weight = float(item.get("weight_pct") or 0)
+            if not name or weight <= 0:
+                continue
+            requires_lookthrough = _official_requires_lookthrough(name)
+            official_rows.append({
+                "name": name,
+                "display_name": f"{name}（待穿透）" if requires_lookthrough else name,
+                "weight_pct": round(weight, 4),
+                "requires_lookthrough": requires_lookthrough,
+            })
+
+        tag_rows = [
+            {
+                "id": tag_id,
+                "name": name,
+                "weight_pct": round(weight, 4),
+                "evidence_level": "disclosed_stock_classification",
+                "source_name": tag_sources.get((tag_id, name)) or "巨潮资讯上市公司行业归属",
+            }
+            for (tag_id, name), weight in sorted(tags.items(), key=lambda item: -item[1])
         ]
-        return {
-            "primary": rows(secondary),
-            "secondary": rows(secondary),
-            "broad": rows(broad),
-            "system_tags": [
-                {"id": tag_id, "name": name, "weight_pct": round(weight, 4)}
-                for (tag_id, name), weight in sorted(tags.items(), key=lambda item: (-item[1], item[0][0]))
-            ],
+        primary = rows(layer_totals["primary"])
+        secondary = rows(layer_totals["secondary"])
+        detail = rows(layer_totals["detail"])
+        calculation_basis = "最新公开前十大持仓原始占基金净值比例 × 上市公司公开行业分类；未披露部分未归一化"
+        lookthrough = {
+            "status": "disclosed" if classifications else "unavailable",
+            "message": (
+                "行业暴露仅基于公开持仓估算，未披露部分未归一化"
+                if classifications
+                else "股票行业穿透暂不可用；官方行业配置不代替穿透结果"
+            ),
+            "primary": primary,
+            "secondary": secondary,
+            "detail": detail,
             "identified_coverage_pct": round(identified, 4),
-            "unidentified_disclosed_pct": round(unidentified, 4),
+            "other_pct": round(other_primary, 4),
+            "unknown_pct": round(unknown, 4),
             "undisclosed_stock_pct": round(undisclosed_stock, 4),
             "non_stock_pct": round(non_stock, 4),
-            "calculation_basis": "东方财富公开行业配置（覆盖基金全部股票资产）" if using_allocation else "最新公开前十大持仓比例 × 东方财富证券行业分类",
-            "industry_classification_source": "东方财富基金行业配置" if using_allocation else "东方财富证券行情 f100 行业字段",
+            "disclosure_date": holdings.get("disclosure_date"),
+            "source_name": classification_meta.get("source_name") or "",
+            "source_reference": classification_meta.get("source_reference") or "",
+            "classification_standard": "、".join(sorted(used_standards)),
+            "calculation_basis": calculation_basis,
+        }
+        official_allocation = {
+            "exposure": official_rows,
+            "stock_exposure_pct": round(stock_exposure, 4),
+            "as_of_date": allocation.get("as_of_date") or allocation_meta.get("as_of_date"),
+            "source_name": allocation_meta.get("source_name") or "",
+            "source_reference": allocation_meta.get("source_reference") or "",
+        }
+        return {
+            "official_allocation": official_allocation,
+            "lookthrough": lookthrough,
+            "industry_chain_tags": tag_rows,
+            "other_constituents": other_constituents,
+            "unknown_constituents": unknown_constituents,
+            # Compatibility fields for existing clients during the V0.2-W1 transition.
+            "primary": primary,
+            "secondary": secondary,
+            "broad": primary,
+            "system_tags": [
+                {"id": item["id"], "name": item["name"], "weight_pct": item["weight_pct"]}
+                for item in tag_rows
+            ],
+            "identified_coverage_pct": lookthrough["identified_coverage_pct"],
+            "unidentified_disclosed_pct": lookthrough["unknown_pct"],
+            "undisclosed_stock_pct": lookthrough["undisclosed_stock_pct"],
+            "non_stock_pct": lookthrough["non_stock_pct"],
+            "calculation_basis": calculation_basis,
+            "industry_classification_source": lookthrough["source_name"],
         }
 
     def get_fund_analysis(self, code: str, force_refresh: bool = False) -> dict[str, Any]:
@@ -229,25 +346,45 @@ class FundDataService:
         performance = calculate_performance((nav_history.get("data") or {}).get("points") or [])
 
         industry_supported = not any(label in fund_type.upper() for label in ("货币", "FOF", "QDII"))
-        snapshots = self._unavailable("stock_snapshot", "没有可用于行业或盘中估算的公开股票持仓")
+        snapshots = self._unavailable("stock_snapshot", "没有可用于盘中估算的公开股票持仓")
+        classifications = self._unavailable("stock_industry_classification", "没有可用于行业穿透的公开股票持仓")
         allocation = self._unavailable("disclosed_industry_allocation", "当前基金类型不支持 A 股行业穿透")
         if holdings.get("data") and industry_supported:
-            codes = [item.get("stock_code") for item in holdings["data"].get("holdings") or [] if item.get("stock_code")]
+            codes = sorted({
+                str(item.get("stock_code"))
+                for item in holdings["data"].get("holdings") or []
+                if item.get("stock_code")
+            })
             snapshots = self._fetch("stock_snapshot", cache_key=",".join(codes), force_refresh=force_refresh, codes=codes)
+            classifications = self._fetch(
+                "stock_industry_classification",
+                cache_key=",".join(codes),
+                force_refresh=force_refresh,
+                codes=codes,
+            )
             allocation = self._fetch("industry_allocation", cache_key=code, force_refresh=force_refresh, code=code)
 
-        if holdings.get("data") and (snapshots.get("data") or allocation.get("data")):
-            exposure_data = self._industry_exposure(holdings["data"], snapshots.get("data") or {}, allocation.get("data"))
-            allocation_fallback = exposure_data["industry_classification_source"] == "东方财富基金行业配置"
-            exposure_source = allocation["meta"] if allocation_fallback else snapshots["meta"]
+        if holdings.get("data"):
+            exposure_data = self._industry_exposure(holdings["data"], classifications, allocation)
+            classification_meta = classifications["meta"]
+            allocation_meta = allocation["meta"]
+            has_classification = bool(classifications.get("data"))
+            has_official = bool(allocation.get("data"))
+            exposure_source = classification_meta if has_classification else allocation_meta
+            exposure_status = "disclosed" if has_classification or has_official else "unavailable"
             exposure_meta = DataMeta(
-                source_name="东方财富公开行业配置" if allocation_fallback else "东方财富公开持仓与证券行业",
+                source_name=exposure_source.get("source_name") or "",
                 source_reference=exposure_source.get("source_reference") or "",
-                data_type="calculated_industry_exposure", as_of_date=(allocation.get("data") or {}).get("as_of_date") if allocation_fallback else holdings["data"].get("disclosure_date"),
-                fetched_at=self._now().isoformat(), status="disclosed", is_cached=bool(exposure_source.get("is_cached")),
+                data_type="calculated_industry_exposure",
+                as_of_date=holdings["data"].get("disclosure_date"),
+                fetched_at=self._now().isoformat(), status=exposure_status, is_cached=bool(exposure_source.get("is_cached")),
                 is_stale=bool(exposure_source.get("is_stale")), provider=exposure_source.get("provider") or "",
-                fallback_used=bool(exposure_source.get("fallback_used")) or allocation_fallback,
-                message="行业暴露来自基金公开行业配置；未识别资产不做归一化" if allocation_fallback else "行业暴露按公开持仓计算；未知与非股票资产未归一化",
+                fallback_used=bool(exposure_source.get("fallback_used")),
+                message=(
+                    "重仓股穿透按公开持仓与股票行业分类计算；官方行业配置独立展示；未披露部分未归一化"
+                    if has_classification
+                    else "股票行业穿透暂不可用；官方行业配置仅作为独立证据展示"
+                ),
             )
             industry_exposure = {"data": exposure_data, "meta": exposure_meta.to_dict()}
         else:
@@ -286,6 +423,7 @@ class FundDataService:
                 "profile": profile["meta"], "latest_nav": latest_nav["meta"],
                 "nav_history": nav_history["meta"], "holdings": holdings["meta"],
                 "industry_exposure": industry_exposure["meta"], "intraday_estimate": intraday["meta"],
+                "stock_industry_classification": classifications["meta"],
                 "industry_allocation": allocation["meta"],
             },
         }
