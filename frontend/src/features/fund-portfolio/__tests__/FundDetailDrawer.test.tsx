@@ -38,4 +38,3 @@ it("shows all five evidence regions and separates system from user tags", () => 
   expect(screen.getByText("官方净值来源")).toBeInTheDocument();
   expect(screen.getByText("主数据源是否可用")).toBeInTheDocument();
 });
-

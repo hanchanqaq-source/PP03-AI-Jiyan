@@ -164,6 +164,29 @@ def test_analysis_computes_disclosed_industry_without_hiding_unknown_assets(tmp_
     assert result["intraday_estimate"]["data"]["status"] == "estimated"
 
 
+def test_analysis_uses_official_fund_industry_allocation_when_stock_industries_are_missing(tmp_path):
+    clock = Clock()
+    snapshot_without_industry = ({
+        code: {**row, "industry": None}
+        for code, row in SNAPSHOT[0].items()
+    }, "disclosed")
+    provider = FakeProvider("primary", 10, payloads={
+        "profile": PROFILE, "nav_history": NAV, "holdings": HOLDINGS,
+        "stock_snapshot": snapshot_without_industry, "industry_allocation": INDUSTRY,
+    })
+
+    result = make_service(tmp_path, clock, [provider]).get_fund_analysis("000001")
+
+    exposure = result["industry_exposure"]["data"]
+    assert exposure["primary"] == [{"name": "制造业", "weight_pct": 80.0}]
+    assert exposure["broad"] == [{"name": "其他", "weight_pct": 80.0}]
+    assert exposure["identified_coverage_pct"] == 80.0
+    assert exposure["unidentified_disclosed_pct"] == 0.0
+    assert exposure["undisclosed_stock_pct"] == 0.0
+    assert exposure["non_stock_pct"] == 20.0
+    assert exposure["calculation_basis"] == "东方财富公开行业配置（覆盖基金全部股票资产）"
+
+
 def test_portfolio_analysis_calculates_cost_value_overlap_and_date_warning(tmp_path):
     clock = Clock()
     provider = FakeProvider("primary", 10, payloads={

@@ -19,4 +19,3 @@ def test_public_mixed_fund_has_profile_official_nav_and_disclosed_holdings(tmp_p
     assert len(result["holdings"]["data"]["holdings"]) > 0
     assert result["holdings"]["data"]["disclosure_date"]
     assert result["holdings"]["meta"]["status"] == "disclosed"
-

@@ -31,4 +31,3 @@ export function DataStatus({ meta, compact = false }: { meta?: DataMeta | null; 
     </span>
   );
 }
-

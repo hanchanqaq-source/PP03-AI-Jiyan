@@ -27,17 +27,21 @@ class FakeSession:
         if "FundSearchAPI" in url:
             return FakeResponse(payload={
                 "ErrCode": 0,
-                "Datas": [{
-                    "CODE": "000001",
-                    "NAME": "华夏成长混合",
-                    "FundBaseInfo": {
-                        "FTYPE": "混合型-灵活",
-                        "DWJZ": 1.348,
-                        "FSRQ": "2026-08-14",
-                        "JJGS": "华夏基金",
-                        "JJJL": "郑晓辉,刘睿聪",
+                "Datas": [
+                    {
+                        "CODE": "000001",
+                        "NAME": "华夏成长混合",
+                        "FundBaseInfo": {
+                            "FTYPE": "混合型-灵活",
+                            "DWJZ": 1.348,
+                            "FSRQ": "2026-08-14",
+                            "JJGS": "华夏基金",
+                            "JJJL": "郑晓辉,刘睿聪",
+                        },
                     },
-                }],
+                    {"CODE": "000001", "NAME": "平安银行", "SecurityTypeName": "深A"},
+                    {"CODE": "000001", "NAME": "上证指数", "SecurityTypeName": "指数"},
+                ],
             })
         if "pingzhongdata" in url:
             return FakeResponse(text=(

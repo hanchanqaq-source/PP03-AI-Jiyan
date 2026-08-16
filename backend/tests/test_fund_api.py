@@ -71,4 +71,3 @@ def test_portfolio_analysis_uses_migrated_user_truth_without_returning_500(tmp_p
 def test_fund_api_rejects_invalid_or_empty_queries():
     assert client.get("/api/funds/search?q=").status_code == 422
     assert client.get("/api/funds/not-a-code/analysis").status_code == 422
-

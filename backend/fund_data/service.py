@@ -169,11 +169,25 @@ class FundDataService:
             broad[broad_name] = broad.get(broad_name, 0) + weight
             for tag in _system_tags(industry, str(holding.get("stock_name") or "")):
                 tags[tag] = tags.get(tag, 0) + weight
+        allocation_rows = (allocation or {}).get("industries") or []
+        using_allocation = identified <= 0 and bool(allocation_rows)
+        if using_allocation:
+            for item in allocation_rows:
+                industry = str(item.get("name") or "").strip()
+                weight = float(item.get("weight_pct") or 0)
+                if not industry or weight <= 0:
+                    continue
+                identified += weight
+                secondary[industry] = secondary.get(industry, 0) + weight
+                broad_name = _broad_industry(industry)
+                broad[broad_name] = broad.get(broad_name, 0) + weight
+                for tag in _system_tags(industry, ""):
+                    tags[tag] = tags.get(tag, 0) + weight
         top10 = float(holdings.get("top10_coverage_pct") or 0)
         stock_exposure = float((allocation or {}).get("stock_exposure_pct") or top10)
         non_stock = max(0.0, 100 - stock_exposure)
-        undisclosed_stock = max(0.0, stock_exposure - top10)
-        unidentified = max(0.0, top10 - identified)
+        undisclosed_stock = max(0.0, stock_exposure - identified) if using_allocation else max(0.0, stock_exposure - top10)
+        unidentified = 0.0 if using_allocation else max(0.0, top10 - identified)
         rows = lambda values: [
             {"name": name, "weight_pct": round(weight, 4)}
             for name, weight in sorted(values.items(), key=lambda item: (-item[1], item[0]))
@@ -190,8 +204,8 @@ class FundDataService:
             "unidentified_disclosed_pct": round(unidentified, 4),
             "undisclosed_stock_pct": round(undisclosed_stock, 4),
             "non_stock_pct": round(non_stock, 4),
-            "calculation_basis": "最新公开前十大持仓比例 × 东方财富证券行业分类",
-            "industry_classification_source": "东方财富证券行情 f100 行业字段",
+            "calculation_basis": "东方财富公开行业配置（覆盖基金全部股票资产）" if using_allocation else "最新公开前十大持仓比例 × 东方财富证券行业分类",
+            "industry_classification_source": "东方财富基金行业配置" if using_allocation else "东方财富证券行情 f100 行业字段",
         }
 
     def get_fund_analysis(self, code: str, force_refresh: bool = False) -> dict[str, Any]:
@@ -221,15 +235,18 @@ class FundDataService:
             snapshots = self._fetch("stock_snapshot", cache_key=",".join(codes), force_refresh=force_refresh, codes=codes)
             allocation = self._fetch("industry_allocation", cache_key=code, force_refresh=force_refresh, code=code)
 
-        if holdings.get("data") and snapshots.get("data"):
-            exposure_data = self._industry_exposure(holdings["data"], snapshots["data"], allocation.get("data"))
+        if holdings.get("data") and (snapshots.get("data") or allocation.get("data")):
+            exposure_data = self._industry_exposure(holdings["data"], snapshots.get("data") or {}, allocation.get("data"))
+            allocation_fallback = exposure_data["industry_classification_source"] == "东方财富基金行业配置"
+            exposure_source = allocation["meta"] if allocation_fallback else snapshots["meta"]
             exposure_meta = DataMeta(
-                source_name="东方财富公开持仓与证券行业", source_reference=snapshots["meta"].get("source_reference") or "",
-                data_type="calculated_industry_exposure", as_of_date=holdings["data"].get("disclosure_date"),
-                fetched_at=self._now().isoformat(), status="disclosed", is_cached=bool(snapshots["meta"].get("is_cached")),
-                is_stale=bool(snapshots["meta"].get("is_stale")), provider=snapshots["meta"].get("provider") or "",
-                fallback_used=bool(snapshots["meta"].get("fallback_used")),
-                message="行业暴露按公开持仓计算；未知与非股票资产未归一化",
+                source_name="东方财富公开行业配置" if allocation_fallback else "东方财富公开持仓与证券行业",
+                source_reference=exposure_source.get("source_reference") or "",
+                data_type="calculated_industry_exposure", as_of_date=(allocation.get("data") or {}).get("as_of_date") if allocation_fallback else holdings["data"].get("disclosure_date"),
+                fetched_at=self._now().isoformat(), status="disclosed", is_cached=bool(exposure_source.get("is_cached")),
+                is_stale=bool(exposure_source.get("is_stale")), provider=exposure_source.get("provider") or "",
+                fallback_used=bool(exposure_source.get("fallback_used")) or allocation_fallback,
+                message="行业暴露来自基金公开行业配置；未识别资产不做归一化" if allocation_fallback else "行业暴露按公开持仓计算；未知与非股票资产未归一化",
             )
             industry_exposure = {"data": exposure_data, "meta": exposure_meta.to_dict()}
         else:

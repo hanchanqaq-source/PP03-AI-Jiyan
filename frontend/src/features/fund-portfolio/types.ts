@@ -221,4 +221,3 @@ export interface FundPortfolioAnalysisData {
   industry_concentration: PortfolioIndustryConcentration;
   risk_flags: string[];
 }
-

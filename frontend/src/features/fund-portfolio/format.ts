@@ -13,4 +13,3 @@ export const percent = (value: number | null | undefined, digits = 2) => value =
 export const dateTime = (value: string | null | undefined) => value
   ? value.replace("T", " ").replace(/\+08:00$/, "")
   : "—";
-

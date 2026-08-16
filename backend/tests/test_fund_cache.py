@@ -53,4 +53,3 @@ def test_corrupt_cache_entry_is_ignored_without_overwriting_original_bytes(tmp_p
 
     assert cache.get("nav:000001", allow_stale=True) is None
     assert path.read_bytes() == original
-

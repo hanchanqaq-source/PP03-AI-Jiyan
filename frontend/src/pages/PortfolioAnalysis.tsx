@@ -199,7 +199,7 @@ export function PortfolioAnalysis() {
               </div>
             </label>
             {!!results.length && <div className="absolute z-20 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-primary/25 bg-background/95 p-1 shadow-2xl backdrop-blur-xl">{results.map((fund) => (
-              <button key={fund.code} onClick={() => selectFund(fund)} aria-label={`选择基金 ${fund.name}`} className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-muted/60">
+              <button key={`${fund.code}-${fund.name}`} onClick={() => selectFund(fund)} aria-label={`选择基金 ${fund.name}`} className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-muted/60">
                 <span><span className="font-medium">{fund.name}</span><span className="ml-2 font-mono text-xs text-muted-foreground">{fund.code}</span><span className="ml-2 text-xs text-muted-foreground">{fund.fund_type || "类型未提供"}</span></span>
                 <span className="text-right text-xs"><span className="block">{fund.latest_nav ?? "—"}</span><span className="text-muted-foreground">{fund.latest_nav_date || "暂无净值日期"}</span></span>
               </button>

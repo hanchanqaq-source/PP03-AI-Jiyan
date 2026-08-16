@@ -59,6 +59,11 @@ class EastmoneyDirectProvider(BaseFundProvider):
             if not re.fullmatch(r"\d{6}", code):
                 continue
             base = item.get("FundBaseInfo") or {}
+            # The suggestion endpoint also returns A-shares and indices with the
+            # same six-digit code. Only rows carrying the fund-specific payload
+            # are valid fund identities.
+            if not isinstance(base, dict) or not base or not (base.get("FTYPE") or base.get("SHORTNAME")):
+                continue
             managers = [name.strip() for name in re.split(r"[,、]", str(base.get("JJJL") or "")) if name.strip()]
             funds.append({
                 "code": code,
@@ -161,4 +166,3 @@ class EastmoneyDirectProvider(BaseFundProvider):
             data=output, source_name="东方财富证券行情", source_reference=url,
             data_type="stock_snapshot", as_of_date=datetime.now(BEIJING).date().isoformat(), status="disclosed",
         )
-

@@ -16,4 +16,3 @@ class BaseFundProvider:
 
     def fetch(self, capability: str, **kwargs: Any) -> ProviderResult:
         raise ProviderUnavailable(f"{self.name} 不支持 {capability}")
-

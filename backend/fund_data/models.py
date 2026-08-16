@@ -32,4 +32,3 @@ class ProviderResult:
     as_of_date: str | None
     status: str
     message: str = ""
-

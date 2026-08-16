@@ -117,4 +117,3 @@ def test_corrupt_fund_file_degrades_to_empty_and_is_never_overwritten(isolated_f
     assert data["data_status"] == "corrupt"
     assert response.status_code == 409
     assert isolated_fund_file.read_bytes() == original
-

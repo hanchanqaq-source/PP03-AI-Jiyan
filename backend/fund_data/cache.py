@@ -72,4 +72,3 @@ class FundCache:
             path.unlink()
         except FileNotFoundError:
             pass
-

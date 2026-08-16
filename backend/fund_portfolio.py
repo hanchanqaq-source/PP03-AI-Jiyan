@@ -172,7 +172,6 @@ def upsert_fund_holding(record: dict[str, Any], *, replace: bool = False) -> dic
         _save(data)
     return _public(data)
 
-
 def delete_fund_holding(code: str) -> dict[str, Any]:
     with _LOCK:
         data, corrupt = _load()
@@ -183,4 +182,3 @@ def delete_fund_holding(code: str) -> dict[str, Any]:
         data["data_status"] = "ok"
         _save(data)
     return _public(data)
-

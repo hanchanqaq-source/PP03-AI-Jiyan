@@ -24,4 +24,3 @@ it("shows an isolated empty state instead of crashing", () => {
   render(<NavChart points={[]} />);
   expect(screen.getByText("历史净值曲线暂不可用")).toBeInTheDocument();
 });
-

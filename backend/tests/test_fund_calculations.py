@@ -122,4 +122,3 @@ def test_intraday_estimate_requires_reliable_disclosed_and_quote_coverage():
     assert available["holdings_coverage_pct"] == 60.0
     assert available["quote_coverage_pct"] == 100.0
     assert available["formula"] == "最新官方净值 × (1 + Σ公开持仓比例×对应股票涨跌幅)"
-
