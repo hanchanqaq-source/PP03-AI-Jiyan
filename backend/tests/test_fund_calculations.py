@@ -150,21 +150,62 @@ def test_overlap_lists_each_fund_and_weighted_combined_exposure():
     }]
 
 
-def test_industry_concentration_preserves_unknown_exposure_instead_of_normalizing():
+def test_industry_concentration_aggregates_lookthrough_layers_by_reference_value():
     funds = [
-        {"market_value": 1000.0, "broad_exposure": {"科技": 60.0, "医疗": 10.0}, "unknown_pct": 30.0},
-        {"market_value": 2000.0, "broad_exposure": {"科技": 20.0, "消费": 30.0}, "unknown_pct": 50.0},
+        {
+            "market_value": 300.0,
+            "lookthrough": {
+                "primary": [{"name": "电子", "weight_pct": 60.0}],
+                "secondary": [{"name": "半导体", "weight_pct": 60.0}],
+                "detail": [{"name": "半导体设备", "weight_pct": 45.0}],
+                "identified_coverage_pct": 62.0,
+                "other_pct": 2.0,
+                "unknown_pct": 8.0,
+                "undisclosed_stock_pct": 20.0,
+                "non_stock_pct": 10.0,
+            },
+            "industry_chain_tags": [{"id": "semiconductor", "name": "半导体", "weight_pct": 60.0}],
+            "official_allocation": {"exposure": [{"name": "制造业", "weight_pct": 90.0}]},
+        },
+        {
+            "market_value": 100.0,
+            "lookthrough": {
+                "primary": [{"name": "机械设备", "weight_pct": 40.0}],
+                "secondary": [{"name": "通用设备", "weight_pct": 40.0}],
+                "detail": [{"name": "仪器仪表", "weight_pct": 40.0}],
+                "identified_coverage_pct": 40.0,
+                "other_pct": 0.0,
+                "unknown_pct": 10.0,
+                "undisclosed_stock_pct": 30.0,
+                "non_stock_pct": 20.0,
+            },
+            "industry_chain_tags": [],
+            "official_allocation": {"exposure": [{"name": "制造业", "weight_pct": 80.0}]},
+        },
     ]
 
     result = calculate_industry_concentration(funds)
 
-    assert result["exposure"] == [
-        {"name": "科技", "weight_pct": 33.3333},
-        {"name": "消费", "weight_pct": 20.0},
-        {"name": "医疗", "weight_pct": 3.3333},
+    assert result["primary"] == [
+        {"name": "电子", "weight_pct": 45.0},
+        {"name": "机械设备", "weight_pct": 10.0},
     ]
-    assert result["identified_coverage_pct"] == pytest.approx(56.6666, abs=1e-4)
-    assert result["unknown_pct"] == pytest.approx(43.3333, abs=1e-4)
+    assert result["secondary"] == [
+        {"name": "半导体", "weight_pct": 45.0},
+        {"name": "通用设备", "weight_pct": 10.0},
+    ]
+    assert result["detail"] == [
+        {"name": "半导体设备", "weight_pct": 33.75},
+        {"name": "仪器仪表", "weight_pct": 10.0},
+    ]
+    assert result["exposure"] == result["primary"]
+    assert result["industry_chain_tags"] == [{"id": "semiconductor", "name": "半导体", "weight_pct": 45.0}]
+    assert result["identified_coverage_pct"] == 56.5
+    assert result["other_pct"] == 1.5
+    assert result["unknown_pct"] == 8.5
+    assert result["undisclosed_stock_pct"] == 22.5
+    assert result["non_stock_pct"] == 12.5
+    assert all(item["name"] != "制造业" for item in result["primary"])
 
 
 def test_intraday_estimate_requires_reliable_disclosed_and_quote_coverage():

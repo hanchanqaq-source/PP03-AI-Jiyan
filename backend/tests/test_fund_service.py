@@ -299,7 +299,13 @@ def test_portfolio_analysis_calculates_cost_value_overlap_and_date_warning(tmp_p
     assert result["overview"]["profit_loss"] == 30.0
     assert result["overview"]["return_rate"] == 10.0
     assert result["overlap"][0]["stock_code"] == "600000"
-    assert result["industry_concentration"]["unknown_pct"] == 40.0
+    assert result["industry_concentration"]["unknown_pct"] == 0.0
+    assert result["industry_concentration"]["undisclosed_stock_pct"] == 20.0
+    assert result["industry_concentration"]["non_stock_pct"] == 20.0
+    assert result["industry_concentration"]["primary"] == [
+        {"name": "电子", "weight_pct": 30.0},
+        {"name": "金融", "weight_pct": 30.0},
+    ]
 
 
 def test_quick_portfolio_revalues_inferred_shares_with_latest_official_nav(tmp_path):

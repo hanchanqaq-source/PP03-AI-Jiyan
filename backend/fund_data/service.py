@@ -503,11 +503,11 @@ class FundDataService:
                     "holdings": disclosed.get("holdings") or [],
                 })
                 exposure = analysis.get("industry_exposure", {}).get("data") or {}
-                broad_map = {item["name"]: item["weight_pct"] for item in exposure.get("broad") or []}
-                unknown = sum(float(exposure.get(key) or 0) for key in (
-                    "unidentified_disclosed_pct", "undisclosed_stock_pct", "non_stock_pct",
-                ))
-                industry_inputs.append({"market_value": market_value, "broad_exposure": broad_map, "unknown_pct": unknown})
+                industry_inputs.append({
+                    "market_value": market_value,
+                    "lookthrough": exposure.get("lookthrough") or {},
+                    "industry_chain_tags": exposure.get("industry_chain_tags") or [],
+                })
                 if intraday.get("status") == "estimated" and intraday.get("estimated_change_pct") is not None:
                     intraday_inputs.append((float(market_value), float(intraday["estimated_change_pct"])))
 
@@ -538,9 +538,6 @@ class FundDataService:
         concentration = calculate_industry_concentration(industry_inputs)
         if overlap:
             risk_flags.append("多只基金公开持仓包含同一批股票；请查看重复持仓明细")
-        technology = next((item["weight_pct"] for item in concentration["exposure"] if item["name"] == "科技"), 0)
-        if technology >= 50:
-            risk_flags.append("组合对科技行业的公开持仓估算暴露较高")
         inconsistent_dates = len(nav_dates) > 1
         if inconsistent_dates:
             risk_flags.append("组合净值数据日期不完全一致")

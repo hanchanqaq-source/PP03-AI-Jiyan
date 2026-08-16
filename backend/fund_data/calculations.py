@@ -189,25 +189,57 @@ def calculate_overlap(funds: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def calculate_industry_concentration(funds: list[dict[str, Any]]) -> dict[str, Any]:
     total_value = sum(float(fund.get("market_value") or 0) for fund in funds)
-    exposure: dict[str, float] = defaultdict(float)
-    unknown = 0.0
+    def weighted_rows(layer: str) -> list[dict[str, Any]]:
+        totals: defaultdict[str, float] = defaultdict(float)
+        if total_value > 0:
+            for fund in funds:
+                portfolio_weight = float(fund.get("market_value") or 0) / total_value
+                for row in (fund.get("lookthrough") or {}).get(layer) or []:
+                    name = str(row.get("name") or "").strip()
+                    if name:
+                        totals[name] += portfolio_weight * float(row.get("weight_pct") or 0)
+        return [
+            {"name": name, "weight_pct": round(weight, 4)}
+            for name, weight in sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+            if weight > 0
+        ]
+
+    scalars = {
+        "identified_coverage_pct": 0.0,
+        "other_pct": 0.0,
+        "unknown_pct": 0.0,
+        "undisclosed_stock_pct": 0.0,
+        "non_stock_pct": 0.0,
+    }
+    tags: dict[tuple[str, str], float] = defaultdict(float)
     if total_value > 0:
         for fund in funds:
             portfolio_weight = float(fund.get("market_value") or 0) / total_value
-            for name, weight in (fund.get("broad_exposure") or {}).items():
-                exposure[str(name)] += portfolio_weight * float(weight or 0)
-            unknown += portfolio_weight * float(fund.get("unknown_pct") or 0)
-    rows = [
-        {"name": name, "weight_pct": round(weight, 4)}
-        for name, weight in sorted(exposure.items(), key=lambda item: (-item[1], item[0]))
+            lookthrough = fund.get("lookthrough") or {}
+            for key in scalars:
+                scalars[key] += portfolio_weight * float(lookthrough.get(key) or 0)
+            for tag in fund.get("industry_chain_tags") or []:
+                tag_id = str(tag.get("id") or "").strip()
+                name = str(tag.get("name") or "").strip()
+                if tag_id and name:
+                    tags[(tag_id, name)] += portfolio_weight * float(tag.get("weight_pct") or 0)
+
+    primary = weighted_rows("primary")
+    secondary = weighted_rows("secondary")
+    detail = weighted_rows("detail")
+    tag_rows = [
+        {"id": tag_id, "name": name, "weight_pct": round(weight, 4)}
+        for (tag_id, name), weight in sorted(tags.items(), key=lambda item: (-item[1], item[0][0]))
         if weight > 0
     ]
-    identified = round(sum(row["weight_pct"] for row in rows), 4)
     return {
-        "exposure": rows,
-        "identified_coverage_pct": identified,
-        "unknown_pct": round(unknown, 4),
-        "calculation_basis": "基金官方净值对应市值权重 × 最新公开行业暴露",
+        "primary": primary,
+        "secondary": secondary,
+        "detail": detail,
+        "exposure": primary,
+        "industry_chain_tags": tag_rows,
+        **{key: round(value, 4) for key, value in scalars.items()},
+        "calculation_basis": "当前参考市值权重 × 最新公开前十大持仓穿透行业；未披露部分未归一化",
     }
 
 
