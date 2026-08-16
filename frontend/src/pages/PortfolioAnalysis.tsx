@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertCircle, CheckCircle2, Info, Loader2, Plus, RefreshCw, ShieldCheck, Trash2, WalletCards, X } from "lucide-react";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -19,6 +19,63 @@ function shortDate(value: string | null | undefined) {
   return value ? value.slice(5, 10) : "暂无";
 }
 
+const FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "[href]",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+function useDialogFocus(open: boolean, onClose: () => void) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
+    (focusable()[0] || dialog).focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialog.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [open]);
+
+  return dialogRef;
+}
+
 export function PortfolioAnalysis() {
   const [portfolio, setPortfolio] = useState<FundPortfolioData | null>(null);
   const [analysis, setAnalysis] = useState<FundPortfolioAnalysisData | null>(null);
@@ -31,15 +88,32 @@ export function PortfolioAnalysis() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showDataInfo, setShowDataInfo] = useState(false);
+  const dataInfoDialogRef = useDialogFocus(showDataInfo, () => setShowDataInfo(false));
+  const deleteDialogRef = useDialogFocus(Boolean(deleteTarget), () => { if (!deleting) setDeleteTarget(null); });
 
   const load = async () => {
     setLoading(true);
     setError(null);
+    setNotice(null);
     const [portfolioResult, analysisResult] = await Promise.allSettled([api.fundPortfolio(), api.fundPortfolioAnalysis()]);
-    if (portfolioResult.status === "fulfilled") setPortfolio(portfolioResult.value);
-    else setError("本地持仓台账加载失败；未执行任何写入。请检查后端状态。");
-    if (analysisResult.status === "fulfilled") setAnalysis(analysisResult.value);
-    else setNotice("组合分析暂不可用；本地持仓仍可独立读取和编辑。");
+    const hasCompleteSnapshot = portfolio !== null && analysis !== null;
+    if (portfolioResult.status === "fulfilled" && analysisResult.status === "fulfilled") {
+      setPortfolio(portfolioResult.value);
+      setAnalysis(analysisResult.value);
+    } else if (!hasCompleteSnapshot) {
+      setPortfolio(portfolioResult.status === "fulfilled" ? portfolioResult.value : null);
+      setAnalysis(analysisResult.status === "fulfilled" ? analysisResult.value : null);
+    }
+    if (portfolioResult.status === "rejected") {
+      setError(hasCompleteSnapshot
+        ? "本地持仓刷新失败；继续显示上次成功结果。"
+        : "本地持仓台账加载失败；未执行任何写入。请检查后端状态。");
+    }
+    if (analysisResult.status === "rejected") {
+      setNotice(hasCompleteSnapshot
+        ? "组合分析刷新失败；继续显示上次成功结果。"
+        : "组合分析暂不可用；本地持仓仍可独立读取和编辑。");
+    }
     setLoading(false);
   };
 
@@ -50,9 +124,14 @@ export function PortfolioAnalysis() {
     setError(null);
     try {
       setPortfolio(await api.upsertFundHolding(payload));
-      try { setAnalysis(await api.fundPortfolioAnalysis()); }
-      catch { setNotice("持仓已保存；公共数据分析刷新暂不可用，可稍后重试。"); }
-      setNotice(payload.replace ? "持仓已更新。" : "基金已添加到本地持仓。");
+      const successMessage = payload.replace ? "持仓已更新。" : "基金已添加到本地持仓。";
+      try {
+        setAnalysis(await api.fundPortfolioAnalysis());
+        setNotice(successMessage);
+      } catch {
+        setAnalysis(null);
+        setNotice(`${successMessage} 公共数据分析刷新暂不可用，可稍后重试。`);
+      }
       setDrawer(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "持仓保存失败；本地原始数据未确认变更。");
@@ -71,17 +150,28 @@ export function PortfolioAnalysis() {
 
   const confirmRemove = async () => {
     if (!deleteTarget) return;
+    const target = deleteTarget;
     setDeleting(true);
     setError(null);
     try {
-      setPortfolio(await api.deleteFundHolding(deleteTarget.code));
-      setAnalysis(await api.fundPortfolioAnalysis());
-      setNotice(`${deleteTarget.name} 已从本地持仓删除。`);
-      setDeleteTarget(null);
-      setDetail(null);
+      setPortfolio(await api.deleteFundHolding(target.code));
     } catch {
       setError("删除失败；本地数据未确认变更。");
-    } finally { setDeleting(false); }
+      setDeleting(false);
+      return;
+    }
+
+    setDeleteTarget(null);
+    setDetail(null);
+    try {
+      setAnalysis(await api.fundPortfolioAnalysis());
+      setNotice(`${target.name} 已从本地持仓删除。`);
+    } catch {
+      setAnalysis(null);
+      setNotice(`${target.name} 已删除；组合分析刷新失败，请刷新重试。`);
+    } finally {
+      setDeleting(false);
+    }
   };
 
   const overview = analysis?.overview;
@@ -139,15 +229,15 @@ export function PortfolioAnalysis() {
         position={detail?.item.position || null}
         onClose={() => setDetail(null)} onEdit={() => { if (detail) setDrawer({ holding: detail.item }); setDetail(null); }} onDelete={() => { if (detail) setDeleteTarget(detail.item); }} />
 
-      {showDataInfo && <div role="dialog" aria-modal="true" aria-label="数据说明" className="fixed inset-0 z-[65] flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.currentTarget === event.target) setShowDataInfo(false); }}>
-        <div className="w-full max-w-lg rounded-2xl border border-blue-400/20 bg-slate-950/95 p-5 shadow-2xl">
+      {showDataInfo && <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.currentTarget === event.target) setShowDataInfo(false); }}>
+        <div ref={dataInfoDialogRef} role="dialog" aria-modal="true" aria-label="数据说明" tabIndex={-1} className="w-full max-w-lg rounded-2xl border border-blue-400/20 bg-slate-950/95 p-5 shadow-2xl">
           <div className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-semibold">数据说明</h2><p className="mt-1 text-xs text-muted-foreground">页面主列表保持精简，完整口径在基金详情中查看。</p></div><button aria-label="关闭数据说明" onClick={() => setShowDataInfo(false)} className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-foreground"><X className="h-4 w-4" /></button></div>
           <div className="mt-4 space-y-3 text-sm leading-6 text-muted-foreground"><p className="flex gap-2"><ShieldCheck className="mt-1 h-4 w-4 shrink-0 text-success" />持仓只保存在本机；用户录入快照不会被正式净值或盘中估算覆盖。</p><p>总持有金额和权重优先按份额 × 最新可靠正式净值计算，无法可靠计算时才回退用户金额快照。</p><p>盘中结果属于参考估算；不满足可靠性门槛时显示“暂无可靠数据”。</p></div>
         </div>
       </div>}
 
-      {deleteTarget && <div role="dialog" aria-modal="true" aria-label="确认删除持仓" className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm">
-        <div className="w-full max-w-md rounded-2xl border border-border bg-background/95 p-6 shadow-2xl">
+      {deleteTarget && <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm">
+        <div ref={deleteDialogRef} role="dialog" aria-modal="true" aria-label="确认删除持仓" tabIndex={-1} className="w-full max-w-md rounded-2xl border border-border bg-background/95 p-6 shadow-2xl">
           <div className="flex items-start gap-3"><div className="rounded-full bg-destructive/10 p-2 text-destructive"><AlertCircle className="h-5 w-5" /></div><div><h2 className="text-lg font-semibold">确认删除持仓</h2><p className="mt-2 text-sm leading-6 text-muted-foreground">确认删除 {deleteTarget.name}（{deleteTarget.code}）？此操作只删除本地持仓记录。</p></div></div>
           <div className="mt-6 flex justify-end gap-2">
             <button aria-label="取消删除" onClick={() => setDeleteTarget(null)} disabled={deleting} className="rounded-xl border border-border px-4 py-2 text-sm text-muted-foreground">取消</button>

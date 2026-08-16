@@ -178,6 +178,13 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
     expect(screen.getByText("共 2 只基金")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新持仓数据" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "数据说明" })).toBeInTheDocument();
+    const dataInfoTrigger = screen.getByRole("button", { name: "数据说明" });
+    await user.click(dataInfoTrigger);
+    expect(screen.getByRole("dialog", { name: "数据说明" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭数据说明" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "数据说明" })).not.toBeInTheDocument();
+    expect(dataInfoTrigger).toHaveFocus();
     const status = screen.getByRole("status", { name: "持仓数据状态" });
     expect(within(status).getByText("官方净值更新至 08-14")).toBeInTheDocument();
     expect(within(status).getByText("1只可盘中估算")).toBeInTheDocument();
@@ -226,10 +233,55 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
     await user.click(screen.getByRole("button", { name: "保存持仓" }));
     await waitFor(() => expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ amount_snapshot: 1100, replace: true })));
 
-    await user.click(screen.getByRole("button", { name: "删除持仓 华夏成长混合" }));
+    const deleteTrigger = screen.getByRole("button", { name: "删除持仓 华夏成长混合" });
+    await user.click(deleteTrigger);
     expect(screen.getByRole("dialog", { name: "确认删除持仓" })).toBeInTheDocument();
     expect(remove).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "取消删除" })).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(screen.getByRole("button", { name: "确认删除" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "取消删除" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "确认删除持仓" })).not.toBeInTheDocument();
+    expect(deleteTrigger).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "删除持仓 华夏成长混合" }));
     await user.click(screen.getByRole("button", { name: "确认删除" }));
     await waitFor(() => expect(remove).toHaveBeenCalledWith("000001"));
+  });
+
+  it("labels stale analysis after a refresh failure and clears the notice after recovery", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "fundPortfolio").mockResolvedValue(savedPortfolio);
+    vi.spyOn(api, "fundPortfolioAnalysis").mockResolvedValue(populatedAnalysis);
+    render(<PortfolioAnalysis />);
+    await screen.findByText("华夏成长混合");
+
+    vi.mocked(api.fundPortfolioAnalysis).mockRejectedValueOnce(new Error("offline"));
+    await user.click(screen.getByRole("button", { name: "刷新持仓数据" }));
+    expect(await screen.findByText("组合分析刷新失败；继续显示上次成功结果。" )).toBeInTheDocument();
+    expect(screen.getByText("华夏成长混合")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "刷新持仓数据" }));
+    await waitFor(() => expect(screen.queryByText("组合分析刷新失败；继续显示上次成功结果。" )).not.toBeInTheDocument());
+  });
+
+  it("keeps a successful delete committed when the follow-up analysis refresh fails", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "fundPortfolio").mockResolvedValue(savedPortfolio);
+    vi.spyOn(api, "fundPortfolioAnalysis").mockResolvedValue(populatedAnalysis);
+    const remainingPortfolio = { ...savedPortfolio, holdings: [secondHolding] };
+    const remove = vi.spyOn(api, "deleteFundHolding").mockResolvedValue(remainingPortfolio);
+    render(<PortfolioAnalysis />);
+    await screen.findByText("华夏成长混合");
+
+    vi.mocked(api.fundPortfolioAnalysis).mockRejectedValueOnce(new Error("offline"));
+    await user.click(screen.getByRole("button", { name: "删除持仓 华夏成长混合" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("000001"));
+    expect(screen.queryByRole("dialog", { name: "确认删除持仓" })).not.toBeInTheDocument();
+    expect(await screen.findByText("华夏成长混合 已删除；组合分析刷新失败，请刷新重试。")).toBeInTheDocument();
+    expect(screen.queryByText("删除失败；本地数据未确认变更。")).not.toBeInTheDocument();
   });
 });
