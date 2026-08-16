@@ -48,6 +48,8 @@ export function PortfolioAnalysis() {
   const [saving, setSaving] = useState(false);
   const [detail, setDetail] = useState<{ holding: FundHolding; analysis: FundAnalysis | null } | null>(null);
   const [detailLoading, setDetailLoading] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ holding: FundHolding; name: string } | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const load = async () => {
     const [portfolioResult, analysisResult] = await Promise.allSettled([api.fundPortfolio(), api.fundPortfolioAnalysis()]);
@@ -135,11 +137,25 @@ export function PortfolioAnalysis() {
     setError(null); window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const remove = async (holding: FundHolding) => {
+  const remove = (holding: FundHolding) => {
     const name = holdingName(holding, analysis);
-    if (!window.confirm(`确认删除 ${name}（${holding.code}）？此操作只删除本地持仓记录。`)) return;
-    try { setPortfolio(await api.deleteFundHolding(holding.code)); setAnalysis(await api.fundPortfolioAnalysis()); setNotice(`${name} 已从本地持仓删除。`); }
+    setError(null);
+    setDeleteTarget({ holding, name });
+  };
+
+  const confirmRemove = async () => {
+    if (!deleteTarget) return;
+    const { holding, name } = deleteTarget;
+    setDeleting(true);
+    setError(null);
+    try {
+      setPortfolio(await api.deleteFundHolding(holding.code));
+      setAnalysis(await api.fundPortfolioAnalysis());
+      setNotice(`${name} 已从本地持仓删除。`);
+      setDeleteTarget(null);
+    }
     catch { setError("删除失败；本地数据未确认变更。"); }
+    finally { setDeleting(false); }
   };
 
   const openDetail = async (holding: FundHolding) => {
@@ -257,6 +273,23 @@ export function PortfolioAnalysis() {
       </GlassCard>
 
       <PortfolioCombination data={analysis} />
+      {deleteTarget && (
+        <div role="dialog" aria-modal="true" aria-labelledby="delete-holding-title" className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-border bg-background/95 p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="rounded-full bg-destructive/10 p-2 text-destructive"><AlertCircle className="h-5 w-5" /></div>
+              <div>
+                <h2 id="delete-holding-title" className="text-lg font-semibold text-foreground">确认删除持仓</h2>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">确认删除 {deleteTarget.name}（{deleteTarget.holding.code}）？此操作只删除本地持仓记录。</p>
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button aria-label="取消删除" onClick={() => setDeleteTarget(null)} disabled={deleting} className="rounded-lg border border-border px-4 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-50">取消</button>
+              <button aria-label="确认删除" onClick={confirmRemove} disabled={deleting} className="inline-flex items-center gap-2 rounded-lg bg-destructive px-4 py-2 text-sm font-semibold text-destructive-foreground disabled:opacity-50">{deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}删除</button>
+            </div>
+          </div>
+        </div>
+      )}
       <TagSelector open={tagSelectorOpen} selectedIds={form.tagIds} onCancel={() => setTagSelectorOpen(false)} onConfirm={(ids) => { set("tagIds", ids); setTagSelectorOpen(false); }} />
       <FundDetailDrawer open={Boolean(detail)} holding={detail?.holding || null} analysis={detail?.analysis || null} onClose={() => setDetail(null)} />
     </div>

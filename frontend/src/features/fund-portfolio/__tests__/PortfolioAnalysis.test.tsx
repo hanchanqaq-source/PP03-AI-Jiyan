@@ -107,12 +107,19 @@ describe("PortfolioAnalysis", () => {
         analysis: null,
       }],
     });
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    const remove = vi.spyOn(api, "deleteFundHolding");
+    const remove = vi.spyOn(api, "deleteFundHolding").mockResolvedValue(emptyPortfolio);
     render(<PortfolioAnalysis />);
     await screen.findByText("华夏成长混合");
+
     await user.click(screen.getByRole("button", { name: "删除 华夏成长混合" }));
-    expect(confirm).toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "确认删除持仓" })).toBeInTheDocument();
+    expect(screen.getByText("确认删除 华夏成长混合（000001）？此操作只删除本地持仓记录。")).toBeInTheDocument();
     expect(remove).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "取消删除" }));
+    expect(screen.queryByRole("dialog", { name: "确认删除持仓" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除 华夏成长混合" }));
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("000001"));
   });
 });
