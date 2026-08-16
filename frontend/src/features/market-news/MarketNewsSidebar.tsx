@@ -7,7 +7,7 @@ function Panel({ title, icon, children }: { title: string; icon: React.ReactNode
 
 const relationLabel = { direct_holding: "直接持仓", industry_relation: "产业关联", watch_tag: "关注标签", none: "普通资讯" } as const;
 
-export function MarketNewsSidebar({ focus, impact }: { focus: MarketNewsEvent[]; impact: MarketNewsImpactSummary }) {
+export function MarketNewsSidebar({ focus, impact }: { focus: MarketNewsEvent[]; impact: MarketNewsImpactSummary | null }) {
   return <aside className="space-y-3 xl:sticky xl:top-4 xl:self-start" aria-label="市场资讯重点面板">
     <Panel title="今日重点" icon={<Radar className="h-4 w-4 text-primary" />}>
       <div className="mt-3 space-y-2">{focus.length ? focus.slice(0, 5).map((event, index) => <div key={event.event_id} className="grid grid-cols-[24px_1fr] gap-2 rounded-xl border border-border/45 bg-black/10 p-2.5">
@@ -17,9 +17,11 @@ export function MarketNewsSidebar({ focus, impact }: { focus: MarketNewsEvent[];
     </Panel>
 
     <Panel title="我的持仓影响" icon={<BarChart3 className="h-4 w-4 text-sky-300" />}>
-      <p className="mt-3 text-sm font-semibold">今天有 {impact.holding_related_count} 个事件与你的持仓相关</p>
-      <div className="mt-3 grid gap-2 text-xs text-muted-foreground"><p>直接涉及重仓公司：{impact.direct_count}</p><p>涉及持仓行业：{impact.industry_count}</p><p>只涉及关注标签：{impact.watch_count}</p></div>
-      {impact.funds.length > 0 && <div className="mt-3 border-t border-border/45 pt-3"><p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">受关联事件最多的基金</p>{impact.funds.map((fund) => <p key={fund.fund_code} className="mt-2 text-xs">{fund.fund_name}（{fund.fund_code}） · {fund.event_count} 个事件</p>)}</div>}
+      {impact ? <>
+        <p className="mt-3 text-sm font-semibold">今天有 {impact.holding_related_count} 个事件与你的持仓相关</p>
+        <div className="mt-3 grid gap-2 text-xs text-muted-foreground"><p>直接涉及重仓公司：{impact.direct_count}</p><p>涉及持仓行业：{impact.industry_count}</p><p>只涉及关注标签：{impact.watch_count}</p></div>
+        {impact.funds.length > 0 && <div className="mt-3 border-t border-border/45 pt-3"><p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">受关联事件最多的基金</p>{impact.funds.map((fund) => <p key={fund.fund_code} className="mt-2 text-xs">{fund.fund_name}（{fund.fund_code}） · {fund.event_count} 个事件</p>)}</div>}
+      </> : <p role="status" className="mt-3 text-sm font-semibold text-warning">持仓数据读取失败，暂无法计算关联</p>}
     </Panel>
 
     <Panel title="关联强度说明" icon={<Link2 className="h-4 w-4 text-violet-300" />}>

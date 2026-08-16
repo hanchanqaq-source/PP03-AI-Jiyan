@@ -4,7 +4,8 @@ import { marketNewsResponse } from "./fixtures";
 
 describe("MarketNewsSidebar", () => {
   it("shows today's ranked focus, holding impact, and fixed relationship definitions", () => {
-    render(<MarketNewsSidebar focus={[...marketNewsResponse.today_focus]} impact={{ ...marketNewsResponse.impact_summary, funds: [...marketNewsResponse.impact_summary.funds] }} />);
+    const impact = marketNewsResponse.impact_summary!;
+    render(<MarketNewsSidebar focus={[...marketNewsResponse.today_focus]} impact={{ ...impact, funds: [...impact.funds] }} />);
 
     expect(screen.getByRole("heading", { name: "今日重点" })).toBeInTheDocument();
     expect(screen.getByText("1")).toBeInTheDocument();

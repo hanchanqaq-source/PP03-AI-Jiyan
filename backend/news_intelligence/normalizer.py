@@ -76,10 +76,10 @@ def _anchors(title: str) -> frozenset[str]:
     return frozenset(anchors)
 
 
-def _parse_datetime(value, fallback: datetime) -> datetime:
+def _parse_datetime(value, fallback: datetime | None) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
-    elif isinstance(value, (int, float)):
+    elif isinstance(value, (int, float)) and value > 0:
         parsed = datetime.fromtimestamp(value, tz=timezone.utc)
     elif value:
         try:
@@ -88,7 +88,7 @@ def _parse_datetime(value, fallback: datetime) -> datetime:
             parsed = fallback
     else:
         parsed = fallback
-    if parsed.tzinfo is None:
+    if parsed is not None and parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
 
@@ -105,16 +105,32 @@ def _category(blob: str) -> str:
     return "industry"
 
 
-def _related_tags(track_key: str, blob: str) -> tuple[tuple[str, str], ...]:
+def _related_tags(track_key: str, blob: str) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
     tags: list[tuple[str, str]] = []
+    text_tags: list[tuple[str, str]] = []
     base = TRACK_TAGS.get(track_key)
     if base:
         tags.append(base)
     lowered = blob.lower()
     for tag_id, name, keywords in SPECIFIC_TAGS:
-        if any(keyword.lower() in lowered for keyword in keywords) and tag_id not in {tag[0] for tag in tags}:
-            tags.append((tag_id, name))
-    return tuple(tags)
+        if any(keyword.lower() in lowered for keyword in keywords):
+            tag = (tag_id, name)
+            text_tags.append(tag)
+            if tag_id not in {existing[0] for existing in tags}:
+                tags.append(tag)
+    return tuple(tags), tuple(text_tags)
+
+
+def _effective_data_status(container_status: str, item_status: str) -> str:
+    if container_status == "stale":
+        return "stale"
+    if container_status == "cache":
+        return "stale" if item_status == "stale" else "cache"
+    if container_status == "partial":
+        return item_status if item_status in {"realtime", "stale", "cache"} else "cache"
+    if container_status == "realtime":
+        return item_status if item_status in {"realtime", "stale"} else "realtime"
+    return container_status or item_status or "cache"
 
 
 def normalize_radar(radar: dict, now: datetime) -> list[NewsSourceItem]:
@@ -131,9 +147,15 @@ def normalize_radar(radar: dict, now: datetime) -> list[NewsSourceItem]:
             summary = html.unescape(str(raw.get("summary_or_excerpt") or raw.get("summary") or "")).strip()
             original_url = str(raw.get("original_url") or raw.get("url") or "").strip()
             source_url = str(raw.get("source_url") or "").strip()
-            published = _parse_datetime(raw.get("published_at") or raw.get("ts"), fallback_fetched)
+            raw_published = raw.get("published_at")
+            if not raw_published:
+                raw_published = raw.get("ts")
+            published = _parse_datetime(raw_published, None)
             fetched = _parse_datetime(raw.get("fetched_at"), fallback_fetched)
+            if fetched is None:
+                fetched = now
             blob = f"{title} {summary}"
+            related_tags, text_related_tags = _related_tags(track_key, blob)
             sources.append(NewsSourceItem(
                 source_name=str(raw.get("source_name") or raw.get("source") or "未知公开来源"),
                 source_url=source_url,
@@ -150,8 +172,9 @@ def normalize_radar(radar: dict, now: datetime) -> list[NewsSourceItem]:
                 normalized_title=normalize_title(title),
                 tokens=_tokens(blob),
                 anchors=_anchors(title),
-                related_tags=_related_tags(track_key, blob),
+                related_tags=related_tags,
+                text_related_tags=text_related_tags,
                 source_domain=(urlparse(original_url).hostname or urlparse(source_url).hostname or "").lower(),
-                data_status=str(raw.get("data_status") or default_status),
+                data_status=_effective_data_status(default_status, str(raw.get("data_status") or default_status)),
             ))
     return sources

@@ -10,6 +10,10 @@ export const directEvent: MarketNewsEvent = {
   ],
   source_count: 2,
   related_tags: [{ id: "semiconductor", name: "半导体" }, { id: "semiconductor-equipment", name: "半导体设备" }],
+  tag_evidence: [
+    { id: "semiconductor", name: "半导体", provenance: "feed_track" },
+    { id: "semiconductor-equipment", name: "半导体设备", provenance: "article_text" },
+  ],
   related_companies: [{ stock_code: "002371", stock_name: "北方华创" }],
   related_funds: [{ fund_code: "017811", fund_name: "东方人工智能主题混合C" }],
   relation_level: "direct_holding",
@@ -31,6 +35,7 @@ export const marketNewsResponse: MarketNewsResponse = {
     holding_related_count: 2, direct_count: 1, industry_count: 1, watch_count: 1,
     funds: [{ fund_code: "017811", fund_name: "东方人工智能主题混合C", event_count: 2 }],
   },
+  snapshot_id: "aaaaaaaaaaaaaaaaaaaa",
   generated_at: "2026-08-17T12:00:00+08:00",
   data_status: "cache",
   source_summary: { total_sources: 108, failed_sources: 0, cache_status: "cache", refresh_failed: false, source_statuses: [] },

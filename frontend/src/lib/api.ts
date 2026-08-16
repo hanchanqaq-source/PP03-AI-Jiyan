@@ -289,7 +289,9 @@ export const api = {
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
   marketNewsEvents: (query: MarketNewsQuery) => get<MarketNewsResponse>(marketNewsPath("/market-news/events", query)),
   marketNewsRefresh: (query: MarketNewsQuery) => request<MarketNewsResponse>(marketNewsPath("/market-news/refresh", query), "POST"),
-  marketNewsEvent: (eventId: string) => get<MarketNewsEvent>(`/market-news/events/${encodeURIComponent(eventId)}`),
+  marketNewsEvent: (eventId: string, snapshotId?: string) => get<MarketNewsEvent>(
+    `/market-news/events/${encodeURIComponent(eventId)}${snapshotId ? `?snapshot_id=${encodeURIComponent(snapshotId)}` : ""}`,
+  ),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),

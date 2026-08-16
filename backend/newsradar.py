@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
+import threading
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCES_FILE = os.path.join(HERE, "news_sources.json")
 CACHE_DIR = os.environ.get("VR_NEWS_CACHE_DIR") or os.path.join(HERE, ".cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "radar.json")
+CACHE_WRITE_LOCK = threading.Lock()
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -123,6 +126,40 @@ def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -
     return out
 
 
+def _set_all_item_status(data: dict, status: str) -> None:
+    for industry in data.get("industries") or []:
+        for item in industry.get("items") or []:
+            item["data_status"] = status
+
+
+def _write_cache(data: dict) -> None:
+    with CACHE_WRITE_LOCK:
+        cache_dir = os.path.dirname(CACHE_FILE)
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cache_dir,
+                prefix="radar.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = tmp_file.name
+                json.dump(data, tmp_file, ensure_ascii=False)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, CACHE_FILE)
+            tmp_path = None
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+
+
 def fetch_radar() -> dict:
     """抓全部源，返回 12 赛道数据并落盘缓存。"""
     with open(SOURCES_FILE, encoding="utf-8") as source_file:
@@ -169,6 +206,7 @@ def fetch_radar() -> dict:
         if previous:
             fallback = json.loads(json.dumps(previous, ensure_ascii=False))
             fallback["cache_status"] = "stale"
+            _set_all_item_status(fallback, "stale")
             fallback["source_statuses"] = source_statuses
             fallback.setdefault("stats", {})["failed_sources"] = failed
             return fallback
@@ -189,11 +227,7 @@ def fetch_radar() -> dict:
         "cache_status": "partial" if failed else "realtime",
         "source_statuses": source_statuses,
     }
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, CACHE_FILE)  # 原子改名，防两次并发刷新交错写坏缓存
+    _write_cache(data)
     return data
 
 
@@ -205,6 +239,7 @@ def load_cache():
         recent_days = int(data.get("recent_days") or 7)
         is_stale = bool(generated_at and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
         data["cache_status"] = "stale" if is_stale else "cache"
+        _set_all_item_status(data, data["cache_status"])
         return data
     except (FileNotFoundError, json.JSONDecodeError):
         return None

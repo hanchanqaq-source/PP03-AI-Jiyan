@@ -2,7 +2,8 @@ import { useEffect, useRef } from "react";
 import { ExternalLink, X } from "lucide-react";
 import type { MarketNewsEvent } from "./types";
 
-function dateTime(value: string) {
+function dateTime(value: string | null) {
+  if (!value) return "时间未知";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value || "时间未知";
   const parts = new Intl.DateTimeFormat("zh-CN", {

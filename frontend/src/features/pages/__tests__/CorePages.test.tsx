@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
@@ -68,6 +68,41 @@ describe("PP03 core pages", () => {
     expect(screen.getByRole("heading", { name: directEvent.title })).toBeInTheDocument();
   });
 
+  it("does not let a stale refresh overwrite a newer filter response", async () => {
+    const user = userEvent.setup();
+    const filteredEvent = { ...directEvent, event_id: "bbbbbbbbbbbbbbbbbbbb", title: "全球科技筛选结果" };
+    const staleRefreshEvent = { ...directEvent, event_id: "cccccccccccccccccccc", title: "旧筛选刷新结果" };
+    vi.spyOn(api, "marketNewsEvents")
+      .mockResolvedValueOnce({ ...marketNewsResponse, events: [directEvent] })
+      .mockResolvedValueOnce({ ...marketNewsResponse, events: [filteredEvent] });
+    let resolveRefresh!: (value: typeof marketNewsResponse) => void;
+    vi.spyOn(api, "marketNewsRefresh").mockImplementation(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: directEvent.title });
+
+    await user.click(screen.getByRole("button", { name: "刷新资讯" }));
+    await user.click(screen.getByRole("button", { name: "全球科技" }));
+    expect(await screen.findByRole("heading", { name: filteredEvent.title })).toBeInTheDocument();
+
+    resolveRefresh({ ...marketNewsResponse, events: [staleRefreshEvent] });
+    await waitFor(() => expect(screen.queryByRole("heading", { name: staleRefreshEvent.title })).not.toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: filteredEvent.title })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新资讯" })).not.toBeDisabled();
+  });
+
+  it("disables refresh while a filter GET is still loading", async () => {
+    let resolveGet!: (value: typeof marketNewsResponse) => void;
+    vi.spyOn(api, "marketNewsEvents").mockImplementation(() => new Promise((resolve) => { resolveGet = resolve; }));
+    const refresh = vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(marketNewsResponse);
+    render(<MarketNews />);
+
+    expect(screen.getByRole("button", { name: "刷新资讯" })).toBeDisabled();
+    expect(refresh).not.toHaveBeenCalled();
+    resolveGet(marketNewsResponse);
+    expect(await screen.findByRole("heading", { name: directEvent.title })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新资讯" })).not.toBeDisabled();
+  });
+
   it("shows data explanation and all explicit degraded states", async () => {
     const user = userEvent.setup();
     vi.spyOn(api, "marketNewsEvents").mockResolvedValue({
@@ -87,13 +122,31 @@ describe("PP03 core pages", () => {
   });
 
   it("persists a genuinely empty market-news tag selection and shows guidance", async () => {
+    const user = userEvent.setup();
     localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: [], activeId: "" }));
     const load = vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [], empty_reason: "no_tags" });
     render(<MarketNews />);
 
     expect(await screen.findByText("还没有选择关注行业")).toBeInTheDocument();
     expect(screen.getByText("添加半导体、存储、机器人、医疗等标签后开始跟踪资讯")).toBeInTheDocument();
+    const addButtons = screen.getAllByRole("button", { name: "添加标签" });
+    await user.click(addButtons[addButtons.length - 1]);
+    expect(screen.getByRole("dialog", { name: "添加投研标签" })).toBeInTheDocument();
     expect(load).not.toHaveBeenCalled();
+  });
+
+  it("shows portfolio read failure instead of factual zero impact", async () => {
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({
+      ...marketNewsResponse,
+      events: [],
+      portfolio_status: "error",
+      impact_summary: null,
+      empty_reason: "portfolio_error",
+    });
+    render(<MarketNews />);
+
+    expect(await screen.findByText("持仓数据读取失败，暂无法计算关联")).toBeInTheDocument();
+    expect(screen.queryByText(/今天有 0 个事件与你的持仓相关/)).not.toBeInTheDocument();
   });
 
   it("shows no-holdings and no-events responses without fake associations", async () => {

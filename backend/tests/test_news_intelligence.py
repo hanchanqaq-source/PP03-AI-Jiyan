@@ -72,6 +72,40 @@ def test_normalize_radar_classifies_policy_and_specific_storage_tag():
     assert sources[0].related_tags == (("semiconductor", "半导体"), ("storage", "存储"))
 
 
+def test_normalize_radar_keeps_unknown_publication_time_explicit_and_out_of_recency():
+    item = _item(
+        "没有可靠发布时间的公开资讯",
+        "https://news.example.test/unknown-date",
+        None,
+        "公开媒体",
+    )
+    item["ts"] = 0
+
+    source = normalize_radar(_radar(item), now=NOW)[0]
+    event = cluster_items([source])[0]
+
+    assert source.published_at is None
+    assert source.fetched_at.isoformat() == "2026-08-17T12:00:00+08:00"
+    assert event.published_at_first is None
+    assert event.published_at_latest is None
+    assert event.to_dict()["published_at_latest"] is None
+
+
+def test_container_cache_status_downgrades_historical_realtime_items():
+    radar = _radar(_item(
+        "缓存中的公开资讯",
+        "https://news.example.test/cached",
+        "2026-08-17T10:35:00+08:00",
+        "公开媒体",
+    ))
+    radar["cache_status"] = "cache"
+
+    assert normalize_radar(radar, now=NOW)[0].data_status == "cache"
+
+    radar["cache_status"] = "stale"
+    assert normalize_radar(radar, now=NOW)[0].data_status == "stale"
+
+
 def test_fund_notice_requires_fund_context_instead_of_generic_market_share_wording():
     sources = normalize_radar(_radar(
         _item(

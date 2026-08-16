@@ -526,8 +526,11 @@ def market_news_refresh(
 
 
 @app.get("/api/market-news/events/{event_id}")
-def market_news_event(event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$")):
-    event = market_news_service.get_service().get_event(event_id)
+def market_news_event(
+    event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$"),
+    snapshot_id: str | None = Query(default=None, pattern=r"^[a-f0-9]{20}$"),
+):
+    event = market_news_service.get_service().get_event(event_id, snapshot_id=snapshot_id)
     if event is None:
         raise HTTPException(404, "资讯事件不存在或已不在当前缓存中")
     return {"data": event}

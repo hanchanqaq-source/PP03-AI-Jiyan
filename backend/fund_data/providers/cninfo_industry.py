@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 import requests
@@ -20,22 +21,30 @@ STANDARD_PRIORITY = {
     "008021": 4,
     "008001": 4,
 }
+_TOKEN_RUNTIME_INIT_LOCK = threading.RLock()
 
 
 class _CninfoTokenFactory:
     def __init__(self):
-        self._runtime: Any | None = None
+        self._thread_state = threading.local()
 
     def __call__(self) -> str:
-        if self._runtime is None:
-            from akshare.datasets import get_ths_js
-            from py_mini_racer import MiniRacer
+        runtime = getattr(self._thread_state, "runtime", None)
+        if runtime is None:
+            # MiniRacer's V8 pool initialization is process-global and crashes the
+            # interpreter when two request threads initialize it concurrently.
+            # The isolate itself is thread-affine, so cache one runtime per thread.
+            with _TOKEN_RUNTIME_INIT_LOCK:
+                runtime = getattr(self._thread_state, "runtime", None)
+                if runtime is None:
+                    from akshare.datasets import get_ths_js
+                    from py_mini_racer import MiniRacer
 
-            runtime = MiniRacer()
-            js_path = Path(get_ths_js("cninfo.js"))
-            runtime.eval(js_path.read_text(encoding="utf-8"))
-            self._runtime = runtime
-        return str(self._runtime.call("getResCode1"))
+                    runtime = MiniRacer()
+                    js_path = Path(get_ths_js("cninfo.js"))
+                    runtime.eval(js_path.read_text(encoding="utf-8"))
+                    self._thread_state.runtime = runtime
+        return str(runtime.call("getResCode1"))
 
 
 def _clean(value: Any) -> str | None:

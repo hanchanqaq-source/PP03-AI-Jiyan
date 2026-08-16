@@ -14,7 +14,8 @@ const IMPACT = { positive: "偏正面", negative: "偏负面", neutral: "中性"
 const CONFIDENCE = { high: "高置信度", medium: "中置信度", low: "低置信度", unavailable: "置信度不可用" } as const;
 const STATUS: Record<string, string> = { realtime: "实时抓取", cache: "缓存数据", stale: "过期缓存", partial: "来源失败", source_failure: "来源失败" };
 
-function shortDateTime(value: string) {
+function shortDateTime(value: string | null) {
+  if (!value) return "时间未知";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value || "时间未知";
   return new Intl.DateTimeFormat("zh-CN", {

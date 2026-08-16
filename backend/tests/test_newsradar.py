@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import newsradar
@@ -89,7 +90,7 @@ def test_all_source_failure_keeps_last_valid_cache_bytes(tmp_path, monkeypatch):
         "recent_days": 7,
         "industries": [{
             "key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 1,
-            "items": [{"title": "最后一次有效资讯", "source_url": "https://failed.example.test/rss"}],
+            "items": [{"title": "最后一次有效资讯", "source_url": "https://failed.example.test/rss", "data_status": "realtime"}],
         }],
         "stats": {"industries": 1, "total_sources": 1, "failed_sources": 0},
         "cache_status": "cache",
@@ -104,6 +105,7 @@ def test_all_source_failure_keeps_last_valid_cache_bytes(tmp_path, monkeypatch):
 
     assert data["industries"][0]["items"][0]["title"] == "最后一次有效资讯"
     assert data["cache_status"] == "stale"
+    assert data["industries"][0]["items"][0]["data_status"] == "stale"
     assert data["stats"]["failed_sources"] == 1
     assert data["source_statuses"][0]["status"] == "failed"
     assert cache.read_bytes() == original_bytes
@@ -130,3 +132,40 @@ def test_single_source_failure_returns_partial_success(tmp_path, monkeypatch):
     assert data["stats"]["failed_sources"] == 1
     assert [status["status"] for status in data["source_statuses"]] == ["ok", "failed"]
     assert json.loads(cache.read_text(encoding="utf-8"))["cache_status"] == "partial"
+
+
+def test_load_cache_downgrades_item_status_to_current_container_state(tmp_path, monkeypatch):
+    cache = tmp_path / "radar.json"
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-17T09:00:00+00:00",
+        "recent_days": 30,
+        "cache_status": "realtime",
+        "industries": [{"key": "semi", "items": [{"title": "缓存资讯", "data_status": "realtime"}]}],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+
+    data = newsradar.load_cache()
+
+    assert data["cache_status"] == "cache"
+    assert data["industries"][0]["items"][0]["data_status"] == "cache"
+
+
+def test_unique_atomic_cache_writes_remain_valid_under_concurrency(tmp_path, monkeypatch):
+    cache = tmp_path / "radar.json"
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    payloads = [{"writer": index, "industries": []} for index in range(12)]
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        list(executor.map(newsradar._write_cache, payloads))
+
+    assert json.loads(cache.read_text(encoding="utf-8")) in payloads
+    assert list(tmp_path.glob("radar.*.tmp")) == []
+
+
+def test_production_sources_include_auditable_mainland_region_metadata():
+    config = json.loads(Path(newsradar.SOURCES_FILE).read_text(encoding="utf-8"))
+    by_name = {source["name"]: source for source in config["sources"]}
+
+    for name in ("量子位", "智东西", "华尔街见闻", "东方财富资讯", "经济观察网"):
+        assert by_name[name]["region"] == "CN"
+        assert by_name[name]["language"] == "zh-CN"

@@ -56,12 +56,15 @@ const STATUS_LABELS: Record<string, string> = {
   source_failure: "来源失败",
 };
 
-function EmptyState({ reason }: { reason: MarketNewsResponse["empty_reason"] }) {
+function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_reason"]; onAddTag: () => void }) {
   if (reason === "no_tags") {
-    return <div className="py-16 text-center"><p className="font-semibold">还没有选择关注行业</p><p className="mt-2 text-sm text-muted-foreground">添加半导体、存储、机器人、医疗等标签后开始跟踪资讯</p></div>;
+    return <div className="py-16 text-center"><p className="font-semibold">还没有选择关注行业</p><p className="mt-2 text-sm text-muted-foreground">添加半导体、存储、机器人、医疗等标签后开始跟踪资讯</p><button onClick={onAddTag} className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">添加标签</button></div>;
   }
   if (reason === "no_holdings") {
     return <div className="py-16 text-center"><p className="font-semibold">还没有基金持仓</p><p className="mt-2 text-sm text-muted-foreground">添加持仓后，系统会把基金公开重仓股与资讯关联</p></div>;
+  }
+  if (reason === "portfolio_error") {
+    return <div className="py-16 text-center"><p className="font-semibold text-warning">持仓数据读取失败，暂无法计算关联</p><p className="mt-2 text-sm text-muted-foreground">资讯仍可查看；持仓关联与影响统计暂不可用。</p></div>;
   }
   return <div className="py-16 text-center"><p className="font-semibold">当前筛选暂无可靠资讯</p><p className="mt-2 text-sm text-muted-foreground">可以扩大时间范围、切换标签或刷新公开来源</p><p className="mt-1 text-xs text-muted-foreground">系统不会用 AI 生成新闻。</p></div>;
 }
@@ -92,6 +95,7 @@ export function MarketNews() {
 
   useEffect(() => {
     const requestId = ++requestIdRef.current;
+    setRefreshing(false);
     if (mode === "my_focus" && query.tag_ids.length === 0) {
       dataRef.current = null;
       setData(null);
@@ -115,17 +119,20 @@ export function MarketNews() {
   }, [mode, query]);
 
   const refresh = async () => {
-    if (refreshing || (mode === "my_focus" && query.tag_ids.length === 0)) return;
+    if (refreshing || loading || (mode === "my_focus" && query.tag_ids.length === 0)) return;
+    const requestId = ++requestIdRef.current;
     setRefreshing(true);
     setError(null);
     try {
       const response = await api.marketNewsRefresh(query);
+      if (requestId !== requestIdRef.current) return;
       dataRef.current = response;
       setData(response);
     } catch {
+      if (requestId !== requestIdRef.current) return;
       setError(dataRef.current ? "资讯刷新失败；继续显示上次成功结果。" : "资讯刷新失败，请稍后重试。");
     } finally {
-      setRefreshing(false);
+      if (requestId === requestIdRef.current) setRefreshing(false);
     }
   };
 
@@ -140,7 +147,7 @@ export function MarketNews() {
         subtitle="把新闻、政策、公司公告和你的基金持仓关联起来"
         actions={<div className="flex items-center gap-2">
           <button onClick={() => setInfoOpen(true)} aria-label="数据说明" className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:border-primary/45 hover:text-foreground"><Database className="h-4 w-4" />数据说明</button>
-          <button onClick={refresh} disabled={refreshing || noTags} aria-label="刷新资讯" className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{refreshing ? "刷新中" : "刷新资讯"}</button>
+          <button onClick={refresh} disabled={refreshing || loading || noTags} aria-label="刷新资讯" className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{refreshing ? "刷新中" : "刷新资讯"}</button>
         </div>}
       />
 
@@ -164,7 +171,7 @@ export function MarketNews() {
 
       <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-border/55 bg-muted/15 px-3 py-2 text-xs text-muted-foreground">
         <span>状态：{status}</span>
-        {data && <span>{data.source_summary.total_sources} 个公开来源</span>}
+        {data && <span>{data.source_summary.total_sources} 个来源配置</span>}
         {data && data.source_summary.failed_sources > 0 && <span className="text-warning">{data.source_summary.failed_sources} 个来源失败</span>}
         {data?.ai_status === "unavailable" && <span>AI：摘要不可用</span>}
         {data?.generated_at && <span className="ml-auto">更新于 {new Date(data.generated_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}</span>}
@@ -172,7 +179,7 @@ export function MarketNews() {
 
       {error && <div role="alert" className="mb-4 flex items-center gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4 shrink-0" />{error}</div>}
 
-      {loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
+      {loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
         <main className="rounded-2xl border border-border/70 bg-gradient-to-b from-slate-950/55 to-background/45 px-5" aria-label="市场资讯事件列表">
           {loading && <p className="border-b border-border/45 py-2 text-xs text-muted-foreground">正在更新筛选结果…</p>}
           {data.events.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={setDetailEvent} />)}

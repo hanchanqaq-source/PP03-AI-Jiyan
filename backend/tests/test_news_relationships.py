@@ -109,6 +109,51 @@ def test_fund_marketing_name_cannot_create_direct_holding_relation():
     assert related.relation_evidence == []
 
 
+def test_feed_track_alone_cannot_create_holding_industry_relation():
+    event = _event(
+        "CEO Interview with Aras about product lifecycle management",
+        summary="The engineering software vendor discussed digital-thread tools.",
+        track_key="semi",
+    )
+
+    related = relate_events([event], _portfolio(), selected_tag_ids=[])[0]
+
+    assert related.related_tags == [
+        {"id": "semiconductor", "name": "半导体"},
+        {"id": "software", "name": "软件"},
+    ]
+    assert related.tag_evidence == [
+        {"id": "semiconductor", "name": "半导体", "provenance": "feed_track"},
+        {"id": "software", "name": "软件", "provenance": "article_text"},
+    ]
+    assert related.relation_level == "none"
+    assert related.relation_evidence == []
+
+
+def test_numeric_codes_and_ambiguous_names_require_complete_entity_matches():
+    numeric = _event("编号 10023710 的公开记录与公司无关")
+    numeric = relate_events([numeric], _portfolio(), selected_tag_ids=[])[0]
+
+    portfolio = _portfolio()
+    portfolio["holdings"][0]["analysis"]["holdings"]["data"]["holdings"] = [{
+        "stock_code": "AAPL", "stock_name": "苹果", "weight_pct": 9.8,
+    }]
+    common_word = relate_events([_event("苹果派烘焙指南", track_key="consumer")], portfolio, selected_tag_ids=[])[0]
+    common_word_action = relate_events([_event("苹果派发布新品配方", track_key="consumer")], portfolio, selected_tag_ids=[])[0]
+    prefixed_common_word = relate_events([_event("红苹果发布新品配方", track_key="consumer")], portfolio, selected_tag_ids=[])[0]
+    reversed_common_word = relate_events([_event("发布苹果派新品配方", track_key="consumer")], portfolio, selected_tag_ids=[])[0]
+
+    named_portfolio = _portfolio()
+    longer_entity = relate_events([_event("北方华创园发布夏季活动")], named_portfolio, selected_tag_ids=[])[0]
+
+    assert numeric.relation_level == "none"
+    assert common_word.relation_level == "none"
+    assert common_word_action.relation_level == "none"
+    assert prefixed_common_word.relation_level == "none"
+    assert reversed_common_word.relation_level == "none"
+    assert longer_entity.relation_level == "none"
+
+
 def test_disclosed_alphabetic_ticker_matches_as_a_complete_word_only():
     portfolio = _portfolio()
     holding_section = portfolio["holdings"][0]["analysis"]["holdings"]

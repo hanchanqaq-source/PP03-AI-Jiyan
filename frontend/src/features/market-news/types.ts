@@ -10,7 +10,7 @@ export interface MarketNewsSource {
   source_name: string;
   source_url: string;
   original_url: string;
-  published_at: string;
+  published_at: string | null;
   fetched_at: string;
   title: string;
   summary_or_excerpt: string;
@@ -40,11 +40,12 @@ export interface MarketNewsEvent {
   summary: string;
   summary_status: "source_excerpt" | "ai_unavailable";
   category: MarketNewsCategory;
-  published_at_first: string;
-  published_at_latest: string;
+  published_at_first: string | null;
+  published_at_latest: string | null;
   sources: MarketNewsSource[];
   source_count: number;
   related_tags: Array<{ id: string; name: string }>;
+  tag_evidence: Array<{ id: string; name: string; provenance: "article_text" | "feed_track" }>;
   related_companies: Array<{ stock_code: string; stock_name: string }>;
   related_funds: Array<{ fund_code: string; fund_name: string }>;
   relation_level: MarketNewsRelationLevel;
@@ -77,7 +78,8 @@ export interface MarketNewsImpactSummary {
 export interface MarketNewsResponse {
   events: MarketNewsEvent[];
   today_focus: MarketNewsEvent[];
-  impact_summary: MarketNewsImpactSummary;
+  impact_summary: MarketNewsImpactSummary | null;
+  snapshot_id: string;
   generated_at: string | null;
   data_status: string;
   source_summary: {
@@ -89,7 +91,7 @@ export interface MarketNewsResponse {
   };
   portfolio_status: "ready" | "empty" | "error";
   ai_status: "available" | "unavailable";
-  empty_reason: "no_tags" | "no_holdings" | "no_events" | null;
+  empty_reason: "no_tags" | "no_holdings" | "portfolio_error" | "no_events" | null;
   filters: MarketNewsQuery;
   filter_options: { modes: MarketNewsMode[]; categories: MarketNewsCategoryFilter[]; days: number[]; sorts: MarketNewsSort[] };
 }

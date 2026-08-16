@@ -128,8 +128,13 @@ def test_portfolio_failure_is_partial_success_and_ai_is_optional(monkeypatch):
     assert response.status_code == 200
     assert len(response.json()["data"]["events"]) == 4
     assert response.json()["data"]["portfolio_status"] == "error"
+    assert response.json()["data"]["impact_summary"] is None
     assert response.json()["data"]["ai_status"] == "unavailable"
     assert all(event["impact_tendency"] == "unclear" for event in response.json()["data"]["events"])
+
+    holdings = client.get("/api/market-news/events?mode=my_holdings")
+    assert holdings.json()["data"]["events"] == []
+    assert holdings.json()["data"]["empty_reason"] == "portfolio_error"
 
 
 def test_refresh_failure_keeps_cached_events(monkeypatch):
@@ -159,6 +164,71 @@ def test_event_detail_and_missing_event(monkeypatch):
     assert found.json()["data"]["event_id"] == event_id
     assert found.json()["data"]["sources"]
     assert missing.status_code == 404
+
+
+def test_detail_snapshots_remain_query_safe_across_different_selected_tags(monkeypatch):
+    service = _service()
+    monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: service)
+
+    first = client.get("/api/market-news/events?mode=my_focus&tag_id=storage").json()["data"]
+    watched = next(event for event in first["events"] if event["title"] == "DRAM 产品报价出现改善")
+    client.get("/api/market-news/events?mode=global_tech&tag_id=robotics")
+
+    detail = client.get(
+        f"/api/market-news/events/{watched['event_id']}?snapshot_id={first['snapshot_id']}"
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["data"]["relation_level"] == "watch_tag"
+
+
+def test_base_snapshot_key_ignores_runtime_portfolio_timestamps(monkeypatch):
+    import news_intelligence.service as service_module
+
+    calls = 0
+    original_normalize = service_module.normalize_radar
+
+    def counting_normalize(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_normalize(*args, **kwargs)
+
+    timestamps = iter(("2026-08-17T11:00:01+08:00", "2026-08-17T11:00:02+08:00"))
+
+    def changing_portfolio():
+        portfolio = _portfolio()
+        portfolio["overview"]["updated_at"] = next(timestamps)
+        portfolio["holdings"][0]["analysis"]["holdings"].setdefault("meta", {})["fetched_at"] = portfolio["overview"]["updated_at"]
+        return portfolio
+
+    monkeypatch.setattr(service_module, "normalize_radar", counting_normalize)
+    service = _service(portfolio_loader=changing_portfolio)
+
+    service.get_events(mode="global_tech", tag_ids=["storage"])
+    service.get_events(mode="global_tech", tag_ids=["robotics"])
+
+    assert calls == 1
+    assert len(service._base_snapshots) == 1
+
+
+def test_unknown_publication_time_is_excluded_from_time_window_and_today_focus(monkeypatch):
+    radar = _radar()
+    radar["industries"][0]["items"].append({
+        **_source("cn", "发布时间未知的政策资讯", "https://cn.example.test/unknown", "", region="CN"),
+        "published_at": None,
+    })
+    service = MarketNewsService(
+        radar_loader=lambda: radar,
+        radar_refresher=lambda: radar,
+        portfolio_loader=_portfolio,
+        now=lambda: NOW,
+    )
+    monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: service)
+
+    data = client.get("/api/market-news/events?mode=domestic_policy&days=30").json()["data"]
+
+    assert "发布时间未知的政策资讯" not in [event["title"] for event in data["events"]]
+    assert "发布时间未知的政策资讯" not in [event["title"] for event in data["today_focus"]]
 
 
 def test_invalid_market_news_filters_return_422(monkeypatch):

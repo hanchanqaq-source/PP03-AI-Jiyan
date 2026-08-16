@@ -6,6 +6,10 @@ from news_intelligence.models import MarketNewsEvent
 RELATION_PRIORITY = {"direct_holding": 3, "industry_relation": 2, "watch_tag": 1, "none": 0}
 
 
+def _timestamp(event: MarketNewsEvent) -> float:
+    return event.published_at_latest.timestamp() if event.published_at_latest else float("-inf")
+
+
 def _importance(event: MarketNewsEvent) -> int:
     if event.relation_level == "direct_holding":
         tier = 500
@@ -24,14 +28,14 @@ def rank_events(events: list[MarketNewsEvent], sort: str) -> list[MarketNewsEven
     for event in events:
         event.importance_score = _importance(event)
     if sort == "importance":
-        key = lambda event: (-event.importance_score, -event.published_at_latest.timestamp(), event.event_id)
+        key = lambda event: (-event.importance_score, -_timestamp(event), event.event_id)
     elif sort == "latest":
-        key = lambda event: (-event.published_at_latest.timestamp(), event.event_id)
+        key = lambda event: (-_timestamp(event), event.event_id)
     elif sort == "holding_relevance":
         key = lambda event: (
             -RELATION_PRIORITY.get(event.relation_level, 0),
             -event.importance_score,
-            -event.published_at_latest.timestamp(),
+            -_timestamp(event),
             event.event_id,
         )
     else:

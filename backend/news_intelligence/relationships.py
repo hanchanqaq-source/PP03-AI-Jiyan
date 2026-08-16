@@ -6,12 +6,47 @@ from typing import Any
 from news_intelligence.models import MarketNewsEvent
 
 
+COMPANY_ACTIONS = (
+    "发布", "公告", "披露", "宣布", "收购", "并购", "签署", "获得", "推出", "量产", "暂停",
+    "回应", "上调", "下调", "财报", "业绩", "营收", "融资", "上市", "shares", "stock", "earnings",
+    "表示", "传来",
+)
+
+
 def _event_blob(event: MarketNewsEvent) -> str:
     return " ".join(
         [event.title, event.summary]
         + [source.title for source in event.sources]
         + [source.summary for source in event.sources]
     ).lower()
+
+
+def _event_texts(event: MarketNewsEvent) -> list[str]:
+    return [event.title, event.summary] + [source.title for source in event.sources] + [source.summary for source in event.sources]
+
+
+def _complete_code_match(code: str, blob: str) -> bool:
+    return bool(code and re.search(rf"(?<![a-z0-9]){re.escape(code.lower())}(?![a-z0-9])", blob))
+
+
+def _company_name_match(name: str, event: MarketNewsEvent) -> bool:
+    candidate = name.strip()
+    if len(candidate) < 2:
+        return False
+    if re.search(r"[a-z]", candidate, re.I):
+        return any(_complete_code_match(candidate, text.lower()) for text in _event_texts(event))
+    action = "|".join(re.escape(word) for word in COMPANY_ACTIONS)
+    escaped = re.escape(candidate)
+    connector = r"(?:公司|集团|股份有限公司|股份)?(?:\s*[：:，,·-]\s*)?"
+    entity_char = r"\u3400-\u9fffA-Za-z0-9"
+    punctuation = r"\s，。；：、,:;（）()《》\[\]【】"
+    company_tail = r"(?:的)?(?:目标价|股价|市值|财报|业绩|营收|产品|芯片|模块)"
+    patterns = (
+        rf"(?<![{entity_char}]){escaped}(?![{entity_char}])",
+        rf"(?<![{entity_char}]){escaped}{connector}(?:{action})",
+        rf"(?:{action})(?:\s*[：:，,·-]\s*)?{escaped}(?:公司|集团|股份有限公司|股份)?(?=$|[{punctuation}]|{company_tail})",
+    )
+    return any(re.search(pattern, text, re.I) for text in _event_texts(event) for pattern in patterns)
 
 
 def _classification_text(evidence: dict[str, Any]) -> str:
@@ -57,8 +92,16 @@ def relate_events(
     portfolio_analysis: dict[str, Any] | None,
     selected_tag_ids: list[str],
 ) -> list[MarketNewsEvent]:
+    relate_holding_evidence(events, portfolio_analysis)
+    apply_watch_relations(events, selected_tag_ids)
+    return events
+
+
+def relate_holding_evidence(
+    events: list[MarketNewsEvent],
+    portfolio_analysis: dict[str, Any] | None,
+) -> list[MarketNewsEvent]:
     funds = (portfolio_analysis or {}).get("holdings") or []
-    selected = set(selected_tag_ids)
     for event in events:
         event.related_companies = []
         event.related_funds = []
@@ -87,12 +130,12 @@ def relate_events(
                 stock_code = str(stock.get("stock_code") or "")
                 stock_name = str(stock.get("stock_name") or "").strip()
                 classification = classifications.get(stock_code, {})
-                if stock_name and len(stock_name) >= 2 and stock_name.lower() in blob:
+                if _company_name_match(stock_name, event):
                     direct_matches.append(_evidence_row(
                         fund_code, fund_name, disclosure_date, stock, classification, "company", stock_name, holdings_meta,
                     ))
                     continue
-                if stock_code and stock_code.lower() in blob:
+                if _complete_code_match(stock_code, blob):
                     direct_matches.append(_evidence_row(
                         fund_code, fund_name, disclosure_date, stock, classification, "company_code", stock_code, holdings_meta,
                     ))
@@ -104,7 +147,9 @@ def relate_events(
                     ))
                     continue
                 classification_blob = _classification_text(classification).lower()
-                relationship_tags = event.related_tags[1:] if len(event.related_tags) > 1 else event.related_tags
+                relationship_tags = [
+                    tag for tag in event.tag_evidence if tag.get("provenance") == "article_text"
+                ]
                 for tag in relationship_tags:
                     tag_name = str(tag.get("name") or "").lower()
                     if tag_name and tag_name in classification_blob:
@@ -129,7 +174,14 @@ def relate_events(
                     "stock_code": row["stock_code"], "stock_name": row["stock_name"],
                 }, ("stock_code",))
             continue
+    return events
 
+
+def apply_watch_relations(events: list[MarketNewsEvent], selected_tag_ids: list[str]) -> list[MarketNewsEvent]:
+    selected = set(selected_tag_ids)
+    for event in events:
+        if event.relation_level != "none":
+            continue
         watched = next((tag for tag in event.related_tags if tag.get("id") in selected), None)
         if watched:
             event.relation_level = "watch_tag"

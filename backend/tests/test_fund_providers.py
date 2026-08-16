@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import sys
 import threading
+import time
+import types
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -255,6 +259,52 @@ def test_cninfo_token_factory_uses_the_installed_public_mini_racer_runtime():
 
     assert isinstance(token, str)
     assert token.strip()
+
+
+def test_cninfo_token_factory_serializes_runtime_initialization_and_keeps_it_thread_local(monkeypatch):
+    state_lock = threading.Lock()
+    state = {"active": 0, "max_active": 0, "created_threads": []}
+
+    class FakeMiniRacer:
+        def __init__(self):
+            self.owner_thread = threading.get_ident()
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                state["created_threads"].append(self.owner_thread)
+            time.sleep(0.03)
+            with state_lock:
+                state["active"] -= 1
+
+        def eval(self, _javascript: str) -> None:
+            return None
+
+        def call(self, _name: str) -> str:
+            assert threading.get_ident() == self.owner_thread
+            return f"token-{self.owner_thread}"
+
+    fake_datasets = types.ModuleType("akshare.datasets")
+    fake_datasets.get_ths_js = lambda _name: __file__
+    fake_runtime = types.ModuleType("py_mini_racer")
+    fake_runtime.MiniRacer = FakeMiniRacer
+    monkeypatch.setitem(sys.modules, "akshare.datasets", fake_datasets)
+    monkeypatch.setitem(sys.modules, "py_mini_racer", fake_runtime)
+
+    factory = _CninfoTokenFactory()
+    barrier = threading.Barrier(2)
+
+    def make_tokens() -> tuple[str, str]:
+        barrier.wait()
+        return factory(), factory()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tokens = [future.result() for future in (executor.submit(make_tokens), executor.submit(make_tokens))]
+
+    assert state["max_active"] == 1
+    assert len(state["created_threads"]) == 2
+    assert len(set(state["created_threads"])) == 2
+    assert all(first == second for first, second in tokens)
+    assert len({first for first, _second in tokens}) == 2
 
 
 def test_cninfo_provider_prefers_current_sw_latest_record_and_keeps_partial_failures():
