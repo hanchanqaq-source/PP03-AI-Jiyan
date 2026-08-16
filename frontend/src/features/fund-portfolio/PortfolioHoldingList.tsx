@@ -1,15 +1,15 @@
 import { useMemo, useState } from "react";
 import { Edit3, Eye, Trash2 } from "lucide-react";
 import { GlassCard } from "@/components/ui/GlassCard";
-import { getTag } from "@/features/tags/catalog";
-import { dateTime, money, number, percent } from "./format";
+import { money, number, percent } from "./format";
 import type { FundPortfolioAnalysisData, PortfolioHoldingAnalysis } from "./types";
 
 type Filter = "all" | "up" | "down" | "profit" | "loss" | "pending";
 type Sort = "position_value" | "today_change" | "today_pnl" | "profit_loss" | "return_rate" | "fund_name";
 
 const FILTERS: Array<[Filter, string]> = [
-  ["all", "全部"], ["up", "上涨"], ["down", "下跌"], ["profit", "盈利"], ["loss", "亏损"], ["pending", "待补充"],
+  ["all", "全部"], ["up", "今日上涨"], ["down", "今日下跌"],
+  ["profit", "盈利"], ["loss", "亏损"], ["pending", "数据待补充"],
 ];
 
 const SORTS: Array<[Sort, string]> = [
@@ -47,6 +47,11 @@ function sortValue(item: PortfolioHoldingAnalysis, sort: Sort): number | string 
   return item.position.position_value;
 }
 
+function movementTone(value: number | null | undefined) {
+  if (value == null || value === 0) return "text-muted-foreground";
+  return value > 0 ? "text-danger" : "text-success";
+}
+
 export function PortfolioHoldingList({ data, onDetail, onEdit, onDelete }: {
   data: FundPortfolioAnalysisData;
   onDetail: (item: PortfolioHoldingAnalysis) => void;
@@ -65,81 +70,53 @@ export function PortfolioHoldingList({ data, onDetail, onEdit, onDelete }: {
   }), [data.holdings, filter, sort]);
 
   return (
-    <GlassCard glow className="mb-5 p-0">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/60 px-5 py-4">
-        <div>
+    <GlassCard className="mb-5 overflow-hidden bg-gradient-to-br from-slate-900/80 via-slate-950/60 to-blue-950/30 p-0">
+      <div className="border-b border-border/60 px-4 py-3.5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="font-semibold">当前基金持仓</h2>
-          <p className="mt-1 text-xs text-muted-foreground">用户快照、正式净值参考值和盘中估算分轨展示</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex flex-wrap gap-1" aria-label="持仓筛选">{FILTERS.map(([value, label]) => (
-            <button key={value} aria-label={`筛选${label}`} aria-pressed={filter === value} onClick={() => setFilter(value)}
-              className={`rounded-full border px-2.5 py-1 text-xs ${filter === value ? "border-primary/60 bg-primary/15 text-primary" : "border-border text-muted-foreground hover:text-foreground"}`}>{label}</button>
-          ))}</div>
-          <select aria-label="排序方式" value={sort} onChange={(event) => setSort(event.target.value as Sort)} className="rounded-lg border border-border bg-background px-2.5 py-1.5 text-xs outline-none focus:border-primary/60">
-            {SORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-          </select>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap gap-1" aria-label="持仓筛选">{FILTERS.map(([value, label]) => (
+              <button key={value} aria-label={`筛选${label}`} aria-pressed={filter === value} onClick={() => setFilter(value)}
+                className={`rounded-md px-2.5 py-1.5 text-xs transition-colors ${filter === value ? "bg-primary text-primary-foreground" : "border border-border/70 bg-slate-950/35 text-muted-foreground hover:border-primary/40 hover:text-foreground"}`}>{label}</button>
+            ))}</div>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">排序
+              <select aria-label="排序方式" value={sort} onChange={(event) => setSort(event.target.value as Sort)} className="rounded-md border border-border/70 bg-slate-950/70 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-primary/60">
+                {SORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>
+          </div>
         </div>
       </div>
 
-      <div className="space-y-3 p-4">
-        {!visible.length && <p className="rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">当前筛选条件下没有持仓</p>}
-        {visible.map((item) => {
-          const holding = item.user_holding;
-          const position = item.position;
-          const profile = item.analysis?.profile.data;
-          const latest = item.analysis?.latest_nav.data;
-          const disclosed = item.analysis?.holdings.data;
-          const confidence = item.analysis?.intraday_estimate.data?.confidence;
-          const valueBasis = position.position_value_basis === "user_amount_snapshot" ? "用户金额快照回退" : "最新正式净值参考";
-          return (
-            <article key={item.code} data-testid="holding-card" className="rounded-2xl border border-border/60 bg-black/10 p-4 transition-colors hover:border-primary/30">
-              <div className="grid gap-4 xl:grid-cols-[minmax(220px,1.3fr)_repeat(3,minmax(145px,1fr))_auto] xl:items-start">
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="font-semibold">{item.name}</h3>
-                    <span className="font-mono text-xs text-muted-foreground">{item.code}</span>
-                    <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] text-primary">{statusLabel(item)}</span>
-                  </div>
-                  <p className="mt-1 text-xs text-muted-foreground">{item.fund_type || "基金类型暂无可靠数据"}</p>
-                  <div className="mt-2 flex flex-wrap gap-1">{holding.custom_tag_ids.map((id) => <span key={id} className="rounded-full bg-muted/50 px-2 py-0.5 text-[10px]">{getTag(id)?.name || id.replace(/^custom:/, "")}</span>)}</div>
-                  <div className="mt-3 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2 xl:grid-cols-1">
-                    <span>经理：{profile?.manager_names.join("、") || "暂无可靠数据"}</span>
-                    <span>规模：{profile?.scale == null ? "暂无可靠数据" : `${number(profile.scale, 2)} ${profile.scale_unit || ""}`}</span>
-                    <span>报告期：{disclosed?.report_period || "暂无可靠数据"}</span>
-                    <span>估算可信度：{confidence || "暂无可靠数据"}</span>
-                  </div>
-                </div>
-
-                <div className="space-y-2 text-sm">
-                  <p className="text-[11px] text-muted-foreground">持有金额 · {valueBasis}</p>
-                  <p className="text-lg font-bold">{money(position.position_value)}</p>
-                  <p className="text-xs text-muted-foreground">持仓占比 {percent(item.weight_pct)}</p>
-                  <p className="text-xs text-muted-foreground">正式净值 {number(latest?.unit_nav)} · {latest?.nav_date || "暂无日期"}</p>
-                </div>
-
-                <div className="space-y-2 text-sm">
-                  <p className="text-[11px] text-muted-foreground">今日估算</p>
-                  <p className={position.today_estimated_profit_loss == null ? "text-muted-foreground" : position.today_estimated_profit_loss >= 0 ? "font-semibold text-success" : "font-semibold text-destructive"}>{money(position.today_estimated_profit_loss)} · {percent(position.intraday_change_pct)}</p>
-                  <p className="text-[11px] text-muted-foreground">累计盈亏</p>
-                  <p className={position.profit_loss == null ? "text-warning" : position.profit_loss >= 0 ? "font-semibold text-success" : "font-semibold text-destructive"}>{position.profit_loss == null ? "待补充" : `${money(position.profit_loss)} · ${percent(position.return_rate)}`}</p>
-                </div>
-
-                <div className="space-y-2 rounded-xl border border-border/50 bg-background/30 p-3 text-xs">
-                  <p><span className="block text-[10px] text-muted-foreground">用户录入金额</span>{money(position.user_amount_snapshot)} <span className="text-muted-foreground">{dateTime(position.snapshot_at)}</span></p>
-                  <p><span className="block text-[10px] text-muted-foreground">正式净值参考值</span>{money(position.official_market_value)}</p>
-                  <p><span className="block text-[10px] text-muted-foreground">盘中估算参考值</span>{money(position.intraday_market_value)}</p>
-                </div>
-
-                <div className="flex gap-1 xl:flex-col">
-                  <button onClick={() => onDetail(item)} aria-label={`查看详情 ${item.name}`} className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-2 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"><Eye className="h-3.5 w-3.5" />详情</button>
-                  <button onClick={() => onEdit(item)} aria-label={`编辑持仓 ${item.name}`} className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-2 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"><Edit3 className="h-3.5 w-3.5" />编辑</button>
-                  <button onClick={() => onDelete(item)} aria-label={`删除持仓 ${item.name}`} className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-2 text-xs text-muted-foreground hover:border-destructive/40 hover:text-destructive"><Trash2 className="h-3.5 w-3.5" />删除</button>
-                </div>
-              </div>
-            </article>
-          );
-        })}
+      <div className="overflow-x-auto">
+        <table aria-label="当前基金持仓" className="w-full min-w-[960px] table-fixed text-left">
+          <colgroup><col className="w-[25%]" /><col className="w-[16%]" /><col className="w-[16%]" /><col className="w-[16%]" /><col className="w-[15%]" /><col className="w-[12%]" /></colgroup>
+          <thead className="bg-slate-950/45 text-[11px] text-muted-foreground">
+            <tr><th className="px-4 py-2.5 font-medium">基金名称 / 代码</th><th className="px-3 py-2.5 font-medium">持有金额 / 占比</th><th className="px-3 py-2.5 font-medium">今日估算</th><th className="px-3 py-2.5 font-medium">累计盈亏</th><th className="px-3 py-2.5 font-medium">官方净值 / 日期</th><th className="px-3 py-2.5 text-right font-medium">操作</th></tr>
+          </thead>
+          <tbody className="divide-y divide-border/45">
+            {!visible.length && <tr><td colSpan={6} className="px-4 py-8 text-center text-sm text-muted-foreground">当前筛选条件下没有持仓</td></tr>}
+            {visible.map((item) => {
+              const position = item.position;
+              const latest = item.analysis?.latest_nav.data;
+              const officialNav = latest?.unit_nav ?? item.user_holding.basis_nav;
+              const navDate = latest?.nav_date ?? item.user_holding.basis_nav_date;
+              return (
+                <tr key={item.code} data-testid="holding-row" className="h-[72px] bg-slate-950/10 transition-colors hover:bg-blue-950/20">
+                  <td className="px-4 py-2.5 align-middle">
+                    <div className="flex items-center gap-2"><button onClick={() => onDetail(item)} className="truncate text-sm font-semibold hover:text-primary">{item.name}</button><span className="shrink-0 rounded-full border border-blue-400/20 bg-blue-400/5 px-1.5 py-0.5 text-[9px] text-blue-200/70">{statusLabel(item)}</span></div>
+                    <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground"><span className="font-mono">{item.code}</span><span className="truncate">{item.fund_type || "类型待补充"}</span></div>
+                  </td>
+                  <td className="px-3 py-2.5 align-middle"><p className="text-sm font-semibold tabular-nums">{money(position.position_value)}</p><p className="mt-1 text-[11px] text-muted-foreground">占比 {percent(item.weight_pct)}</p></td>
+                  <td className="px-3 py-2.5 align-middle"><p data-testid="today-pnl" className={`text-sm font-semibold tabular-nums ${movementTone(position.today_estimated_profit_loss)}`}>{money(position.today_estimated_profit_loss)}</p><p className={`mt-1 text-[11px] tabular-nums ${movementTone(position.intraday_change_pct)}`}>{percent(position.intraday_change_pct)}</p></td>
+                  <td className="px-3 py-2.5 align-middle">{position.profit_loss == null ? <p data-testid="cumulative-pnl" className="text-sm text-warning">待补充</p> : <><p data-testid="cumulative-pnl" className={`text-sm font-semibold tabular-nums ${movementTone(position.profit_loss)}`}>{money(position.profit_loss)}</p><p className={`mt-1 text-[11px] tabular-nums ${movementTone(position.return_rate)}`}>{percent(position.return_rate)}</p></>}</td>
+                  <td className="px-3 py-2.5 align-middle"><p className="text-sm font-semibold tabular-nums">{number(officialNav)}</p><p className="mt-1 text-[11px] text-muted-foreground">{navDate || "日期待补充"}</p></td>
+                  <td className="px-3 py-2.5 align-middle"><div className="flex items-center justify-end gap-1"><button onClick={() => onDetail(item)} aria-label={`查看详情 ${item.name}`} className="inline-flex items-center gap-1 rounded-md border border-primary/35 bg-primary/5 px-2 py-1.5 text-xs text-primary hover:bg-primary/10"><Eye className="h-3.5 w-3.5" />详情</button><button onClick={() => onEdit(item)} aria-label={`编辑持仓 ${item.name}`} title="编辑持仓" className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"><Edit3 className="h-3.5 w-3.5" /></button><button onClick={() => onDelete(item)} aria-label={`删除持仓 ${item.name}`} title="删除持仓" className="rounded-md p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"><Trash2 className="h-3.5 w-3.5" /></button></div></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </GlassCard>
   );

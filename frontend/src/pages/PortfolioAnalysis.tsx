@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, CheckCircle2, Loader2, Plus, ShieldCheck, Trash2, WalletCards } from "lucide-react";
+import { AlertCircle, CheckCircle2, Info, Loader2, Plus, RefreshCw, ShieldCheck, Trash2, WalletCards, X } from "lucide-react";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { FundDetailDrawer } from "@/features/fund-portfolio/FundDetailDrawer";
@@ -11,8 +11,8 @@ import type { FundAnalysis, FundHoldingInput, FundPortfolioAnalysisData, FundPor
 import { api } from "@/lib/api";
 
 function Metric({ label, value, note, tone = "default" }: { label: string; value: string; note: string; tone?: "default" | "up" | "down" }) {
-  const valueTone = tone === "up" ? "text-success" : tone === "down" ? "text-destructive" : "text-foreground";
-  return <GlassCard className="min-h-28"><p className="text-[11px] uppercase tracking-[0.13em] text-muted-foreground">{label}</p><p className={`mt-3 text-2xl font-bold ${valueTone}`}>{value}</p><p className="mt-1.5 text-[11px] text-muted-foreground">{note}</p></GlassCard>;
+  const valueTone = tone === "up" ? "text-danger" : tone === "down" ? "text-success" : "text-foreground";
+  return <GlassCard className="min-h-24 overflow-hidden bg-gradient-to-br from-slate-800/75 via-slate-900/65 to-blue-950/45 p-4"><p className="text-[11px] font-medium tracking-[0.08em] text-muted-foreground">{label}</p><p className={`mt-2 text-2xl font-bold tabular-nums ${valueTone}`}>{value}</p><p className="mt-1 truncate text-[11px] text-muted-foreground" title={note}>{note}</p></GlassCard>;
 }
 
 function shortDate(value: string | null | undefined) {
@@ -30,8 +30,11 @@ export function PortfolioAnalysis() {
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [showDataInfo, setShowDataInfo] = useState(false);
 
   const load = async () => {
+    setLoading(true);
+    setError(null);
     const [portfolioResult, analysisResult] = await Promise.allSettled([api.fundPortfolio(), api.fundPortfolioAnalysis()]);
     if (portfolioResult.status === "fulfilled") setPortfolio(portfolioResult.value);
     else setError("本地持仓台账加载失败；未执行任何写入。请检查后端状态。");
@@ -83,7 +86,7 @@ export function PortfolioAnalysis() {
 
   const overview = analysis?.overview;
   const count = overview?.fund_count ?? portfolio?.holdings.length ?? 0;
-  const subtitle = `共 ${count} 只基金 · 官方净值更新至 ${shortDate(overview?.latest_nav_date)} · ${overview?.estimable_count ?? 0} 只可盘中估算 · ${overview?.official_only_count ?? 0} 只仅正式净值`;
+  const subtitle = `共 ${count} 只基金`;
   const hasHoldings = Boolean(portfolio?.holdings.length);
   const pnlTone = (overview?.profit_loss ?? 0) > 0 ? "up" : (overview?.profit_loss ?? 0) < 0 ? "down" : "default";
   const todayTone = (overview?.intraday_estimated_profit_loss ?? 0) > 0 ? "up" : (overview?.intraday_estimated_profit_loss ?? 0) < 0 ? "down" : "default";
@@ -91,13 +94,13 @@ export function PortfolioAnalysis() {
   return (
     <div>
       <PageHeader title="我的持仓" subtitle={subtitle} actions={
-        <button onClick={() => setDrawer({ holding: null })} className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-glow"><Plus className="h-4 w-4" />添加基金</button>
+        <>
+          <button aria-label="刷新持仓数据" onClick={() => void load()} disabled={loading} className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-border/70 bg-slate-900/50 text-muted-foreground transition-colors hover:border-primary/45 hover:text-foreground disabled:opacity-50"><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} /></button>
+          <button onClick={() => setShowDataInfo(true)} className="inline-flex items-center gap-2 rounded-lg border border-border/70 bg-slate-900/50 px-3.5 py-2 text-sm text-muted-foreground transition-colors hover:border-primary/45 hover:text-foreground"><Info className="h-4 w-4" />数据说明</button>
+          <button onClick={() => setDrawer({ holding: null })} className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow-glow"><Plus className="h-4 w-4" />添加基金</button>
+        </>
       } />
 
-      <div className="mb-4 flex gap-2 rounded-xl border border-success/25 bg-success/5 p-3 text-xs text-muted-foreground">
-        <ShieldCheck className="h-4 w-4 shrink-0 text-success" />
-        <span>持仓仅保存在本机。用户快照不会被正式净值或盘中估算覆盖；无可靠数据时明确显示为空。</span>
-      </div>
       {portfolio?.migration && <p className="mb-4 rounded-xl border border-warning/30 bg-warning/5 p-3 text-xs text-warning">已从 V{portfolio.migration.from_schema} 台账迁移到 schema v3；原文件备份为 {portfolio.migration.backup_file}。</p>}
       {error && <p className="mb-4 flex items-center gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{error}</p>}
       {notice && <p className="mb-4 flex items-center gap-2 rounded-xl border border-primary/25 bg-primary/5 p-3 text-sm text-muted-foreground"><CheckCircle2 className="h-4 w-4 text-primary" />{notice}</p>}
@@ -111,11 +114,17 @@ export function PortfolioAnalysis() {
         </GlassCard>
       ) : (
         <>
-          <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="mb-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <Metric label="总持有金额" value={money(overview?.total_holding_value ?? overview?.market_value)} note="优先按最新正式净值参考值汇总" />
             <Metric label="今日估算盈亏" value={money(overview?.intraday_estimated_profit_loss)} note={overview?.intraday_message || "暂无可靠数据"} tone={todayTone} />
             <Metric label="累计持有盈亏" value={overview?.pnl_complete ? money(overview.profit_loss) : "待补充"} note={overview?.pnl_complete ? "基于用户成本或盈亏快照" : "部分持仓未填写累计盈亏"} tone={pnlTone} />
             <Metric label="累计收益率" value={overview?.pnl_complete ? percent(overview.return_rate) : "待补充"} note="仅在参考总成本大于 0 时计算" tone={pnlTone} />
+          </div>
+
+          <div role="status" aria-label="持仓数据状态" className="mb-4 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl border border-blue-400/15 bg-gradient-to-r from-slate-900/80 to-blue-950/35 px-4 py-2.5 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-primary" />官方净值更新至 {shortDate(overview?.latest_nav_date)}</span>
+            <span>{overview?.estimable_count ?? 0}只可盘中估算</span>
+            <span>{overview?.official_only_count ?? 0}只仅有正式净值</span>
           </div>
 
           {analysis && <PortfolioHoldingList data={analysis} onDetail={openDetail} onEdit={(item) => setDrawer({ holding: item })} onDelete={setDeleteTarget} />}
@@ -129,6 +138,13 @@ export function PortfolioAnalysis() {
       <FundDetailDrawer open={Boolean(detail)} holding={detail?.item.user_holding || null} analysis={detail?.analysis || null}
         position={detail?.item.position || null}
         onClose={() => setDetail(null)} onEdit={() => { if (detail) setDrawer({ holding: detail.item }); setDetail(null); }} onDelete={() => { if (detail) setDeleteTarget(detail.item); }} />
+
+      {showDataInfo && <div role="dialog" aria-modal="true" aria-label="数据说明" className="fixed inset-0 z-[65] flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.currentTarget === event.target) setShowDataInfo(false); }}>
+        <div className="w-full max-w-lg rounded-2xl border border-blue-400/20 bg-slate-950/95 p-5 shadow-2xl">
+          <div className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-semibold">数据说明</h2><p className="mt-1 text-xs text-muted-foreground">页面主列表保持精简，完整口径在基金详情中查看。</p></div><button aria-label="关闭数据说明" onClick={() => setShowDataInfo(false)} className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-foreground"><X className="h-4 w-4" /></button></div>
+          <div className="mt-4 space-y-3 text-sm leading-6 text-muted-foreground"><p className="flex gap-2"><ShieldCheck className="mt-1 h-4 w-4 shrink-0 text-success" />持仓只保存在本机；用户录入快照不会被正式净值或盘中估算覆盖。</p><p>总持有金额和权重优先按份额 × 最新可靠正式净值计算，无法可靠计算时才回退用户金额快照。</p><p>盘中结果属于参考估算；不满足可靠性门槛时显示“暂无可靠数据”。</p></div>
+        </div>
+      </div>}
 
       {deleteTarget && <div role="dialog" aria-modal="true" aria-label="确认删除持仓" className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 px-4 backdrop-blur-sm">
         <div className="w-full max-w-md rounded-2xl border border-border bg-background/95 p-6 shadow-2xl">

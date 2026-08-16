@@ -126,6 +126,8 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
 
     expect(screen.getByText("已识别基金：华夏成长混合（000001）")).toBeInTheDocument();
     expect(screen.getByLabelText("当前持有金额")).toBeInTheDocument();
+    expect(screen.queryByLabelText("当前累计盈亏")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "展开其他信息" }));
     expect(screen.getByLabelText("当前累计盈亏")).toBeInTheDocument();
     expect(screen.queryByLabelText("持有份额")).not.toBeInTheDocument();
     await user.type(screen.getByLabelText("当前持有金额"), "1000");
@@ -147,7 +149,7 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
     await user.click(await screen.findByRole("button", { name: "添加基金" }));
     await user.type(screen.getByLabelText("搜索基金代码或名称"), "000001");
     await user.click(await screen.findByRole("button", { name: "选择基金 华夏成长混合" }));
-    await user.click(screen.getByRole("button", { name: "展开高级信息" }));
+    await user.click(screen.getByRole("button", { name: "展开其他信息" }));
     await user.click(screen.getByRole("radio", { name: "精确模式" }));
     await user.type(screen.getByLabelText("持有份额"), "500");
     await user.type(screen.getByLabelText("平均单位成本"), "2");
@@ -162,7 +164,7 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
     })));
   });
 
-  it("renders four overview cards and dense cards with filters and sorting", async () => {
+  it("renders the compact header, status bar, four cards, and one-fund-per-row table", async () => {
     const user = userEvent.setup();
     vi.spyOn(api, "fundPortfolio").mockResolvedValue(savedPortfolio);
     vi.spyOn(api, "fundPortfolioAnalysis").mockResolvedValue(populatedAnalysis);
@@ -173,14 +175,31 @@ describe("PortfolioAnalysis schema v3 redesign", () => {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
     expect(screen.queryByText("基金数量")).not.toBeInTheDocument();
-    expect(screen.getByText("共 2 只基金 · 官方净值更新至 08-14 · 1 只可盘中估算 · 1 只仅正式净值")).toBeInTheDocument();
-    for (const filter of ["全部", "上涨", "下跌", "盈利", "亏损", "待补充"]) {
+    expect(screen.getByText("共 2 只基金")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新持仓数据" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "数据说明" })).toBeInTheDocument();
+    const status = screen.getByRole("status", { name: "持仓数据状态" });
+    expect(within(status).getByText("官方净值更新至 08-14")).toBeInTheDocument();
+    expect(within(status).getByText("1只可盘中估算")).toBeInTheDocument();
+    expect(within(status).getByText("1只仅有正式净值")).toBeInTheDocument();
+    for (const filter of ["全部", "今日上涨", "今日下跌", "盈利", "亏损", "数据待补充"]) {
       expect(screen.getByRole("button", { name: `筛选${filter}` })).toBeInTheDocument();
     }
-    const cards = screen.getAllByTestId("holding-card");
-    expect(within(cards[0]).getByText("用户录入金额")).toBeInTheDocument();
-    expect(within(cards[0]).getByText("正式净值参考值")).toBeInTheDocument();
-    expect(within(cards[0]).getByText("盘中估算参考值")).toBeInTheDocument();
+    const table = screen.getByRole("table", { name: "当前基金持仓" });
+    for (const column of ["基金名称 / 代码", "持有金额 / 占比", "今日估算", "累计盈亏", "官方净值 / 日期", "操作"]) {
+      expect(within(table).getByRole("columnheader", { name: column })).toBeInTheDocument();
+    }
+    const rows = within(table).getAllByTestId("holding-row");
+    expect(rows).toHaveLength(2);
+    const growthRow = rows.find((row) => within(row).queryByText("华夏成长混合"));
+    const valueRow = rows.find((row) => within(row).queryByText("测试价值基金"));
+    expect(growthRow).toBeDefined();
+    expect(valueRow).toBeDefined();
+    expect(within(growthRow!).queryByText("用户录入金额")).not.toBeInTheDocument();
+    expect(within(growthRow!).queryByText("正式净值参考值")).not.toBeInTheDocument();
+    expect(within(growthRow!).queryByText("盘中估算参考值")).not.toBeInTheDocument();
+    expect(within(growthRow!).getByTestId("today-pnl")).toHaveClass("text-danger");
+    expect(within(valueRow!).getByTestId("cumulative-pnl")).toHaveClass("text-success");
 
     await user.click(screen.getByRole("button", { name: "筛选亏损" }));
     expect(screen.queryByText("华夏成长混合")).not.toBeInTheDocument();

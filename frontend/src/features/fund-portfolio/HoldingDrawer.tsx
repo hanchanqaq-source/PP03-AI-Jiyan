@@ -64,7 +64,7 @@ export function HoldingDrawer({ open, holding, identified, existingCodes, saving
   useEffect(() => {
     if (!open) return;
     setDraft(draftFromHolding(holding));
-    setAdvanced(Boolean(holding && (holding.input_mode === "shares_cost" || holding.notes || holding.custom_tag_ids.length)));
+    setAdvanced(Boolean(holding && (holding.input_mode === "shares_cost" || holding.cumulative_pnl_snapshot != null || holding.buy_date || holding.notes || holding.custom_tag_ids.length)));
     setQuery("");
     setResults([]);
     setSearchMeta(null);
@@ -157,7 +157,7 @@ export function HoldingDrawer({ open, holding, identified, existingCodes, saving
       shares: draft.inputMode === "shares_cost" ? shares : null,
       avg_unit_cost: draft.inputMode === "shares_cost" ? avgCost : null,
       avg_cost: draft.inputMode === "shares_cost" ? avgCost : null,
-      buy_date: draft.inputMode === "shares_cost" ? draft.buyDate : "",
+      buy_date: draft.buyDate,
       notes: draft.notes.trim(),
       custom_tag_ids: draft.tagIds,
       verification_status: "verified",
@@ -171,7 +171,7 @@ export function HoldingDrawer({ open, holding, identified, existingCodes, saving
       if (event.currentTarget === event.target && !saving) onClose();
     }}>
       <aside role="dialog" aria-modal="true" aria-label={editing ? "编辑持仓" : "添加基金"}
-        className="ml-auto flex h-full w-full max-w-xl flex-col border-l border-primary/25 bg-background/95 shadow-2xl">
+        className="ml-auto flex h-full w-full max-w-xl flex-col border-l border-blue-400/20 bg-gradient-to-b from-slate-950 via-slate-950 to-blue-950/95 shadow-2xl">
         <header className="flex items-start justify-between border-b border-border/60 px-6 py-5">
           <div>
             <h2 className="text-xl font-bold">{editing ? "编辑持仓" : "添加基金"}</h2>
@@ -204,7 +204,7 @@ export function HoldingDrawer({ open, holding, identified, existingCodes, saving
             {searchMeta && <div className="mt-2"><DataStatus meta={searchMeta} compact /></div>}
           </section>
 
-          {selected && <section className="rounded-2xl border border-success/25 bg-success/5 p-4 text-sm">
+          {selected && <section className="rounded-xl border border-blue-400/20 bg-gradient-to-br from-slate-900/85 to-blue-950/45 p-4 text-sm">
             <p className="font-semibold">已识别基金：{selected.name}（{selected.code}）</p>
             <div className="mt-2 grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
               <span>类型：{selected.fund_type || "暂无可靠数据"}</span>
@@ -217,17 +217,18 @@ export function HoldingDrawer({ open, holding, identified, existingCodes, saving
             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-primary">02 · 核心输入</p>
             {draft.inputMode === "amount_pnl" ? <div className="mt-3 grid gap-4">
               <label className="text-xs text-muted-foreground">当前持有金额（必填）<input aria-label="当前持有金额" type="number" min="0" step="any" value={draft.amount} onChange={(event) => update("amount", event.target.value)} className={fieldClass} /><span className="mt-1 block text-[11px]">用于计算组合占比和今日估算</span></label>
-              <label className="text-xs text-muted-foreground">当前累计盈亏（选填）<input aria-label="当前累计盈亏" type="number" step="any" value={draft.pnl} onChange={(event) => update("pnl", event.target.value)} className={fieldClass} /><span className="mt-1 block text-[11px]">不填也可以先加入持仓，累计收益率将显示待补充</span></label>
             </div> : <p className="mt-3 rounded-xl border border-primary/25 bg-primary/5 p-3 text-xs text-muted-foreground">精确模式使用真实份额与单位成本跟踪正式净值。</p>}
           </section>
 
-          <section className="rounded-2xl border border-border/60 bg-black/10 p-4">
+          <section className="rounded-xl border border-border/60 bg-slate-950/35 p-4">
             <button aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)} className="flex w-full items-center justify-between text-sm font-semibold">
-              {advanced ? "收起高级信息" : "展开高级信息"}{advanced ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+              {advanced ? "收起其他信息" : "展开其他信息"}{advanced ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
             </button>
             {advanced && <div className="mt-4 space-y-4 border-t border-border/50 pt-4">
+              {draft.inputMode === "amount_pnl" && <label className="block text-xs text-muted-foreground">当前累计盈亏（选填）<input aria-label="当前累计盈亏" type="number" step="any" value={draft.pnl} onChange={(event) => update("pnl", event.target.value)} className={fieldClass} /><span className="mt-1 block text-[11px]">不填也可以加入持仓，累计收益率将显示待补充</span></label>}
+              <label className="block text-xs text-muted-foreground">买入日期（选填）<input aria-label="买入日期" type="date" value={draft.buyDate} onChange={(event) => update("buyDate", event.target.value)} className={fieldClass} /></label>
               <fieldset>
-                <legend className="text-xs text-muted-foreground">持仓录入模式</legend>
+                <legend className="text-xs text-muted-foreground">录入方式</legend>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <label className={`rounded-xl border p-3 text-sm ${draft.inputMode === "amount_pnl" ? "border-primary/60 bg-primary/10" : "border-border"}`}><input type="radio" name="mode" aria-label="快速模式" checked={draft.inputMode === "amount_pnl"} onChange={() => update("inputMode", "amount_pnl")} className="mr-2" />快速模式</label>
                   <label className={`rounded-xl border p-3 text-sm ${draft.inputMode === "shares_cost" ? "border-primary/60 bg-primary/10" : "border-border"}`}><input type="radio" name="mode" aria-label="精确模式" checked={draft.inputMode === "shares_cost"} onChange={() => update("inputMode", "shares_cost")} className="mr-2" />精确模式</label>
@@ -236,9 +237,8 @@ export function HoldingDrawer({ open, holding, identified, existingCodes, saving
               {draft.inputMode === "shares_cost" && <div className="grid gap-3 sm:grid-cols-2">
                 <label className="text-xs text-muted-foreground">持有份额<input aria-label="持有份额" type="number" step="any" min="0" value={draft.shares} onChange={(event) => update("shares", event.target.value)} className={fieldClass} /></label>
                 <label className="text-xs text-muted-foreground">平均单位成本<input aria-label="平均单位成本" type="number" step="any" min="0" value={draft.avgCost} onChange={(event) => update("avgCost", event.target.value)} className={fieldClass} /></label>
-                <label className="text-xs text-muted-foreground sm:col-span-2">买入日期<input aria-label="买入日期" type="date" value={draft.buyDate} onChange={(event) => update("buyDate", event.target.value)} className={fieldClass} /></label>
               </div>}
-              <label className="block text-xs text-muted-foreground">备注<textarea aria-label="备注" value={draft.notes} onChange={(event) => update("notes", event.target.value)} className={`${fieldClass} min-h-20 resize-y`} /></label>
+              <label className="block text-xs text-muted-foreground">备注（选填）<textarea aria-label="备注" value={draft.notes} onChange={(event) => update("notes", event.target.value)} className={`${fieldClass} min-h-20 resize-y`} /></label>
               <div>
                 <p className="text-xs text-muted-foreground">用户标签</p>
                 <div className="mt-2 flex flex-wrap gap-2">{tagNames.map((name) => <span key={name} className="rounded-full border border-border bg-muted/40 px-2 py-1 text-xs">{name}</span>)}</div>
