@@ -286,6 +286,7 @@ class FundDataService:
             "primary": primary,
             "secondary": secondary,
             "detail": detail,
+            "disclosed_coverage_pct": round(top10, 4),
             "identified_coverage_pct": round(identified, 4),
             "other_pct": round(other_primary, 4),
             "unknown_pct": round(unknown, 4),

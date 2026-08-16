@@ -181,6 +181,7 @@ def test_analysis_computes_disclosed_industry_without_hiding_unknown_assets(tmp_
         {"name": "半导体", "weight_pct": 30.0},
         {"name": "银行", "weight_pct": 30.0},
     ]
+    assert exposure["lookthrough"]["disclosed_coverage_pct"] == 60.0
     assert exposure["lookthrough"]["identified_coverage_pct"] == 60.0
     assert exposure["lookthrough"]["unknown_pct"] == 0.0
     assert exposure["lookthrough"]["undisclosed_stock_pct"] == 20.0

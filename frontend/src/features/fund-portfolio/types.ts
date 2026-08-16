@@ -79,7 +79,51 @@ export interface DisclosedHoldings {
 
 export interface ExposureItem { name: string; weight_pct: number }
 export interface SystemTagExposure { id: string; name: string; weight_pct: number }
+export interface ExposureConstituent {
+  stock_code: string;
+  stock_name: string;
+  weight_pct: number;
+  reason: string;
+}
+export interface OfficialAllocationItem extends ExposureItem {
+  display_name: string;
+  requires_lookthrough: boolean;
+}
+export interface OfficialIndustryAllocation {
+  exposure: OfficialAllocationItem[];
+  stock_exposure_pct: number;
+  as_of_date: string | null;
+  source_name: string;
+  source_reference: string;
+}
+export interface LookthroughExposure {
+  status: "disclosed" | "unavailable";
+  message: string;
+  primary: ExposureItem[];
+  secondary: ExposureItem[];
+  detail: ExposureItem[];
+  disclosed_coverage_pct?: number;
+  identified_coverage_pct: number;
+  other_pct: number;
+  unknown_pct: number;
+  undisclosed_stock_pct: number;
+  non_stock_pct: number;
+  disclosure_date: string | null;
+  source_name: string;
+  source_reference: string;
+  classification_standard: string;
+  calculation_basis: string;
+}
+export interface IndustryChainTag extends SystemTagExposure {
+  evidence_level: "disclosed_stock_classification";
+  source_name: string;
+}
 export interface FundIndustryExposure {
+  official_allocation: OfficialIndustryAllocation;
+  lookthrough: LookthroughExposure;
+  industry_chain_tags: IndustryChainTag[];
+  other_constituents: ExposureConstituent[];
+  unknown_constituents: ExposureConstituent[];
   primary: ExposureItem[];
   secondary: ExposureItem[];
   broad: ExposureItem[];
@@ -239,9 +283,16 @@ export interface OverlapStock {
 }
 
 export interface PortfolioIndustryConcentration {
+  primary: ExposureItem[];
+  secondary: ExposureItem[];
+  detail: ExposureItem[];
   exposure: ExposureItem[];
+  industry_chain_tags: SystemTagExposure[];
   identified_coverage_pct: number;
+  other_pct: number;
   unknown_pct: number;
+  undisclosed_stock_pct: number;
+  non_stock_pct: number;
   calculation_basis: string;
 }
 
