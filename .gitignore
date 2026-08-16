@@ -7,6 +7,7 @@ VibeResearch-专业化建议.md
 
 # ── 私有数据（持仓 / 关注股 / 缓存：只存本地、不上传） ──────────────
 **/.cache/
+.tmp/
 my-watchlist.json
 portfolio.json
 public/user-data/
