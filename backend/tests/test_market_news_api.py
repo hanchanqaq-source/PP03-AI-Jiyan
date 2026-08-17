@@ -414,3 +414,56 @@ def test_market_news_translation_endpoint_allows_missing_model_and_rejects_more_
 
     assert missing.status_code == 200
     assert too_many.status_code == 422
+
+
+def test_single_source_retry_returns_one_complete_current_query_snapshot(monkeypatch):
+    service = _service()
+    called = []
+    monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: service)
+    monkeypatch.setattr(
+        app_module.newsradar,
+        "retry_source",
+        lambda source_id: called.append(source_id) or {"ok": True, "source_status": {"source_id": source_id}},
+    )
+
+    response = client.post(
+        "/api/market-news/sources/0123456789abcdef/retry"
+        "?mode=global_tech&tag_id=storage&category=all&days=7&sort=latest"
+    )
+
+    assert response.status_code == 200
+    assert called == ["0123456789abcdef"]
+    data = response.json()["data"]
+    assert data["filters"] == {
+        "mode": "global_tech", "tag_ids": ["storage"], "category": "all", "days": 7, "sort": "latest",
+    }
+    assert [event["event_id"] for event in data["focus_events"]] == [event["event_id"] for event in data["events"]]
+    assert data["source_summary"]["source_state"] == "cached"
+
+
+def test_single_source_retry_failure_is_inspectable_and_unknown_source_is_rejected(monkeypatch):
+    failure = {
+        "source_id": "0123456789abcdef",
+        "source_name": "公开测试源",
+        "source_url": "https://feed.example.test/rss",
+        "status": "failed",
+        "error_type": "timeout",
+        "error_reason": "来源请求超时",
+        "last_success_at": "2026-08-16T10:35:00+08:00",
+        "used_cached_items": True,
+        "item_count": 1,
+    }
+
+    def retry(source_id):
+        if source_id == "f" * 16:
+            raise ValueError("该资讯来源未配置，不能重试")
+        return {"ok": False, "source_status": failure}
+
+    monkeypatch.setattr(app_module.newsradar, "retry_source", retry)
+
+    failed = client.post("/api/market-news/sources/0123456789abcdef/retry")
+    unknown = client.post(f"/api/market-news/sources/{'f' * 16}/retry")
+
+    assert failed.status_code == 200
+    assert failed.json()["data"] == {"retry_succeeded": False, "source_status": failure}
+    assert unknown.status_code == 404

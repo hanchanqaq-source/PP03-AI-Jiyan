@@ -549,6 +549,24 @@ def market_news_translations(req: MarketNewsTranslationReq):
         raise HTTPException(422, str(error)) from error
 
 
+@app.post("/api/market-news/sources/{source_id}/retry")
+def market_news_retry_source(
+    source_id: str = ApiPath(pattern=r"^[a-f0-9]{16}$"),
+    mode: MarketNewsMode = "my_focus",
+    tag_id: list[str] = Query(default=[]),
+    category: MarketNewsCategory = "all",
+    days: MarketNewsDays = 7,
+    sort: MarketNewsSort = "importance",
+):
+    try:
+        result = newsradar.retry_source(source_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    if not result.get("ok"):
+        return {"data": {"retry_succeeded": False, "source_status": result.get("source_status")}}
+    return _market_news_payload(mode, tag_id, category, days, sort, False)
+
+
 @app.get("/api/market-news/events/{event_id}")
 def market_news_event(
     event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$"),

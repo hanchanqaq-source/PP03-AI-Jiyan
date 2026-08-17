@@ -10,10 +10,14 @@ AI「今日要点」不在此模块——复用 Vibe-Research 的可插拔 AI �
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import socket
+import ssl
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +33,42 @@ CACHE_WRITE_LOCK = threading.Lock()
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 BEIJING = timezone(timedelta(hours=8))
+
+
+def source_id(source: dict) -> str:
+    """Stable non-secret identifier; retry never accepts a caller-provided URL."""
+    return hashlib.sha256(str(source.get("url") or "").encode("utf-8")).hexdigest()[:16]
+
+
+def sanitize_source_error(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [redacted]", text)
+    text = re.sub(
+        r"(?i)\b(authorization|cookie|token|api[_-]?key)\s*[:=]\s*[^\s,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\b[A-Z]:\\Users\\[^\s]+", "[local-path]", text)
+    text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", text)
+    return re.sub(r"\s+", " ", text).strip()[:200]
+
+
+def classify_source_error(error: BaseException) -> tuple[str, str]:
+    nested = getattr(error, "reason", None)
+    if isinstance(error, urllib.error.HTTPError):
+        return "http_status", f"来源返回 HTTP {int(error.code)}"
+    if isinstance(error, ET.ParseError):
+        return "rss_parse", "来源 RSS / XML 解析失败"
+    if isinstance(error, (TimeoutError, socket.timeout)) or isinstance(nested, (TimeoutError, socket.timeout)):
+        return "timeout", "来源请求超时"
+    if isinstance(error, ssl.SSLError) or isinstance(nested, ssl.SSLError):
+        return "tls", "来源 TLS 连接失败"
+    if isinstance(error, socket.gaierror) or isinstance(nested, socket.gaierror):
+        return "dns", "来源域名解析失败"
+    if isinstance(error, (ConnectionError, urllib.error.URLError, OSError)):
+        return "connection", "来源连接失败"
+    kind = sanitize_source_error(type(error).__name__) or "UnknownError"
+    return "unknown", f"来源抓取失败（{kind}）"[:200]
 
 
 def _load_source_config() -> dict:
@@ -131,9 +171,16 @@ def _fetch_source(src: dict, per: int, cutoff, redline: list[str]):
             d["original_url"] = d["url"]
             d["summary_or_excerpt"] = d["summary"]
             out.append(d)
-        return {"status": "ok", "items": out}
-    except Exception:
-        return {"status": "failed", "items": []}
+        return {
+            "status": "ok", "items": out, "fetched_at": fetched_at,
+            "error_type": None, "error_reason": None,
+        }
+    except Exception as error:
+        error_type, reason = classify_source_error(error)
+        return {
+            "status": "failed", "items": [], "fetched_at": None,
+            "error_type": error_type, "error_reason": sanitize_source_error(reason),
+        }
 
 
 def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -> list[dict]:
@@ -150,6 +197,32 @@ def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -
             copied["region"] = src.get("region") or copied.get("region") or "unknown"
             out.append(copied)
     return out
+
+
+def _last_success_at(previous: dict | None, cached_items: list[dict]) -> str | None:
+    timestamps = [
+        str(item.get("fetched_at") or item.get("published_at") or "")
+        for item in cached_items
+        if item.get("fetched_at") or item.get("published_at")
+    ]
+    if timestamps:
+        return max(timestamps)
+    return str((previous or {}).get("generated_at") or "") or None
+
+
+def _source_status(src: dict, result: dict, cached_items: list[dict], previous: dict | None) -> dict:
+    succeeded = result.get("status") == "ok"
+    return {
+        "source_id": source_id(src),
+        "source_name": src["name"],
+        "source_url": src["url"],
+        "status": result.get("status") or "failed",
+        "error_type": result.get("error_type"),
+        "error_reason": result.get("error_reason"),
+        "last_success_at": result.get("fetched_at") if succeeded else _last_success_at(previous, cached_items),
+        "used_cached_items": bool(cached_items) and not succeeded,
+        "item_count": len(result.get("items") or []) if succeeded else len(cached_items),
+    }
 
 
 def _set_all_item_status(data: dict, status: str) -> None:
@@ -214,29 +287,28 @@ def fetch_radar() -> dict:
     source_statuses = []
     for idx, src, result in results:
         items = result["items"]
-        source_statuses.append({
-            "source_name": src["name"],
-            "source_url": src["url"],
-            "status": result["status"],
-            "item_count": len(items),
-        })
         if result["status"] == "failed":
             failed += 1
-            industries[idx]["items"].extend(_cached_items_for_source(previous, industries[idx]["key"], src))
+            cached_items = _cached_items_for_source(previous, industries[idx]["key"], src)
+            industries[idx]["items"].extend(cached_items)
+            source_statuses.append(_source_status(src, result, cached_items, previous))
             continue
         succeeded += 1
         industries[idx]["items"].extend(items)
+        source_statuses.append(_source_status(src, result, [], previous))
 
     if succeeded == 0:
         if previous:
             fallback = json.loads(json.dumps(previous, ensure_ascii=False))
             fallback["cache_status"] = "stale"
+            fallback["source_state"] = "stale_cache"
             _set_all_item_status(fallback, "stale")
             fallback["source_statuses"] = source_statuses
             fallback.setdefault("stats", {})["failed_sources"] = failed
             return fallback
         fallback = skeleton()
         fallback["cache_status"] = "source_failure"
+        fallback["source_state"] = "all_failed"
         fallback["source_statuses"] = source_statuses
         fallback["stats"]["failed_sources"] = failed
         return fallback
@@ -250,6 +322,7 @@ def fetch_radar() -> dict:
         "industries": industries,
         "stats": {"industries": len(cfg["industries"]), "total_sources": len(cfg["sources"]), "failed_sources": failed},
         "cache_status": "partial" if failed else "realtime",
+        "source_state": "partial_failure" if failed else "all_success",
         "source_statuses": source_statuses,
     }
     _write_cache(data)
@@ -265,6 +338,8 @@ def load_cache():
         recent_days = int(data.get("recent_days") or 7)
         is_stale = bool(generated_at and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
         data["cache_status"] = "stale" if is_stale else "cache"
+        failed_sources = int((data.get("stats") or {}).get("failed_sources") or 0)
+        data["source_state"] = "stale_cache" if is_stale else ("partial_failure" if failed_sources else "cached")
         _set_all_item_status(data, data["cache_status"])
         return data
     except (FileNotFoundError, json.JSONDecodeError):
@@ -283,8 +358,78 @@ def skeleton() -> dict:
         "industries": [{"key": i["key"], "name": i["name"], "accent": i["accent"], "total": byhint.get(i["key"], 0), "items": []} for i in cfg["industries"]],
         "stats": {"industries": len(cfg["industries"]), "total_sources": len(cfg["sources"]), "failed_sources": 0},
         "cache_status": "empty",
+        "source_state": "empty",
         "source_statuses": [],
     }
+
+
+def retry_source(requested_source_id: str) -> dict:
+    """Retry one configured source and atomically merge it into the current radar cache."""
+    cfg = _load_source_config()
+    src = next((source for source in cfg["sources"] if source_id(source) == requested_source_id), None)
+    if src is None:
+        raise ValueError("该资讯来源未配置，不能重试")
+
+    previous = load_cache()
+    days = int(cfg.get("fetch", {}).get("recent_days", 7))
+    per = int(cfg.get("fetch", {}).get("per_source", 6))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    redline = [str(key).lower() for key in cfg.get("redline_keywords", [])]
+    result = _fetch_source(src, per, cutoff, redline)
+    cached_items = _cached_items_for_source(previous, str(src.get("hint") or ""), src)
+    status = _source_status(src, result, cached_items, previous)
+    if result["status"] != "ok":
+        return {"ok": False, "source_status": status}
+
+    data = json.loads(json.dumps(previous or skeleton(), ensure_ascii=False))
+    industry = next((row for row in data.get("industries") or [] if row.get("key") == src.get("hint")), None)
+    if industry is None:
+        raise ValueError("该资讯来源的行业配置不存在")
+    industry["items"] = [
+        item for item in industry.get("items") or []
+        if item.get("source_url") != src["url"]
+        and item.get("source_name") != src["name"]
+        and item.get("source") != src["name"]
+    ]
+    industry["items"].extend(result["items"])
+    industry["items"].sort(key=lambda item: item.get("ts", 0), reverse=True)
+
+    existing = {
+        str(row.get("source_id") or source_id({"url": row.get("source_url")})): dict(row)
+        for row in data.get("source_statuses") or []
+        if row.get("source_url")
+    }
+    existing[requested_source_id] = status
+    statuses = []
+    for configured in cfg["sources"]:
+        configured_id = source_id(configured)
+        row = existing.get(configured_id)
+        if row is None:
+            cached = _cached_items_for_source(data, str(configured.get("hint") or ""), configured)
+            row = {
+                "source_id": configured_id,
+                "source_name": configured["name"],
+                "source_url": configured["url"],
+                "status": "ok",
+                "error_type": None,
+                "error_reason": None,
+                "last_success_at": _last_success_at(previous, cached),
+                "used_cached_items": bool(cached),
+                "item_count": len(cached),
+            }
+        statuses.append(row)
+
+    failed = sum(row.get("status") == "failed" for row in statuses)
+    data["generated_at"] = datetime.now(BEIJING).isoformat(timespec="seconds")
+    data["recent_days"] = days
+    data["source_statuses"] = statuses
+    data["cache_status"] = "partial" if failed else "realtime"
+    data["source_state"] = "partial_failure" if failed else "all_success"
+    data.setdefault("stats", {})["industries"] = len(cfg["industries"])
+    data["stats"]["total_sources"] = len(cfg["sources"])
+    data["stats"]["failed_sources"] = failed
+    _write_cache(data)
+    return {"ok": True, "source_status": status, "radar": data}
 
 
 def get_radar(force: bool = False) -> dict:

@@ -226,6 +226,13 @@ class MarketNewsService:
                 fund_counts[(str(fund.get("fund_code") or ""), str(fund.get("fund_name") or ""))] += 1
         failed_sources = int((radar.get("stats") or {}).get("failed_sources") or 0)
         data_status = str(radar.get("cache_status") or "cache")
+        source_state = str(radar.get("source_state") or {
+            "realtime": "all_success",
+            "partial": "partial_failure",
+            "cache": "cached",
+            "stale": "stale_cache",
+            "source_failure": "all_failed",
+        }.get(data_status, "cached"))
         return {
             "events": [event.to_dict() for event in filtered],
             "focus_events": [event.to_dict() for event in filtered[:5]],
@@ -245,6 +252,7 @@ class MarketNewsService:
                 "total_sources": int((radar.get("stats") or {}).get("total_sources") or 0),
                 "failed_sources": failed_sources,
                 "cache_status": data_status,
+                "source_state": source_state,
                 "refresh_failed": refresh_failed,
                 "source_statuses": radar.get("source_statuses") or [],
             },

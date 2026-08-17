@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import newsradar
+import pytest
 
 
 class _Response:
@@ -82,12 +86,19 @@ def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch)
     assert item["language"] == "zh-CN"
     assert item["region"] == "CN"
     assert data["cache_status"] == "realtime"
-    assert data["source_statuses"] == [{
+    status = data["source_statuses"][0]
+    assert status == {
+        "source_id": newsradar.source_id({"url": "https://feed.example.test/rss"}),
         "source_name": "公开源 1",
         "source_url": "https://feed.example.test/rss",
         "status": "ok",
+        "error_type": None,
+        "error_reason": None,
+        "last_success_at": item["fetched_at"],
+        "used_cached_items": False,
         "item_count": 1,
-    }]
+    }
+    assert data["source_state"] == "all_success"
 
 
 def test_fetch_radar_applies_audited_config_default_region(tmp_path, monkeypatch):
@@ -168,6 +179,11 @@ def test_single_source_failure_returns_partial_success(tmp_path, monkeypatch):
     assert data["cache_status"] == "partial"
     assert data["stats"]["failed_sources"] == 1
     assert [status["status"] for status in data["source_statuses"]] == ["ok", "failed"]
+    failed = data["source_statuses"][1]
+    assert failed["error_type"] == "connection"
+    assert failed["error_reason"] == "来源连接失败"
+    assert failed["used_cached_items"] is False
+    assert data["source_state"] == "partial_failure"
     assert json.loads(cache.read_text(encoding="utf-8"))["cache_status"] == "partial"
 
 
@@ -208,6 +224,10 @@ def test_partial_failure_reuses_legacy_item_with_configured_region(tmp_path, mon
     assert data["cache_status"] == "partial"
     assert reused["data_status"] == "stale"
     assert reused["region"] == "GLOBAL"
+    failed = next(status for status in data["source_statuses"] if status["status"] == "failed")
+    assert failed["used_cached_items"] is True
+    assert failed["item_count"] == 1
+    assert failed["last_success_at"] == "2026-08-17T09:00:00+00:00"
 
 
 def test_load_cache_downgrades_item_status_to_current_container_state(tmp_path, monkeypatch):
@@ -275,3 +295,90 @@ def test_production_sources_include_auditable_mainland_region_metadata():
     for name in ("量子位", "智东西", "华尔街见闻", "东方财富资讯", "经济观察网"):
         assert by_name[name]["region"] == "CN"
         assert by_name[name]["language"] == "zh-CN"
+
+
+def test_source_error_classification_is_bounded_and_sanitized():
+    cases = [
+        (TimeoutError("token=secret"), "timeout", "来源请求超时"),
+        (urllib.error.HTTPError("https://feed.test/?token=secret", 503, "Bearer secret", {}, None), "http_status", "来源返回 HTTP 503"),
+        (ssl.SSLError("C:\\Users\\private\\cert.pem token=secret"), "tls", "来源 TLS 连接失败"),
+        (socket.gaierror("dns token=secret"), "dns", "来源域名解析失败"),
+        (ConnectionError("Authorization: Bearer secret"), "connection", "来源连接失败"),
+    ]
+
+    for error, expected_type, expected_reason in cases:
+        error_type, reason = newsradar.classify_source_error(error)
+        assert (error_type, reason) == (expected_type, expected_reason)
+        assert len(reason) <= 200
+        assert "secret" not in reason
+        assert "Users" not in reason
+
+    sanitized = newsradar.sanitize_source_error(
+        "Authorization: Bearer abc token=xyz C:\\Users\\private\\cache https://x.test/?api_key=value"
+    )
+    assert len(sanitized) <= 200
+    assert "abc" not in sanitized and "xyz" not in sanitized and "private" not in sanitized and "value" not in sanitized
+
+
+def test_retry_source_is_whitelisted_and_atomically_replaces_only_that_source(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://feed.example.test/rss"])
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-16T10:35:00+08:00",
+        "recent_days": 7,
+        "industries": [{
+            "key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 1,
+            "items": [{
+                "title": "旧资讯", "source_name": "公开源 1", "source_url": "https://feed.example.test/rss",
+                "fetched_at": "2026-08-16T10:35:00+08:00", "ts": 1,
+            }],
+        }],
+        "stats": {"industries": 1, "total_sources": 1, "failed_sources": 1},
+        "cache_status": "partial",
+        "source_statuses": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("重试后的新资讯", "https://news.example.test/retry")),
+    )
+
+    result = newsradar.retry_source(newsradar.source_id({"url": "https://feed.example.test/rss"}))
+
+    assert result["ok"] is True
+    stored = json.loads(cache.read_text(encoding="utf-8"))
+    assert [item["title"] for item in stored["industries"][0]["items"]] == ["重试后的新资讯"]
+    assert stored["source_statuses"][0]["status"] == "ok"
+    assert stored["source_state"] == "all_success"
+
+
+def test_retry_source_rejects_unknown_id_and_failed_retry_preserves_cache_bytes(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://feed.example.test/rss"])
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-16T10:35:00+08:00", "recent_days": 7,
+        "industries": [{"key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 1, "items": []}],
+        "stats": {"industries": 1, "total_sources": 1, "failed_sources": 1},
+        "cache_status": "partial", "source_statuses": [],
+    }), encoding="utf-8")
+    original = cache.read_bytes()
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(TimeoutError("token=private")),
+    )
+
+    with pytest.raises(ValueError, match="未配置"):
+        newsradar.retry_source("0" * 16)
+    result = newsradar.retry_source(newsradar.source_id({"url": "https://feed.example.test/rss"}))
+
+    assert result["ok"] is False
+    assert result["source_status"]["error_type"] == "timeout"
+    assert "private" not in json.dumps(result, ensure_ascii=False)
+    assert cache.read_bytes() == original
