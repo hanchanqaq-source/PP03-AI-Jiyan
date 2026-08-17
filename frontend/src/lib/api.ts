@@ -10,9 +10,12 @@ import type {
   FundSearchResult,
 } from "@/features/fund-portfolio/types";
 import type {
+  CacheCleanupResult,
+  CacheStatus,
   MarketNewsEvent,
   MarketNewsQuery,
   MarketNewsResponse,
+  MarketNewsSourceRetryResult,
   MarketNewsTranslationResponse,
 } from "@/features/market-news/types";
 import type { LlmConfig } from "@/lib/llm";
@@ -295,6 +298,10 @@ export const api = {
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
   marketNewsEvents: (query: MarketNewsQuery) => get<MarketNewsResponse>(marketNewsPath("/market-news/events", query)),
   marketNewsRefresh: (query: MarketNewsQuery) => request<MarketNewsResponse>(marketNewsPath("/market-news/refresh", query), "POST"),
+  marketNewsRetrySource: (sourceId: string, query: MarketNewsQuery) => request<MarketNewsSourceRetryResult>(
+    marketNewsPath(`/market-news/sources/${encodeURIComponent(sourceId)}/retry`, query),
+    "POST",
+  ),
   marketNewsTranslations: (payload: {
     items: Array<{ event_id: string; title: string; summary: string; source_language: string }>;
     llm: LlmConfig | null;
@@ -302,6 +309,8 @@ export const api = {
   marketNewsEvent: (eventId: string, snapshotId?: string) => get<MarketNewsEvent>(
     `/market-news/events/${encodeURIComponent(eventId)}${snapshotId ? `?snapshot_id=${encodeURIComponent(snapshotId)}` : ""}`,
   ),
+  cacheStatus: () => get<CacheStatus>("/cache/status"),
+  cacheCleanupExpired: () => request<CacheCleanupResult>("/cache/cleanup-expired", "POST"),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),

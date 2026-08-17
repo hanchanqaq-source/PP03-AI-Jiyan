@@ -413,6 +413,81 @@ describe("PP03 core pages", () => {
     expect(screen.getByText(/不会输出买入、卖出/)).toBeInTheDocument();
   });
 
+  it("retries one failed source and replaces list, focus and impact with one matching response snapshot", async () => {
+    const user = userEvent.setup();
+    const sourceId = "0123456789abcdef";
+    const initialEvent = eventFor("source-old-event", "来源重试前事件", "storage", "存储");
+    const retriedEvent = eventFor("source-new-event", "来源重试后事件", "storage", "存储");
+    const initial = responseFor(queryFor("storage"), initialEvent, "source-old-snapshot", 1);
+    initial.source_summary = {
+      ...initial.source_summary,
+      failed_sources: 1,
+      source_state: "partial_failure",
+      source_statuses: [{
+        source_id: sourceId,
+        source_name: "存储公开源",
+        source_url: "https://feed.example.test/storage.xml",
+        status: "failed",
+        error_type: "timeout",
+        error_reason: "来源请求超时",
+        last_success_at: "2026-08-16T10:35:00+08:00",
+        used_cached_items: true,
+        item_count: 1,
+      }],
+    };
+    const retried = responseFor(queryFor("storage"), retriedEvent, "source-new-snapshot", 2);
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue(initial);
+    const retry = vi.spyOn(api, "marketNewsRetrySource").mockResolvedValue(retried);
+
+    render(<MarketNews />);
+    expect(await screen.findByRole("heading", { name: initialEvent.title })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "1 个来源失败，查看详情" }));
+    await user.click(screen.getByRole("button", { name: "重试来源 存储公开源" }));
+
+    expect(retry).toHaveBeenCalledWith(sourceId, queryFor("storage"));
+    expect(await screen.findByRole("heading", { name: retriedEvent.title })).toBeInTheDocument();
+    expect(screen.getAllByText(retriedEvent.title)).toHaveLength(2);
+    expect(screen.getByText("过去 7 天有 2 个事件与你的持仓相关")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: initialEvent.title })).not.toBeInTheDocument();
+  });
+
+  it("rejects a failed-source retry response whose filters do not match the current query", async () => {
+    const user = userEvent.setup();
+    const sourceId = "fedcba9876543210";
+    const initialEvent = eventFor("retry-stable-event", "重试时保留的当前快照", "storage", "存储");
+    const wrongEvent = eventFor("retry-wrong-event", "错误标签的重试响应", "robotics", "机器人");
+    const initial = responseFor(queryFor("storage"), initialEvent, "retry-stable-snapshot", 1);
+    initial.source_summary = {
+      ...initial.source_summary,
+      failed_sources: 1,
+      source_state: "partial_failure",
+      source_statuses: [{
+        source_id: sourceId,
+        source_name: "存储政策源",
+        source_url: "https://feed.example.test/policy.xml",
+        status: "failed",
+        error_type: "http_status",
+        error_reason: "来源返回 HTTP 503",
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 0,
+      }],
+    };
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue(initial);
+    vi.spyOn(api, "marketNewsRetrySource").mockResolvedValue(
+      responseFor(queryFor("robotics"), wrongEvent, "retry-wrong-snapshot", 3),
+    );
+
+    render(<MarketNews />);
+    expect(await screen.findByRole("heading", { name: initialEvent.title })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "1 个来源失败，查看详情" }));
+    await user.click(screen.getByRole("button", { name: "重试来源 存储政策源" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("该来源重试失败，请稍后再试。");
+    expect(screen.getByRole("heading", { name: initialEvent.title })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: wrongEvent.title })).not.toBeInTheDocument();
+  });
+
   it("persists a genuinely empty market-news tag selection and shows guidance", async () => {
     const user = userEvent.setup();
     localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: [], activeId: "" }));

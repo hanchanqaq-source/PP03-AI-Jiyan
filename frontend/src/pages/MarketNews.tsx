@@ -5,6 +5,7 @@ import { DataInfoDialog } from "@/features/market-news/DataInfoDialog";
 import { EventCard } from "@/features/market-news/EventCard";
 import { EventDetailDrawer } from "@/features/market-news/EventDetailDrawer";
 import { MarketNewsSidebar } from "@/features/market-news/MarketNewsSidebar";
+import { SourceFailureDialog } from "@/features/market-news/SourceFailureDialog";
 import type {
   MarketNewsCategoryFilter,
   MarketNewsEvent,
@@ -56,6 +57,15 @@ const STATUS_LABELS: Record<string, string> = {
   stale: "过期缓存",
   partial: "部分来源可用",
   source_failure: "来源失败",
+};
+
+const SOURCE_STATE_LABELS: Record<string, string> = {
+  all_success: "全部成功",
+  partial_failure: "部分来源失败",
+  cached: "使用缓存",
+  stale_cache: "使用过期缓存",
+  all_failed: "全部来源失败",
+  empty: "等待来源",
 };
 
 const MARKET_NEWS_CACHE_LIMIT = 12;
@@ -149,6 +159,7 @@ export function MarketNews() {
   const [view, setView] = useState<{ queryKey: string; response: MarketNewsResponse } | null>(null);
   const responseCacheRef = useRef<Map<string, MarketNewsResponse>>(new Map());
   const requestIdRef = useRef(0);
+  const sourceRetryIdRef = useRef(0);
   const translationIdRef = useRef(0);
   const translationRequestedRef = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -156,6 +167,7 @@ export function MarketNews() {
   const [queryError, setQueryError] = useState<{ queryKey: string; message: string } | null>(null);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
+  const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
   const [detailSelection, setDetailSelection] = useState<{
     queryKey: string;
     snapshotId: string;
@@ -183,6 +195,8 @@ export function MarketNews() {
 
   useEffect(() => {
     setDetailSelection(null);
+    setSourceDialogOpen(false);
+    sourceRetryIdRef.current += 1;
   }, [queryKey]);
 
   useEffect(() => {
@@ -290,6 +304,40 @@ export function MarketNews() {
     }
   };
 
+  const retrySource = async (sourceId: string) => {
+    if (!data) throw new Error("missing current market-news snapshot");
+    const retryId = ++sourceRetryIdRef.current;
+    const retryQueryKey = queryKey;
+    const retrySnapshotId = data.snapshot_id;
+    const result = await api.marketNewsRetrySource(sourceId, query);
+    if (retryId !== sourceRetryIdRef.current || activeQueryKeyRef.current !== retryQueryKey) return;
+    const current = responseCacheRef.current.get(retryQueryKey);
+    if (!current || current.snapshot_id !== retrySnapshotId) return;
+    if ("retry_succeeded" in result && result.retry_succeeded === false) {
+      const sourceStatuses = current.source_summary.source_statuses.map((source) => (
+        source.source_id === sourceId ? result.source_status : source
+      ));
+      const failedSources = sourceStatuses.filter((source) => source.status === "failed").length;
+      const updated: MarketNewsResponse = {
+        ...current,
+        source_summary: {
+          ...current.source_summary,
+          failed_sources: failedSources,
+          source_state: failedSources >= current.source_summary.total_sources ? "all_failed" : "partial_failure",
+          source_statuses: sourceStatuses,
+        },
+      };
+      cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, updated);
+      setView({ queryKey: retryQueryKey, response: updated });
+      throw new Error("configured source retry failed");
+    }
+    if (!responseMatchesQuery(result, query)) throw new Error("market-news retry filters mismatch");
+    cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, result);
+    setView({ queryKey: retryQueryKey, response: result });
+    setQueryError(null);
+    if (result.source_summary.failed_sources === 0) setSourceDialogOpen(false);
+  };
+
   const noTags = mode === "my_focus" && query.tag_ids.length === 0;
   const error = queryError?.queryKey === queryKey ? queryError.message : null;
   const queryFailedWithoutCache = Boolean(error && !data && !noTags);
@@ -328,7 +376,8 @@ export function MarketNews() {
       <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-border/55 bg-muted/15 px-3 py-2 text-xs text-muted-foreground">
         <span>状态：{status}</span>
         {data && <span>{data.source_summary.total_sources} 个来源配置</span>}
-        {data && data.source_summary.failed_sources > 0 && <span className="text-warning">{data.source_summary.failed_sources} 个来源失败</span>}
+        {data && <span>来源：{SOURCE_STATE_LABELS[data.source_summary.source_state] || "状态未知"}</span>}
+        {data && data.source_summary.failed_sources > 0 && <button onClick={() => setSourceDialogOpen(true)} aria-label={`${data.source_summary.failed_sources} 个来源失败，查看详情`} className="text-warning underline decoration-dotted underline-offset-2 hover:text-foreground">{data.source_summary.failed_sources} 个来源失败</button>}
         {data?.ai_status === "unavailable" && <span>AI：摘要不可用</span>}
         {data?.generated_at && <span className="ml-auto">更新于 {new Date(data.generated_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}</span>}
       </div>
@@ -345,6 +394,7 @@ export function MarketNews() {
 
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} onCancel={() => setSelectorOpen(false)} onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
       <DataInfoDialog open={infoOpen} onClose={() => setInfoOpen(false)} />
+      <SourceFailureDialog open={sourceDialogOpen} statuses={data?.source_summary.source_statuses || []} onClose={() => setSourceDialogOpen(false)} onRetry={retrySource} />
       <EventDetailDrawer open={detailEvent !== null} event={detailEvent} onClose={() => setDetailSelection(null)} />
     </div>
   );

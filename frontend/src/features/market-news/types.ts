@@ -78,6 +78,51 @@ export interface MarketNewsTranslationResponse {
   limit: number;
 }
 
+export type MarketNewsSourceState = "all_success" | "partial_failure" | "cached" | "stale_cache" | "all_failed" | "empty";
+
+export interface MarketNewsSourceStatus {
+  source_id: string;
+  source_name: string;
+  source_url: string;
+  status: "ok" | "failed";
+  error_type: "timeout" | "http_status" | "tls" | "dns" | "connection" | "rss_parse" | "unknown" | null;
+  error_reason: string | null;
+  last_success_at: string | null;
+  used_cached_items: boolean;
+  item_count: number;
+}
+
+export interface CacheCategoryStatus {
+  bytes: number;
+  file_count: number;
+  expired_count: number;
+  reclaimable_bytes: number;
+  pinned_count: number;
+}
+
+export interface CacheStatus {
+  total_bytes: number;
+  file_count: number;
+  expired_count: number;
+  reclaimable_bytes: number;
+  categories: Record<string, CacheCategoryStatus>;
+  last_auto_cleanup_at: string | null;
+  limit_bytes: number;
+  over_limit_bytes: number;
+}
+
+export interface CacheCleanupResult {
+  manual: boolean;
+  released_bytes: number;
+  deleted_categories: string[];
+  status: CacheStatus;
+}
+
+export type MarketNewsSourceRetryResult = MarketNewsResponse | {
+  retry_succeeded: false;
+  source_status: MarketNewsSourceStatus;
+};
+
 export interface MarketNewsQuery {
   mode: MarketNewsMode;
   tag_ids: string[];
@@ -105,9 +150,9 @@ export interface MarketNewsResponse {
     total_sources: number;
     failed_sources: number;
     cache_status: string;
-    source_state: "all_success" | "partial_failure" | "cached" | "stale_cache" | "all_failed" | "empty";
+    source_state: MarketNewsSourceState;
     refresh_failed: boolean;
-    source_statuses: Array<{ source_name: string; source_url: string; status: string; item_count: number }>;
+    source_statuses: MarketNewsSourceStatus[];
   };
   portfolio_status: "ready" | "empty" | "error";
   ai_status: "available" | "unavailable";
