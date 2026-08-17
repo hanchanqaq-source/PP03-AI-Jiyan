@@ -17,6 +17,7 @@ _SENSITIVE_QUERY_PARTS = (
     "token", "key", "secret", "password", "passwd", "session", "cookie",
     "authorization", "credential", "signature", "jwt",
 )
+_SENSITIVE_QUERY_NAMES = {"code"}
 
 
 class ProbeSchemaError(ValueError):
@@ -54,7 +55,7 @@ def redact_url(value: object) -> str:
     query = []
     for key, item_value in parse_qsl(parts.query, keep_blank_values=True):
         lowered = key.lower()
-        if any(part in lowered for part in _SENSITIVE_QUERY_PARTS):
+        if lowered in _SENSITIVE_QUERY_NAMES or any(part in lowered for part in _SENSITIVE_QUERY_PARTS):
             item_value = "[redacted]"
         query.append((key, item_value))
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))

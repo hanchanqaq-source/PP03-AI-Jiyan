@@ -162,7 +162,7 @@ class SourceHealthRunner:
             cache_status=str(raw.get("cache_status") or "not_used"),
             fallback_available=self._fallback_available(descriptor),
             redirected=bool(raw.get("redirected", False)),
-            final_reference=raw.get("final_reference"),
+            final_reference=raw.get("final_reference") or raw.get("final_url"),
         )
         score_observation(
             observation,

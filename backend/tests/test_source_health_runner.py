@@ -159,6 +159,36 @@ def test_progress_reports_every_result_and_source_failure_does_not_fail_run():
     runner.shutdown()
 
 
+@pytest.mark.parametrize("reference_field", ["final_reference", "final_url"])
+def test_runner_maps_news_probe_reference_to_health_final_reference(reference_field):
+    row = descriptor(
+        "news:moved",
+        source_name="moved",
+        group="news",
+        capability="feed",
+    )
+    raw = successful_result("moved")
+    raw.update({
+        "status": "partial",
+        "error_type": "redirect",
+        "redirected": True,
+    })
+    raw.pop("final_reference")
+    raw[reference_field] = "https://public.example.test/final.xml"
+    runner = SourceHealthRunner(
+        [row],
+        providers=[],
+        news_sources={row.source_id: {"name": "moved"}},
+        news_probe=lambda *_args, **_kwargs: raw,
+        now=lambda: NOW,
+    )
+
+    [observation] = runner.run("full")
+
+    assert observation.final_reference == "https://public.example.test/final.xml"
+    runner.shutdown()
+
+
 def test_shutdown_closes_both_probe_pools():
     runner = SourceHealthRunner([], providers=[], news_sources={})
 

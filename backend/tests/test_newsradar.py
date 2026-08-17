@@ -132,9 +132,26 @@ def test_probe_source_config_reports_permanent_redirect(monkeypatch):
     assert result["status"] == "partial"
     assert result["error_type"] == "redirect"
     assert result["redirected"] is True
-    assert result["final_reference"] == "https://feed.example.test/permanent.xml"
+    assert result["final_url"] == "https://feed.example.test/permanent.xml"
     assert result["field_completeness_pct"] == 100.0
-    assert "final_url" not in result
+
+
+def test_probe_source_config_completeness_counts_core_news_fields(monkeypatch):
+    payload = b'''<?xml version="1.0"?><rss><channel>
+      <item><title>Complete</title><link>https://news.example.test/complete</link><pubDate>Tue, 18 Aug 2026 01:00:00 GMT</pubDate></item>
+      <item><title>Title only</title></item>
+    </channel></rss>'''
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(payload),
+    )
+
+    result = newsradar.probe_source_config(_probe_source(), recent_days=30)
+
+    assert result["status"] == "success"
+    assert result["returned_items"] == 2
+    assert result["field_completeness_pct"] == pytest.approx(66.67, abs=0.01)
 
 
 def test_probe_source_config_retries_http_429_once_and_honors_capped_retry_after(monkeypatch):

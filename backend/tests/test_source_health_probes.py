@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from fund_data.models import ProviderResult
-from source_health.probe_errors import classify_probe_error
+from source_health.probe_errors import classify_probe_error, redact_url
 from source_health.probes.fund_provider import probe_provider_capability
 
 
@@ -223,6 +223,17 @@ def test_probe_redacts_credentials_and_local_paths():
     assert "Bearer" not in result.message
     assert "26365" not in result.message
     assert "trace.log" not in result.message
+
+
+def test_url_redaction_treats_only_exact_code_query_key_as_sensitive():
+    redacted = redact_url(
+        "https://public.example.test/callback?code=opaque-uuid&decode=public&postcode=200000"
+    )
+
+    assert "code=%5Bredacted%5D" in redacted
+    assert "decode=public" in redacted
+    assert "postcode=200000" in redacted
+    assert "opaque-uuid" not in redacted
 
 
 @pytest.mark.parametrize(

@@ -351,9 +351,16 @@ def probe_source_config(
             "error_type": "redirect",
             "error_message_redacted": "来源已重定向到公开最终地址",
         })
-    final_url = result.pop("final_url", None)
-    result["final_reference"] = final_url if result["redirected"] else None
-    result["field_completeness_pct"] = 100.0 if result["items"] else 0.0
+    core_fields = ("title", "url", "published_at")
+    total_fields = len(result["items"]) * len(core_fields)
+    present_fields = sum(
+        value is not None and str(value).strip() != ""
+        for item in result["items"]
+        for value in (item.get(field) for field in core_fields)
+    )
+    result["field_completeness_pct"] = (
+        round(present_fields / total_fields * 100, 2) if total_fields else 0.0
+    )
     result["returned_items"] = len(result["items"])
     result["latest_published_at"] = max(
         (str(item["published_at"]) for item in result["items"] if item.get("published_at")),
