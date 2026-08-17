@@ -21,8 +21,14 @@ class _Response:
         return self._payload
 
 
-def _write_sources(path: Path, urls: list[str]) -> None:
-    path.write_text(json.dumps({
+def _write_sources(
+    path: Path,
+    urls: list[str],
+    *,
+    default_region: str | None = None,
+    source_region: str | None = "CN",
+) -> None:
+    config = {
         "fetch": {"recent_days": 7, "per_source": 6},
         "redline_keywords": [],
         "industries": [{"key": "semi", "name": "半导体", "accent": "#f59e0b"}],
@@ -32,11 +38,14 @@ def _write_sources(path: Path, urls: list[str]) -> None:
                 "url": url,
                 "hint": "semi",
                 "language": "zh-CN",
-                "region": "CN",
+                **({"region": source_region} if source_region else {}),
             }
             for index, url in enumerate(urls, start=1)
         ],
-    }, ensure_ascii=False), encoding="utf-8")
+    }
+    if default_region:
+        config["default_region"] = default_region
+    path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
 
 def _rss(title: str, link: str) -> bytes:
@@ -81,16 +90,43 @@ def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch)
     }]
 
 
+def test_fetch_radar_applies_audited_config_default_region(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(
+        sources,
+        ["https://global.example.test/rss"],
+        default_region="GLOBAL",
+        source_region=None,
+    )
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("Global chip policy update", "https://global.example.test/a")),
+    )
+
+    data = newsradar.fetch_radar()
+
+    assert data["industries"][0]["items"][0]["region"] == "GLOBAL"
+
+
 def test_all_source_failure_keeps_last_valid_cache_bytes(tmp_path, monkeypatch):
     sources = tmp_path / "sources.json"
     cache = tmp_path / "radar.json"
-    _write_sources(sources, ["https://failed.example.test/rss"])
+    _write_sources(
+        sources,
+        ["https://failed.example.test/rss"],
+        default_region="GLOBAL",
+        source_region=None,
+    )
     old = {
         "generated_at": "2026-08-15T09:00:00+08:00",
         "recent_days": 7,
         "industries": [{
             "key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 1,
-            "items": [{"title": "最后一次有效资讯", "source_url": "https://failed.example.test/rss", "data_status": "realtime"}],
+            "items": [{"title": "最后一次有效资讯", "source_url": "https://failed.example.test/rss", "region": "unknown", "data_status": "realtime"}],
         }],
         "stats": {"industries": 1, "total_sources": 1, "failed_sources": 0},
         "cache_status": "cache",
@@ -106,6 +142,7 @@ def test_all_source_failure_keeps_last_valid_cache_bytes(tmp_path, monkeypatch):
     assert data["industries"][0]["items"][0]["title"] == "最后一次有效资讯"
     assert data["cache_status"] == "stale"
     assert data["industries"][0]["items"][0]["data_status"] == "stale"
+    assert data["industries"][0]["items"][0]["region"] == "GLOBAL"
     assert data["stats"]["failed_sources"] == 1
     assert data["source_statuses"][0]["status"] == "failed"
     assert cache.read_bytes() == original_bytes
@@ -134,6 +171,45 @@ def test_single_source_failure_returns_partial_success(tmp_path, monkeypatch):
     assert json.loads(cache.read_text(encoding="utf-8"))["cache_status"] == "partial"
 
 
+def test_partial_failure_reuses_legacy_item_with_configured_region(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    urls = ["https://good.example.test/rss", "https://failed.example.test/rss"]
+    _write_sources(sources, urls, default_region="GLOBAL", source_region=None)
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-17T09:00:00+00:00",
+        "recent_days": 30,
+        "cache_status": "realtime",
+        "industries": [{
+            "key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 2,
+            "items": [{
+                "title": "失败源旧资讯",
+                "source_name": "公开源 2",
+                "source_url": "https://failed.example.test/rss",
+                "region": "unknown",
+                "data_status": "realtime",
+            }],
+        }],
+        "stats": {"industries": 1, "total_sources": 2, "failed_sources": 0},
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+
+    def fake_open(request, timeout):
+        if request.full_url == "https://good.example.test/rss":
+            return _Response(_rss("新抓取资讯", "https://news.example.test/new"))
+        raise OSError("offline")
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+
+    data = newsradar.fetch_radar()
+    reused = next(item for item in data["industries"][0]["items"] if item["title"] == "失败源旧资讯")
+
+    assert data["cache_status"] == "partial"
+    assert reused["data_status"] == "stale"
+    assert reused["region"] == "GLOBAL"
+
+
 def test_load_cache_downgrades_item_status_to_current_container_state(tmp_path, monkeypatch):
     cache = tmp_path / "radar.json"
     cache.write_text(json.dumps({
@@ -148,6 +224,36 @@ def test_load_cache_downgrades_item_status_to_current_container_state(tmp_path, 
 
     assert data["cache_status"] == "cache"
     assert data["industries"][0]["items"][0]["data_status"] == "cache"
+
+
+def test_load_cache_enriches_legacy_region_in_memory_without_rewriting_bytes(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(
+        sources,
+        ["https://global.example.test/rss"],
+        default_region="GLOBAL",
+        source_region=None,
+    )
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-17T09:00:00+00:00",
+        "recent_days": 30,
+        "cache_status": "realtime",
+        "industries": [{"key": "semi", "items": [{
+            "title": "旧缓存全球资讯",
+            "source_url": "https://global.example.test/rss",
+            "region": "unknown",
+            "data_status": "realtime",
+        }]}],
+    }, ensure_ascii=False), encoding="utf-8")
+    original_bytes = cache.read_bytes()
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+
+    data = newsradar.load_cache()
+
+    assert data["industries"][0]["items"][0]["region"] == "GLOBAL"
+    assert cache.read_bytes() == original_bytes
 
 
 def test_unique_atomic_cache_writes_remain_valid_under_concurrency(tmp_path, monkeypatch):

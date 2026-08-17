@@ -194,6 +194,21 @@ def test_watch_tag_applies_only_after_holding_evidence_is_absent():
     assert related.relation_evidence == [{
         "matched_kind": "watch_tag", "matched_value": "存储", "tag_id": "storage",
     }]
+
+
+def test_watch_tag_uses_selected_article_evidence_not_feed_track():
+    event = _event("DRAM 产品报价出现改善", track_key="semi")
+
+    related = relate_events(
+        [event],
+        {"overview": {"fund_count": 0}, "holdings": []},
+        selected_tag_ids=["semiconductor", "storage"],
+    )[0]
+
+    assert related.relation_level == "watch_tag"
+    assert related.relation_evidence == [{
+        "matched_kind": "watch_tag", "matched_value": "存储", "tag_id": "storage",
+    }]
     assert related.confidence == "low"
 
 

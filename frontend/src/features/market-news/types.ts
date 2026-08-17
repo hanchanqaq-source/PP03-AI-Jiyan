@@ -77,7 +77,7 @@ export interface MarketNewsImpactSummary {
 
 export interface MarketNewsResponse {
   events: MarketNewsEvent[];
-  today_focus: MarketNewsEvent[];
+  focus_events: MarketNewsEvent[];
   impact_summary: MarketNewsImpactSummary | null;
   snapshot_id: string;
   generated_at: string | null;

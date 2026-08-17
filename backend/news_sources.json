@@ -5,6 +5,7 @@
   "timeout": 15,
   "recent_days": 7
  },
+ "default_region": "GLOBAL",
  "industries": [
   {
    "key": "ai",
@@ -284,6 +285,7 @@
    "name": "CnEVPost",
    "hint": "auto",
    "type": "rss",
+   "region": "CN",
    "url": "https://cnevpost.com/feed/"
   },
   {
@@ -338,6 +340,7 @@
    "name": "国际能源网",
    "hint": "energy",
    "type": "rss",
+   "region": "CN",
    "url": "https://www.in-en.com/feed/rss.php?mid=21"
   },
   {
@@ -494,24 +497,28 @@
    "name": "36氪",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://36kr.com/feed"
   },
   {
    "name": "钛媒体",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://www.tmtpost.com/rss.xml"
   },
   {
    "name": "少数派",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://sspai.com/feed"
   },
   {
    "name": "IT之家",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://www.ithome.com/rss/"
   },
   {
@@ -530,30 +537,35 @@
    "name": "虎嗅",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://rss.huxiu.com/"
   },
   {
    "name": "动点科技",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://cn.technode.com/feed/"
   },
   {
    "name": "月光博客",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://www.williamlong.info/rss.xml"
   },
   {
    "name": "Solidot",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://www.solidot.org/index.rss"
   },
   {
    "name": "白鲸出海",
    "hint": "tech",
    "type": "rss",
+   "region": "CN",
    "url": "https://www.baijingapp.com/feed"
   },
   {
@@ -596,6 +608,7 @@
    "name": "少数派",
    "hint": "consumer",
    "type": "rss",
+   "region": "CN",
    "url": "https://sspai.com/feed"
   },
   {

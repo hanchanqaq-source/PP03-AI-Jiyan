@@ -72,6 +72,29 @@ def test_normalize_radar_classifies_policy_and_specific_storage_tag():
     assert sources[0].related_tags == (("semiconductor", "半导体"), ("storage", "存储"))
 
 
+def test_article_tags_cover_enabled_ai_healthcare_and_semiconductor_aliases():
+    sources = normalize_radar(_radar(
+        _item("芯片产业需求升温", "https://news.example.test/chip", "2026-08-17T09:00:00+08:00", "公开媒体"),
+        _item("AI 医疗器械创新加速", "https://news.example.test/health-ai", "2026-08-17T09:05:00+08:00", "公开媒体"),
+    ), now=NOW)
+
+    chip_tags = set(sources[0].text_related_tags)
+    health_ai_tags = set(sources[1].text_related_tags)
+    assert ("semiconductor", "半导体") in chip_tags
+    assert ("artificial-intelligence", "人工智能") in health_ai_tags
+    assert ("healthcare", "医疗") in health_ai_tags
+    assert ("medical-device", "医疗器械") in health_ai_tags
+
+
+def test_robotics_article_tag_covers_chinese_and_english_automation_aliases():
+    sources = normalize_radar(_radar(
+        _item("工业自动化产线升级", "https://news.example.test/automation-cn", "2026-08-17T09:10:00+08:00", "公开媒体"),
+        _item("Factory automation investment rises", "https://news.example.test/automation-en", "2026-08-17T09:15:00+08:00", "公开媒体"),
+    ), now=NOW)
+
+    assert all(("robotics", "机器人") in set(source.text_related_tags) for source in sources)
+
+
 def test_normalize_radar_keeps_unknown_publication_time_explicit_and_out_of_recency():
     item = _item(
         "没有可靠发布时间的公开资讯",

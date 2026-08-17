@@ -147,9 +147,11 @@ def relate_holding_evidence(
                     ))
                     continue
                 classification_blob = _classification_text(classification).lower()
-                relationship_tags = [
-                    tag for tag in event.tag_evidence if tag.get("provenance") == "article_text"
-                ]
+                relationship_tags = sorted(
+                    (tag for tag in event.tag_evidence if tag.get("provenance") == "article_text"),
+                    key=lambda tag: len(str(tag.get("name") or "")),
+                    reverse=True,
+                )
                 for tag in relationship_tags:
                     tag_name = str(tag.get("name") or "").lower()
                     if tag_name and tag_name in classification_blob:
@@ -182,7 +184,10 @@ def apply_watch_relations(events: list[MarketNewsEvent], selected_tag_ids: list[
     for event in events:
         if event.relation_level != "none":
             continue
-        watched = next((tag for tag in event.related_tags if tag.get("id") in selected), None)
+        watched = next((
+            tag for tag in event.tag_evidence
+            if tag.get("id") in selected and tag.get("provenance") == "article_text"
+        ), None)
         if watched:
             event.relation_level = "watch_tag"
             event.confidence = "low"

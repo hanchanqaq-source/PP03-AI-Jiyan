@@ -27,10 +27,51 @@ TRACK_TAGS = {
 SPECIFIC_TAGS = (
     ("storage", "存储", ("存储", "dram", "nand", "hbm", "memory")),
     ("semiconductor-equipment", "半导体设备", ("半导体设备", "光刻", "刻蚀")),
+    ("semiconductor-materials", "半导体材料", ("半导体材料", "光刻胶", "电子特气")),
+    ("advanced-packaging", "先进封装", ("先进封装", "chiplet")),
     ("chip-design", "芯片设计", ("芯片设计", "ic设计", "数字芯片")),
+    ("pcb", "PCB", ("pcb", "印制电路板")),
     ("ai-computing", "AI算力", ("ai算力", "算力", "gpu", "服务器")),
+    ("optical-module", "光模块", ("光模块", "cpo")),
+    ("liquid-cooling", "液冷", ("液冷", "liquid cooling")),
+    ("data-center", "数据中心", ("数据中心", "data center")),
     ("software", "软件", ("软件", "software")),
-    ("robotics", "机器人", ("机器人", "具身智能", "robotics", "robot")),
+    ("robotics", "机器人", ("机器人", "人形机器人", "具身智能", "自动化", "robotics", "robot", "automation")),
+    ("reducer", "减速器", ("减速器", "谐波减速器")),
+    ("servo-system", "伺服系统", ("伺服系统", "伺服电机")),
+    ("machine-vision", "机器视觉", ("机器视觉", "machine vision")),
+    ("medical-device", "医疗器械", ("医疗器械", "medical device")),
+    ("innovative-drug", "创新药", ("创新药", "innovative drug")),
+    ("consumer-electronics", "消费电子", ("消费电子", "consumer electronics")),
+    ("food-beverage", "食品饮料", ("食品饮料", "food and beverage")),
+    ("new-energy-vehicle", "新能源汽车", ("新能源汽车", "新能源车", "electric vehicle", "ev")),
+    ("energy-storage", "储能", ("储能", "energy storage")),
+    ("photovoltaic", "光伏", ("光伏", "photovoltaic", "solar")),
+    ("industrial-automation", "工业自动化", ("工业自动化", "industrial automation")),
+    ("commercial-space", "商业航天", ("商业航天", "commercial space")),
+    ("cyclical-resources", "周期资源", ("周期资源", "cyclical resources")),
+    ("nonferrous", "有色金属", ("有色金属", "nonferrous")),
+    ("real-estate", "房地产", ("房地产", "real estate")),
+    ("transportation", "交通运输", ("交通运输", "transportation")),
+    ("overseas-market", "海外市场", ("海外市场", "overseas market")),
+    ("us-market", "美国市场", ("美国市场", "美股", "us market")),
+    ("hk-market", "香港市场", ("香港市场", "港股", "hong kong market")),
+    ("semiconductor", "半导体", ("半导体", "芯片", "集成电路", "晶圆", "封装", "semiconductor")),
+    ("artificial-intelligence", "人工智能", ("人工智能", "artificial intelligence", "ai")),
+    ("sensor", "传感器", ("传感器", "sensor")),
+    ("healthcare", "医疗", ("医疗", "医药", "生物医药", "healthcare")),
+    ("consumer", "消费", ("消费", "consumer")),
+    ("finance", "金融", ("金融", "finance")),
+    ("banking", "银行", ("银行", "banking")),
+    ("insurance", "保险", ("保险", "insurance")),
+    ("new-energy", "新能源", ("新能源", "new energy")),
+    ("advanced-manufacturing", "高端制造", ("高端制造", "advanced manufacturing")),
+    ("defense", "军工", ("军工", "defense")),
+    ("coal", "煤炭", ("煤炭", "coal")),
+    ("media", "传媒", ("传媒", "media")),
+    ("agriculture", "农业", ("农业", "agriculture")),
+    ("utilities", "公用事业", ("公用事业", "utilities")),
+    ("technology", "科技", ("科技", "technology")),
 )
 
 POLICY_RE = re.compile(r"政策|监管|国务院|部委|规则|规范|法案|禁令|制裁|policy|regulation|government", re.I)
@@ -113,12 +154,19 @@ def _related_tags(track_key: str, blob: str) -> tuple[tuple[tuple[str, str], ...
         tags.append(base)
     lowered = blob.lower()
     for tag_id, name, keywords in SPECIFIC_TAGS:
-        if any(keyword.lower() in lowered for keyword in keywords):
+        if any(_contains_keyword(lowered, keyword) for keyword in keywords):
             tag = (tag_id, name)
             text_tags.append(tag)
             if tag_id not in {existing[0] for existing in tags}:
                 tags.append(tag)
     return tuple(tags), tuple(text_tags)
+
+
+def _contains_keyword(lowered: str, keyword: str) -> bool:
+    needle = keyword.lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9+.# -]*", needle):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", lowered))
+    return needle in lowered
 
 
 def _effective_data_status(container_status: str, item_status: str) -> str:

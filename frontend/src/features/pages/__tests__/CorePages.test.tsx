@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
 import { directEvent, marketNewsResponse } from "@/features/market-news/__tests__/fixtures";
-import { MarketNews } from "@/pages/MarketNews";
+import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse } from "@/features/market-news/types";
+import { cacheMarketNewsResponse, MarketNews, readMarketNewsCache } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
 
 const now = Math.floor(Date.now() / 1000);
@@ -19,6 +20,42 @@ const radar: RadarData = {
     ] },
   ],
 };
+
+function queryFor(tagId: string, mode: MarketNewsQuery["mode"] = "my_focus"): MarketNewsQuery {
+  return { mode, tag_ids: [tagId], category: "all", days: 7, sort: "importance" };
+}
+
+function eventFor(id: string, title: string, tagId: string, tagName: string): MarketNewsEvent {
+  return {
+    ...directEvent,
+    event_id: id,
+    title,
+    related_tags: [{ id: tagId, name: tagName }],
+    tag_evidence: [{ id: tagId, name: tagName, provenance: "article_text" }],
+  };
+}
+
+function responseFor(
+  query: MarketNewsQuery,
+  event: MarketNewsEvent,
+  snapshotId: string,
+  holdingRelatedCount = 1,
+): MarketNewsResponse {
+  return {
+    ...marketNewsResponse,
+    events: [event],
+    focus_events: [event],
+    snapshot_id: snapshotId,
+    filters: query,
+    impact_summary: {
+      holding_related_count: holdingRelatedCount,
+      direct_count: holdingRelatedCount,
+      industry_count: 0,
+      watch_count: 0,
+      funds: holdingRelatedCount ? [{ fund_code: "017811", fund_name: "测试基金", event_count: holdingRelatedCount }] : [],
+    },
+  };
+}
 
 describe("PP03 core pages", () => {
   beforeEach(() => {
@@ -50,7 +87,20 @@ describe("PP03 core pages", () => {
     expect(load).toHaveBeenLastCalledWith({ mode: "domestic_policy", tag_ids: ["robotics"], category: "policy", days: 30, sort: "latest" });
   });
 
-  it("disables duplicate refresh and preserves the last successful events on failure", async () => {
+  it("bounds the full market-news response cache with LRU eviction", () => {
+    const cache = new Map<string, MarketNewsResponse>();
+    for (let index = 0; index < 12; index += 1) {
+      cacheMarketNewsResponse(cache, `query-${index}`, marketNewsResponse);
+    }
+
+    expect(cache).toHaveLength(12);
+    expect(readMarketNewsCache(cache, "query-0")).toBe(marketNewsResponse);
+    cacheMarketNewsResponse(cache, "query-12", marketNewsResponse);
+    expect(cache.has("query-0")).toBe(true);
+    expect(cache.has("query-1")).toBe(false);
+  });
+
+  it("preserves only the same query's last successful response on refresh failure", async () => {
     const user = userEvent.setup();
     vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [directEvent] });
     let rejectRefresh!: (reason: Error) => void;
@@ -64,8 +114,122 @@ describe("PP03 core pages", () => {
     expect(screen.getByText("刷新中")).toBeInTheDocument();
     rejectRefresh(new Error("offline"));
 
-    expect(await screen.findByText("资讯刷新失败；继续显示上次成功结果。")).toBeInTheDocument();
+    expect(await screen.findByText("当前筛选加载失败，继续显示该筛选上次成功结果。")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: directEvent.title })).toBeInTheDocument();
+  });
+
+  it("does not show a semiconductor response when a new storage query fails", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: ["semiconductor", "storage"], activeId: "semiconductor" }));
+    const semiconductorEvent = eventFor("semi-query-event", "半导体筛选成功事件", "semiconductor", "半导体");
+    const semiconductorQuery = queryFor("semiconductor");
+    vi.spyOn(api, "marketNewsEvents").mockImplementation((query) => {
+      if (query.tag_ids[0] === "semiconductor") {
+        return Promise.resolve(responseFor(semiconductorQuery, semiconductorEvent, "semi-snapshot"));
+      }
+      return Promise.reject(new Error("storage query offline"));
+    });
+
+    render(<MarketNews />);
+    expect(await screen.findByRole("heading", { name: semiconductorEvent.title })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "切换到存储" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("当前筛选加载失败，请稍后重试。");
+    expect(screen.getByText("当前筛选加载失败")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: semiconductorEvent.title })).not.toBeInTheDocument();
+  });
+
+  it("rejects a response whose filters do not match the current query", async () => {
+    const mismatchedEvent = eventFor("mismatch-event", "错误标签响应事件", "semiconductor", "半导体");
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue(
+      responseFor(queryFor("semiconductor"), mismatchedEvent, "mismatch-snapshot"),
+    );
+
+    render(<MarketNews />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("当前筛选加载失败，请稍后重试。");
+    expect(screen.queryByRole("heading", { name: mismatchedEvent.title })).not.toBeInTheDocument();
+  });
+
+  it("keeps list sidebar impact and open detail on the same query snapshot", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: ["storage", "robotics"], activeId: "storage" }));
+    const storageEvent = eventFor("storage-snapshot-event", "存储查询事件", "storage", "存储");
+    const roboticsEvent = eventFor("robotics-snapshot-event", "机器人查询事件", "robotics", "机器人");
+    vi.spyOn(api, "marketNewsEvents").mockImplementation((query) => Promise.resolve(
+      query.tag_ids[0] === "storage"
+        ? responseFor(queryFor("storage"), storageEvent, "storage-snapshot", 1)
+        : responseFor(queryFor("robotics"), roboticsEvent, "robotics-snapshot", 2),
+    ));
+
+    render(<MarketNews />);
+    expect(await screen.findByRole("heading", { name: storageEvent.title })).toBeInTheDocument();
+    expect(screen.getAllByText(storageEvent.title)).toHaveLength(2);
+    await user.click(screen.getByRole("button", { name: `查看事件详情 ${storageEvent.title}` }));
+    expect(screen.getByRole("dialog", { name: `${storageEvent.title}事件详情` })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+
+    expect(await screen.findByRole("heading", { name: roboticsEvent.title })).toBeInTheDocument();
+    expect(screen.getByText("过去 7 天有 2 个事件与你的持仓相关")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: `${storageEvent.title}事件详情` })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: storageEvent.title })).not.toBeInTheDocument();
+  });
+
+  it("does not reopen an old detail when returning to a query with a new snapshot", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: ["storage", "robotics"], activeId: "storage" }));
+    const storageOld = eventFor("storage-old-event", "存储旧快照事件", "storage", "存储");
+    const storageNew = eventFor("storage-new-event", "存储新快照事件", "storage", "存储");
+    const roboticsEvent = eventFor("robotics-between-event", "机器人中间查询", "robotics", "机器人");
+    let storageCalls = 0;
+    vi.spyOn(api, "marketNewsEvents").mockImplementation((query) => {
+      if (query.tag_ids[0] === "robotics") {
+        return Promise.resolve(responseFor(queryFor("robotics"), roboticsEvent, "robotics-between-snapshot"));
+      }
+      storageCalls += 1;
+      return Promise.resolve(storageCalls === 1
+        ? responseFor(queryFor("storage"), storageOld, "storage-old-snapshot")
+        : responseFor(queryFor("storage"), storageNew, "storage-new-snapshot"));
+    });
+
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: storageOld.title });
+    await user.click(screen.getByRole("button", { name: `查看事件详情 ${storageOld.title}` }));
+    expect(screen.getByRole("dialog", { name: `${storageOld.title}事件详情` })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    await screen.findByRole("heading", { name: roboticsEvent.title });
+    await user.click(screen.getByRole("button", { name: "切换到存储" }));
+
+    expect(screen.queryByRole("dialog", { name: `${storageOld.title}事件详情` })).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: storageNew.title })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not let an older tag response overwrite the newest tag query", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: ["storage", "semiconductor", "robotics"], activeId: "storage" }));
+    const storageEvent = eventFor("storage-event", "存储初始事件", "storage", "存储");
+    const semiconductorEvent = eventFor("semiconductor-event", "迟到的半导体事件", "semiconductor", "半导体");
+    const roboticsEvent = eventFor("robotics-event", "最新机器人事件", "robotics", "机器人");
+    let resolveSemiconductor!: (value: MarketNewsResponse) => void;
+    vi.spyOn(api, "marketNewsEvents").mockImplementation((query) => {
+      const tag = query.tag_ids[0];
+      if (tag === "storage") return Promise.resolve(responseFor(queryFor("storage"), storageEvent, "storage-snapshot"));
+      if (tag === "semiconductor") return new Promise((resolve) => { resolveSemiconductor = resolve; });
+      return Promise.resolve(responseFor(queryFor("robotics"), roboticsEvent, "robotics-snapshot"));
+    });
+
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: storageEvent.title });
+    await user.click(screen.getByRole("button", { name: "切换到半导体" }));
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    expect(await screen.findByRole("heading", { name: roboticsEvent.title })).toBeInTheDocument();
+
+    resolveSemiconductor(responseFor(queryFor("semiconductor"), semiconductorEvent, "semiconductor-snapshot"));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: semiconductorEvent.title })).not.toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: roboticsEvent.title })).toBeInTheDocument();
   });
 
   it("does not let a stale refresh overwrite a newer filter response", async () => {
@@ -74,7 +238,11 @@ describe("PP03 core pages", () => {
     const staleRefreshEvent = { ...directEvent, event_id: "cccccccccccccccccccc", title: "旧筛选刷新结果" };
     vi.spyOn(api, "marketNewsEvents")
       .mockResolvedValueOnce({ ...marketNewsResponse, events: [directEvent] })
-      .mockResolvedValueOnce({ ...marketNewsResponse, events: [filteredEvent] });
+      .mockResolvedValueOnce({
+        ...marketNewsResponse,
+        events: [filteredEvent],
+        filters: queryFor("storage", "global_tech"),
+      });
     let resolveRefresh!: (value: typeof marketNewsResponse) => void;
     vi.spyOn(api, "marketNewsRefresh").mockImplementation(() => new Promise((resolve) => { resolveRefresh = resolve; }));
     render(<MarketNews />);
@@ -153,8 +321,19 @@ describe("PP03 core pages", () => {
     const user = userEvent.setup();
     const load = vi.spyOn(api, "marketNewsEvents")
       .mockResolvedValueOnce({ ...marketNewsResponse, events: [directEvent] })
-      .mockResolvedValueOnce({ ...marketNewsResponse, events: [], empty_reason: "no_holdings", portfolio_status: "empty" })
-      .mockResolvedValueOnce({ ...marketNewsResponse, events: [], empty_reason: "no_events" });
+      .mockResolvedValueOnce({
+        ...marketNewsResponse,
+        events: [],
+        empty_reason: "no_holdings",
+        portfolio_status: "empty",
+        filters: queryFor("storage", "my_holdings"),
+      })
+      .mockResolvedValueOnce({
+        ...marketNewsResponse,
+        events: [],
+        empty_reason: "no_events",
+        filters: queryFor("storage", "global_tech"),
+      });
     render(<MarketNews />);
     await screen.findByRole("heading", { name: directEvent.title });
     await user.click(screen.getByRole("button", { name: "我的持仓" }));

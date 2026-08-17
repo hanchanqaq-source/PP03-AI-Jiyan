@@ -56,6 +56,47 @@ const STATUS_LABELS: Record<string, string> = {
   source_failure: "来源失败",
 };
 
+const MARKET_NEWS_CACHE_LIMIT = 12;
+
+export function cacheMarketNewsResponse(
+  cache: Map<string, MarketNewsResponse>,
+  queryKey: string,
+  response: MarketNewsResponse,
+): void {
+  cache.delete(queryKey);
+  cache.set(queryKey, response);
+  while (cache.size > MARKET_NEWS_CACHE_LIMIT) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
+  }
+}
+
+export function readMarketNewsCache(
+  cache: Map<string, MarketNewsResponse>,
+  queryKey: string,
+): MarketNewsResponse | null {
+  const response = cache.get(queryKey) || null;
+  if (response) {
+    cache.delete(queryKey);
+    cache.set(queryKey, response);
+  }
+  return response;
+}
+
+function normalizeQuery(query: MarketNewsQuery): MarketNewsQuery {
+  return { ...query, tag_ids: [...query.tag_ids].sort() };
+}
+
+function marketNewsQueryKey(query: MarketNewsQuery): string {
+  const normalized = normalizeQuery(query);
+  return [normalized.mode, normalized.tag_ids.join(","), normalized.category, normalized.days, normalized.sort].join("|");
+}
+
+function responseMatchesQuery(response: MarketNewsResponse, query: MarketNewsQuery): boolean {
+  return marketNewsQueryKey(response.filters) === marketNewsQueryKey(query);
+}
+
 function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_reason"]; onAddTag: () => void }) {
   if (reason === "no_tags") {
     return <div className="py-16 text-center"><p className="font-semibold">还没有选择关注行业</p><p className="mt-2 text-sm text-muted-foreground">添加半导体、存储、机器人、医疗等标签后开始跟踪资讯</p><button onClick={onAddTag} className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">添加标签</button></div>;
@@ -69,74 +110,112 @@ function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_re
   return <div className="py-16 text-center"><p className="font-semibold">当前筛选暂无可靠资讯</p><p className="mt-2 text-sm text-muted-foreground">可以扩大时间范围、切换标签或刷新公开来源</p><p className="mt-1 text-xs text-muted-foreground">系统不会用 AI 生成新闻。</p></div>;
 }
 
+function QueryFailureState() {
+  return <div className="py-16 text-center"><p className="font-semibold text-destructive">当前筛选加载失败</p><p className="mt-2 text-sm text-muted-foreground">该筛选还没有可回用的成功结果，请稍后重试。</p></div>;
+}
+
 export function MarketNews() {
   const tags = usePageTags("market_news");
   const [mode, setMode] = useState<MarketNewsMode>("my_focus");
   const [category, setCategory] = useState<MarketNewsCategoryFilter>("all");
   const [days, setDays] = useState<1 | 3 | 7 | 30>(7);
   const [sort, setSort] = useState<MarketNewsSort>("importance");
-  const [data, setData] = useState<MarketNewsResponse | null>(null);
-  const dataRef = useRef<MarketNewsResponse | null>(null);
+  const [view, setView] = useState<{ queryKey: string; response: MarketNewsResponse } | null>(null);
+  const responseCacheRef = useRef<Map<string, MarketNewsResponse>>(new Map());
   const requestIdRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [queryError, setQueryError] = useState<{ queryKey: string; message: string } | null>(null);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
-  const [detailEvent, setDetailEvent] = useState<MarketNewsEvent | null>(null);
+  const [detailSelection, setDetailSelection] = useState<{
+    queryKey: string;
+    snapshotId: string;
+    event: MarketNewsEvent;
+  } | null>(null);
 
-  const query = useMemo<MarketNewsQuery>(() => ({
+  const query = useMemo<MarketNewsQuery>(() => normalizeQuery({
     mode,
     tag_ids: tags.activeTag ? [tags.activeTag.id] : [],
     category,
     days,
     sort,
   }), [category, days, mode, sort, tags.activeTag]);
+  const queryKey = marketNewsQueryKey(query);
+  const data = view?.queryKey === queryKey
+    ? view.response
+    : responseCacheRef.current.get(queryKey) || null;
+  const detailEvent = detailSelection?.queryKey === queryKey && detailSelection.snapshotId === data?.snapshot_id
+    ? detailSelection.event
+    : null;
+
+  useEffect(() => {
+    setDetailSelection(null);
+  }, [queryKey]);
 
   useEffect(() => {
     const requestId = ++requestIdRef.current;
+    const cached = readMarketNewsCache(responseCacheRef.current, queryKey);
     setRefreshing(false);
     if (mode === "my_focus" && query.tag_ids.length === 0) {
-      dataRef.current = null;
-      setData(null);
+      setView(null);
       setLoading(false);
-      setError(null);
+      setQueryError(null);
       return;
     }
 
+    setView(cached ? { queryKey, response: cached } : null);
     setLoading(true);
-    setError(null);
+    setQueryError(null);
     api.marketNewsEvents(query).then((response) => {
       if (requestId !== requestIdRef.current) return;
-      dataRef.current = response;
-      setData(response);
+      if (!responseMatchesQuery(response, query)) throw new Error("market-news response filters mismatch");
+      cacheMarketNewsResponse(responseCacheRef.current, queryKey, response);
+      setView({ queryKey, response });
     }).catch(() => {
       if (requestId !== requestIdRef.current) return;
-      setError(dataRef.current ? "资讯加载失败；继续显示上次成功结果。" : "市场资讯加载失败，请稍后重试。");
+      const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
+      setView(sameQueryCache ? { queryKey, response: sameQueryCache } : null);
+      setQueryError({
+        queryKey,
+        message: sameQueryCache
+          ? "当前筛选加载失败，继续显示该筛选上次成功结果。"
+          : "当前筛选加载失败，请稍后重试。",
+      });
     }).finally(() => {
       if (requestId === requestIdRef.current) setLoading(false);
     });
-  }, [mode, query]);
+  }, [mode, query, queryKey]);
 
   const refresh = async () => {
     if (refreshing || loading || (mode === "my_focus" && query.tag_ids.length === 0)) return;
     const requestId = ++requestIdRef.current;
     setRefreshing(true);
-    setError(null);
+    setQueryError(null);
     try {
       const response = await api.marketNewsRefresh(query);
       if (requestId !== requestIdRef.current) return;
-      dataRef.current = response;
-      setData(response);
+      if (!responseMatchesQuery(response, query)) throw new Error("market-news refresh filters mismatch");
+      cacheMarketNewsResponse(responseCacheRef.current, queryKey, response);
+      setView({ queryKey, response });
     } catch {
       if (requestId !== requestIdRef.current) return;
-      setError(dataRef.current ? "资讯刷新失败；继续显示上次成功结果。" : "资讯刷新失败，请稍后重试。");
+      const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
+      setView(sameQueryCache ? { queryKey, response: sameQueryCache } : null);
+      setQueryError({
+        queryKey,
+        message: sameQueryCache
+          ? "当前筛选加载失败，继续显示该筛选上次成功结果。"
+          : "当前筛选加载失败，请稍后重试。",
+      });
     } finally {
       if (requestId === requestIdRef.current) setRefreshing(false);
     }
   };
 
   const noTags = mode === "my_focus" && query.tag_ids.length === 0;
+  const error = queryError?.queryKey === queryKey ? queryError.message : null;
+  const queryFailedWithoutCache = Boolean(error && !data && !noTags);
   const emptyReason = noTags ? "no_tags" : data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
   const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
 
@@ -179,17 +258,17 @@ export function MarketNews() {
 
       {error && <div role="alert" className="mb-4 flex items-center gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4 shrink-0" />{error}</div>}
 
-      {loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
+      {queryFailedWithoutCache ? <div className="rounded-2xl border border-destructive/30 bg-destructive/5"><QueryFailureState /></div> : loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
         <main className="rounded-2xl border border-border/70 bg-gradient-to-b from-slate-950/55 to-background/45 px-5" aria-label="市场资讯事件列表">
           {loading && <p className="border-b border-border/45 py-2 text-xs text-muted-foreground">正在更新筛选结果…</p>}
-          {data.events.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={setDetailEvent} />)}
+          {data.events.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id, event: selectedEvent })} />)}
         </main>
-        <MarketNewsSidebar focus={data.today_focus} impact={data.impact_summary} />
+        <MarketNewsSidebar focus={data.focus_events} impact={data.impact_summary} days={data.filters.days} />
       </div>}
 
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} onCancel={() => setSelectorOpen(false)} onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
       <DataInfoDialog open={infoOpen} onClose={() => setInfoOpen(false)} />
-      <EventDetailDrawer open={detailEvent !== null} event={detailEvent} onClose={() => setDetailEvent(null)} />
+      <EventDetailDrawer open={detailEvent !== null} event={detailEvent} onClose={() => setDetailSelection(null)} />
     </div>
   );
 }

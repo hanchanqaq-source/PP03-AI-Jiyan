@@ -30,7 +30,7 @@ export const directEvent: MarketNewsEvent = {
 
 export const marketNewsResponse: MarketNewsResponse = {
   events: [directEvent],
-  today_focus: [directEvent],
+  focus_events: [directEvent],
   impact_summary: {
     holding_related_count: 2, direct_count: 1, industry_count: 1, watch_count: 1,
     funds: [{ fund_code: "017811", fund_name: "东方人工智能主题混合C", event_count: 2 }],

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
@@ -41,9 +41,17 @@ def _radar() -> dict:
                 _source("cn", "北方华创发布公开公告", "https://cn.example.test/direct", "2026-08-17T11:30:00+08:00", region="CN"),
                 _source("cn", "半导体设备产业政策发布", "https://cn.example.test/policy", "2026-08-17T10:30:00+08:00", region="CN"),
                 _source("cn", "DRAM 产品报价出现改善", "https://cn.example.test/storage", "2026-08-17T09:30:00+08:00", region="CN"),
+                _source("cn", "存储产业支持政策发布", "https://cn.example.test/storage-policy", "2026-08-17T09:00:00+08:00", region="CN"),
             ]},
             {"key": "ai", "name": "AI / 大模型", "items": [
                 _source("global", "Global AI chip demand rises", "https://global.example.test/ai", "2026-08-17T08:30:00+08:00", region="US", language="en"),
+            ]},
+            {"key": "tech", "name": "Global technology", "items": [
+                _source("global", "Global HBM storage demand rises", "https://global.example.test/storage", "2026-08-17T08:00:00+08:00", region="US", language="en"),
+                _source("unknown", "Memory prices rise amid supply constraints", "https://unknown.example.test/storage", "2026-08-17T07:45:00+08:00", region="unknown", language="en"),
+            ]},
+            {"key": "robot", "name": "机器人", "items": [
+                _source("cn", "机器人公司发布量产公告", "https://cn.example.test/robot", "2026-08-17T07:30:00+08:00", region="CN"),
             ]},
         ],
     }
@@ -57,13 +65,24 @@ def _portfolio() -> dict:
             "analysis": {
                 "holdings": {"data": {
                     "disclosure_date": "2026-06-30",
-                    "holdings": [{"stock_code": "002371", "stock_name": "北方华创", "weight_pct": 9.8}],
+                    "holdings": [
+                        {"stock_code": "002371", "stock_name": "北方华创", "weight_pct": 9.8},
+                        {"stock_code": "300999", "stock_name": "机器人公司", "weight_pct": 4.2},
+                    ],
                 }},
                 "industry_exposure": {"data": {
                     "holding_industry_evidence": [{
                         "stock_code": "002371", "stock_name": "北方华创", "weight_pct": 9.8,
                         "primary_industry": "电子", "secondary_industry": "半导体",
                         "detail_industry": "半导体设备", "fine_industry": "半导体设备",
+                        "classification_standard": "申银万国行业分类标准",
+                        "source_name": "巨潮资讯上市公司行业归属",
+                        "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
+                        "holding_disclosure_date": "2026-06-30",
+                    }, {
+                        "stock_code": "300999", "stock_name": "机器人公司", "weight_pct": 4.2,
+                        "primary_industry": "机械设备", "secondary_industry": "自动化设备",
+                        "detail_industry": "机器人", "fine_industry": "机器人",
                         "classification_standard": "申银万国行业分类标准",
                         "source_name": "巨潮资讯上市公司行业归属",
                         "source_reference": "https://webapi.cninfo.com.cn/api/stock/p_stock2110",
@@ -90,16 +109,113 @@ def test_api_supports_four_modes_and_keeps_filters(monkeypatch):
     focus = client.get("/api/market-news/events?mode=my_focus&tag_id=storage&category=all&days=7&sort=importance")
     holdings = client.get("/api/market-news/events?mode=my_holdings&category=all&days=7&sort=holding_relevance")
     global_tech = client.get("/api/market-news/events?mode=global_tech&category=all&days=7&sort=latest")
-    policy = client.get("/api/market-news/events?mode=domestic_policy&category=policy&days=7&sort=importance")
+    policy = client.get("/api/market-news/events?mode=domestic_policy&tag_id=semiconductor&category=policy&days=7&sort=importance")
 
     assert focus.status_code == holdings.status_code == global_tech.status_code == policy.status_code == 200
-    assert [event["title"] for event in focus.json()["data"]["events"]] == ["DRAM 产品报价出现改善"]
+    assert [event["title"] for event in focus.json()["data"]["events"]] == [
+        "存储产业支持政策发布",
+        "DRAM 产品报价出现改善",
+        "Global HBM storage demand rises",
+        "Memory prices rise amid supply constraints",
+    ]
     assert {event["relation_level"] for event in holdings.json()["data"]["events"]} == {"direct_holding", "industry_relation"}
     assert "Global AI chip demand rises" in [event["title"] for event in global_tech.json()["data"]["events"]]
     assert [event["title"] for event in policy.json()["data"]["events"]] == ["半导体设备产业政策发布"]
     assert focus.json()["data"]["filters"] == {
         "mode": "my_focus", "tag_ids": ["storage"], "category": "all", "days": 7, "sort": "importance",
     }
+
+
+def test_all_modes_apply_selected_article_text_tags_after_mode_filter(monkeypatch):
+    monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: _service())
+
+    policy_semiconductor = client.get(
+        "/api/market-news/events?mode=domestic_policy&tag_id=semiconductor&category=all&days=7&sort=importance"
+    ).json()["data"]
+    policy_storage = client.get(
+        "/api/market-news/events?mode=domestic_policy&tag_id=storage&category=all&days=7&sort=importance"
+    ).json()["data"]
+    holdings_robotics = client.get(
+        "/api/market-news/events?mode=my_holdings&tag_id=robotics&category=all&days=7&sort=importance"
+    ).json()["data"]
+    global_storage = client.get(
+        "/api/market-news/events?mode=global_tech&tag_id=storage&category=all&days=7&sort=importance"
+    ).json()["data"]
+
+    assert [event["title"] for event in policy_semiconductor["events"]] == ["半导体设备产业政策发布"]
+    assert [event["title"] for event in policy_storage["events"]] == ["存储产业支持政策发布"]
+    assert [event["title"] for event in holdings_robotics["events"]] == ["机器人公司发布量产公告"]
+    assert [event["title"] for event in global_storage["events"]] == ["Global HBM storage demand rises"]
+    assert all(
+        any(tag["id"] == selected and tag["provenance"] == "article_text" for tag in event["tag_evidence"])
+        for data, selected in (
+            (policy_semiconductor, "semiconductor"),
+            (policy_storage, "storage"),
+            (holdings_robotics, "robotics"),
+            (global_storage, "storage"),
+        )
+        for event in data["events"]
+    )
+
+
+def test_focus_impact_and_detail_snapshot_use_only_current_filtered_range():
+    service = _service()
+    all_holdings = service.get_events(mode="my_holdings", tag_ids=[])
+    excluded = next(event for event in all_holdings["events"] if event["title"] == "北方华创发布公开公告")
+
+    robotics = service.get_events(
+        mode="my_holdings", tag_ids=["robotics"], category="all", days=7, sort="importance",
+    )
+    robotics_latest = service.get_events(
+        mode="my_holdings", tag_ids=["robotics"], category="all", days=7, sort="latest",
+    )
+
+    assert [event["title"] for event in robotics["events"]] == ["机器人公司发布量产公告"]
+    assert [event["event_id"] for event in robotics["focus_events"]] == [
+        event["event_id"] for event in robotics["events"]
+    ]
+    assert robotics["impact_summary"] == {
+        "holding_related_count": 1,
+        "direct_count": 1,
+        "industry_count": 0,
+        "watch_count": 0,
+        "funds": [{"fund_code": "017811", "fund_name": "东方人工智能主题混合C", "event_count": 1}],
+    }
+    assert service.get_event(excluded["event_id"], robotics["snapshot_id"]) is None
+    assert robotics["snapshot_id"] != robotics_latest["snapshot_id"]
+
+
+def test_snapshot_identity_changes_when_time_filter_ages_events_out():
+    clock = [NOW]
+    service = MarketNewsService(
+        radar_loader=_radar,
+        radar_refresher=_radar,
+        portfolio_loader=_portfolio,
+        now=lambda: clock[0],
+    )
+
+    first = service.get_events(mode="global_tech", tag_ids=["storage"], days=7)
+    first_event_id = first["events"][0]["event_id"]
+    clock[0] = NOW + timedelta(days=8)
+    second = service.get_events(mode="global_tech", tag_ids=["storage"], days=7)
+
+    assert second["events"] == []
+    assert first["snapshot_id"] != second["snapshot_id"]
+    assert service.get_event(first_event_id, first["snapshot_id"]) is not None
+
+
+def test_feed_track_only_tag_cannot_pass_current_article_tag_filter(monkeypatch):
+    monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: _service())
+
+    data = client.get(
+        "/api/market-news/events?mode=my_holdings&tag_id=semiconductor&category=all&days=7&sort=importance"
+    ).json()["data"]
+
+    assert "北方华创发布公开公告" not in [event["title"] for event in data["events"]]
+    assert all(
+        any(tag == {"id": "semiconductor", "name": "半导体", "provenance": "article_text"} for tag in event["tag_evidence"])
+        for event in data["events"]
+    )
 
 
 def test_api_returns_explicit_no_tags_and_no_holdings_states(monkeypatch):
@@ -126,7 +242,7 @@ def test_portfolio_failure_is_partial_success_and_ai_is_optional(monkeypatch):
     response = client.get("/api/market-news/events?mode=global_tech")
 
     assert response.status_code == 200
-    assert len(response.json()["data"]["events"]) == 4
+    assert len(response.json()["data"]["events"]) == 2
     assert response.json()["data"]["portfolio_status"] == "error"
     assert response.json()["data"]["impact_summary"] is None
     assert response.json()["data"]["ai_status"] == "unavailable"
@@ -146,7 +262,7 @@ def test_refresh_failure_keeps_cached_events(monkeypatch):
     response = client.post("/api/market-news/refresh?mode=global_tech&days=7&sort=importance")
 
     assert response.status_code == 200
-    assert len(response.json()["data"]["events"]) == 4
+    assert len(response.json()["data"]["events"]) == 2
     assert response.json()["data"]["source_summary"]["refresh_failed"] is True
     assert response.json()["data"]["data_status"] == "cache"
 
@@ -211,7 +327,7 @@ def test_base_snapshot_key_ignores_runtime_portfolio_timestamps(monkeypatch):
     assert len(service._base_snapshots) == 1
 
 
-def test_unknown_publication_time_is_excluded_from_time_window_and_today_focus(monkeypatch):
+def test_unknown_publication_time_is_excluded_from_time_window_and_filter_focus(monkeypatch):
     radar = _radar()
     radar["industries"][0]["items"].append({
         **_source("cn", "发布时间未知的政策资讯", "https://cn.example.test/unknown", "", region="CN"),
@@ -228,7 +344,7 @@ def test_unknown_publication_time_is_excluded_from_time_window_and_today_focus(m
     data = client.get("/api/market-news/events?mode=domestic_policy&days=30").json()["data"]
 
     assert "发布时间未知的政策资讯" not in [event["title"] for event in data["events"]]
-    assert "发布时间未知的政策资讯" not in [event["title"] for event in data["today_focus"]]
+    assert "发布时间未知的政策资讯" not in [event["title"] for event in data["focus_events"]]
 
 
 def test_invalid_market_news_filters_return_422(monkeypatch):

@@ -17,8 +17,8 @@ from news_intelligence.ranking import rank_events
 from news_intelligence.relationships import apply_watch_relations, relate_events
 
 
-BEIJING = timezone(timedelta(hours=8))
 TECH_TRACKS = {"ai", "semi", "robot", "auto", "energy", "bio", "space", "security", "tech", "consumer", "science"}
+GLOBAL_REGIONS = {"GLOBAL", "US", "CA", "EU", "UK", "JP", "KR", "TW", "HK", "SG", "AU"}
 MODES = {"my_focus", "my_holdings", "global_tech", "domestic_policy"}
 CATEGORIES = {"all", "policy", "industry", "company", "fund_notice", "deep_content"}
 SORTS = {"importance", "latest", "holding_relevance"}
@@ -132,6 +132,14 @@ class MarketNewsService:
             while len(self._detail_snapshots) > 16:
                 self._detail_snapshots.popitem(last=False)
 
+    @staticmethod
+    def _article_tag_ids(event: Any) -> set[str]:
+        return {
+            str(tag.get("id") or "")
+            for tag in event.tag_evidence
+            if tag.get("provenance") == "article_text" and tag.get("id")
+        }
+
     def get_events(
         self,
         *,
@@ -152,12 +160,8 @@ class MarketNewsService:
             now = now.replace(tzinfo=timezone.utc)
         base_key, all_events = self._base_events(radar, portfolio, portfolio_status, now)
         apply_watch_relations(all_events, selected_tags)
-        all_events = rank_events(all_events, "importance")
-        snapshot_id = hashlib.sha256(
-            f"{base_key}|{'|'.join(sorted(selected_tags))}".encode("utf-8")
-        ).hexdigest()[:20]
-        self._remember_details(snapshot_id, all_events)
 
+        # One canonical query pipeline: time -> category -> mode -> article tags -> sort.
         cutoff = now - timedelta(days=days)
         filtered = [
             event for event in all_events
@@ -184,33 +188,47 @@ class MarketNewsService:
             else:
                 filtered = [event for event in filtered if event.relation_level in {"direct_holding", "industry_relation"}]
         elif mode == "global_tech":
-            filtered = [event for event in filtered if any(source.track_key in TECH_TRACKS for source in event.sources)]
+            filtered = [
+                event for event in filtered
+                if any(source.track_key in TECH_TRACKS and source.region.upper() in GLOBAL_REGIONS for source in event.sources)
+            ]
         elif mode == "domestic_policy":
             filtered = [
                 event for event in filtered
                 if event.category == "policy" and any(source.region.upper() == "CN" for source in event.sources)
             ]
 
+        if selected_tags:
+            selected = set(selected_tags)
+            filtered = [event for event in filtered if selected & self._article_tag_ids(event)]
+
         filtered = rank_events(filtered, sort)
         if not filtered and empty_reason is None:
             empty_reason = "no_events"
 
-        today = now.astimezone(BEIJING).date()
-        today_events = [
-            event for event in all_events
-            if event.published_at_latest is not None and event.published_at_latest.astimezone(BEIJING).date() == today
-        ]
-        today_ranked = rank_events(today_events, "importance")
-        relation_counts = Counter(event.relation_level for event in today_events)
+        normalized_query = {
+            "mode": mode,
+            "tag_ids": sorted(selected_tags),
+            "category": category,
+            "days": days,
+            "sort": sort,
+        }
+        filtered_fingerprint = self._fingerprint([event.event_id for event in filtered])
+        snapshot_id = hashlib.sha256(
+            f"{base_key}|{self._fingerprint(normalized_query)}|{filtered_fingerprint}".encode("utf-8")
+        ).hexdigest()[:20]
+        self._remember_details(snapshot_id, filtered)
+
+        relation_counts = Counter(event.relation_level for event in filtered)
         fund_counts: Counter[tuple[str, str]] = Counter()
-        for event in today_events:
+        for event in filtered:
             for fund in event.related_funds:
                 fund_counts[(str(fund.get("fund_code") or ""), str(fund.get("fund_name") or ""))] += 1
         failed_sources = int((radar.get("stats") or {}).get("failed_sources") or 0)
         data_status = str(radar.get("cache_status") or "cache")
         return {
             "events": [event.to_dict() for event in filtered],
-            "today_focus": [event.to_dict() for event in today_ranked[:5]],
+            "focus_events": [event.to_dict() for event in filtered[:5]],
             "impact_summary": None if portfolio_status == "error" else {
                 "holding_related_count": relation_counts["direct_holding"] + relation_counts["industry_relation"],
                 "direct_count": relation_counts["direct_holding"],
@@ -234,9 +252,7 @@ class MarketNewsService:
             "snapshot_id": snapshot_id,
             "ai_status": "unavailable",
             "empty_reason": empty_reason,
-            "filters": {
-                "mode": mode, "tag_ids": selected_tags, "category": category, "days": days, "sort": sort,
-            },
+            "filters": normalized_query,
             "filter_options": {
                 "modes": sorted(MODES), "categories": sorted(CATEGORIES), "days": [1, 3, 7, 30], "sorts": sorted(SORTS),
             },

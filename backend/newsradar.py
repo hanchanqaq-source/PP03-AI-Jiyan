@@ -31,6 +31,31 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 BEIJING = timezone(timedelta(hours=8))
 
 
+def _load_source_config() -> dict:
+    with open(SOURCES_FILE, encoding="utf-8") as source_file:
+        config = json.load(source_file)
+    default_region = str(config.get("default_region") or "unknown")
+    config["sources"] = [
+        {**source, "region": source.get("region") or default_region}
+        for source in config["sources"]
+    ]
+    return config
+
+
+def _apply_configured_regions(data: dict, sources: list[dict]) -> None:
+    by_url = {str(source.get("url") or ""): str(source.get("region") or "unknown") for source in sources}
+    by_name = {str(source.get("name") or ""): str(source.get("region") or "unknown") for source in sources}
+    for industry in data.get("industries") or []:
+        for item in industry.get("items") or []:
+            if str(item.get("region") or "unknown").lower() != "unknown":
+                continue
+            region = by_url.get(str(item.get("source_url") or ""))
+            if not region:
+                region = by_name.get(str(item.get("source_name") or item.get("source") or ""))
+            if region:
+                item["region"] = region
+
+
 def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
 
@@ -122,6 +147,7 @@ def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -
         if item.get("source_url") == src["url"] or item.get("source_name") == src["name"] or item.get("source") == src["name"]:
             copied = dict(item)
             copied["data_status"] = "stale"
+            copied["region"] = src.get("region") or copied.get("region") or "unknown"
             out.append(copied)
     return out
 
@@ -162,8 +188,7 @@ def _write_cache(data: dict) -> None:
 
 def fetch_radar() -> dict:
     """抓全部源，返回 12 赛道数据并落盘缓存。"""
-    with open(SOURCES_FILE, encoding="utf-8") as source_file:
-        cfg = json.load(source_file)
+    cfg = _load_source_config()
     previous = load_cache()
     days = cfg.get("fetch", {}).get("recent_days", 7)
     per = cfg.get("fetch", {}).get("per_source", 6)
@@ -235,6 +260,7 @@ def load_cache():
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        _apply_configured_regions(data, _load_source_config()["sources"])
         generated_at = _parse_dt(str(data.get("generated_at") or ""))
         recent_days = int(data.get("recent_days") or 7)
         is_stale = bool(generated_at and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
