@@ -28,6 +28,7 @@ from email.utils import parsedate_to_datetime
 
 from source_health.probe_errors import (
     ProbeEmptyPayloadError,
+    ProbeParseError,
     classify_probe_error,
     redact_probe_message,
     redact_url,
@@ -140,7 +141,10 @@ def _parse_dt(s: str):
 def _decode_feed(raw: bytes, headers: object) -> str:
     content_encoding = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Encoding", "") or "").lower()
     if "gzip" in content_encoding or raw.startswith(b"\x1f\x8b"):
-        raw = gzip.decompress(raw)
+        try:
+            raw = gzip.decompress(raw)
+        except Exception as error:
+            raise ProbeParseError("gzip decode failed") from error
     content_type = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Type", "") or "")
     charset = None
     match = re.search(r"(?i)charset\s*=\s*['\"]?([^\s;'\"]+)", content_type)
@@ -150,11 +154,23 @@ def _decode_feed(raw: bytes, headers: object) -> str:
         declaration = re.match(br"\s*<\?xml[^>]*encoding\s*=\s*['\"]([^'\"]+)", raw, flags=re.I)
         if declaration:
             charset = declaration.group(1).decode("ascii", errors="replace")
-    return raw.decode(charset or "utf-8-sig")
+    try:
+        return raw.decode(charset or "utf-8-sig")
+    except (LookupError, UnicodeError) as error:
+        raise ProbeParseError("character decode failed") from error
 
 
-def _parse_feed_items(src: dict, root: ET.Element, per: int, cutoff, redline: list[str], fetched_at: str) -> list[dict]:
+def _parse_feed_items(
+    src: dict,
+    root: ET.Element,
+    per: int,
+    cutoff,
+    redline: list[str],
+    fetched_at: str,
+) -> tuple[list[dict], int, str | None]:
     out = []
+    valid_items_before_cutoff = 0
+    latest_valid_published_at = None
     for n in [e for e in root.iter() if _local(e.tag) in ("item", "entry")]:
         if len(out) >= per:
             break
@@ -181,19 +197,22 @@ def _parse_feed_items(src: dict, root: ET.Element, per: int, cutoff, redline: li
         blob = (d["title"] + " " + d["summary"]).lower()
         if any(k in blob for k in redline):
             continue
+        valid_items_before_cutoff += 1
         dt = _parse_dt(rawtime)
         if dt is not None:
+            published_at = dt.astimezone(BEIJING).isoformat(timespec="seconds")
+            latest_valid_published_at = max(latest_valid_published_at or published_at, published_at)
             if cutoff and dt < cutoff:
                 continue
             d["time"] = dt.astimezone(BEIJING).strftime("%m-%d %H:%M")
             d["ts"] = int(dt.timestamp())
-            d["published_at"] = dt.astimezone(BEIJING).isoformat(timespec="seconds")
+            d["published_at"] = published_at
         else:
             d["time"] = "—"
         d["original_url"] = d["url"]
         d["summary_or_excerpt"] = d["summary"]
         out.append(d)
-    return out
+    return out, valid_items_before_cutoff, latest_valid_published_at
 
 
 def _request_decode_parse_source(
@@ -226,7 +245,9 @@ def _request_decode_parse_source(
                 content_type = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Type", "") or "")
             decoded = _decode_feed(raw, headers)
             root = ET.fromstring(decoded)
-            items = _parse_feed_items(src, root, per, cutoff, redline, fetched_at)
+            items, valid_items_before_cutoff, latest_valid_published_at = _parse_feed_items(
+                src, root, per, cutoff, redline, fetched_at,
+            )
             return {
                 "status": "success",
                 "items": items,
@@ -238,6 +259,8 @@ def _request_decode_parse_source(
                 "redirected": str(final_url) != str(src["url"]),
                 "final_url": redact_url(final_url),
                 "content_type": content_type,
+                "_valid_items_before_cutoff": valid_items_before_cutoff,
+                "_latest_valid_published_at": latest_valid_published_at,
             }
         except Exception as error:
             classified = classify_probe_error(error)
@@ -306,13 +329,22 @@ def probe_source_config(
         timeout=float(timeout if timeout is not None else 14),
         retry_transient=True,
     )
+    valid_items_before_cutoff = int(result.pop("_valid_items_before_cutoff", 0))
+    latest_valid_published_at = result.pop("_latest_valid_published_at", None)
     if result["status"] == "success" and not result["items"]:
-        classified = classify_probe_error(ProbeEmptyPayloadError())
-        result.update({
-            "status": "failure",
-            "error_type": classified.error_type,
-            "error_message_redacted": classified.message,
-        })
+        if valid_items_before_cutoff and latest_valid_published_at:
+            result.update({
+                "status": "partial",
+                "error_type": "stale_data",
+                "error_message_redacted": "数据日期超过能力新鲜度阈值",
+            })
+        else:
+            classified = classify_probe_error(ProbeEmptyPayloadError())
+            result.update({
+                "status": "failure",
+                "error_type": classified.error_type,
+                "error_message_redacted": classified.message,
+            })
     elif result["status"] == "success" and result["redirected"]:
         result.update({
             "status": "partial",
@@ -322,7 +354,7 @@ def probe_source_config(
     result["returned_items"] = len(result["items"])
     result["latest_published_at"] = max(
         (str(item["published_at"]) for item in result["items"] if item.get("published_at")),
-        default=None,
+        default=latest_valid_published_at,
     )
     result["error_message_redacted"] = redact_probe_message(result["error_message_redacted"])
     return result

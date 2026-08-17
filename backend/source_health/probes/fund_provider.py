@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import math
+from numbers import Real
 import re
 import time
 from typing import Any
@@ -23,6 +25,10 @@ def _present(value: Any) -> bool:
 
 def _valid_code(value: Any) -> bool:
     return bool(_CODE.fullmatch(str(value or "")))
+
+
+def _finite_real(value: Any) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
 def _valid_date(value: Any) -> bool:
@@ -69,7 +75,7 @@ def _validate(capability: str, data: Any, probe_args: dict[str, Any]) -> tuple[f
             raise ProbeSchemaError()
         points = data.get("points")
         latest = data.get("latest")
-        numeric_nav = isinstance(latest, dict) and isinstance(latest.get("unit_nav"), (int, float)) and latest["unit_nav"] > 0
+        numeric_nav = isinstance(latest, dict) and _finite_real(latest.get("unit_nav")) and latest["unit_nav"] > 0
         checks = (isinstance(points, list) and bool(points), numeric_nav, isinstance(latest, dict) and _valid_date(latest.get("nav_date")))
         completeness = _pct(sum(map(int, checks)), len(checks))
         if not all(checks):
@@ -140,21 +146,26 @@ def _validate(capability: str, data: Any, probe_args: dict[str, Any]) -> tuple[f
     if capability == "stock_snapshot":
         if not isinstance(data, dict):
             raise ProbeSchemaError()
-        requested = {str(code) for code in probe_args.get("codes") or []}
-        matched = [
-            row for key, row in data.items()
-            if isinstance(row, dict) and (str(key) in requested or str(row.get("stock_code") or "") in requested)
-        ]
-        if not requested or not matched:
+        requested = list(dict.fromkeys(str(code) for code in probe_args.get("codes") or []))
+        if not requested or not all(_valid_code(code) for code in requested):
             raise ProbeSchemaError()
         checks = []
-        for row in matched:
+        matched = []
+        for code in requested:
+            row = data.get(code)
+            consistent = isinstance(row, dict) and str(row.get("stock_code") or "") == code
+            if not consistent:
+                checks.extend([False, False, False, False])
+                continue
+            matched.append(row)
             checks.extend([
                 _valid_code(row.get("stock_code")),
                 _present(row.get("stock_name")),
-                _present(row.get("price")),
-                _present(row.get("change_pct")),
+                _finite_real(row.get("price")),
+                _finite_real(row.get("change_pct")),
             ])
+        if not matched:
+            raise ProbeSchemaError()
         return _pct(sum(map(int, checks)), len(checks)), len(matched)
 
     raise ProbeSchemaError()

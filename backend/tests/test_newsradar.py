@@ -190,6 +190,71 @@ def test_probe_source_config_parse_failure_and_empty_feed_do_not_retry(monkeypat
         assert len(calls) == 1
 
 
+def test_probe_source_config_classifies_valid_old_feed_as_stale_data(monkeypatch):
+    old = '''<?xml version="1.0"?><rss><channel><item><title>历史公开资讯</title><link>https://news.example.test/old</link><pubDate>Wed, 01 Jan 2020 00:00:00 GMT</pubDate></item></channel></rss>'''.encode()
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(old),
+    )
+
+    result = newsradar.probe_source_config(_probe_source(), recent_days=30)
+
+    assert result["status"] == "partial"
+    assert result["error_type"] == "stale_data"
+    assert result["returned_items"] == 0
+    assert result["latest_published_at"] == "2020-01-01T08:00:00+08:00"
+
+
+@pytest.mark.parametrize(
+    ("payload", "headers"),
+    [
+        (b"\x1f\x8bnot-a-valid-gzip-stream", {"Content-Encoding": "gzip"}),
+        (_rss("编码未知", "https://news.example.test/charset"), {"Content-Type": "application/rss+xml; charset=not-a-real-codec"}),
+    ],
+)
+def test_probe_source_config_treats_decode_failures_as_non_retryable_parse(payload, headers, monkeypatch):
+    calls = []
+
+    def fake_open(request, timeout):
+        calls.append(request)
+        return _Response(payload, headers=headers)
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+
+    result = newsradar.probe_source_config(_probe_source())
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == "parse"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "WRONG_VERSION_NUMBER",
+        "unsupported protocol",
+        "no shared cipher",
+        "certificate verify failed",
+    ],
+)
+def test_probe_source_config_does_not_retry_permanent_tls_errors(detail, monkeypatch):
+    calls = []
+
+    def fake_open(request, timeout):
+        calls.append(request)
+        raise ssl.SSLError(detail)
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: pytest.fail("permanent TLS errors must not sleep"))
+
+    result = newsradar.probe_source_config(_probe_source())
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == "tls"
+    assert len(calls) == 1
+
+
 def test_probe_source_config_redacts_failures_and_never_writes_radar_cache(tmp_path, monkeypatch):
     cache = tmp_path / "radar.json"
     monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))

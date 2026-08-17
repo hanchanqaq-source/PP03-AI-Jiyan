@@ -31,6 +31,10 @@ class ProbeStaleDataError(ValueError):
     pass
 
 
+class ProbeParseError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class ClassifiedProbeError:
     error_type: str
@@ -60,6 +64,11 @@ def redact_probe_message(value: object) -> str:
     text = str(value or "")
     text = re.sub(r"(?is)Traceback \(most recent call last\):.*", "", text)
     text = re.sub(
+        r"(?i)(?<![\w:/])(?:\\\\\?\\)?[A-Z]:[\\/].*$",
+        "[local-path]",
+        text,
+    )
+    text = re.sub(
         r"(?i)\b(?:authorization|proxy-authorization|cookie)\s*[:=]\s*[^\r\n,;]+",
         "[credential-redacted]",
         text,
@@ -75,8 +84,6 @@ def redact_probe_message(value: object) -> str:
         return redact_url(match.group(0)) or "[url-redacted]"
 
     text = re.sub(r"https?://[^\s,;]+", _redact_match, text)
-    text = re.sub(r"(?i)\b[A-Z]:\\Users\\[^\s,;]+", "[local-path]", text)
-    text = re.sub(r"(?i)(?<![\w:/])\b[A-Z]:\\[^\s,;]+", "[local-path]", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:200]
 
@@ -116,8 +123,13 @@ def classify_probe_error(error: BaseException) -> ClassifiedProbeError:
     for item in chain:
         if isinstance(item, (requests.exceptions.SSLError, ssl.SSLError)):
             detail = str(item).lower()
-            temporary = not any(marker in detail for marker in ("certificate verify", "cert_verify", "hostname mismatch"))
+            temporary = isinstance(item, (ssl.SSLWantReadError, ssl.SSLWantWriteError)) or any(
+                marker in detail
+                for marker in ("temporary", "temporarily", "timed out", "timeout", "try again", "unexpected eof")
+            )
             return ClassifiedProbeError("tls", "TLS 连接失败", retryable=temporary)
+    if any(isinstance(item, ProbeParseError) for item in chain):
+        return ClassifiedProbeError("parse", "响应内容解析失败")
     if any(isinstance(item, (requests.ConnectionError, ConnectionError, urllib.error.URLError, OSError)) for item in chain):
         return ClassifiedProbeError("connection", "连接失败", retryable=True)
     if any(isinstance(item, ProbeEmptyPayloadError) for item in chain):

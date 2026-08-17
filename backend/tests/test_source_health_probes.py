@@ -104,6 +104,82 @@ def test_stock_snapshot_missing_optional_quotes_is_partial_without_fabricating_v
     assert "change_pct" not in result["data"]["600000"]
 
 
+def test_stock_snapshot_completeness_counts_every_requested_code():
+    provider = FakeProvider({
+        "600000": {
+            "stock_code": "600000",
+            "stock_name": "浦发银行",
+            "price": 10.5,
+            "change_pct": 1.2,
+        }
+    })
+
+    result = probe_provider_capability(
+        provider,
+        "stock_snapshot",
+        probe_args={"codes": ["600000", "000001"]},
+    )
+
+    assert result["status"] == "partial"
+    assert result["returned_items"] == 1
+    assert result["field_completeness_pct"] == 50.0
+
+
+def test_stock_snapshot_rejects_mismatched_mapping_key_and_row_code():
+    provider = FakeProvider({
+        "600000": {
+            "stock_code": "000001",
+            "stock_name": "错误映射",
+            "price": 10.5,
+            "change_pct": 1.2,
+        }
+    })
+
+    result = probe_provider_capability(
+        provider,
+        "stock_snapshot",
+        probe_args={"codes": ["600000"]},
+    )
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == "schema_changed"
+    assert result["field_completeness_pct"] == 0.0
+
+
+def test_nav_and_quote_completeness_require_finite_non_boolean_numbers():
+    nav = probe_provider_capability(
+        FakeProvider({
+            "points": [{"date": "2026-08-18", "unit_nav": True}],
+            "latest": {"unit_nav": True, "nav_date": "2026-08-18"},
+        }),
+        "nav_history",
+        probe_args={"code": "000001"},
+    )
+    quote = probe_provider_capability(
+        FakeProvider({
+            "600000": {
+                "stock_code": "600000",
+                "stock_name": "浦发银行",
+                "price": "--",
+                "change_pct": True,
+            },
+            "000001": {
+                "stock_code": "000001",
+                "stock_name": "平安银行",
+                "price": float("nan"),
+                "change_pct": float("inf"),
+            },
+        }),
+        "stock_snapshot",
+        probe_args={"codes": ["600000", "000001"]},
+    )
+
+    assert nav["status"] == "failure"
+    assert nav["error_type"] == "schema_changed"
+    assert quote["status"] == "partial"
+    assert quote["field_completeness_pct"] == 50.0
+
+
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
@@ -147,3 +223,22 @@ def test_probe_redacts_credentials_and_local_paths():
     assert "Bearer" not in result.message
     assert "26365" not in result.message
     assert "trace.log" not in result.message
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\Alice Smith\private folder\trace.log",
+        "C:/Users/Alice Smith/private folder/trace.log",
+        r"D:\private workspace\source health\debug.txt",
+    ],
+)
+def test_probe_redacts_standalone_windows_paths_with_spaces_and_slashes(path):
+    result = classify_probe_error(RuntimeError(path))
+
+    lowered = result.message.lower()
+    assert "alice" not in lowered
+    assert "private" not in lowered
+    assert "trace.log" not in lowered
+    assert "debug.txt" not in lowered
+    assert "users" not in lowered
