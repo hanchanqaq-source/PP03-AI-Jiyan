@@ -25,6 +25,7 @@ import cli_runtime
 import debate as debate_layer
 import gstock
 import newsradar
+import news_translation
 import portfolio as pf
 import fund_portfolio as fpf
 from fund_data import service as fund_service
@@ -487,6 +488,18 @@ MarketNewsSort = Literal["importance", "latest", "holding_relevance"]
 MarketNewsDays = int
 
 
+class MarketNewsTranslationItem(BaseModel):
+    event_id: str = Field(pattern=r"^[a-f0-9]{20}$")
+    title: str = Field(min_length=1, max_length=1000)
+    summary: str = Field(default="", max_length=8000)
+    source_language: str = Field(default="unknown", max_length=32)
+
+
+class MarketNewsTranslationReq(BaseModel):
+    items: list[MarketNewsTranslationItem] = Field(default_factory=list, max_length=20)
+    llm: LLMConfig | None = None
+
+
 def _market_news_payload(
     mode: MarketNewsMode,
     tag_id: list[str],
@@ -523,6 +536,17 @@ def market_news_refresh(
     sort: MarketNewsSort = "importance",
 ):
     return _market_news_payload(mode, tag_id, category, days, sort, True)
+
+
+@app.post("/api/market-news/translations")
+def market_news_translations(req: MarketNewsTranslationReq):
+    """Translate only the requested visible events; model credentials are request-scoped."""
+    try:
+        items = [item.model_dump() for item in req.items]
+        llm = req.llm.model_dump() if req.llm is not None else None
+        return {"data": news_translation.get_service().translate_batch(items, llm)}
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
 
 
 @app.get("/api/market-news/events/{event_id}")

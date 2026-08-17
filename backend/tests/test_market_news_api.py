@@ -352,3 +352,65 @@ def test_invalid_market_news_filters_return_422(monkeypatch):
 
     for query in ["mode=unknown", "category=rumor", "days=2", "sort=ai_opinion"]:
         assert client.get(f"/api/market-news/events?{query}").status_code == 422
+
+
+def test_market_news_translation_endpoint_passes_ephemeral_model_config(monkeypatch):
+    captured = {}
+
+    class TranslationService:
+        def translate_batch(self, items, llm):
+            captured["items"] = items
+            captured["llm"] = llm
+            return {"translations": [{
+                "event_id": items[0]["event_id"],
+                "translated_title_zh": "美光发布 HBM3E",
+                "translated_summary_zh": "本季度开始出货。",
+                "translation_status": "translated",
+                "translation_provider": llm["provider"],
+                "translated_at": "2026-08-17T04:00:00+00:00",
+            }], "limit": 20}
+
+    monkeypatch.setattr(app_module.news_translation, "get_service", lambda: TranslationService())
+    payload = {
+        "items": [{
+            "event_id": "a" * 20,
+            "title": "Micron launches HBM3E",
+            "summary": "Shipments begin this quarter.",
+            "source_language": "en",
+        }],
+        "llm": {
+            "provider": "openai",
+            "baseURL": "https://model.example.test/v1",
+            "apiKey": "request-only-secret",
+            "model": "test-model",
+        },
+    }
+
+    response = client.post("/api/market-news/translations", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["data"]["translations"][0]["translated_title_zh"] == "美光发布 HBM3E"
+    assert captured == {"items": payload["items"], "llm": payload["llm"]}
+    assert "request-only-secret" not in response.text
+
+
+def test_market_news_translation_endpoint_allows_missing_model_and_rejects_more_than_twenty(monkeypatch):
+    class TranslationService:
+        def translate_batch(self, items, llm):
+            assert llm is None
+            return {"translations": [], "limit": 20}
+
+    monkeypatch.setattr(app_module.news_translation, "get_service", lambda: TranslationService())
+
+    missing = client.post("/api/market-news/translations", json={"items": []})
+    too_many = client.post("/api/market-news/translations", json={
+        "items": [{
+            "event_id": f"{index:020x}",
+            "title": "English title",
+            "summary": "Summary",
+            "source_language": "en",
+        } for index in range(21)],
+    })
+
+    assert missing.status_code == 200
+    assert too_many.status_code == 422
