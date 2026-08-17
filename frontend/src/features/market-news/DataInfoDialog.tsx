@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Loader2, Trash2, X } from "lucide-react";
 import type { CacheStatus } from "./types";
 import { api } from "@/lib/api";
+import { SourceHealthSummary } from "@/features/source-health/SourceHealthSummary";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
@@ -13,7 +14,23 @@ function formatTime(value: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "暂无记录";
 }
 
-export function DataInfoDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+interface DataInfoDialogProps {
+  open: boolean;
+  onClose: () => void;
+  onOpenSourceHealth?: () => void;
+  onSourceHealthUpdated?: () => void;
+  sourceHealthDetailsRef?: RefObject<HTMLButtonElement | null>;
+  autoFocusSourceHealthDetails?: boolean;
+}
+
+export function DataInfoDialog({
+  open,
+  onClose,
+  onOpenSourceHealth = () => {},
+  onSourceHealthUpdated,
+  sourceHealthDetailsRef,
+  autoFocusSourceHealthDetails = false,
+}: DataInfoDialogProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const previousRef = useRef<HTMLElement | null>(null);
   const [status, setStatus] = useState<CacheStatus | null>(null);
@@ -61,6 +78,12 @@ export function DataInfoDialog({ open, onClose }: { open: boolean; onClose: () =
   return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section role="dialog" aria-modal="true" aria-label="市场资讯数据说明" className="glass max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-primary/30 p-5 shadow-2xl">
     <header className="flex items-start justify-between gap-3"><div><h2 className="text-lg font-bold">数据说明</h2><p className="mt-1 text-xs text-muted-foreground">资讯、持仓与 AI 的边界</p></div><button ref={closeRef} onClick={onClose} aria-label="关闭数据说明" className="rounded-lg p-2 text-muted-foreground hover:bg-muted"><X className="h-4 w-4" /></button></header>
     <div className="mt-4 space-y-3 text-sm leading-6 text-muted-foreground"><p><strong className="text-foreground">资讯来源：</strong>公开 RSS、公司公告、政策与公开产业内容；每个事件保留原始链接、发布时间和来源状态。</p><p><strong className="text-foreground">持仓依据：</strong>只使用基金最新公开前十大持仓与有来源的上市公司行业分类，不根据基金名称生成直接关系。</p><p><strong className="text-foreground">更新时间：</strong>刷新失败时继续显示最后一次有效缓存，并明确标记缓存、过期或来源失败。</p><p><strong className="text-foreground">AI 边界：</strong>AI 仅可辅助摘要、解释和原文翻译；不可编造新闻、持仓或数字，也不会输出买入、卖出、加仓或减仓指令。</p></div>
+    <SourceHealthSummary
+      onOpenDetails={onOpenSourceHealth}
+      onUpdated={onSourceHealthUpdated}
+      detailsButtonRef={sourceHealthDetailsRef}
+      autoFocusDetails={autoFocusSourceHealthDetails}
+    />
     <section className="mt-5 rounded-xl border border-border/60 bg-muted/15 p-4" aria-label="缓存管理">
       <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold text-foreground">缓存管理</h3><p className="mt-1 text-xs text-muted-foreground">只清理已过期缓存和临时文件，不清空持仓、标签、设置或有效缓存。</p></div><button onClick={cleanup} disabled={cleaning} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/45 disabled:cursor-not-allowed disabled:opacity-50">{cleaning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}清理过期缓存</button></div>
       {status && <div className="mt-3 grid gap-1 text-xs text-muted-foreground sm:grid-cols-2"><p>当前占用：{formatBytes(status.total_bytes)}</p><p>可回收：{formatBytes(status.reclaimable_bytes)}</p><p>文件数量：{status.file_count}</p><p>过期数量：{status.expired_count}</p><p className="sm:col-span-2">上次清理：{formatTime(status.last_auto_cleanup_at)}</p></div>}

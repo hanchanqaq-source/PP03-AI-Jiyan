@@ -6,6 +6,7 @@ import { EventCard } from "@/features/market-news/EventCard";
 import { EventDetailDrawer } from "@/features/market-news/EventDetailDrawer";
 import { MarketNewsSidebar } from "@/features/market-news/MarketNewsSidebar";
 import { SourceFailureDialog } from "@/features/market-news/SourceFailureDialog";
+import { SourceHealthDrawer } from "@/features/source-health/SourceHealthDrawer";
 import type {
   MarketNewsCategoryFilter,
   MarketNewsEvent,
@@ -195,6 +196,10 @@ export function MarketNews() {
   const [queryError, setQueryError] = useState<{ queryKey: string; message: string } | null>(null);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
+  const [sourceHealthOpen, setSourceHealthOpen] = useState(false);
+  const [sourceHealthRefreshToken, setSourceHealthRefreshToken] = useState(0);
+  const [returnToSourceHealthDetails, setReturnToSourceHealthDetails] = useState(false);
+  const sourceHealthDetailsRef = useRef<HTMLButtonElement>(null);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
   const [detailSelection, setDetailSelection] = useState<{
     queryKey: string;
@@ -381,7 +386,7 @@ export function MarketNews() {
         title="市场资讯"
         subtitle="把新闻、政策、公司公告和你的基金持仓关联起来"
         actions={<div className="flex items-center gap-2">
-          <button onClick={() => setInfoOpen(true)} aria-label="数据说明" className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:border-primary/45 hover:text-foreground"><Database className="h-4 w-4" />数据说明</button>
+          <button onClick={() => { setReturnToSourceHealthDetails(false); setInfoOpen(true); }} aria-label="数据说明" className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:border-primary/45 hover:text-foreground"><Database className="h-4 w-4" />数据说明</button>
           <button onClick={refresh} disabled={refreshing || loading || noTags} aria-label="刷新资讯" className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{refreshing ? "刷新中" : "刷新资讯"}</button>
         </div>}
       />
@@ -424,7 +429,23 @@ export function MarketNews() {
       </div>}
 
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} onCancel={() => setSelectorOpen(false)} onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
-      <DataInfoDialog open={infoOpen} onClose={() => setInfoOpen(false)} />
+      <DataInfoDialog
+        open={infoOpen}
+        onClose={() => setInfoOpen(false)}
+        onOpenSourceHealth={() => { setInfoOpen(false); setSourceHealthOpen(true); }}
+        onSourceHealthUpdated={() => setSourceHealthRefreshToken((value) => value + 1)}
+        sourceHealthDetailsRef={sourceHealthDetailsRef}
+        autoFocusSourceHealthDetails={returnToSourceHealthDetails}
+      />
+      <SourceHealthDrawer
+        open={sourceHealthOpen}
+        refreshToken={sourceHealthRefreshToken}
+        onClose={() => {
+          setSourceHealthOpen(false);
+          setReturnToSourceHealthDetails(true);
+          setInfoOpen(true);
+        }}
+      />
       <SourceFailureDialog open={sourceDialogOpen} statuses={data?.source_summary.source_statuses || []} onClose={() => setSourceDialogOpen(false)} onRetry={retrySource} />
       <EventDetailDrawer open={detailEvent !== null} event={detailEvent} onClose={() => setDetailSelection(null)} />
     </div>

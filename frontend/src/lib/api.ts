@@ -19,6 +19,12 @@ import type {
   MarketNewsTranslationResponse,
 } from "@/features/market-news/types";
 import type { LlmConfig } from "@/lib/llm";
+import type {
+  SourceHealthRun,
+  SourceHealthRunStarted,
+  SourceHealthSource,
+  SourceHealthSummaryData,
+} from "@/features/source-health/types";
 
 export type {
   DataMeta,
@@ -311,6 +317,10 @@ export const api = {
   ),
   cacheStatus: () => get<CacheStatus>("/cache/status"),
   cacheCleanupExpired: () => request<CacheCleanupResult>("/cache/cleanup-expired", "POST"),
+  sourceHealthSummary: () => get<SourceHealthSummaryData>("/source-health/summary"),
+  sourceHealthSources: () => get<SourceHealthSource[]>("/source-health/sources"),
+  sourceHealthStartFullRun: () => request<SourceHealthRunStarted>("/source-health/runs", "POST", { scope: "full" }),
+  sourceHealthRun: (runId: string) => get<SourceHealthRun>(`/source-health/runs/${encodeURIComponent(runId)}`),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),

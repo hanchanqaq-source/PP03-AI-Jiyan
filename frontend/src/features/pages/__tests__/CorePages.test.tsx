@@ -455,6 +455,33 @@ describe("PP03 core pages", () => {
     expect(screen.getByText(/不会输出买入、卖出/)).toBeInTheDocument();
   });
 
+  it("moves from data info to one health drawer and restores focus to details after Escape", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [directEvent] });
+    vi.spyOn(api, "cacheStatus").mockResolvedValue({ total_bytes: 0, file_count: 0, expired_count: 0, reclaimable_bytes: 0, categories: {}, last_auto_cleanup_at: null, limit_bytes: 0, over_limit_bytes: 0 });
+    (api as any).sourceHealthSummary = vi.fn().mockResolvedValue({
+      rating_confidence: "initial", last_run_at: "2026-08-18T06:30:00+00:00",
+      fund: { healthy: 1, usable: 0, degraded: 0, failed: 0 },
+      news: { healthy: 1, usable: 0, degraded: 0, failed: 0 }, total_sources: 2, reclaimable_bytes: 0,
+    });
+    (api as any).sourceHealthSources = vi.fn().mockResolvedValue([]);
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: directEvent.title });
+
+    await user.click(screen.getByRole("button", { name: "数据说明" }));
+    const details = await screen.findByRole("button", { name: "查看详情" });
+    await user.click(details);
+
+    expect(screen.queryByRole("dialog", { name: "市场资讯数据说明" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "数据源健康详情" })).toBeInTheDocument();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+
+    await user.keyboard("{Escape}");
+    expect(await screen.findByRole("dialog", { name: "市场资讯数据说明" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "数据源健康详情" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "查看详情" })).toHaveFocus();
+  });
+
   it("retries one failed source and replaces list, focus and impact with one matching response snapshot", async () => {
     const user = userEvent.setup();
     const sourceId = "0123456789abcdef";
