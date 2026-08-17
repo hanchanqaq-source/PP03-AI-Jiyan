@@ -290,6 +290,36 @@ def test_authoritative_snapshot_is_durable_before_completed_last_run_marker(tmp_
     service.shutdown()
 
 
+def test_authoritative_snapshot_wins_over_failed_last_run_for_same_run_after_restart(tmp_path):
+    class FailCompletedLastRunStorage(SourceHealthStorage):
+        def write_last_run(self, document):
+            if document.get("status") == "completed":
+                raise OSError("completed marker unavailable")
+            return super().write_last_run(document)
+
+    storage = FailCompletedLastRunStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    first = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+
+    run = first.start_run("full")
+    wait_for(first, run["run_id"], status="failed")
+    assert first.get_summary()["total_sources"] == 0
+    first.shutdown()
+
+    restarted = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+
+    assert restarted.get_summary()["total_sources"] == 1
+    assert restarted.list_sources()[0]["source_id"] == "fund:p1:profile"
+    assert restarted.get_run(run["run_id"])["status"] == "completed"
+
+    distinct_run_id = "d" * 20
+    storage.write_last_run({"run_id": distinct_run_id, "scope": "full", "status": "failed"})
+    with_distinct_last_run = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+    assert with_distinct_last_run.get_run(run["run_id"])["status"] == "completed"
+    assert with_distinct_last_run.get_run(distinct_run_id)["status"] == "failed"
+    restarted.shutdown()
+    with_distinct_last_run.shutdown()
+
+
 def test_quick_admission_is_durable_before_background_run_completes(tmp_path):
     runner = BlockingRunner()
     storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)

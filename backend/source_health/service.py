@@ -75,6 +75,7 @@ class SourceHealthService:
             return None
 
     def _restore_state(self) -> None:
+        snapshot_run_id = ""
         snapshot = self._read_json(self.storage.current_snapshot_path)
         if snapshot:
             summary = snapshot.get("summary")
@@ -89,7 +90,7 @@ class SourceHealthService:
         last_run = self._read_json(self.storage.last_run_path)
         if last_run:
             run_id = str(last_run.get("run_id") or "")
-            if run_id:
+            if run_id and run_id != snapshot_run_id:
                 self._runs[run_id] = last_run
         admission = self._read_json(self.storage.quick_admission_path)
         stamp = admission.get("scheduled_at") if admission else None
