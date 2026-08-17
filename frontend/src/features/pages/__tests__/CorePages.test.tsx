@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
 import { directEvent, marketNewsResponse, translatedEnglishEvent } from "@/features/market-news/__tests__/fixtures";
-import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse } from "@/features/market-news/types";
+import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse, MarketNewsTranslationResponse } from "@/features/market-news/types";
 import { cacheMarketNewsResponse, MarketNews, readMarketNewsCache } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
 
@@ -166,10 +166,10 @@ describe("PP03 core pages", () => {
         ? responseFor(queryFor("storage"), storage, "storage-translation-snapshot")
         : responseFor(queryFor("robotics"), robotics, "robotics-translation-snapshot"),
     ));
-    let resolveStorage!: (value: { translations: Array<Record<string, unknown>>; limit: number }) => void;
-    vi.spyOn(api as any, "marketNewsTranslations").mockImplementation(({ items }: { items: Array<{ event_id: string }> }) => {
+    let resolveStorage!: (value: MarketNewsTranslationResponse) => void;
+    vi.spyOn(api, "marketNewsTranslations").mockImplementation(({ items }) => {
       if (items[0].event_id === storage.event_id) return new Promise((resolve) => { resolveStorage = resolve; });
-      return Promise.resolve({ translations: [{ event_id: robotics.event_id, translated_title_zh: "机器人中文标题", translated_summary_zh: "机器人摘要", translation_status: "translated", translation_provider: "openai", translated_at: "2026-08-17T04:01:00+00:00" }], limit: 20 });
+      return Promise.resolve<MarketNewsTranslationResponse>({ translations: [{ event_id: robotics.event_id, translated_title_zh: "机器人中文标题", translated_summary_zh: "机器人摘要", translation_status: "translated", translation_provider: "openai", translated_at: "2026-08-17T04:01:00+00:00" }], limit: 20 });
     });
 
     render(<MarketNews />);

@@ -313,7 +313,7 @@ export function MarketNews() {
     if (retryId !== sourceRetryIdRef.current || activeQueryKeyRef.current !== retryQueryKey) return;
     const current = responseCacheRef.current.get(retryQueryKey);
     if (!current || current.snapshot_id !== retrySnapshotId) return;
-    if ("retry_succeeded" in result && result.retry_succeeded === false) {
+    if (!("events" in result)) {
       const sourceStatuses = current.source_summary.source_statuses.map((source) => (
         source.source_id === sourceId ? result.source_status : source
       ));
