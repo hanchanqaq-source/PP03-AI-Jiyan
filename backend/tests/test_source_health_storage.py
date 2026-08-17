@@ -59,17 +59,28 @@ def test_concurrent_history_append_keeps_every_json_line_valid(tmp_path):
 
 
 def test_cleanup_history_retains_exactly_ninety_days_and_current_files(tmp_path):
-    storage = SourceHealthStorage(root=tmp_path / "source-health")
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
     storage.write_current_summary({"keep": True})
     storage.write_last_run({"keep": True})
-    expired = storage.append_history({"age": 91}, observed_at=NOW - timedelta(days=91))
-    boundary = storage.append_history({"age": 90}, observed_at=NOW - timedelta(days=90))
-    recent = storage.append_history({"age": 1}, observed_at=NOW - timedelta(days=1))
+    expired = storage.history_path(NOW - timedelta(days=91))
+    boundary = storage.history_path(NOW - timedelta(days=90))
+    recent = storage.history_path(NOW - timedelta(days=1))
+    storage.history_root.mkdir(parents=True)
+    for path in (expired, boundary, recent):
+        path.write_text('{"fixture":true}\n', encoding="utf-8")
 
-    removed = storage.cleanup_history(now=NOW)
+    removed = storage.cleanup_history()
 
     assert removed == [expired]
     assert not expired.exists()
     assert boundary.exists() and recent.exists()
     assert storage.current_summary_path.exists()
     assert storage.last_run_path.exists()
+
+
+def test_append_history_does_not_leave_an_expired_backfill(tmp_path):
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
+
+    expired = storage.append_history({"age": 91}, observed_at=NOW - timedelta(days=91))
+
+    assert not expired.exists()

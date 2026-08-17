@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from cache_io_lock import CACHE_IO_LOCK
 
@@ -38,6 +38,7 @@ class SourceHealthStorage:
         root: str | os.PathLike[str] | None = None,
         *,
         data_dir: str | os.PathLike[str] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         if root is not None and data_dir is not None:
             raise ValueError("pass root or data_dir, not both")
@@ -53,6 +54,7 @@ class SourceHealthStorage:
         self.current_summary_path = self.root / "current-summary.json"
         self.last_run_path = self.root / "last-run.json"
         self.history_root = self.root / "history"
+        self._now = now or (lambda: datetime.now(timezone.utc))
 
     def _atomic_write(self, path: Path, document: Mapping[str, Any] | object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,15 +97,15 @@ class SourceHealthStorage:
         *,
         observed_at: date | datetime | str | None = None,
     ) -> Path:
-        timestamp = observed_at or datetime.now(timezone.utc)
+        timestamp = observed_at or self._now()
         path = self.history_path(timestamp)
         encoded = json.dumps(_json_document(document), ensure_ascii=False, separators=(",", ":")) + "\n"
         with CACHE_IO_LOCK:
             self.history_root.mkdir(parents=True, exist_ok=True)
-            self._cleanup_history(datetime.now(timezone.utc))
             with path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(encoded)
                 handle.flush()
+            self._cleanup_history(self._now())
         return path
 
     def _cleanup_history(self, now: date | datetime) -> list[Path]:
@@ -129,7 +131,7 @@ class SourceHealthStorage:
 
     def cleanup_history(self, *, now: date | datetime | None = None) -> list[Path]:
         with CACHE_IO_LOCK:
-            return self._cleanup_history(now or datetime.now(timezone.utc))
+            return self._cleanup_history(now or self._now())
 
     def load_history(
         self,
@@ -139,7 +141,7 @@ class SourceHealthStorage:
     ) -> list[dict[str, Any]]:
         if days < 1 or days > HISTORY_RETENTION_DAYS:
             raise ValueError(f"days must be between 1 and {HISTORY_RETENTION_DAYS}")
-        end = _date_value(now or datetime.now(timezone.utc))
+        end = _date_value(now or self._now())
         start = end - timedelta(days=days - 1)
         documents: list[dict[str, Any]] = []
         with CACHE_IO_LOCK:

@@ -162,6 +162,8 @@ def score_observation(
     observation_dates: Iterable[date | datetime | str] = (),
     sample_count: int = 1,
 ) -> ProbeObservation:
+    if freshness_applicable and freshness_max_age_seconds is None:
+        raise ValueError("freshness_max_age_seconds is required when freshness is applicable")
     dimensions: dict[str, float | int | None] = {
         "availability": availability_score(observation.probe_status),
         "freshness": (

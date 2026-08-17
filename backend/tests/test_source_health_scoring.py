@@ -187,6 +187,15 @@ def test_score_observation_removes_an_inapplicable_fallback_even_when_one_exists
     assert subject.rating_score == pytest.approx(22.67)
 
 
+def test_score_observation_rejects_applicable_freshness_without_a_threshold():
+    with pytest.raises(ValueError, match="freshness_max_age_seconds is required"):
+        score_observation(
+            observation(),
+            freshness_max_age_seconds=None,
+            freshness_applicable=True,
+        )
+
+
 def test_tls_bypass_is_never_recommended_as_an_immediate_fix():
     advice = advise_repair(
         observation(probe_status="failure", error_type="tls"),
