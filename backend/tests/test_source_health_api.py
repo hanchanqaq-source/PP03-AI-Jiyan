@@ -81,6 +81,24 @@ class BlockingRunner(ImmediateRunner):
         return super().run(scope, on_result=on_result)
 
 
+class ScopedRunner(ImmediateRunner):
+    def __init__(self, *, full_rows, quick_rows):
+        super().__init__(full_rows)
+        self.full_rows = full_rows
+        self.quick_rows = quick_rows
+
+    def select(self, scope):
+        return [object() for _ in (self.quick_rows if scope == "quick" else self.full_rows)]
+
+    def run(self, scope, *, on_result=None):
+        rows = self.quick_rows if scope == "quick" else self.full_rows
+        self.calls.append(scope)
+        for row in rows:
+            if on_result:
+                on_result(row)
+        return list(rows)
+
+
 def wait_for(service: SourceHealthService, run_id: str, status: str = "completed"):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -180,6 +198,109 @@ def test_completed_run_persists_last_run_summary_and_history(tmp_path):
     assert {row["run_id"] for row in history} == {run["run_id"]}
     assert service.list_sources(group="news", rating="failed")[0]["source_id"] == "news:n1"
     service.shutdown()
+
+
+def test_quick_refresh_merges_critical_rows_without_dropping_full_snapshot(tmp_path):
+    critical_id = "fund:critical:profile"
+    news_id = "news:noncritical"
+    runner = ScopedRunner(
+        full_rows=[
+            observation(critical_id),
+            observation(news_id, group="news"),
+        ],
+        quick_rows=[observation(critical_id, status="failure", rating="failed")],
+    )
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    service = SourceHealthService(runner=runner, storage=storage, now=lambda: NOW)
+
+    full = service.start_run("full")
+    wait_for(service, full["run_id"])
+    quick = service.schedule_quick_if_due()
+    assert quick is not None
+    wait_for(service, quick["run_id"])
+
+    sources = {row["source_id"]: row for row in service.list_sources()}
+    summary = service.get_summary()
+    assert set(sources) == {critical_id, news_id}
+    assert sources[critical_id]["rating"] == "failed"
+    assert sources[news_id]["rating"] == "healthy"
+    assert summary["total_sources"] == 2
+    assert summary["fund"]["failed"] == 1
+    assert summary["news"]["healthy"] == 1
+    service.shutdown()
+
+
+def test_run_stays_running_until_persistence_succeeds_or_becomes_failed(tmp_path):
+    class FailingSnapshotStorage(SourceHealthStorage):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.persistence_reached = threading.Event()
+            self.release = threading.Event()
+
+        def write_current_snapshot(self, document):
+            self.persistence_reached.set()
+            self.release.wait(timeout=2)
+            raise OSError("snapshot unavailable")
+
+    storage = FailingSnapshotStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    service = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+
+    run = service.start_run("full")
+    assert storage.persistence_reached.wait(timeout=1)
+    assert service.get_run(run["run_id"])["status"] == "running"
+    assert service.get_summary()["total_sources"] == 0
+    assert service.list_sources() == []
+
+    storage.release.set()
+    failed = wait_for(service, run["run_id"], status="failed")
+    assert failed["status"] == "failed"
+    assert service.get_summary()["total_sources"] == 0
+    assert service.list_sources() == []
+    service.shutdown()
+
+
+def test_quick_admission_is_durable_before_background_run_completes(tmp_path):
+    runner = BlockingRunner()
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    first = SourceHealthService(runner=runner, storage=storage, now=lambda: NOW)
+
+    admitted = first.schedule_quick_if_due()
+    assert admitted is not None
+    assert runner.started.wait(timeout=1)
+    admission = json.loads(storage.quick_admission_path.read_text(encoding="utf-8"))
+    assert admission == {"run_id": admitted["run_id"], "scheduled_at": NOW.isoformat()}
+
+    restarted = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+    assert restarted.schedule_quick_if_due() is None
+
+    runner.release.set()
+    wait_for(first, admitted["run_id"])
+    first.shutdown()
+    restarted.shutdown()
+
+
+def test_completed_source_snapshot_restores_summary_and_sources_after_restart(tmp_path):
+    rows = [
+        observation("fund:persisted:profile"),
+        observation("news:persisted", group="news", status="failure", rating="failed"),
+    ]
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    first = SourceHealthService(runner=ImmediateRunner(rows), storage=storage, now=lambda: NOW)
+    run = first.start_run("full")
+    wait_for(first, run["run_id"])
+    expected_summary = first.get_summary()
+    first.shutdown()
+
+    restarted = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+
+    assert restarted.get_summary() == expected_summary
+    assert {row["source_id"] for row in restarted.list_sources()} == {
+        "fund:persisted:profile", "news:persisted",
+    }
+    assert restarted.list_sources(group="news", rating="failed")[0]["source_id"] == "news:persisted"
+    assert "sources" not in restarted.get_summary()
+    assert "sources" not in json.loads(storage.current_summary_path.read_text(encoding="utf-8"))
+    restarted.shutdown()
 
 
 def test_service_never_reads_fund_portfolio_user_data(monkeypatch, tmp_path):

@@ -75,18 +75,28 @@ class SourceHealthService:
             return None
 
     def _restore_state(self) -> None:
-        summary = self._read_json(self.storage.current_summary_path)
-        if summary:
-            self._summary = summary
+        snapshot = self._read_json(self.storage.current_snapshot_path)
+        if snapshot:
+            summary = snapshot.get("summary")
+            sources = snapshot.get("sources")
+            completed_run = snapshot.get("run")
+            if isinstance(summary, dict) and isinstance(sources, list) and isinstance(completed_run, dict):
+                self._summary = summary
+                self._sources = [dict(row) for row in sources if isinstance(row, dict)]
+                snapshot_run_id = str(completed_run.get("run_id") or "")
+                if snapshot_run_id:
+                    self._runs[snapshot_run_id] = completed_run
         last_run = self._read_json(self.storage.last_run_path)
-        if not last_run:
-            return
-        run_id = str(last_run.get("run_id") or "")
-        if run_id:
-            self._runs[run_id] = last_run
-        stamp = last_run.get("last_quick_run_at")
-        if not stamp and last_run.get("scope") == "quick" and last_run.get("status") == "completed":
-            stamp = last_run.get("finished_at")
+        if last_run:
+            run_id = str(last_run.get("run_id") or "")
+            if run_id:
+                self._runs[run_id] = last_run
+        admission = self._read_json(self.storage.quick_admission_path)
+        stamp = admission.get("scheduled_at") if admission else None
+        if not stamp and last_run:
+            stamp = last_run.get("last_quick_run_at")
+            if not stamp and last_run.get("scope") == "quick" and last_run.get("status") == "completed":
+                stamp = last_run.get("finished_at")
         if stamp:
             try:
                 self._last_quick_run_at = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
@@ -138,8 +148,13 @@ class SourceHealthService:
         if scope == "full":
             self._active_full = run["run_id"]
         else:
+            scheduled_at = self._now()
+            self.storage.write_quick_admission({
+                "run_id": run["run_id"],
+                "scheduled_at": scheduled_at.isoformat(),
+            })
             self._quick_pending = True
-            self._last_quick_run_at = self._now()
+            self._last_quick_run_at = scheduled_at
         self._coordinator.submit(self._execute, run["run_id"])
         return dict(run)
 
@@ -167,18 +182,18 @@ class SourceHealthService:
             run[observation.probe_status] += 1
             run["current_source"] = observation.source_name
 
-    def _build_summary(self, observations: list[ProbeObservation], finished_at: str) -> dict[str, Any]:
+    def _build_summary(self, sources: list[dict[str, Any]], finished_at: str) -> dict[str, Any]:
         fund = _empty_counts()
         news = _empty_counts()
-        for observation in observations:
-            target = news if observation.group == "news" else fund
-            target[observation.rating] += 1
+        for source in sources:
+            target = news if source.get("group") == "news" else fund
+            target[str(source.get("rating") or "failed")] += 1
         return {
             "rating_confidence": "initial",
             "last_run_at": finished_at,
             "fund": fund,
             "news": news,
-            "total_sources": len(observations),
+            "total_sources": len(sources),
             "reclaimable_bytes": self._reclaimable_bytes(),
         }
 
@@ -190,27 +205,40 @@ class SourceHealthService:
         try:
             observations = self.runner.run(scope, on_result=lambda row: self._record_result(run_id, row))
             finished_at = self._now().isoformat()
-            summary = self._build_summary(observations, finished_at)
-            source_rows = [row.to_dict() for row in observations]
+            refreshed_rows = [row.to_dict() for row in observations]
             with self._lock:
-                run = self._runs[run_id]
-                run["status"] = "completed"
-                run["finished_at"] = finished_at
                 if scope == "quick":
-                    self._last_quick_run_at = datetime.fromisoformat(finished_at)
-                persisted_run = dict(run)
+                    merged = {row["source_id"]: dict(row) for row in self._sources}
+                    for row in refreshed_rows:
+                        merged[row["source_id"]] = row
+                    source_rows = list(merged.values())
+                else:
+                    source_rows = refreshed_rows
+                completed_run = {
+                    **self._runs[run_id],
+                    "status": "completed",
+                    "finished_at": finished_at,
+                }
+                persisted_run = dict(completed_run)
                 if self._last_quick_run_at is not None:
                     persisted_run["last_quick_run_at"] = self._last_quick_run_at.isoformat()
-            self.storage.write_current_summary(summary)
-            for source in source_rows:
+            summary = self._build_summary(source_rows, finished_at)
+            for source in refreshed_rows:
                 self.storage.append_history(
                     {"run_id": run_id, "scope": scope, **source},
                     observed_at=finished_at,
                 )
+            self.storage.write_current_summary(summary)
             self.storage.write_last_run(persisted_run)
+            self.storage.write_current_snapshot({
+                "run": persisted_run,
+                "summary": summary,
+                "sources": source_rows,
+            })
             with self._lock:
                 self._sources = source_rows
                 self._summary = summary
+                self._runs[run_id] = completed_run
         except Exception:
             finished_at = self._now().isoformat()
             with self._lock:

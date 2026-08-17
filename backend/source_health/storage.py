@@ -52,7 +52,9 @@ class SourceHealthStorage:
                 profile = Path(os.environ.get("USERPROFILE") or Path.home())
                 self.root = profile / ".vibe-research" / "source-health"
         self.current_summary_path = self.root / "current-summary.json"
+        self.current_snapshot_path = self.root / "current-snapshot.json"
         self.last_run_path = self.root / "last-run.json"
+        self.quick_admission_path = self.root / "quick-admission.json"
         self.history_root = self.root / "history"
         self._now = now or (lambda: datetime.now(timezone.utc))
 
@@ -87,6 +89,16 @@ class SourceHealthStorage:
         with CACHE_IO_LOCK:
             self._atomic_write(self.last_run_path, document)
         return self.last_run_path
+
+    def write_current_snapshot(self, document: Mapping[str, Any] | object) -> Path:
+        with CACHE_IO_LOCK:
+            self._atomic_write(self.current_snapshot_path, document)
+        return self.current_snapshot_path
+
+    def write_quick_admission(self, document: Mapping[str, Any] | object) -> Path:
+        with CACHE_IO_LOCK:
+            self._atomic_write(self.quick_admission_path, document)
+        return self.quick_admission_path
 
     def history_path(self, observed_date: date | datetime | str) -> Path:
         return self.history_root / f"{_date_value(observed_date).isoformat()}.jsonl"
