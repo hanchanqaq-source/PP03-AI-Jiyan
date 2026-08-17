@@ -4,6 +4,7 @@ from dataclasses import fields
 
 from source_health.models import ProbeObservation, SourceDescriptor
 from source_health.registry import (
+    build_news_descriptors,
     build_provider_descriptors,
     build_registry,
     news_source_id,
@@ -65,7 +66,26 @@ def test_registry_expands_provider_by_capability_and_reads_provider_priority():
     assert "quote:eastmoney-direct:stock_snapshot" in by_id
     assert "industry:cninfo-industry:stock_industry_classification" in by_id
     assert by_id["fund:eastmoney-direct:search"].priority == FakeProvider.priority
-    assert [row.source_id for row in rows] == sorted(by_id)
+    assert [row.source_id for row in rows] == [
+        "fund:eastmoney-direct:nav_history",
+        "fund:eastmoney-direct:search",
+        "quote:eastmoney-direct:stock_snapshot",
+        "industry:cninfo-industry:stock_industry_classification",
+    ]
+
+
+def test_default_registry_preserves_actual_runtime_provider_order():
+    from fund_data.service import FundDataService
+
+    runtime_providers = FundDataService(cache=object()).providers
+    expected = [
+        (provider.name, capability)
+        for provider in runtime_providers
+        for capability in sorted(provider.capabilities)
+    ]
+    actual = [(row.source_name, row.capability) for row in build_provider_descriptors()]
+
+    assert actual == expected
 
 
 def test_news_source_identity_includes_track_name_and_url():
@@ -75,6 +95,28 @@ def test_news_source_identity_includes_track_name_and_url():
     assert baseline != news_source_id("ai", "Other", "https://example.com/feed")
     assert baseline != news_source_id("ai", "Same", "https://example.com/other")
     assert baseline.startswith("news:")
+
+
+def test_news_identity_and_reference_remove_non_public_query_parameters():
+    public_url = "https://example.com/feed?mid=21"
+    configured_url = (
+        public_url
+        + "&client_secret=client-value&password=password-value"
+        + "&refresh_token=refresh-value&session=session-value&jwt=jwt-value"
+    )
+    row = build_news_descriptors({
+        "sources": [{"hint": "ai", "name": "Public feed", "url": configured_url}]
+    })[0]
+    serialized = str(row.to_dict()).lower()
+
+    assert row.source_reference == public_url
+    assert row.source_id == news_source_id("ai", "Public feed", public_url)
+    for forbidden in (
+        "client_secret", "client-value", "password", "password-value",
+        "refresh_token", "refresh-value", "session", "session-value",
+        "jwt", "jwt-value",
+    ):
+        assert forbidden not in serialized
 
 
 def test_registry_never_contains_credentials():

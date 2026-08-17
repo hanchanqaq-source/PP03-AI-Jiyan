@@ -53,6 +53,15 @@ CHAIN_TAG_RULES = [
 ]
 
 
+def default_fund_providers() -> list[Any]:
+    """Build the canonical ordered runtime Provider roster."""
+    providers = [
+        CninfoIndustryProvider(), EastmoneyDirectProvider(), TencentQuoteProvider(),
+        AkshareEastmoneyProvider(), AkshareDanjuanProvider(),
+    ]
+    return sorted(providers, key=lambda provider: getattr(provider, "priority", 100))
+
+
 def _industry_chain_tags(classification: dict[str, Any]) -> list[tuple[str, str]]:
     text = " ".join(str(classification.get(key) or "") for key in (
         "primary_industry", "secondary_industry", "detail_industry", "fine_industry",
@@ -80,12 +89,10 @@ class FundDataService:
         now: Callable[[], datetime] | None = None,
     ):
         self._now = now or (lambda: datetime.now(BEIJING))
-        self.providers = sorted(
-            providers or [
-                CninfoIndustryProvider(), EastmoneyDirectProvider(), TencentQuoteProvider(),
-                AkshareEastmoneyProvider(), AkshareDanjuanProvider(),
-            ],
-            key=lambda provider: getattr(provider, "priority", 100),
+        self.providers = (
+            default_fund_providers()
+            if not providers
+            else sorted(providers, key=lambda provider: getattr(provider, "priority", 100))
         )
         self.cache = cache or FundCache(Path(_default_data_dir()) / "fund-cache" / "v1", now=self._now)
 

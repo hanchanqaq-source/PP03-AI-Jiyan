@@ -6,23 +6,9 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fund_data.providers import (
-    AkshareDanjuanProvider,
-    AkshareEastmoneyProvider,
-    CninfoIndustryProvider,
-    EastmoneyDirectProvider,
-    TencentQuoteProvider,
-)
+from fund_data.service import default_fund_providers
 
 from .models import SourceDescriptor, SourceGroup
-
-PROVIDER_CLASSES = (
-    CninfoIndustryProvider,
-    EastmoneyDirectProvider,
-    TencentQuoteProvider,
-    AkshareEastmoneyProvider,
-    AkshareDanjuanProvider,
-)
 
 CAPABILITY_GROUPS: dict[str, SourceGroup] = {
     "search": "fund",
@@ -42,24 +28,16 @@ PROVIDER_REFERENCES = {
     "akshare-danjuan": "https://danjuanfunds.com/",
 }
 
-_SENSITIVE_QUERY_NAMES = {
-    "api-key", "api_key", "apikey", "authorization", "auth", "cookie",
-    "key", "secret", "signature", "token", "access_token",
-}
-
-
-def news_source_id(hint: str, name: str, url: str) -> str:
-    raw = f"{hint.strip()}|{name.strip()}|{url.strip()}"
-    return "news:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+_PUBLIC_QUERY_NAMES = {"mid"}
 
 
 def _public_reference(url: str) -> str:
-    """Keep public routing parameters but never retain credential parameters."""
+    """Keep only explicitly public routing parameters and discard all others."""
     parts = urlsplit(url.strip())
     query = [
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key.strip().lower() not in _SENSITIVE_QUERY_NAMES
+        if key.strip().lower() in _PUBLIC_QUERY_NAMES
     ]
     netloc = parts.hostname or ""
     if parts.port:
@@ -67,11 +45,16 @@ def _public_reference(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query), ""))
 
 
+def news_source_id(hint: str, name: str, url: str) -> str:
+    raw = f"{hint.strip()}|{name.strip()}|{_public_reference(url)}"
+    return "news:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def build_provider_descriptors(
     providers: Iterable[Any] | None = None,
 ) -> list[SourceDescriptor]:
     """Expand actual Provider classes or instances into source-by-capability rows."""
-    provider_rows = list(providers if providers is not None else PROVIDER_CLASSES)
+    provider_rows = list(providers) if providers is not None else default_fund_providers()
     minimum_priority: dict[str, int] = {}
     for provider in provider_rows:
         priority = int(getattr(provider, "priority", 100))
@@ -95,7 +78,7 @@ def build_provider_descriptors(
                 requires_api_key=False,
                 probe_kind="provider",
             ))
-    return sorted(descriptors, key=lambda row: row.source_id)
+    return descriptors
 
 
 def build_news_descriptors(news_config: dict[str, Any]) -> list[SourceDescriptor]:
@@ -118,7 +101,7 @@ def build_news_descriptors(news_config: dict[str, Any]) -> list[SourceDescriptor
             probe_kind="news_feed",
             probe_args={"hint": hint},
         ))
-    return sorted(descriptors, key=lambda row: row.source_id)
+    return descriptors
 
 
 def load_news_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -134,4 +117,4 @@ def build_registry(
 ) -> list[SourceDescriptor]:
     rows = build_provider_descriptors(providers)
     rows.extend(build_news_descriptors(news_config if news_config is not None else load_news_config()))
-    return sorted(rows, key=lambda row: row.source_id)
+    return rows
