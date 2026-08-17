@@ -236,3 +236,42 @@ def test_cleanup_revalidates_a_translation_accessed_after_scan(tmp_path, monkeyp
     remaining = json.loads(translation_file.read_text(encoding="utf-8"))["entries"]
     assert set(remaining) == {"old"}
     assert result["released_bytes"] == 0
+
+
+def test_source_health_history_counts_toward_limit_and_only_expired_history_is_reclaimed(tmp_path):
+    subject = manager(tmp_path, max_bytes=1)
+    health_root = tmp_path / "data" / "source-health"
+    history_root = health_root / "history"
+    history_root.mkdir(parents=True)
+    current = health_root / "current-summary.json"
+    last_run = health_root / "last-run.json"
+    config = health_root / "health-config.json"
+    old_history = history_root / "2026-05-18.jsonl"
+    boundary_history = history_root / "2026-05-20.jsonl"
+    recent_history = history_root / "2026-08-17.jsonl"
+    user_holdings = tmp_path / "data" / "fund-portfolio.json"
+    for path, content in (
+        (current, "current"),
+        (last_run, "last-run"),
+        (config, "config"),
+        (old_history, "old"),
+        (boundary_history, "boundary"),
+        (recent_history, "recent"),
+        (user_holdings, json.dumps({"holdings": []})),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    protected = {path: path.read_bytes() for path in (current, last_run, config, boundary_history, recent_history, user_holdings)}
+    source_health_bytes = sum(path.stat().st_size for path in (current, last_run, config, old_history, boundary_history, recent_history))
+
+    status = subject.status()
+    result = subject.cleanup_expired(manual=True)
+
+    assert status["categories"]["source_health"]["file_count"] == 6
+    assert status["categories"]["source_health"]["expired_count"] == 1
+    assert status["categories"]["source_health"]["bytes"] == source_health_bytes
+    assert status["total_bytes"] >= source_health_bytes
+    assert not old_history.exists()
+    for path, content in protected.items():
+        assert path.read_bytes() == content
+    assert "source_health" in result["deleted_categories"]

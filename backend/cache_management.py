@@ -27,7 +27,7 @@ CAPABILITY_CATEGORY = {
     "industry_allocation": "fund_180d",
     "stock_industry_classification": "fund_180d",
 }
-CATEGORY_ORDER = ("temporary", "translations", "stock_quotes", "fund_30d", "fund_180d", "logs")
+CATEGORY_ORDER = ("temporary", "translations", "source_health", "stock_quotes", "fund_30d", "fund_180d", "logs")
 
 
 def _aware(value: datetime) -> datetime:
@@ -61,6 +61,8 @@ class CacheManager:
         self.fund_root = self.data_dir / "fund-cache" / "v1"
         self.translation_file = self.data_dir / "cache" / "translations" / "v1.json"
         self.state_file = self.data_dir / "cache" / "cleanup-state.json"
+        self.source_health_root = self.data_dir / "source-health"
+        self.source_health_history_root = self.source_health_root / "history"
         self.acceptance_root = Path(
             acceptance_root or os.environ.get("VR_ACCEPTANCE_DIR") or repo_root / ".tmp" / "acceptance"
         )
@@ -240,11 +242,44 @@ class CacheManager:
                 "size": stat.st_size, "time": stat.st_mtime, "mtime_ns": stat.st_mtime_ns,
             })
 
+    def _scan_source_health(self, categories: dict[str, dict[str, int]], candidates: list[dict]) -> None:
+        root = self.source_health_root
+        if not root.exists():
+            return
+        category = categories["source_health"]
+        cutoff = _aware(self._now()).date() - timedelta(days=90)
+        for path in root.rglob("*"):
+            if not path.is_file() or not self._contained(path, root):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            category["bytes"] += stat.st_size
+            category["file_count"] += 1
+            if path.parent != self.source_health_history_root or path.suffix != ".jsonl":
+                continue
+            try:
+                observed_date = datetime.strptime(path.stem, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if observed_date >= cutoff:
+                continue
+            category["expired_count"] += 1
+            category["reclaimable_bytes"] += stat.st_size
+            candidates.append({
+                "kind": "file", "category": "source_health", "path": path,
+                "root": self.source_health_history_root, "size": stat.st_size,
+                "time": datetime.combine(observed_date, datetime.min.time(), tzinfo=timezone.utc).timestamp(),
+                "mtime_ns": stat.st_mtime_ns,
+            })
+
     def _scan(self) -> tuple[dict[str, Any], list[dict]]:
         categories = {name: _empty_category() for name in (*CATEGORY_ORDER, "unclassified_fund")}
         candidates: list[dict] = []
         self._scan_fund_files(categories, candidates)
         self._scan_translations(categories, candidates)
+        self._scan_source_health(categories, candidates)
         self._scan_owned_files(self.acceptance_root, "temporary", timedelta(days=7), categories, candidates)
         self._scan_owned_files(self.logs_root, "logs", timedelta(days=14), categories, candidates)
         total_bytes = sum(row["bytes"] for row in categories.values())
@@ -294,6 +329,14 @@ class CacheManager:
             return False
         if stat.st_size != candidate.get("size") or stat.st_mtime_ns != candidate.get("mtime_ns"):
             return False
+        if candidate.get("category") == "source_health":
+            if candidate.get("root") != self.source_health_history_root or path.parent != self.source_health_history_root:
+                return False
+            try:
+                observed_date = datetime.strptime(path.stem, "%Y-%m-%d").date()
+            except ValueError:
+                return False
+            return observed_date < _aware(self._now()).date() - timedelta(days=90)
         if candidate.get("root") != self.fund_root:
             return True
         try:
