@@ -12,11 +12,13 @@ import type {
   MarketNewsQuery,
   MarketNewsResponse,
   MarketNewsSort,
+  MarketNewsTranslation,
 } from "@/features/market-news/types";
 import { SelectedTagBar } from "@/features/tags/SelectedTagBar";
 import { TagSelector } from "@/features/tags/TagSelector";
 import { usePageTags } from "@/features/tags/usePageTags";
 import { api } from "@/lib/api";
+import { loadLlm } from "@/lib/llm";
 import { cn } from "@/lib/utils";
 
 const MODES: Array<{ value: MarketNewsMode; label: string }> = [
@@ -97,6 +99,30 @@ function responseMatchesQuery(response: MarketNewsResponse, query: MarketNewsQue
   return marketNewsQueryKey(response.filters) === marketNewsQueryKey(query);
 }
 
+function sourceLanguage(event: MarketNewsEvent): string {
+  return event.sources.find((source) => source.language && !source.language.toLowerCase().startsWith("zh"))?.language
+    || event.sources[0]?.language
+    || "unknown";
+}
+
+function needsTranslation(event: MarketNewsEvent): boolean {
+  const language = sourceLanguage(event).toLowerCase();
+  return !language.startsWith("zh") && !/[\u3400-\u9fff]/.test(`${event.title} ${event.summary}`);
+}
+
+function mergeTranslations(response: MarketNewsResponse, translations: MarketNewsTranslation[]): MarketNewsResponse {
+  const byId = new Map(translations.map((translation) => [translation.event_id, translation]));
+  const mergeEvent = (event: MarketNewsEvent): MarketNewsEvent => {
+    const translation = byId.get(event.event_id);
+    return translation ? { ...event, ...translation } : event;
+  };
+  return {
+    ...response,
+    events: response.events.map(mergeEvent),
+    focus_events: response.focus_events.map(mergeEvent),
+  };
+}
+
 function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_reason"]; onAddTag: () => void }) {
   if (reason === "no_tags") {
     return <div className="py-16 text-center"><p className="font-semibold">还没有选择关注行业</p><p className="mt-2 text-sm text-muted-foreground">添加半导体、存储、机器人、医疗等标签后开始跟踪资讯</p><button onClick={onAddTag} className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">添加标签</button></div>;
@@ -123,6 +149,8 @@ export function MarketNews() {
   const [view, setView] = useState<{ queryKey: string; response: MarketNewsResponse } | null>(null);
   const responseCacheRef = useRef<Map<string, MarketNewsResponse>>(new Map());
   const requestIdRef = useRef(0);
+  const translationIdRef = useRef(0);
+  const translationRequestedRef = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [queryError, setQueryError] = useState<{ queryKey: string; message: string } | null>(null);
@@ -146,8 +174,12 @@ export function MarketNews() {
     ? view.response
     : responseCacheRef.current.get(queryKey) || null;
   const detailEvent = detailSelection?.queryKey === queryKey && detailSelection.snapshotId === data?.snapshot_id
-    ? detailSelection.event
+    ? data?.events.find((event) => event.event_id === detailSelection.event.event_id) || detailSelection.event
     : null;
+  const activeQueryKeyRef = useRef(queryKey);
+  const activeSnapshotRef = useRef(data?.snapshot_id || "");
+  activeQueryKeyRef.current = queryKey;
+  activeSnapshotRef.current = data?.snapshot_id || "";
 
   useEffect(() => {
     setDetailSelection(null);
@@ -186,6 +218,51 @@ export function MarketNews() {
       if (requestId === requestIdRef.current) setLoading(false);
     });
   }, [mode, query, queryKey]);
+
+  useEffect(() => {
+    if (!data) return;
+    const candidates = data.events.filter(needsTranslation).slice(0, 20);
+    if (!candidates.length) return;
+    const translationKey = `${queryKey}|${data.snapshot_id}`;
+    if (translationRequestedRef.current.has(translationKey)) return;
+    translationRequestedRef.current.add(translationKey);
+    if (translationRequestedRef.current.size > 48) {
+      const oldest = translationRequestedRef.current.values().next().value;
+      if (oldest) translationRequestedRef.current.delete(oldest);
+    }
+    const translationId = ++translationIdRef.current;
+    const apply = (translations: MarketNewsTranslation[]) => {
+      if (translationId !== translationIdRef.current) return;
+      if (activeQueryKeyRef.current !== queryKey || activeSnapshotRef.current !== data.snapshot_id) return;
+      const current = responseCacheRef.current.get(queryKey);
+      if (!current || current.snapshot_id !== data.snapshot_id) return;
+      const merged = mergeTranslations(current, translations);
+      cacheMarketNewsResponse(responseCacheRef.current, queryKey, merged);
+      setView({ queryKey, response: merged });
+    };
+    const unavailable = candidates.map<MarketNewsTranslation>((event) => ({
+      event_id: event.event_id,
+      translated_title_zh: null,
+      translated_summary_zh: null,
+      translation_status: "unavailable",
+      translation_provider: null,
+      translated_at: null,
+    }));
+    const llm = loadLlm();
+    if (!llm) {
+      apply(unavailable);
+      return;
+    }
+    api.marketNewsTranslations({
+      items: candidates.map((event) => ({
+        event_id: event.event_id,
+        title: event.title,
+        summary: event.summary,
+        source_language: sourceLanguage(event),
+      })),
+      llm,
+    }).then((result) => apply(result.translations)).catch(() => apply(unavailable));
+  }, [data?.snapshot_id, queryKey]);
 
   const refresh = async () => {
     if (refreshing || loading || (mode === "my_focus" && query.tag_ids.length === 0)) return;

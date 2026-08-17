@@ -28,6 +28,26 @@ export const directEvent: MarketNewsEvent = {
   missing_information: ["AI摘要暂不可用"], importance_score: 502,
 };
 
+export const translatedEnglishEvent: MarketNewsEvent = {
+  ...directEvent,
+  event_id: "eeeeeeeeeeeeeeeeeeee",
+  title: "Micron launches HBM3E",
+  summary: "Shipments begin this quarter.",
+  sources: directEvent.sources.map((source) => ({
+    ...source,
+    title: "Micron launches HBM3E",
+    summary_or_excerpt: "Shipments begin this quarter.",
+    language: "en",
+    original_url: "https://news.example.test/micron-hbm3e",
+  })),
+  original_links: ["https://news.example.test/micron-hbm3e"],
+  translated_title_zh: "美光（Micron）发布 HBM3E",
+  translated_summary_zh: "本季度开始出货。",
+  translation_status: "translated",
+  translation_provider: "openai",
+  translated_at: "2026-08-17T04:00:00+00:00",
+};
+
 export const marketNewsResponse: MarketNewsResponse = {
   events: [directEvent],
   focus_events: [directEvent],
@@ -38,7 +58,7 @@ export const marketNewsResponse: MarketNewsResponse = {
   snapshot_id: "aaaaaaaaaaaaaaaaaaaa",
   generated_at: "2026-08-17T12:00:00+08:00",
   data_status: "cache",
-  source_summary: { total_sources: 108, failed_sources: 0, cache_status: "cache", refresh_failed: false, source_statuses: [] },
+  source_summary: { total_sources: 108, failed_sources: 0, cache_status: "cache", source_state: "cached", refresh_failed: false, source_statuses: [] },
   portfolio_status: "ready",
   ai_status: "unavailable",
   empty_reason: null,

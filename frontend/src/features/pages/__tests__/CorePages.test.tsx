@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
-import { directEvent, marketNewsResponse } from "@/features/market-news/__tests__/fixtures";
+import { directEvent, marketNewsResponse, translatedEnglishEvent } from "@/features/market-news/__tests__/fixtures";
 import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse } from "@/features/market-news/types";
 import { cacheMarketNewsResponse, MarketNews, readMarketNewsCache } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
@@ -85,6 +85,130 @@ describe("PP03 core pages", () => {
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
 
     expect(load).toHaveBeenLastCalledWith({ mode: "domestic_policy", tag_ids: ["robotics"], category: "policy", days: 30, sort: "latest" });
+  });
+
+  it("translates only visible English events and updates list plus open detail on the same snapshot", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-llm", JSON.stringify({
+      provider: "openai", baseURL: "https://model.example.test/v1", apiKey: "request-only", model: "test-model",
+    }));
+    const englishEvent = {
+      ...translatedEnglishEvent,
+      translated_title_zh: undefined,
+      translated_summary_zh: undefined,
+      translation_status: undefined,
+      translation_provider: undefined,
+      translated_at: undefined,
+    };
+    let resolveTranslations!: (value: { translations: Array<Record<string, unknown>>; limit: number }) => void;
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue(responseFor(queryFor("storage"), englishEvent, "translation-snapshot"));
+    const translate = vi.spyOn(api as any, "marketNewsTranslations").mockImplementation(
+      () => new Promise((resolve) => { resolveTranslations = resolve; }),
+    );
+
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: englishEvent.title });
+    await user.click(screen.getByRole("button", { name: `查看事件详情 ${englishEvent.title}` }));
+
+    expect(translate).toHaveBeenCalledWith({
+      items: [{
+        event_id: englishEvent.event_id,
+        title: englishEvent.title,
+        summary: englishEvent.summary,
+        source_language: "en",
+      }],
+      llm: { provider: "openai", baseURL: "https://model.example.test/v1", apiKey: "request-only", model: "test-model" },
+    });
+
+    resolveTranslations({ translations: [{
+      event_id: englishEvent.event_id,
+      translated_title_zh: "美光（Micron）发布 HBM3E",
+      translated_summary_zh: "本季度开始出货。",
+      translation_status: "translated",
+      translation_provider: "openai",
+      translated_at: "2026-08-17T04:00:00+00:00",
+    }], limit: 20 });
+
+    expect((await screen.findAllByRole("heading", { name: "美光（Micron）发布 HBM3E" })).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByRole("dialog", { name: "美光（Micron）发布 HBM3E事件详情" })).toBeInTheDocument();
+    expect(screen.getByText("过去 7 天有 1 个事件与你的持仓相关")).toBeInTheDocument();
+  });
+
+  it("keeps English originals available without a model and does not call translation", async () => {
+    const englishEvent = {
+      ...translatedEnglishEvent,
+      translated_title_zh: undefined,
+      translated_summary_zh: undefined,
+      translation_status: undefined,
+      translation_provider: undefined,
+      translated_at: undefined,
+    };
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue(responseFor(queryFor("storage"), englishEvent, "no-model-snapshot"));
+    const translate = vi.spyOn(api as any, "marketNewsTranslations").mockResolvedValue({ translations: [], limit: 20 });
+
+    render(<MarketNews />);
+
+    expect(await screen.findByRole("heading", { name: englishEvent.title })).toBeInTheDocument();
+    expect(await screen.findByText("中文翻译暂不可用")).toBeInTheDocument();
+    expect(translate).not.toHaveBeenCalled();
+  });
+
+  it("ignores a delayed translation from an older query snapshot", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-llm", JSON.stringify({
+      provider: "openai", baseURL: "https://model.example.test/v1", apiKey: "request-only", model: "test-model",
+    }));
+    localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: ["storage", "robotics"], activeId: "storage" }));
+    const storage = { ...translatedEnglishEvent, event_id: "11111111111111111111", title: "Storage source title", translated_title_zh: undefined, translated_summary_zh: undefined, translation_status: undefined };
+    const robotics = { ...translatedEnglishEvent, event_id: "22222222222222222222", title: "Robotics source title", translated_title_zh: undefined, translated_summary_zh: undefined, translation_status: undefined };
+    vi.spyOn(api, "marketNewsEvents").mockImplementation((query) => Promise.resolve(
+      query.tag_ids[0] === "storage"
+        ? responseFor(queryFor("storage"), storage, "storage-translation-snapshot")
+        : responseFor(queryFor("robotics"), robotics, "robotics-translation-snapshot"),
+    ));
+    let resolveStorage!: (value: { translations: Array<Record<string, unknown>>; limit: number }) => void;
+    vi.spyOn(api as any, "marketNewsTranslations").mockImplementation(({ items }: { items: Array<{ event_id: string }> }) => {
+      if (items[0].event_id === storage.event_id) return new Promise((resolve) => { resolveStorage = resolve; });
+      return Promise.resolve({ translations: [{ event_id: robotics.event_id, translated_title_zh: "机器人中文标题", translated_summary_zh: "机器人摘要", translation_status: "translated", translation_provider: "openai", translated_at: "2026-08-17T04:01:00+00:00" }], limit: 20 });
+    });
+
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: storage.title });
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    expect(await screen.findByRole("heading", { name: "机器人中文标题" })).toBeInTheDocument();
+
+    resolveStorage({ translations: [{ event_id: storage.event_id, translated_title_zh: "迟到的存储中文标题", translated_summary_zh: "迟到摘要", translation_status: "translated", translation_provider: "openai", translated_at: "2026-08-17T04:02:00+00:00" }], limit: 20 });
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "迟到的存储中文标题" })).not.toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "机器人中文标题" })).toBeInTheDocument();
+  });
+
+  it("caps one translation batch at twenty visible English events", async () => {
+    localStorage.setItem("vr-llm", JSON.stringify({
+      provider: "openai", baseURL: "https://model.example.test/v1", apiKey: "request-only", model: "test-model",
+    }));
+    const events = Array.from({ length: 22 }, (_, index) => ({
+      ...translatedEnglishEvent,
+      event_id: index.toString(16).padStart(20, "0"),
+      title: `English event ${index}`,
+      translated_title_zh: undefined,
+      translated_summary_zh: undefined,
+      translation_status: undefined,
+    }));
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({
+      ...marketNewsResponse,
+      events,
+      focus_events: events.slice(0, 5),
+      snapshot_id: "twenty-event-snapshot",
+      filters: queryFor("storage"),
+    });
+    const translate = vi.spyOn(api, "marketNewsTranslations").mockResolvedValue({ translations: [], limit: 20 });
+
+    render(<MarketNews />);
+
+    await waitFor(() => expect(translate).toHaveBeenCalled());
+    const payload = translate.mock.calls[0][0];
+    expect(payload.items).toHaveLength(20);
+    expect(payload.items.map((item) => item.event_id)).toEqual(events.slice(0, 20).map((event) => event.event_id));
   });
 
   it("bounds the full market-news response cache with LRU eviction", () => {

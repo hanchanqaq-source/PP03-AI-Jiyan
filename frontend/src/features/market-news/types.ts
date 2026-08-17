@@ -57,6 +57,25 @@ export interface MarketNewsEvent {
   data_status: string;
   missing_information: string[];
   importance_score: number;
+  translated_title_zh?: string | null;
+  translated_summary_zh?: string | null;
+  translation_status?: "translated" | "unavailable" | "not_required";
+  translation_provider?: string | null;
+  translated_at?: string | null;
+}
+
+export interface MarketNewsTranslation {
+  event_id: string;
+  translated_title_zh: string | null;
+  translated_summary_zh: string | null;
+  translation_status: "translated" | "unavailable" | "not_required";
+  translation_provider: string | null;
+  translated_at: string | null;
+}
+
+export interface MarketNewsTranslationResponse {
+  translations: MarketNewsTranslation[];
+  limit: number;
 }
 
 export interface MarketNewsQuery {
@@ -86,6 +105,7 @@ export interface MarketNewsResponse {
     total_sources: number;
     failed_sources: number;
     cache_status: string;
+    source_state: "all_success" | "partial_failure" | "cached" | "stale_cache" | "all_failed" | "empty";
     refresh_failed: boolean;
     source_statuses: Array<{ source_name: string; source_url: string; status: string; item_count: number }>;
   };

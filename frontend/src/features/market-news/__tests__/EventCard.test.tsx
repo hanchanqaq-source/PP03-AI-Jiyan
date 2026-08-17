@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { EventCard } from "@/features/market-news/EventCard";
-import { directEvent } from "./fixtures";
+import { directEvent, translatedEnglishEvent } from "./fixtures";
 
 describe("MarketNews EventCard", () => {
   it("shows every required evidence summary and actions", async () => {
@@ -42,5 +42,34 @@ describe("MarketNews EventCard", () => {
     render(<EventCard event={{ ...directEvent, summary: "AI摘要暂不可用", summary_status: "ai_unavailable", data_status: "stale" }} onOpenDetails={() => {}} />);
     expect(screen.getByText("AI摘要暂不可用")).toBeInTheDocument();
     expect(screen.getByText("过期缓存")).toBeInTheDocument();
+  });
+
+  it("defaults to Chinese translation and lets the user switch to the immutable original", async () => {
+    const user = userEvent.setup();
+    render(<EventCard event={translatedEnglishEvent} onOpenDetails={() => {}} />);
+
+    expect(screen.getByRole("heading", { name: "美光（Micron）发布 HBM3E" })).toBeInTheDocument();
+    expect(screen.getByText("本季度开始出货。")).toBeInTheDocument();
+    expect(screen.queryByText("Shipments begin this quarter.")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "查看原文" }));
+    expect(screen.getByRole("heading", { name: "Micron launches HBM3E" })).toBeInTheDocument();
+    expect(screen.getByText("Shipments begin this quarter.")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "中文" }));
+    expect(screen.getByRole("heading", { name: "美光（Micron）发布 HBM3E" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /打开原始来源/ })).toHaveAttribute("href", "https://news.example.test/micron-hbm3e");
+  });
+
+  it("keeps the original readable when Chinese translation is unavailable", () => {
+    render(<EventCard event={{
+      ...translatedEnglishEvent,
+      translated_title_zh: undefined,
+      translated_summary_zh: undefined,
+      translation_status: "unavailable",
+    }} onOpenDetails={() => {}} />);
+
+    expect(screen.getByRole("heading", { name: "Micron launches HBM3E" })).toBeInTheDocument();
+    expect(screen.getByText("中文翻译暂不可用")).toBeInTheDocument();
   });
 });

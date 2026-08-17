@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { ExternalLink, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ExternalLink, Languages, X } from "lucide-react";
 import type { MarketNewsEvent } from "./types";
 
 function dateTime(value: string | null) {
@@ -19,6 +19,11 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 export function EventDetailDrawer({ open, event, onClose }: { open: boolean; event: MarketNewsEvent | null; onClose: () => void }) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const hasTranslation = event?.translation_status === "translated" && Boolean(event.translated_title_zh);
+  const [language, setLanguage] = useState<"zh" | "original">(hasTranslation ? "zh" : "original");
+  useEffect(() => {
+    setLanguage(hasTranslation ? "zh" : "original");
+  }, [event?.event_id, event?.translated_at, hasTranslation]);
   useEffect(() => {
     if (!open || !event) return;
     previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -37,18 +42,21 @@ export function EventDetailDrawer({ open, event, onClose }: { open: boolean; eve
   }, [event, onClose, open]);
 
   if (!open || !event) return null;
+  const showChinese = hasTranslation && language === "zh";
+  const displayTitle = showChinese ? event.translated_title_zh || event.title : event.title;
+  const displaySummary = showChinese ? event.translated_summary_zh || event.summary : event.summary;
   return (
     <div className="fixed inset-0 z-50 bg-black/70" onMouseDown={(mouseEvent) => { if (mouseEvent.currentTarget === mouseEvent.target) onClose(); }}>
-      <aside role="dialog" aria-modal="true" aria-label={`${event.title}事件详情`} className="ml-auto flex h-full w-full max-w-3xl flex-col border-l border-primary/25 bg-background/95 shadow-2xl backdrop-blur-xl">
+      <aside role="dialog" aria-modal="true" aria-label={`${displayTitle}事件详情`} className="ml-auto flex h-full w-full max-w-3xl flex-col border-l border-primary/25 bg-background/95 shadow-2xl backdrop-blur-xl">
         <header className="border-b border-border/60 px-5 py-4">
           <div className="flex items-start justify-between gap-4">
-            <div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Event intelligence</p><h2 className="mt-1 text-xl font-bold leading-7">{event.title}</h2><p className="mt-2 text-xs text-muted-foreground">最早：{dateTime(event.published_at_first)} · 最新：{dateTime(event.published_at_latest)}</p></div>
-            <button ref={closeButtonRef} onClick={onClose} aria-label="关闭事件详情" className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-foreground"><X className="h-5 w-5" /></button>
+            <div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-primary">Event intelligence</p><h2 className="mt-1 text-xl font-bold leading-7">{displayTitle}</h2><p className="mt-2 text-xs text-muted-foreground">最早：{dateTime(event.published_at_first)} · 最新：{dateTime(event.published_at_latest)}</p></div>
+            <div className="flex items-center gap-1">{hasTranslation && <button onClick={() => setLanguage(showChinese ? "original" : "zh")} aria-label={showChinese ? "查看原文" : "中文"} className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs text-muted-foreground hover:border-primary/45 hover:text-primary"><Languages className="h-3.5 w-3.5" />{showChinese ? "查看原文" : "中文"}</button>}<button ref={closeButtonRef} onClick={onClose} aria-label="关闭事件详情" className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-foreground"><X className="h-5 w-5" /></button></div>
           </div>
         </header>
 
         <div className="flex-1 space-y-4 overflow-y-auto p-5">
-          <Section title="事件摘要"><p className="text-sm leading-6 text-muted-foreground">{event.summary}</p></Section>
+          <Section title="事件摘要"><p className="text-sm leading-6 text-muted-foreground">{displaySummary}</p>{event.translation_status === "unavailable" && <p className="mt-2 text-xs text-warning">中文翻译暂不可用</p>}</Section>
           <Section title={`全部公开来源（${event.source_count}）`}>
             <div className="space-y-2">{event.sources.map((source) => <div key={`${source.source_name}-${source.original_url}`} className="rounded-xl border border-border/50 p-3 text-xs">
               <div className="flex flex-wrap items-center gap-2 text-muted-foreground"><strong className="text-foreground">{source.source_name}</strong><span>{dateTime(source.published_at)}</span><span>{source.data_status === "stale" ? "过期缓存" : "公开来源"}</span></div>

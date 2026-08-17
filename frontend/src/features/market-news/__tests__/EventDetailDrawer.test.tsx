@@ -2,7 +2,7 @@ import { useState } from "react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { EventDetailDrawer } from "@/features/market-news/EventDetailDrawer";
-import { directEvent } from "./fixtures";
+import { directEvent, translatedEnglishEvent } from "./fixtures";
 
 function Harness() {
   const [open, setOpen] = useState(false);
@@ -43,5 +43,18 @@ describe("MarketNews EventDetailDrawer", () => {
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it("uses the translated event by default while preserving original sources and toggle", async () => {
+    const user = userEvent.setup();
+    render(<EventDetailDrawer open event={translatedEnglishEvent} onClose={() => {}} />);
+
+    expect(screen.getByRole("dialog", { name: "美光（Micron）发布 HBM3E事件详情" })).toBeInTheDocument();
+    expect(screen.getByText("本季度开始出货。")).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: /打开原始来源/ })[0]).toHaveAttribute("href", "https://news.example.test/micron-hbm3e");
+
+    await user.click(screen.getByRole("button", { name: "查看原文" }));
+    expect(screen.getByRole("dialog", { name: "Micron launches HBM3E事件详情" })).toBeInTheDocument();
+    expect(screen.getAllByText("Shipments begin this quarter.").length).toBeGreaterThan(0);
   });
 });

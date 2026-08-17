@@ -9,7 +9,13 @@ import type {
   FundPortfolioData,
   FundSearchResult,
 } from "@/features/fund-portfolio/types";
-import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse } from "@/features/market-news/types";
+import type {
+  MarketNewsEvent,
+  MarketNewsQuery,
+  MarketNewsResponse,
+  MarketNewsTranslationResponse,
+} from "@/features/market-news/types";
+import type { LlmConfig } from "@/lib/llm";
 
 export type {
   DataMeta,
@@ -289,6 +295,10 @@ export const api = {
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
   marketNewsEvents: (query: MarketNewsQuery) => get<MarketNewsResponse>(marketNewsPath("/market-news/events", query)),
   marketNewsRefresh: (query: MarketNewsQuery) => request<MarketNewsResponse>(marketNewsPath("/market-news/refresh", query), "POST"),
+  marketNewsTranslations: (payload: {
+    items: Array<{ event_id: string; title: string; summary: string; source_language: string }>;
+    llm: LlmConfig | null;
+  }) => request<MarketNewsTranslationResponse>("/market-news/translations", "POST", payload),
   marketNewsEvent: (eventId: string, snapshotId?: string) => get<MarketNewsEvent>(
     `/market-news/events/${encodeURIComponent(eventId)}${snapshotId ? `?snapshot_id=${encodeURIComponent(snapshotId)}` : ""}`,
   ),
