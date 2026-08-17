@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { DataInfoDialog } from "@/features/market-news/DataInfoDialog";
 import type { SourceHealthSummaryData } from "@/features/source-health/types";
 import { api, ApiError } from "@/lib/api";
@@ -78,6 +79,67 @@ describe("source health summary in DataInfoDialog", () => {
     expect(screen.getByText("9 健康 / 1 基本可用 / 1 降级 / 0 失败")).toBeInTheDocument();
     expect(summary).toHaveBeenCalledTimes(2);
     expect(audited).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes refresh and detail invalidation when the completed summary response is delayed", async () => {
+    vi.useFakeTimers();
+    let resolveSummary!: (value: SourceHealthSummaryData) => void;
+    (api as any).sourceHealthSummary
+      .mockResolvedValueOnce(previousSummary)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSummary = resolve; }));
+    (api as any).sourceHealthStartFullRun.mockResolvedValue({ run_id: "run-delayed-summary" });
+    (api as any).sourceHealthRun.mockResolvedValue({
+      run_id: "run-delayed-summary", scope: "full", status: "completed", started_at: "2026-08-18T06:31:00Z",
+      finished_at: "2026-08-18T06:32:00Z", total: 2, completed: 2, success: 2, partial: 0, failure: 0, current_source: "公开资讯源",
+    });
+    const audited = vi.fn();
+    render(<DataInfoDialog open onClose={() => {}} onOpenSourceHealth={() => {}} onSourceHealthUpdated={audited} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "运行全量体检" }));
+    await act(async () => {});
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+
+    resolveSummary({ ...previousSummary, last_run_at: "2026-08-18T06:32:00Z" });
+    await act(async () => {});
+
+    expect(screen.getByText("体检完成 · 2 / 2")).toBeInTheDocument();
+    expect(audited).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables the run action and shows pending text while the start request is unresolved", async () => {
+    let resolveStart!: (value: { run_id: string }) => void;
+    (api as any).sourceHealthStartFullRun.mockImplementation(() => new Promise((resolve) => { resolveStart = resolve; }));
+    render(<DataInfoDialog open onClose={() => {}} onOpenSourceHealth={() => {}} />);
+    await screen.findByText("8 健康 / 2 基本可用 / 1 降级 / 0 失败");
+
+    const button = screen.getByRole("button", { name: "运行全量体检" });
+    fireEvent.click(button);
+
+    expect(button).toBeDisabled();
+    expect(button).toHaveTextContent("体检中");
+    expect(screen.getByText("体检中 · 等待任务启动")).toBeInTheDocument();
+    fireEvent.click(button);
+    expect((api as any).sourceHealthStartFullRun).toHaveBeenCalledTimes(1);
+
+    resolveStart({ run_id: "run-pending" });
+    await act(async () => {});
+  });
+
+  it("continues audit lifecycle after StrictMode replays mount effects", async () => {
+    vi.useFakeTimers();
+    (api as any).sourceHealthSummary.mockResolvedValue(previousSummary);
+    (api as any).sourceHealthStartFullRun.mockResolvedValue({ run_id: "strict-run" });
+    (api as any).sourceHealthRun.mockResolvedValue({
+      run_id: "strict-run", scope: "full", status: "completed", started_at: "2026-08-18T06:31:00Z",
+      finished_at: "2026-08-18T06:32:00Z", total: 1, completed: 1, success: 1, partial: 0, failure: 0, current_source: "公开来源",
+    });
+    render(<StrictMode><DataInfoDialog open onClose={() => {}} onOpenSourceHealth={() => {}} /></StrictMode>);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "运行全量体检" }));
+    await act(async () => {});
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+
+    expect(screen.getByText("体检完成 · 1 / 1")).toBeInTheDocument();
   });
 
   it("keeps the prior report when the backend returns 409", async () => {

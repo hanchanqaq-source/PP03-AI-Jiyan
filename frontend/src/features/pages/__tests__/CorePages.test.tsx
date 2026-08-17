@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
 import { directEvent, marketNewsResponse, translatedEnglishEvent } from "@/features/market-news/__tests__/fixtures";
 import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse, MarketNewsTranslationResponse } from "@/features/market-news/types";
@@ -20,6 +20,8 @@ const radar: RadarData = {
     ] },
   ],
 };
+
+afterEach(() => vi.useRealTimers());
 
 function queryFor(tagId: string, mode: MarketNewsQuery["mode"] = "my_focus"): MarketNewsQuery {
   return { mode, tag_ids: [tagId], category: "all", days: 7, sort: "importance" };
@@ -480,6 +482,39 @@ describe("PP03 core pages", () => {
     expect(await screen.findByRole("dialog", { name: "市场资讯数据说明" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "数据源健康详情" })).not.toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "查看详情" })).toHaveFocus();
+  });
+
+  it("keeps one audit running while data info is closed and shows completion after reopening", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [directEvent] });
+    vi.spyOn(api, "cacheStatus").mockResolvedValue({ total_bytes: 0, file_count: 0, expired_count: 0, reclaimable_bytes: 0, categories: {}, last_auto_cleanup_at: null, limit_bytes: 0, over_limit_bytes: 0 });
+    const healthSummary = {
+      rating_confidence: "initial" as const, last_run_at: "2026-08-18T06:30:00+00:00",
+      fund: { healthy: 1, usable: 0, degraded: 0, failed: 0 },
+      news: { healthy: 1, usable: 0, degraded: 0, failed: 0 }, total_sources: 2, reclaimable_bytes: 0,
+    };
+    (api as any).sourceHealthSummary = vi.fn().mockResolvedValue(healthSummary);
+    const start = (api as any).sourceHealthStartFullRun = vi.fn().mockResolvedValue({ run_id: "persistent-run" });
+    const run = (api as any).sourceHealthRun = vi.fn()
+      .mockResolvedValueOnce({ run_id: "persistent-run", scope: "full", status: "running", started_at: "2026-08-18T06:31:00Z", finished_at: null, total: 2, completed: 1, success: 1, partial: 0, failure: 0, current_source: "基金源" })
+      .mockResolvedValueOnce({ run_id: "persistent-run", scope: "full", status: "completed", started_at: "2026-08-18T06:31:00Z", finished_at: "2026-08-18T06:32:00Z", total: 2, completed: 2, success: 2, partial: 0, failure: 0, current_source: "资讯源" });
+    render(<MarketNews />);
+    await act(async () => {});
+
+    fireEvent.click(screen.getByRole("button", { name: "数据说明" }));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "运行全量体检" }));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "关闭数据说明" }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(run).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(run).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "数据说明" }));
+    expect(screen.getByText("体检完成 · 2 / 2")).toBeInTheDocument();
+    expect(start).toHaveBeenCalledTimes(1);
   });
 
   it("retries one failed source and replaces list, focus and impact with one matching response snapshot", async () => {

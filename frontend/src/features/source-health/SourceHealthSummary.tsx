@@ -38,10 +38,16 @@ export function SourceHealthSummary({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [run, setRun] = useState<SourceHealthRun | null>(null);
+  const [starting, setStarting] = useState(false);
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const startingRef = useRef(false);
+  const mountedRef = useRef(true);
   const onUpdatedRef = useRef(onUpdated);
   useEffect(() => { onUpdatedRef.current = onUpdated; }, [onUpdated]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const loadSummary = useCallback(async () => {
     try {
@@ -65,41 +71,43 @@ export function SourceHealthSummary({
 
   useEffect(() => {
     if (!run || !["queued", "running"].includes(run.status)) return;
-    let active = true;
     const timer = window.setTimeout(async () => {
       try {
         const next = await api.sourceHealthRun(run.run_id);
-        if (!active) return;
+        if (!mountedRef.current) return;
         setRun(next);
         if (next.status === "completed") {
           await loadSummary();
-          if (!active) return;
+          if (!mountedRef.current) return;
           setNotice({ kind: "success", text: `体检完成 · ${next.completed} / ${next.total}` });
           onUpdatedRef.current();
         } else if (next.status === "failed") {
           setNotice({ kind: "error", text: "体检失败，已保留上一次成功报告" });
         }
       } catch {
-        if (active) setNotice({ kind: "error", text: "体检状态读取失败，已保留上一次成功报告" });
+        if (mountedRef.current) setNotice({ kind: "error", text: "体检状态读取失败，已保留上一次成功报告" });
       }
     }, 2000);
-    return () => { active = false; window.clearTimeout(timer); };
+    return () => window.clearTimeout(timer);
   }, [loadSummary, run]);
 
-  const running = run?.status === "queued" || run?.status === "running";
+  const running = starting || run?.status === "queued" || run?.status === "running";
   const hasReport = Boolean(summary?.last_run_at && summary.total_sources > 0);
 
   const startFullRun = async () => {
     if (startingRef.current || running) return;
     startingRef.current = true;
+    setStarting(true);
     setNotice(null);
     try {
       const started = await api.sourceHealthStartFullRun();
+      if (!mountedRef.current) return;
       setRun({
         run_id: started.run_id, scope: "full", status: "queued", started_at: new Date().toISOString(),
         finished_at: null, total: 0, completed: 0, success: 0, partial: 0, failure: 0, current_source: "",
       });
     } catch (error) {
+      if (!mountedRef.current) return;
       setNotice({
         kind: "error",
         text: error instanceof ApiError && error.status === 409
@@ -108,6 +116,7 @@ export function SourceHealthSummary({
       });
     } finally {
       startingRef.current = false;
+      if (mountedRef.current) setStarting(false);
     }
   };
 
@@ -145,7 +154,7 @@ export function SourceHealthSummary({
       {running && (
         <p className="mt-3 inline-flex items-center gap-2 text-xs text-foreground" aria-live="polite">
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-          体检中 · {run.completed} / {run.total}
+          {starting && !run ? "体检中 · 等待任务启动" : `体检中 · ${run?.completed || 0} / ${run?.total || 0}`}
         </p>
       )}
       {notice && <p role={notice.kind === "error" ? "alert" : "status"} className={`mt-3 text-xs ${notice.kind === "error" ? "text-warning" : "text-primary"}`}>{notice.text}</p>}
