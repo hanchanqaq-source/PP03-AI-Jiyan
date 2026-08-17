@@ -276,6 +276,42 @@ def test_load_cache_enriches_legacy_region_in_memory_without_rewriting_bytes(tmp
     assert cache.read_bytes() == original_bytes
 
 
+def test_load_cache_enriches_legacy_source_failures_without_inventing_error_detail(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://feed.example.test/rss"])
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-17T09:00:00+00:00",
+        "recent_days": 30,
+        "industries": [{"key": "semi", "items": []}],
+        "stats": {"industries": 1, "total_sources": 1, "failed_sources": 1},
+        "source_statuses": [{
+            "source_name": "公开源 1",
+            "source_url": "https://feed.example.test/rss",
+            "status": "failed",
+            "item_count": 0,
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    original_bytes = cache.read_bytes()
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+
+    data = newsradar.load_cache()
+
+    assert data["source_statuses"] == [{
+        "source_id": newsradar.source_id({"url": "https://feed.example.test/rss"}),
+        "source_name": "公开源 1",
+        "source_url": "https://feed.example.test/rss",
+        "status": "failed",
+        "error_type": "unknown",
+        "error_reason": "旧缓存未记录具体失败原因",
+        "last_success_at": None,
+        "used_cached_items": False,
+        "item_count": 0,
+    }]
+    assert cache.read_bytes() == original_bytes
+
+
 def test_unique_atomic_cache_writes_remain_valid_under_concurrency(tmp_path, monkeypatch):
     cache = tmp_path / "radar.json"
     monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
@@ -380,5 +416,6 @@ def test_retry_source_rejects_unknown_id_and_failed_retry_preserves_cache_bytes(
 
     assert result["ok"] is False
     assert result["source_status"]["error_type"] == "timeout"
+    assert result["source_status"]["last_success_at"] is None
     assert "private" not in json.dumps(result, ensure_ascii=False)
     assert cache.read_bytes() == original

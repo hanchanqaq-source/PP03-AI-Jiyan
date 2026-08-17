@@ -199,7 +199,14 @@ def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -
     return out
 
 
-def _last_success_at(previous: dict | None, cached_items: list[dict]) -> str | None:
+def _last_success_at(previous: dict | None, cached_items: list[dict], source_url: str | None = None) -> str | None:
+    if source_url:
+        previous_status = next((
+            row for row in (previous or {}).get("source_statuses") or []
+            if str(row.get("source_url") or "") == source_url and row.get("last_success_at")
+        ), None)
+        if previous_status:
+            return str(previous_status["last_success_at"])
     timestamps = [
         str(item.get("fetched_at") or item.get("published_at") or "")
         for item in cached_items
@@ -207,7 +214,9 @@ def _last_success_at(previous: dict | None, cached_items: list[dict]) -> str | N
     ]
     if timestamps:
         return max(timestamps)
-    return str((previous or {}).get("generated_at") or "") or None
+    if cached_items:
+        return str((previous or {}).get("generated_at") or "") or None
+    return None
 
 
 def _source_status(src: dict, result: dict, cached_items: list[dict], previous: dict | None) -> dict:
@@ -219,7 +228,7 @@ def _source_status(src: dict, result: dict, cached_items: list[dict], previous: 
         "status": result.get("status") or "failed",
         "error_type": result.get("error_type"),
         "error_reason": result.get("error_reason"),
-        "last_success_at": result.get("fetched_at") if succeeded else _last_success_at(previous, cached_items),
+        "last_success_at": result.get("fetched_at") if succeeded else _last_success_at(previous, cached_items, src["url"]),
         "used_cached_items": bool(cached_items) and not succeeded,
         "item_count": len(result.get("items") or []) if succeeded else len(cached_items),
     }
@@ -229,6 +238,43 @@ def _set_all_item_status(data: dict, status: str) -> None:
     for industry in data.get("industries") or []:
         for item in industry.get("items") or []:
             item["data_status"] = status
+
+
+def _normalize_cached_source_statuses(data: dict, sources: list[dict]) -> None:
+    """Expose the new diagnostic schema for legacy cache rows without rewriting cache bytes."""
+    configured_by_url = {str(source.get("url") or ""): source for source in sources}
+    normalized = []
+    for legacy in data.get("source_statuses") or []:
+        row = dict(legacy)
+        source_url = str(row.get("source_url") or "")
+        configured = configured_by_url.get(source_url)
+        cached_items = _cached_items_for_source(
+            data,
+            str((configured or {}).get("hint") or ""),
+            configured or {"url": source_url, "name": row.get("source_name") or ""},
+        ) if source_url else []
+        failed = row.get("status") == "failed"
+        used_cached_items = bool(row.get("used_cached_items")) if "used_cached_items" in row else failed and bool(cached_items)
+        item_count = int(row.get("item_count") or 0)
+        if failed and used_cached_items:
+            item_count = len(cached_items)
+        last_success_at = row.get("last_success_at")
+        if not last_success_at:
+            last_success_at = _last_success_at(data, cached_items, source_url)
+            if not failed and not last_success_at:
+                last_success_at = data.get("generated_at")
+        normalized.append({
+            "source_id": str(row.get("source_id") or source_id({"url": source_url})),
+            "source_name": str(row.get("source_name") or (configured or {}).get("name") or "未知来源"),
+            "source_url": source_url,
+            "status": "failed" if failed else "ok",
+            "error_type": (row.get("error_type") or "unknown") if failed else None,
+            "error_reason": (row.get("error_reason") or "旧缓存未记录具体失败原因") if failed else None,
+            "last_success_at": last_success_at,
+            "used_cached_items": used_cached_items,
+            "item_count": item_count,
+        })
+    data["source_statuses"] = normalized
 
 
 def _write_cache(data: dict) -> None:
@@ -333,7 +379,9 @@ def load_cache():
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        _apply_configured_regions(data, _load_source_config()["sources"])
+        sources = _load_source_config()["sources"]
+        _apply_configured_regions(data, sources)
+        _normalize_cached_source_statuses(data, sources)
         generated_at = _parse_dt(str(data.get("generated_at") or ""))
         recent_days = int(data.get("recent_days") or 7)
         is_stale = bool(generated_at and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
@@ -413,7 +461,7 @@ def retry_source(requested_source_id: str) -> dict:
                 "status": "ok",
                 "error_type": None,
                 "error_reason": None,
-                "last_success_at": _last_success_at(previous, cached),
+                "last_success_at": _last_success_at(previous, cached, configured["url"]),
                 "used_cached_items": bool(cached),
                 "item_count": len(cached),
             }
