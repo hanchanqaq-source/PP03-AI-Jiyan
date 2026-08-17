@@ -30,6 +30,7 @@ import newsradar
 import news_translation
 import portfolio as pf
 import fund_portfolio as fpf
+import source_health
 from fund_data import service as fund_service
 from news_intelligence import service as market_news_service
 import market
@@ -53,7 +54,18 @@ def _run_startup_cache_cleanup():
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _run_startup_cache_cleanup()
-    yield
+    health_service = None
+    try:
+        try:
+            health_service = source_health.get_service()
+            if os.environ.get("VR_SOURCE_HEALTH_STARTUP", "1") != "0":
+                health_service.schedule_quick_if_due()
+        except Exception:
+            pass
+        yield
+    finally:
+        if health_service is not None:
+            health_service.shutdown()
 
 
 app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
@@ -111,6 +123,49 @@ def cache_status():
 @app.post("/api/cache/cleanup-expired")
 def cache_cleanup_expired():
     return {"data": cache_management.get_manager().cleanup_expired(manual=True)}
+
+
+SourceHealthGroup = Literal["fund", "quote", "industry", "news"]
+SourceHealthRating = Literal["healthy", "usable", "degraded", "failed"]
+
+
+class SourceHealthRunRequest(BaseModel):
+    scope: Literal["full"] = "full"
+
+
+@app.get("/api/source-health/summary")
+def source_health_summary():
+    return source_health.get_service().get_summary()
+
+
+@app.get("/api/source-health/sources")
+def source_health_sources(
+    group: SourceHealthGroup | None = None,
+    rating: SourceHealthRating | None = None,
+    repair_value: str | None = None,
+):
+    return source_health.get_service().list_sources(
+        group=group,
+        rating=rating,
+        repair_value=repair_value,
+    )
+
+
+@app.post("/api/source-health/runs", status_code=202)
+def source_health_start_run(req: SourceHealthRunRequest):
+    try:
+        run = source_health.get_service().start_run(req.scope)
+    except source_health.FullRunConflict as error:
+        raise HTTPException(409, str(error)) from error
+    return {"run_id": run["run_id"]}
+
+
+@app.get("/api/source-health/runs/{run_id}")
+def source_health_run(run_id: str = ApiPath(min_length=1, max_length=64)):
+    run = source_health.get_service().get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "数据源体检记录不存在")
+    return run
 
 
 class LLMConfig(BaseModel):
