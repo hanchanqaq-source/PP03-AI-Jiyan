@@ -132,7 +132,9 @@ def test_probe_source_config_reports_permanent_redirect(monkeypatch):
     assert result["status"] == "partial"
     assert result["error_type"] == "redirect"
     assert result["redirected"] is True
-    assert result["final_url"] == "https://feed.example.test/permanent.xml"
+    assert result["final_reference"] == "https://feed.example.test/permanent.xml"
+    assert result["field_completeness_pct"] == 100.0
+    assert "final_url" not in result
 
 
 def test_probe_source_config_retries_http_429_once_and_honors_capped_retry_after(monkeypatch):
