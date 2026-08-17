@@ -229,12 +229,12 @@ class SourceHealthService:
                     observed_at=finished_at,
                 )
             self.storage.write_current_summary(summary)
-            self.storage.write_last_run(persisted_run)
             self.storage.write_current_snapshot({
                 "run": persisted_run,
                 "summary": summary,
                 "sources": source_rows,
             })
+            self.storage.write_last_run(persisted_run)
             with self._lock:
                 self._sources = source_rows
                 self._summary = summary

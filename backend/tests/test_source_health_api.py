@@ -259,6 +259,37 @@ def test_run_stays_running_until_persistence_succeeds_or_becomes_failed(tmp_path
     service.shutdown()
 
 
+def test_authoritative_snapshot_is_durable_before_completed_last_run_marker(tmp_path):
+    class RecordingStorage(SourceHealthStorage):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.durable = []
+
+        def write_current_summary(self, document):
+            path = super().write_current_summary(document)
+            self.durable.append("summary")
+            return path
+
+        def write_current_snapshot(self, document):
+            path = super().write_current_snapshot(document)
+            self.durable.append("snapshot")
+            return path
+
+        def write_last_run(self, document):
+            path = super().write_last_run(document)
+            self.durable.append(f"last-run:{document['status']}")
+            return path
+
+    storage = RecordingStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    service = SourceHealthService(runner=ImmediateRunner(), storage=storage, now=lambda: NOW)
+
+    run = service.start_run("full")
+    wait_for(service, run["run_id"])
+
+    assert storage.durable == ["summary", "snapshot", "last-run:completed"]
+    service.shutdown()
+
+
 def test_quick_admission_is_durable_before_background_run_completes(tmp_path):
     runner = BlockingRunner()
     storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
