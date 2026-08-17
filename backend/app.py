@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
@@ -20,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import astock
+import cache_management
 import chat as chat_layer
 import cli_runtime
 import debate as debate_layer
@@ -39,7 +41,22 @@ from version import read_version
 
 __version__ = read_version()
 
-app = FastAPI(title="Vibe-Research API", version=__version__)
+
+def _run_startup_cache_cleanup():
+    """Startup maintenance is best-effort and must never block the local API."""
+    try:
+        return cache_management.get_manager().maybe_auto_cleanup()
+    except Exception as error:  # cache corruption/permissions are reported without leaking paths
+        return {"ran": False, "released_bytes": 0, "error": type(error).__name__}
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _run_startup_cache_cleanup()
+    yield
+
+
+app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
 
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)
@@ -84,6 +101,16 @@ def _validate(code: str) -> str:
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "vibe-research-api", "version": __version__}
+
+
+@app.get("/api/cache/status")
+def cache_status():
+    return {"data": cache_management.get_manager().status()}
+
+
+@app.post("/api/cache/cleanup-expired")
+def cache_cleanup_expired():
+    return {"data": cache_management.get_manager().cleanup_expired(manual=True)}
 
 
 class LLMConfig(BaseModel):

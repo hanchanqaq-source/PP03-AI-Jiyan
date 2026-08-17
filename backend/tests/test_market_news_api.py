@@ -467,3 +467,41 @@ def test_single_source_retry_failure_is_inspectable_and_unknown_source_is_reject
     assert failed.status_code == 200
     assert failed.json()["data"] == {"retry_succeeded": False, "source_status": failure}
     assert unknown.status_code == 404
+
+
+def test_cache_status_cleanup_and_startup_use_the_bounded_manager(monkeypatch):
+    calls = []
+    status = {
+        "total_bytes": 2048,
+        "file_count": 3,
+        "expired_count": 1,
+        "reclaimable_bytes": 1024,
+        "categories": {"temporary": {"bytes": 1024, "file_count": 1, "expired_count": 1, "reclaimable_bytes": 1024, "pinned_count": 0}},
+        "last_auto_cleanup_at": "2026-08-17T04:00:00+00:00",
+        "limit_bytes": 524288000,
+        "over_limit_bytes": 0,
+    }
+
+    class Manager:
+        def status(self):
+            calls.append("status")
+            return status
+
+        def cleanup_expired(self, manual=False):
+            calls.append(("cleanup", manual))
+            return {"manual": manual, "released_bytes": 1024, "deleted_categories": ["temporary"], "status": status}
+
+        def maybe_auto_cleanup(self):
+            calls.append("startup")
+            return {"ran": True, "released_bytes": 0, "status": status}
+
+    monkeypatch.setattr(app_module.cache_management, "get_manager", lambda: Manager())
+
+    cache_status = client.get("/api/cache/status")
+    cleanup = client.post("/api/cache/cleanup-expired")
+    app_module._run_startup_cache_cleanup()
+
+    assert cache_status.status_code == 200 and cache_status.json()["data"] == status
+    assert cleanup.status_code == 200 and cleanup.json()["data"]["released_bytes"] == 1024
+    assert calls == ["status", ("cleanup", True), "startup"]
+    assert "C:\\" not in cache_status.text
