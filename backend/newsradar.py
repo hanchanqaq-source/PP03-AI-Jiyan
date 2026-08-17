@@ -33,11 +33,17 @@ CACHE_WRITE_LOCK = threading.Lock()
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 BEIJING = timezone(timedelta(hours=8))
+SOURCE_ERROR_TYPES = {"timeout", "http_status", "tls", "dns", "connection", "rss_parse", "unknown"}
 
 
 def source_id(source: dict) -> str:
     """Stable non-secret identifier; retry never accepts a caller-provided URL."""
-    return hashlib.sha256(str(source.get("url") or "").encode("utf-8")).hexdigest()[:16]
+    identity = "\0".join((
+        str(source.get("hint") or ""),
+        str(source.get("name") or ""),
+        str(source.get("url") or ""),
+    ))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
 def sanitize_source_error(value: object) -> str:
@@ -199,11 +205,12 @@ def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -
     return out
 
 
-def _last_success_at(previous: dict | None, cached_items: list[dict], source_url: str | None = None) -> str | None:
-    if source_url:
+def _last_success_at(previous: dict | None, cached_items: list[dict], source: dict | None = None) -> str | None:
+    if source:
+        configured_id = source_id(source)
         previous_status = next((
             row for row in (previous or {}).get("source_statuses") or []
-            if str(row.get("source_url") or "") == source_url and row.get("last_success_at")
+            if str(row.get("source_id") or "") == configured_id and row.get("last_success_at")
         ), None)
         if previous_status:
             return str(previous_status["last_success_at"])
@@ -228,7 +235,7 @@ def _source_status(src: dict, result: dict, cached_items: list[dict], previous: 
         "status": result.get("status") or "failed",
         "error_type": result.get("error_type"),
         "error_reason": result.get("error_reason"),
-        "last_success_at": result.get("fetched_at") if succeeded else _last_success_at(previous, cached_items, src["url"]),
+        "last_success_at": result.get("fetched_at") if succeeded else _last_success_at(previous, cached_items, src),
         "used_cached_items": bool(cached_items) and not succeeded,
         "item_count": len(result.get("items") or []) if succeeded else len(cached_items),
     }
@@ -242,12 +249,27 @@ def _set_all_item_status(data: dict, status: str) -> None:
 
 def _normalize_cached_source_statuses(data: dict, sources: list[dict]) -> None:
     """Expose the new diagnostic schema for legacy cache rows without rewriting cache bytes."""
-    configured_by_url = {str(source.get("url") or ""): source for source in sources}
+    configured_by_id = {source_id(source): source for source in sources}
+    assigned_ids: set[str] = set()
     normalized = []
     for legacy in data.get("source_statuses") or []:
         row = dict(legacy)
         source_url = str(row.get("source_url") or "")
-        configured = configured_by_url.get(source_url)
+        configured = configured_by_id.get(str(row.get("source_id") or ""))
+        if configured is None:
+            candidates = [
+                source for source in sources
+                if str(source.get("url") or "") == source_url and source_id(source) not in assigned_ids
+            ]
+            source_name = str(row.get("source_name") or "")
+            configured = next((source for source in candidates if str(source.get("name") or "") == source_name), None)
+            configured = configured or (candidates[0] if candidates else None)
+        configured_id = source_id(configured) if configured else source_id({
+            "url": source_url,
+            "name": row.get("source_name") or "",
+            "hint": row.get("hint") or "",
+        })
+        assigned_ids.add(configured_id)
         cached_items = _cached_items_for_source(
             data,
             str((configured or {}).get("hint") or ""),
@@ -260,16 +282,19 @@ def _normalize_cached_source_statuses(data: dict, sources: list[dict]) -> None:
             item_count = len(cached_items)
         last_success_at = row.get("last_success_at")
         if not last_success_at:
-            last_success_at = _last_success_at(data, cached_items, source_url)
+            last_success_at = _last_success_at(data, cached_items, configured)
             if not failed and not last_success_at:
                 last_success_at = data.get("generated_at")
+        raw_error_type = str(row.get("error_type") or "unknown")
+        error_type = raw_error_type if raw_error_type in SOURCE_ERROR_TYPES else "unknown"
+        error_reason = sanitize_source_error(row.get("error_reason")) or "旧缓存未记录具体失败原因"
         normalized.append({
-            "source_id": str(row.get("source_id") or source_id({"url": source_url})),
+            "source_id": configured_id,
             "source_name": str(row.get("source_name") or (configured or {}).get("name") or "未知来源"),
             "source_url": source_url,
             "status": "failed" if failed else "ok",
-            "error_type": (row.get("error_type") or "unknown") if failed else None,
-            "error_reason": (row.get("error_reason") or "旧缓存未记录具体失败原因") if failed else None,
+            "error_type": error_type if failed else None,
+            "error_reason": error_reason if failed else None,
             "last_success_at": last_success_at,
             "used_cached_items": used_cached_items,
             "item_count": item_count,
@@ -443,9 +468,9 @@ def retry_source(requested_source_id: str) -> dict:
     industry["items"].sort(key=lambda item: item.get("ts", 0), reverse=True)
 
     existing = {
-        str(row.get("source_id") or source_id({"url": row.get("source_url")})): dict(row)
+        str(row.get("source_id") or ""): dict(row)
         for row in data.get("source_statuses") or []
-        if row.get("source_url")
+        if row.get("source_id")
     }
     existing[requested_source_id] = status
     statuses = []
@@ -454,25 +479,44 @@ def retry_source(requested_source_id: str) -> dict:
         row = existing.get(configured_id)
         if row is None:
             cached = _cached_items_for_source(data, str(configured.get("hint") or ""), configured)
-            row = {
-                "source_id": configured_id,
-                "source_name": configured["name"],
-                "source_url": configured["url"],
-                "status": "ok",
-                "error_type": None,
-                "error_reason": None,
-                "last_success_at": _last_success_at(previous, cached, configured["url"]),
-                "used_cached_items": bool(cached),
-                "item_count": len(cached),
-            }
+            if previous is None:
+                row = {
+                    "source_id": configured_id,
+                    "source_name": configured["name"],
+                    "source_url": configured["url"],
+                    "status": "failed",
+                    "error_type": "unknown",
+                    "error_reason": "暂无成功缓存，本次单源重试未抓取该来源",
+                    "last_success_at": None,
+                    "used_cached_items": False,
+                    "item_count": 0,
+                }
+            else:
+                row = {
+                    "source_id": configured_id,
+                    "source_name": configured["name"],
+                    "source_url": configured["url"],
+                    "status": "ok",
+                    "error_type": None,
+                    "error_reason": None,
+                    "last_success_at": _last_success_at(previous, cached, configured),
+                    "used_cached_items": bool(cached),
+                    "item_count": len(cached),
+                }
         statuses.append(row)
 
     failed = sum(row.get("status") == "failed" for row in statuses)
-    data["generated_at"] = datetime.now(BEIJING).isoformat(timespec="seconds")
+    if not data.get("generated_at"):
+        data["generated_at"] = datetime.now(BEIJING).isoformat(timespec="seconds")
     data["recent_days"] = days
     data["source_statuses"] = statuses
-    data["cache_status"] = "partial" if failed else "realtime"
-    data["source_state"] = "partial_failure" if failed else "all_success"
+    generated_at = _parse_dt(str(data.get("generated_at") or ""))
+    is_stale = bool(
+        generated_at
+        and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=days)
+    )
+    data["cache_status"] = "stale" if is_stale else ("partial" if failed else "realtime")
+    data["source_state"] = "stale_cache" if is_stale else ("partial_failure" if failed else "all_success")
     data.setdefault("stats", {})["industries"] = len(cfg["industries"])
     data["stats"]["total_sources"] = len(cfg["sources"])
     data["stats"]["failed_sources"] = failed

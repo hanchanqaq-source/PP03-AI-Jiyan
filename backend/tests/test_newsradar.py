@@ -88,7 +88,7 @@ def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch)
     assert data["cache_status"] == "realtime"
     status = data["source_statuses"][0]
     assert status == {
-        "source_id": newsradar.source_id({"url": "https://feed.example.test/rss"}),
+        "source_id": newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"}),
         "source_name": "公开源 1",
         "source_url": "https://feed.example.test/rss",
         "status": "ok",
@@ -299,7 +299,7 @@ def test_load_cache_enriches_legacy_source_failures_without_inventing_error_deta
     data = newsradar.load_cache()
 
     assert data["source_statuses"] == [{
-        "source_id": newsradar.source_id({"url": "https://feed.example.test/rss"}),
+        "source_id": newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"}),
         "source_name": "公开源 1",
         "source_url": "https://feed.example.test/rss",
         "status": "failed",
@@ -356,6 +356,86 @@ def test_source_error_classification_is_bounded_and_sanitized():
     assert "abc" not in sanitized and "xyz" not in sanitized and "private" not in sanitized and "value" not in sanitized
 
 
+def test_load_cache_sanitizes_and_normalizes_legacy_failure_diagnostics(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://feed.example.test/rss"])
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-17T09:00:00+00:00",
+        "recent_days": 30,
+        "industries": [{"key": "semi", "items": []}],
+        "stats": {"industries": 1, "total_sources": 1, "failed_sources": 1},
+        "source_statuses": [{
+            "source_name": "公开源 1",
+            "source_url": "https://feed.example.test/rss",
+            "status": "failed",
+            "error_type": "private_exception",
+            "error_reason": "Authorization: Bearer secret C:\\Users\\private\\cache https://x.test/?token=value",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+
+    status = newsradar.load_cache()["source_statuses"][0]
+
+    assert status["error_type"] == "unknown"
+    assert "Authorization=[redacted]" in status["error_reason"]
+    assert "[local-path]" in status["error_reason"]
+    assert "https://x.test/?[redacted]" in status["error_reason"]
+    assert "secret" not in status["error_reason"]
+    assert "private" not in status["error_reason"]
+    assert "value" not in status["error_reason"]
+    assert len(status["error_reason"]) <= 200
+
+
+def test_duplicate_url_sources_have_track_scoped_ids_and_retry_the_selected_track(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    shared_url = "https://shared.example.test/rss"
+    configured = [
+        {"name": "共享公开源", "url": shared_url, "hint": "tech", "language": "en", "region": "GLOBAL"},
+        {"name": "共享公开源", "url": shared_url, "hint": "consumer", "language": "en", "region": "GLOBAL"},
+    ]
+    sources.write_text(json.dumps({
+        "fetch": {"recent_days": 7, "per_source": 6},
+        "redline_keywords": [],
+        "industries": [
+            {"key": "tech", "name": "科技", "accent": "#111111"},
+            {"key": "consumer", "name": "消费", "accent": "#222222"},
+        ],
+        "sources": configured,
+    }, ensure_ascii=False), encoding="utf-8")
+    cache.write_text(json.dumps({
+        "generated_at": "2026-08-16T10:35:00+08:00",
+        "recent_days": 7,
+        "industries": [
+            {"key": "tech", "items": [{"title": "科技旧资讯", "source_name": "共享公开源", "source_url": shared_url}]},
+            {"key": "consumer", "items": [{"title": "消费旧资讯", "source_name": "共享公开源", "source_url": shared_url}]},
+        ],
+        "stats": {"industries": 2, "total_sources": 2, "failed_sources": 2},
+        "source_statuses": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("消费重试资讯", "https://news.example.test/consumer")),
+    )
+
+    tech_id = newsradar.source_id(configured[0])
+    consumer_id = newsradar.source_id(configured[1])
+    result = newsradar.retry_source(consumer_id)
+
+    assert tech_id != consumer_id
+    assert result["source_status"]["source_id"] == consumer_id
+    stored = json.loads(cache.read_text(encoding="utf-8"))
+    by_key = {row["key"]: row["items"] for row in stored["industries"]}
+    assert [item["title"] for item in by_key["tech"]] == ["科技旧资讯"]
+    assert [item["title"] for item in by_key["consumer"]] == ["消费重试资讯"]
+    assert len({row["source_id"] for row in stored["source_statuses"]}) == 2
+
+
 def test_retry_source_is_whitelisted_and_atomically_replaces_only_that_source(tmp_path, monkeypatch):
     sources = tmp_path / "sources.json"
     cache = tmp_path / "radar.json"
@@ -382,13 +462,78 @@ def test_retry_source_is_whitelisted_and_atomically_replaces_only_that_source(tm
         lambda request, timeout: _Response(_rss("重试后的新资讯", "https://news.example.test/retry")),
     )
 
-    result = newsradar.retry_source(newsradar.source_id({"url": "https://feed.example.test/rss"}))
+    result = newsradar.retry_source(newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"}))
 
     assert result["ok"] is True
     stored = json.loads(cache.read_text(encoding="utf-8"))
     assert [item["title"] for item in stored["industries"][0]["items"]] == ["重试后的新资讯"]
     assert stored["source_statuses"][0]["status"] == "ok"
     assert stored["source_state"] == "all_success"
+
+
+def test_successful_retry_does_not_refresh_untouched_stale_cache(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    urls = ["https://retry.example.test/rss", "https://untouched.example.test/rss"]
+    _write_sources(sources, urls)
+    original_generated_at = "2026-07-01T10:35:00+08:00"
+    cache.write_text(json.dumps({
+        "generated_at": original_generated_at,
+        "recent_days": 7,
+        "industries": [{
+            "key": "semi", "name": "半导体", "accent": "#f59e0b", "total": 2,
+            "items": [
+                {"title": "待重试旧资讯", "source_name": "公开源 1", "source_url": urls[0], "ts": 2},
+                {"title": "未重试旧资讯", "source_name": "公开源 2", "source_url": urls[1], "ts": 1},
+            ],
+        }],
+        "stats": {"industries": 1, "total_sources": 2, "failed_sources": 1},
+        "source_statuses": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("重试后的新资讯", "https://news.example.test/retry")),
+    )
+
+    newsradar.retry_source(newsradar.source_id({"url": urls[0], "hint": "semi", "name": "公开源 1"}))
+    stored = json.loads(cache.read_text(encoding="utf-8"))
+    loaded = newsradar.load_cache()
+
+    assert stored["generated_at"] == original_generated_at
+    assert loaded["cache_status"] == "stale"
+    untouched = next(item for item in loaded["industries"][0]["items"] if item["title"] == "未重试旧资讯")
+    assert untouched["data_status"] == "stale"
+
+
+def test_retry_without_cache_does_not_invent_success_for_unfetched_sources(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    urls = ["https://retry.example.test/rss", "https://not-retried.example.test/rss"]
+    _write_sources(sources, urls)
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("单源恢复资讯", "https://news.example.test/retry")),
+    )
+
+    result = newsradar.retry_source(newsradar.source_id({
+        "url": urls[0], "hint": "semi", "name": "公开源 1",
+    }))
+
+    assert result["ok"] is True
+    stored = json.loads(cache.read_text(encoding="utf-8"))
+    assert stored["stats"]["failed_sources"] == 1
+    assert stored["source_state"] == "partial_failure"
+    statuses = {row["source_url"]: row for row in stored["source_statuses"]}
+    assert statuses[urls[0]]["status"] == "ok"
+    assert statuses[urls[1]]["status"] == "failed"
+    assert statuses[urls[1]]["error_type"] == "unknown"
+    assert statuses[urls[1]]["error_reason"] == "暂无成功缓存，本次单源重试未抓取该来源"
 
 
 def test_retry_source_rejects_unknown_id_and_failed_retry_preserves_cache_bytes(tmp_path, monkeypatch):
@@ -412,7 +557,7 @@ def test_retry_source_rejects_unknown_id_and_failed_retry_preserves_cache_bytes(
 
     with pytest.raises(ValueError, match="未配置"):
         newsradar.retry_source("0" * 16)
-    result = newsradar.retry_source(newsradar.source_id({"url": "https://feed.example.test/rss"}))
+    result = newsradar.retry_source(newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"}))
 
     assert result["ok"] is False
     assert result["source_status"]["error_type"] == "timeout"

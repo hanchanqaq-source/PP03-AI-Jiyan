@@ -180,3 +180,59 @@ def test_auto_cleanup_runs_at_startup_no_more_than_once_per_twenty_four_hours(tm
     assert second["ran"] is False
     assert third["ran"] is True
     assert third["status"]["last_auto_cleanup_at"] == clock[0].isoformat()
+
+
+def test_cleanup_revalidates_a_fund_cache_replaced_after_scan(tmp_path, monkeypatch):
+    subject = manager(tmp_path)
+    fund_root = tmp_path / "data" / "fund-cache" / "v1"
+    path = write_fund_cache(fund_root, "profile", "profile:017811", NOW - timedelta(days=31))
+    original_scan = subject._scan
+    scan_calls = 0
+
+    def scan_then_refresh():
+        nonlocal scan_calls
+        scan_calls += 1
+        status, candidates = original_scan()
+        if scan_calls == 1:
+            write_fund_cache(fund_root, "profile", "profile:017811", NOW + timedelta(days=1))
+        return status, candidates
+
+    monkeypatch.setattr(subject, "_scan", scan_then_refresh)
+
+    result = subject.cleanup_expired(manual=True)
+
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["expires_at"] == (NOW + timedelta(days=1)).isoformat()
+    assert result["released_bytes"] == 0
+
+
+def test_cleanup_revalidates_a_translation_accessed_after_scan(tmp_path, monkeypatch):
+    subject = manager(tmp_path)
+    translation_file = tmp_path / "data" / "cache" / "translations" / "v1.json"
+    translation_file.parent.mkdir(parents=True)
+    translation_file.write_text(json.dumps({"version": 1, "entries": {
+        "old": {
+            "translated_title_zh": "中文", "translated_summary_zh": "摘要",
+            "translation_status": "translated", "last_accessed_at": (NOW - timedelta(days=91)).isoformat(),
+        },
+    }}), encoding="utf-8")
+    original_scan = subject._scan
+    scan_calls = 0
+
+    def scan_then_access():
+        nonlocal scan_calls
+        scan_calls += 1
+        status, candidates = original_scan()
+        if scan_calls == 1:
+            document = json.loads(translation_file.read_text(encoding="utf-8"))
+            document["entries"]["old"]["last_accessed_at"] = NOW.isoformat()
+            translation_file.write_text(json.dumps(document), encoding="utf-8")
+        return status, candidates
+
+    monkeypatch.setattr(subject, "_scan", scan_then_access)
+
+    result = subject.cleanup_expired(manual=True)
+
+    remaining = json.loads(translation_file.read_text(encoding="utf-8"))["entries"]
+    assert set(remaining) == {"old"}
+    assert result["released_bytes"] == 0

@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 import chat as chat_layer
+from cache_io_lock import CACHE_IO_LOCK
 
 
 MAX_BATCH_SIZE = 20
 MAX_TITLE_LENGTH = 1000
 MAX_SUMMARY_LENGTH = 8000
-_CACHE_LOCK = threading.Lock()
+_TRANSLATION_LOCK = threading.Lock()
 _CHINESE_RE = re.compile(r"[\u3400-\u9fff]")
 _ALLOWED_MODEL_KEYS = {"translated_title_zh", "translated_summary_zh"}
 
@@ -158,31 +159,34 @@ class TranslationService:
         now_text = self._now().isoformat()
         results: list[dict[str, Any] | None] = [None] * len(clean)
         misses: list[tuple[int, str, dict[str, str]]] = []
-        cache_changed = False
+        with _TRANSLATION_LOCK:
+            with CACHE_IO_LOCK:
+                document = self._load()
+                entries = document["entries"]
+                cache_changed = False
+                for index, item in enumerate(clean):
+                    if _is_chinese(item):
+                        results[index] = _unavailable(item["event_id"], "not_required")
+                        continue
+                    digest = content_hash(item["title"], item["summary"], item["source_language"])
+                    cached = entries.get(digest)
+                    if isinstance(cached, dict) and cached.get("translation_status") == "translated":
+                        cached["last_accessed_at"] = now_text
+                        cache_changed = True
+                        results[index] = {
+                            "event_id": item["event_id"],
+                            "translated_title_zh": cached.get("translated_title_zh"),
+                            "translated_summary_zh": cached.get("translated_summary_zh"),
+                            "translation_status": "translated",
+                            "translation_provider": cached.get("translation_provider"),
+                            "translated_at": cached.get("translated_at"),
+                        }
+                    else:
+                        misses.append((index, digest, item))
+                if cache_changed:
+                    self._write(document)
 
-        with _CACHE_LOCK:
-            document = self._load()
-            entries = document["entries"]
-            for index, item in enumerate(clean):
-                if _is_chinese(item):
-                    results[index] = _unavailable(item["event_id"], "not_required")
-                    continue
-                digest = content_hash(item["title"], item["summary"], item["source_language"])
-                cached = entries.get(digest)
-                if isinstance(cached, dict) and cached.get("translation_status") == "translated":
-                    cached["last_accessed_at"] = now_text
-                    cache_changed = True
-                    results[index] = {
-                        "event_id": item["event_id"],
-                        "translated_title_zh": cached.get("translated_title_zh"),
-                        "translated_summary_zh": cached.get("translated_summary_zh"),
-                        "translation_status": "translated",
-                        "translation_provider": cached.get("translation_provider"),
-                        "translated_at": cached.get("translated_at"),
-                    }
-                else:
-                    misses.append((index, digest, item))
-
+            generated_entries: dict[str, dict[str, Any]] = {}
             if misses and llm and str(llm.get("model") or "").strip():
                 try:
                     model_rows = self._model_runner([item for _, _, item in misses], dict(llm))
@@ -203,8 +207,7 @@ class TranslationService:
                             "translated_at": now_text,
                             "last_accessed_at": now_text,
                         }
-                        entries[digest] = entry
-                        cache_changed = True
+                        generated_entries[digest] = entry
                         results[index] = {"event_id": item["event_id"], **{
                             key: entry[key] for key in (
                                 "translated_title_zh", "translated_summary_zh", "translation_status",
@@ -214,11 +217,14 @@ class TranslationService:
                 except Exception:  # model failures must never block market-news evidence
                     pass
 
+            if generated_entries:
+                with CACHE_IO_LOCK:
+                    latest = self._load()
+                    latest["entries"].update(generated_entries)
+                    self._write(latest)
             for index, _, item in misses:
                 if results[index] is None:
                     results[index] = _unavailable(item["event_id"])
-            if cache_changed:
-                self._write(document)
 
         return {"translations": results, "limit": MAX_BATCH_SIZE}
 
@@ -231,4 +237,3 @@ def get_service() -> TranslationService:
     if _service is None:
         _service = TranslationService()
     return _service
-

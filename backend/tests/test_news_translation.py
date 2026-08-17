@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -147,3 +148,44 @@ def test_batch_limit_and_input_validation_are_enforced(tmp_path):
         service.translate_batch([{**english_event(str(index).zfill(20))} for index in range(21)], None)
     with pytest.raises(ValueError, match="标题"):
         service.translate_batch([{**english_event(), "title": ""}], None)
+
+
+def test_slow_translation_does_not_block_the_independent_fund_cache(tmp_path):
+    from fund_data.cache import FundCache
+    from news_translation import TranslationService
+
+    model_started = threading.Event()
+    release_model = threading.Event()
+    translation_done = threading.Event()
+    fund_write_done = threading.Event()
+
+    def runner(items: list[dict], llm: dict) -> list[dict]:
+        model_started.set()
+        assert release_model.wait(3)
+        return translated_payload()
+
+    service = TranslationService(
+        cache_file=tmp_path / "translations.json",
+        now=lambda: NOW,
+        model_runner=runner,
+    )
+    fund_cache = FundCache(tmp_path / "fund-cache", now=lambda: NOW)
+    translation_thread = threading.Thread(
+        target=lambda: (service.translate_batch([english_event()], {"provider": "openai", "model": "test"}), translation_done.set()),
+    )
+    fund_thread = threading.Thread(
+        target=lambda: (fund_cache.set("profile:017811", {"name": "测试基金"}, 60), fund_write_done.set()),
+    )
+
+    translation_thread.start()
+    assert model_started.wait(1)
+    fund_thread.start()
+    try:
+        assert fund_write_done.wait(1), "slow model call held the shared cache I/O lock"
+    finally:
+        release_model.set()
+        translation_thread.join(timeout=3)
+        fund_thread.join(timeout=3)
+
+    assert translation_done.is_set()
+    assert fund_cache.get("profile:017811") is not None

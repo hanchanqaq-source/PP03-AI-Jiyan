@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from cache_io_lock import CACHE_IO_LOCK
+
 
 DEFAULT_MAX_BYTES = 500 * 1024 * 1024
 DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024
@@ -111,7 +113,8 @@ class CacheManager:
             if not path.is_file() or not self._contained(path, self.fund_root):
                 continue
             try:
-                size = path.stat().st_size
+                stat = path.stat()
+                size = stat.st_size
                 raw = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 size = path.stat().st_size if path.exists() else 0
@@ -127,6 +130,7 @@ class CacheManager:
             records.append({
                 "path": path, "size": size, "category": category_name, "capability": capability,
                 "cache_key": cache_key, "expires": expires, "fetched": fetched,
+                "mtime_ns": stat.st_mtime_ns,
             })
 
         pinned_paths: set[Path] = set()
@@ -159,7 +163,7 @@ class CacheManager:
                 candidates.append({
                     "kind": "file", "category": record["category"], "path": record["path"],
                     "root": self.fund_root, "size": record["size"],
-                    "time": (record["expires"] or now).timestamp(),
+                    "time": (record["expires"] or now).timestamp(), "mtime_ns": record["mtime_ns"],
                 })
 
     def _scan_translations(self, categories: dict[str, dict[str, int]], candidates: list[dict]) -> None:
@@ -233,7 +237,7 @@ class CacheManager:
             category["reclaimable_bytes"] += stat.st_size
             candidates.append({
                 "kind": "file", "category": category_name, "path": path, "root": root,
-                "size": stat.st_size, "time": stat.st_mtime,
+                "size": stat.st_size, "time": stat.st_mtime, "mtime_ns": stat.st_mtime_ns,
             })
 
     def _scan(self) -> tuple[dict[str, Any], list[dict]]:
@@ -258,22 +262,60 @@ class CacheManager:
         return status, candidates
 
     def status(self) -> dict[str, Any]:
-        return self._scan()[0]
+        with CACHE_IO_LOCK:
+            return self._scan()[0]
 
-    def _remove_translation_entries(self, keys: set[str]) -> int:
+    def _remove_translation_entries(self, keys: set[str]) -> tuple[int, int]:
         try:
             before = self.translation_file.stat().st_size
             document = json.loads(self.translation_file.read_text(encoding="utf-8"))
             entries = document.get("entries") or {}
+            cutoff = _aware(self._now()) - timedelta(days=90)
+            removed = 0
             for key in keys:
-                entries.pop(key, None)
+                entry = entries.get(key)
+                accessed = _parse_time(entry.get("last_accessed_at") if isinstance(entry, dict) else None)
+                if accessed is not None and accessed < cutoff:
+                    entries.pop(key, None)
+                    removed += 1
+            if removed == 0:
+                return 0, 0
             document["entries"] = entries
             self._atomic_write(self.translation_file, document)
-            return max(0, before - self.translation_file.stat().st_size)
+            return max(0, before - self.translation_file.stat().st_size), removed
         except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-            return 0
+            return 0, 0
+
+    def _file_candidate_still_expired(self, candidate: dict[str, Any]) -> bool:
+        path = candidate["path"]
+        try:
+            stat = path.stat()
+        except (FileNotFoundError, OSError):
+            return False
+        if stat.st_size != candidate.get("size") or stat.st_mtime_ns != candidate.get("mtime_ns"):
+            return False
+        if candidate.get("root") != self.fund_root:
+            return True
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            capability = str(document.get("key") or "").partition(":")[0]
+            category = CAPABILITY_CATEGORY.get(capability)
+            expires = _parse_time(document.get("expires_at"))
+            retention = RETENTION_AFTER_EXPIRY.get(str(category or ""))
+            return bool(
+                category == candidate.get("category")
+                and expires is not None
+                and retention is not None
+                and _aware(self._now()) > expires + retention
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return False
 
     def cleanup_expired(self, manual: bool = False) -> dict[str, Any]:
+        with CACHE_IO_LOCK:
+            return self._cleanup_expired(manual)
+
+    def _cleanup_expired(self, manual: bool) -> dict[str, Any]:
         _, candidates = self._scan()
         priority = {name: index for index, name in enumerate(CATEGORY_ORDER)}
         candidates.sort(key=lambda row: (priority.get(row["category"], 99), row["time"]))
@@ -287,10 +329,10 @@ class CacheManager:
                 continue
             path = candidate["path"]
             root = candidate["root"]
-            if not self._contained(path, root):
+            if not self._contained(path, root) or not self._file_candidate_still_expired(candidate):
                 continue
             try:
-                size = path.stat().st_size
+                size = candidate["size"]
                 path.unlink()
                 released += size
                 if category not in deleted_categories:
@@ -307,8 +349,8 @@ class CacheManager:
                     parent = parent.parent
 
         if translation_keys:
-            translation_released = self._remove_translation_entries(translation_keys)
-            if translation_released or translation_keys:
+            translation_released, translation_removed = self._remove_translation_entries(translation_keys)
+            if translation_removed:
                 released += translation_released
                 insert_at = min(1, len(deleted_categories))
                 deleted_categories.insert(insert_at, "translations")
@@ -323,16 +365,17 @@ class CacheManager:
         }
 
     def maybe_auto_cleanup(self) -> dict[str, Any]:
-        now = _aware(self._now())
-        last = _parse_time(self._read_state().get("last_auto_cleanup_at"))
-        if last is not None and now - last < timedelta(hours=24):
-            return {"ran": False, "released_bytes": 0, "status": self.status()}
-        result = self.cleanup_expired(manual=False)
-        self._atomic_write(self.state_file, {
-            "last_auto_cleanup_at": now.isoformat(),
-            "last_released_bytes": result["released_bytes"],
-        })
-        return {"ran": True, "released_bytes": result["released_bytes"], "status": self.status()}
+        with CACHE_IO_LOCK:
+            now = _aware(self._now())
+            last = _parse_time(self._read_state().get("last_auto_cleanup_at"))
+            if last is not None and now - last < timedelta(hours=24):
+                return {"ran": False, "released_bytes": 0, "status": self.status()}
+            result = self._cleanup_expired(manual=False)
+            self._atomic_write(self.state_file, {
+                "last_auto_cleanup_at": now.isoformat(),
+                "last_released_bytes": result["released_bytes"],
+            })
+            return {"ran": True, "released_bytes": result["released_bytes"], "status": self.status()}
 
 
 _manager: CacheManager | None = None
@@ -343,4 +386,3 @@ def get_manager() -> CacheManager:
     if _manager is None:
         _manager = CacheManager()
     return _manager
-

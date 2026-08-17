@@ -133,6 +133,34 @@ function mergeTranslations(response: MarketNewsResponse, translations: MarketNew
   };
 }
 
+function preserveSameSnapshotTranslations(
+  response: MarketNewsResponse,
+  previous: MarketNewsResponse | undefined,
+): MarketNewsResponse {
+  if (!previous || previous.snapshot_id !== response.snapshot_id) return response;
+  const previousById = new Map(
+    [...previous.events, ...previous.focus_events].map((event) => [event.event_id, event]),
+  );
+  const preserve = (event: MarketNewsEvent): MarketNewsEvent => {
+    if (event.translation_status) return event;
+    const prior = previousById.get(event.event_id);
+    if (!prior?.translation_status) return event;
+    return {
+      ...event,
+      translated_title_zh: prior.translated_title_zh,
+      translated_summary_zh: prior.translated_summary_zh,
+      translation_status: prior.translation_status,
+      translation_provider: prior.translation_provider,
+      translated_at: prior.translated_at,
+    };
+  };
+  return {
+    ...response,
+    events: response.events.map(preserve),
+    focus_events: response.focus_events.map(preserve),
+  };
+}
+
 function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_reason"]; onAddTag: () => void }) {
   if (reason === "no_tags") {
     return <div className="py-16 text-center"><p className="font-semibold">还没有选择关注行业</p><p className="mt-2 text-sm text-muted-foreground">添加半导体、存储、机器人、医疗等标签后开始跟踪资讯</p><button onClick={onAddTag} className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">添加标签</button></div>;
@@ -216,8 +244,9 @@ export function MarketNews() {
     api.marketNewsEvents(query).then((response) => {
       if (requestId !== requestIdRef.current) return;
       if (!responseMatchesQuery(response, query)) throw new Error("market-news response filters mismatch");
-      cacheMarketNewsResponse(responseCacheRef.current, queryKey, response);
-      setView({ queryKey, response });
+      const accepted = preserveSameSnapshotTranslations(response, responseCacheRef.current.get(queryKey));
+      cacheMarketNewsResponse(responseCacheRef.current, queryKey, accepted);
+      setView({ queryKey, response: accepted });
     }).catch(() => {
       if (requestId !== requestIdRef.current) return;
       const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
@@ -287,8 +316,9 @@ export function MarketNews() {
       const response = await api.marketNewsRefresh(query);
       if (requestId !== requestIdRef.current) return;
       if (!responseMatchesQuery(response, query)) throw new Error("market-news refresh filters mismatch");
-      cacheMarketNewsResponse(responseCacheRef.current, queryKey, response);
-      setView({ queryKey, response });
+      const accepted = preserveSameSnapshotTranslations(response, responseCacheRef.current.get(queryKey));
+      cacheMarketNewsResponse(responseCacheRef.current, queryKey, accepted);
+      setView({ queryKey, response: accepted });
     } catch {
       if (requestId !== requestIdRef.current) return;
       const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
@@ -332,8 +362,9 @@ export function MarketNews() {
       throw new Error("configured source retry failed");
     }
     if (!responseMatchesQuery(result, query)) throw new Error("market-news retry filters mismatch");
-    cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, result);
-    setView({ queryKey: retryQueryKey, response: result });
+    const accepted = preserveSameSnapshotTranslations(result, current);
+    cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, accepted);
+    setView({ queryKey: retryQueryKey, response: accepted });
     setQueryError(null);
     if (result.source_summary.failed_sources === 0) setSourceDialogOpen(false);
   };

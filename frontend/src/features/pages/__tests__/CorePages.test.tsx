@@ -182,6 +182,48 @@ describe("PP03 core pages", () => {
     expect(screen.getByRole("heading", { name: "机器人中文标题" })).toBeInTheDocument();
   });
 
+  it("preserves a translated same snapshot across an A to B to A reload", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("vr-llm", JSON.stringify({
+      provider: "openai", baseURL: "https://model.example.test/v1", apiKey: "request-only", model: "test-model",
+    }));
+    localStorage.setItem("vr-page-tags:market_news", JSON.stringify({ ids: ["storage", "robotics"], activeId: "storage" }));
+    const storage = {
+      ...translatedEnglishEvent,
+      event_id: "33333333333333333333",
+      title: "Storage source title",
+      translated_title_zh: undefined,
+      translated_summary_zh: undefined,
+      translation_status: undefined,
+    };
+    const robotics = eventFor("44444444444444444444", "机器人原始中文标题", "robotics", "机器人");
+    vi.spyOn(api, "marketNewsEvents").mockImplementation((query) => Promise.resolve(
+      query.tag_ids[0] === "storage"
+        ? responseFor(queryFor("storage"), storage, "stable-storage-snapshot")
+        : responseFor(queryFor("robotics"), robotics, "robotics-snapshot"),
+    ));
+    const translate = vi.spyOn(api, "marketNewsTranslations").mockResolvedValue({
+      translations: [{
+        event_id: storage.event_id,
+        translated_title_zh: "稳定的存储中文标题",
+        translated_summary_zh: "稳定的中文摘要",
+        translation_status: "translated",
+        translation_provider: "openai",
+        translated_at: "2026-08-17T04:03:00+00:00",
+      }],
+      limit: 20,
+    });
+
+    render(<MarketNews />);
+    expect(await screen.findByRole("heading", { name: "稳定的存储中文标题" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    expect(await screen.findByRole("heading", { name: "机器人原始中文标题" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "切换到存储" }));
+
+    expect(await screen.findByRole("heading", { name: "稳定的存储中文标题" })).toBeInTheDocument();
+    expect(translate).toHaveBeenCalledTimes(1);
+  });
+
   it("caps one translation batch at twenty visible English events", async () => {
     localStorage.setItem("vr-llm", JSON.stringify({
       provider: "openai", baseURL: "https://model.example.test/v1", apiKey: "request-only", model: "test-model",

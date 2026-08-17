@@ -58,4 +58,3 @@ describe("MarketNews DataInfoDialog cache management", () => {
     expect(screen.getByRole("button", { name: "关闭数据说明" })).toBeEnabled();
   });
 });
-

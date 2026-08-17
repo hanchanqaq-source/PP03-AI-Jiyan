@@ -64,4 +64,3 @@ describe("MarketNews SourceFailureDialog", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("该来源重试失败，请稍后再试。");
   });
 });
-
