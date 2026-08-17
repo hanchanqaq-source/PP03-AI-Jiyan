@@ -236,6 +236,7 @@ def test_probe_source_config_treats_decode_failures_as_non_retryable_parse(paylo
         "unsupported protocol",
         "no shared cipher",
         "certificate verify failed",
+        "unexpected eof while reading",
     ],
 )
 def test_probe_source_config_does_not_retry_permanent_tls_errors(detail, monkeypatch):

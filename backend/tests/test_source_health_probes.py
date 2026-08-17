@@ -242,3 +242,21 @@ def test_probe_redacts_standalone_windows_paths_with_spaces_and_slashes(path):
     assert "trace.log" not in lowered
     assert "debug.txt" not in lowered
     assert "users" not in lowered
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\Alice Smith\private folder\trace.log",
+        "C:/Users/Alice Smith/private folder/trace.log",
+    ],
+)
+def test_probe_redacts_windows_path_on_one_line_without_swallowing_the_next(path):
+    result = classify_probe_error(RuntimeError(f"{path}\nPublic follow-up detail"))
+
+    lowered = result.message.lower()
+    assert "alice" not in lowered
+    assert "private" not in lowered
+    assert "trace.log" not in lowered
+    assert "users" not in lowered
+    assert "public follow-up detail" in lowered

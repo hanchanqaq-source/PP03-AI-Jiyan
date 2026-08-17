@@ -64,7 +64,7 @@ def redact_probe_message(value: object) -> str:
     text = str(value or "")
     text = re.sub(r"(?is)Traceback \(most recent call last\):.*", "", text)
     text = re.sub(
-        r"(?i)(?<![\w:/])(?:\\\\\?\\)?[A-Z]:[\\/].*$",
+        r"(?im)(?<![\w:/])(?:\\\\\?\\)?[A-Z]:[\\/][^\r\n]*$",
         "[local-path]",
         text,
     )
@@ -125,7 +125,7 @@ def classify_probe_error(error: BaseException) -> ClassifiedProbeError:
             detail = str(item).lower()
             temporary = isinstance(item, (ssl.SSLWantReadError, ssl.SSLWantWriteError)) or any(
                 marker in detail
-                for marker in ("temporary", "temporarily", "timed out", "timeout", "try again", "unexpected eof")
+                for marker in ("temporary", "temporarily", "timed out", "timeout", "try again")
             )
             return ClassifiedProbeError("tls", "TLS 连接失败", retryable=temporary)
     if any(isinstance(item, ProbeParseError) for item in chain):
