@@ -10,6 +10,7 @@ AI「今日要点」不在此模块——复用 Vibe-Research 的可插拔 AI �
 from __future__ import annotations
 
 import json
+import gzip
 import hashlib
 import os
 import re
@@ -17,12 +18,21 @@ import socket
 import ssl
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
+
+from source_health.probe_errors import (
+    ProbeEmptyPayloadError,
+    classify_probe_error,
+    redact_probe_message,
+    redact_url,
+    retry_delay_seconds,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCES_FILE = os.path.join(HERE, "news_sources.json")
@@ -127,66 +137,195 @@ def _parse_dt(s: str):
     return dt
 
 
+def _decode_feed(raw: bytes, headers: object) -> str:
+    content_encoding = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Encoding", "") or "").lower()
+    if "gzip" in content_encoding or raw.startswith(b"\x1f\x8b"):
+        raw = gzip.decompress(raw)
+    content_type = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Type", "") or "")
+    charset = None
+    match = re.search(r"(?i)charset\s*=\s*['\"]?([^\s;'\"]+)", content_type)
+    if match:
+        charset = match.group(1)
+    if not charset:
+        declaration = re.match(br"\s*<\?xml[^>]*encoding\s*=\s*['\"]([^'\"]+)", raw, flags=re.I)
+        if declaration:
+            charset = declaration.group(1).decode("ascii", errors="replace")
+    return raw.decode(charset or "utf-8-sig")
+
+
+def _parse_feed_items(src: dict, root: ET.Element, per: int, cutoff, redline: list[str], fetched_at: str) -> list[dict]:
+    out = []
+    for n in [e for e in root.iter() if _local(e.tag) in ("item", "entry")]:
+        if len(out) >= per:
+            break
+        d = {
+            "title": "", "url": "", "time": "", "ts": 0, "summary": "", "source": src["name"],
+            "source_name": src["name"], "source_url": src["url"], "original_url": "",
+            "published_at": None, "fetched_at": fetched_at, "summary_or_excerpt": "",
+            "language": src.get("language") or "unknown", "region": src.get("region") or "unknown",
+            "data_status": "realtime",
+        }
+        rawtime = ""
+        for c in n:
+            t = _local(c.tag)
+            if t == "title" and not d["title"]:
+                d["title"] = (c.text or "").strip()
+            elif t == "link" and not d["url"]:
+                d["url"] = c.get("href") or (c.text or "").strip()
+            elif t in ("pubDate", "published", "updated", "date") and not rawtime:
+                rawtime = (c.text or "").strip()
+            elif t in ("description", "summary", "content") and not d["summary"]:
+                d["summary"] = _strip_html(c.text or "")[:160]
+        if not d["title"]:
+            continue
+        blob = (d["title"] + " " + d["summary"]).lower()
+        if any(k in blob for k in redline):
+            continue
+        dt = _parse_dt(rawtime)
+        if dt is not None:
+            if cutoff and dt < cutoff:
+                continue
+            d["time"] = dt.astimezone(BEIJING).strftime("%m-%d %H:%M")
+            d["ts"] = int(dt.timestamp())
+            d["published_at"] = dt.astimezone(BEIJING).isoformat(timespec="seconds")
+        else:
+            d["time"] = "—"
+        d["original_url"] = d["url"]
+        d["summary_or_excerpt"] = d["summary"]
+        out.append(d)
+    return out
+
+
+def _request_decode_parse_source(
+    src: dict,
+    per: int,
+    cutoff,
+    redline: list[str],
+    *,
+    timeout: float,
+    retry_transient: bool,
+) -> dict:
+    """Shared production/probe request, decode and RSS/Atom parse path."""
+    started = time.perf_counter()
+    for attempt in range(2 if retry_transient else 1):
+        try:
+            fetched_at = datetime.now(BEIJING).isoformat(timespec="seconds")
+            req = urllib.request.Request(src["url"], headers={
+                "User-Agent": UA,
+                "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*",
+                "Accept-Encoding": "gzip",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw = response.read()
+                headers = getattr(response, "headers", {}) or {}
+                http_status = getattr(response, "status", None)
+                if http_status is None and hasattr(response, "getcode"):
+                    http_status = response.getcode()
+                http_status = int(http_status or 200)
+                final_url = response.geturl() if hasattr(response, "geturl") else src["url"]
+                content_type = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Type", "") or "")
+            decoded = _decode_feed(raw, headers)
+            root = ET.fromstring(decoded)
+            items = _parse_feed_items(src, root, per, cutoff, redline, fetched_at)
+            return {
+                "status": "success",
+                "items": items,
+                "fetched_at": fetched_at,
+                "http_status": http_status,
+                "error_type": "none",
+                "error_message_redacted": "",
+                "latency_ms": max(0, round((time.perf_counter() - started) * 1000)),
+                "redirected": str(final_url) != str(src["url"]),
+                "final_url": redact_url(final_url),
+                "content_type": content_type,
+            }
+        except Exception as error:
+            classified = classify_probe_error(error)
+            if retry_transient and attempt == 0 and classified.retryable:
+                time.sleep(retry_delay_seconds(error))
+                continue
+            return {
+                "status": "failure",
+                "items": [],
+                "fetched_at": None,
+                "http_status": classified.http_status,
+                "error_type": classified.error_type,
+                "error_message_redacted": classified.message,
+                "latency_ms": max(0, round((time.perf_counter() - started) * 1000)),
+                "redirected": False,
+                "final_url": redact_url(src.get("url")),
+                "content_type": "",
+            }
+    raise AssertionError("unreachable")
+
+
 def _fetch_source(src: dict, per: int, cutoff, redline: list[str]):
     """抓单个 RSS 源；失败只返回来源级状态，不抛出整页异常。"""
-    try:
-        fetched_at = datetime.now(BEIJING).isoformat(timespec="seconds")
-        req = urllib.request.Request(src["url"], headers={
-            "User-Agent": UA,
-            "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*",
-        })
-        with urllib.request.urlopen(req, timeout=14) as r:
-            raw = r.read()
-        root = ET.fromstring(raw)
-        out = []
-        for n in [e for e in root.iter() if _local(e.tag) in ("item", "entry")]:
-            if len(out) >= per:
-                break
-            d = {
-                "title": "", "url": "", "time": "", "ts": 0, "summary": "", "source": src["name"],
-                "source_name": src["name"], "source_url": src["url"], "original_url": "",
-                "published_at": None, "fetched_at": fetched_at, "summary_or_excerpt": "",
-                "language": src.get("language") or "unknown", "region": src.get("region") or "unknown",
-                "data_status": "realtime",
-            }
-            rawtime = ""
-            for c in n:
-                t = _local(c.tag)
-                if t == "title" and not d["title"]:
-                    d["title"] = (c.text or "").strip()
-                elif t == "link" and not d["url"]:
-                    d["url"] = c.get("href") or (c.text or "").strip()
-                elif t in ("pubDate", "published", "updated", "date") and not rawtime:
-                    rawtime = (c.text or "").strip()
-                elif t in ("description", "summary", "content") and not d["summary"]:
-                    d["summary"] = _strip_html(c.text or "")[:160]
-            if not d["title"]:
-                continue
-            blob = (d["title"] + " " + d["summary"]).lower()
-            if any(k in blob for k in redline):  # 合规红线过滤
-                continue
-            dt = _parse_dt(rawtime)
-            if dt is not None:
-                if cutoff and dt < cutoff:
-                    continue
-                d["time"] = dt.astimezone(BEIJING).strftime("%m-%d %H:%M")
-                d["ts"] = int(dt.timestamp())
-                d["published_at"] = dt.astimezone(BEIJING).isoformat(timespec="seconds")
-            else:
-                d["time"] = "—"
-            d["original_url"] = d["url"]
-            d["summary_or_excerpt"] = d["summary"]
-            out.append(d)
+    result = _request_decode_parse_source(src, per, cutoff, redline, timeout=14, retry_transient=False)
+    if result["status"] == "success":
         return {
-            "status": "ok", "items": out, "fetched_at": fetched_at,
+            "status": "ok", "items": result["items"], "fetched_at": result["fetched_at"],
             "error_type": None, "error_reason": None,
         }
-    except Exception as error:
-        error_type, reason = classify_source_error(error)
-        return {
-            "status": "failed", "items": [], "fetched_at": None,
-            "error_type": error_type, "error_reason": sanitize_source_error(reason),
-        }
+    legacy_type = {
+        "parse": "rss_parse",
+        "authentication": "http_status",
+        "rate_limit": "http_status",
+        "http": "http_status",
+    }.get(result["error_type"], result["error_type"])
+    legacy_reason = {
+        "parse": "来源 RSS / XML 解析失败",
+        "authentication": f"来源返回 HTTP {result['http_status']}",
+        "rate_limit": f"来源返回 HTTP {result['http_status']}",
+        "http": f"来源返回 HTTP {result['http_status']}",
+        "timeout": "来源请求超时",
+        "tls": "来源 TLS 连接失败",
+        "dns": "来源域名解析失败",
+        "connection": "来源连接失败",
+    }.get(result["error_type"], f"来源抓取失败（{result['error_message_redacted'] or 'UnknownError'}）")
+    return {
+        "status": "failed", "items": [], "fetched_at": None,
+        "error_type": legacy_type, "error_reason": sanitize_source_error(legacy_reason),
+    }
+
+
+def probe_source_config(
+    source: dict,
+    *,
+    per_source: int = 2,
+    recent_days: int = 30,
+    timeout: float | None = None,
+) -> dict:
+    """Use the production request/decode/parser path without cache or user-data access."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
+    result = _request_decode_parse_source(
+        dict(source),
+        max(1, int(per_source)),
+        cutoff,
+        [],
+        timeout=float(timeout if timeout is not None else 14),
+        retry_transient=True,
+    )
+    if result["status"] == "success" and not result["items"]:
+        classified = classify_probe_error(ProbeEmptyPayloadError())
+        result.update({
+            "status": "failure",
+            "error_type": classified.error_type,
+            "error_message_redacted": classified.message,
+        })
+    elif result["status"] == "success" and result["redirected"]:
+        result.update({
+            "status": "partial",
+            "error_type": "redirect",
+            "error_message_redacted": "来源已重定向到公开最终地址",
+        })
+    result["returned_items"] = len(result["items"])
+    result["latest_published_at"] = max(
+        (str(item["published_at"]) for item in result["items"] if item.get("published_at")),
+        default=None,
+    )
+    result["error_message_redacted"] = redact_probe_message(result["error_message_redacted"])
+    return result
 
 
 def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -> list[dict]:

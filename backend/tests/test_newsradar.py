@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import gzip
 import socket
 import ssl
+import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -12,8 +14,18 @@ import pytest
 
 
 class _Response:
-    def __init__(self, payload: bytes):
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        status: int = 200,
+        url: str = "https://feed.example.test/rss",
+        headers: dict[str, str] | None = None,
+    ):
         self._payload = payload
+        self.status = status
+        self._url = url
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -23,6 +35,12 @@ class _Response:
 
     def read(self) -> bytes:
         return self._payload
+
+    def getcode(self) -> int:
+        return self.status
+
+    def geturl(self) -> str:
+        return self._url
 
 
 def _write_sources(
@@ -59,6 +77,140 @@ def _rss(title: str, link: str) -> bytes:
       <pubDate>Sun, 16 Aug 2026 02:35:00 GMT</pubDate>
       <description>公开摘要内容</description>
     </item></channel></rss>""".encode()
+
+
+def _probe_source() -> dict:
+    return {
+        "name": "公开探测源",
+        "url": "https://feed.example.test/rss",
+        "hint": "semi",
+        "language": "zh-CN",
+        "region": "CN",
+    }
+
+
+def test_probe_source_config_parses_rss_atom_and_namespaced_atom(monkeypatch):
+    feeds = [
+        _rss("RSS 资讯", "https://news.example.test/rss"),
+        b'''<?xml version="1.0"?><feed><entry><title>Atom news</title><link href="https://news.example.test/atom"/><updated>2026-08-18T01:00:00Z</updated></entry></feed>''',
+        b'''<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Namespaced Atom</title><link href="https://news.example.test/ns"/><published>2026-08-18T02:00:00Z</published></entry></feed>''',
+    ]
+
+    for payload, expected_title in zip(feeds, ("RSS 资讯", "Atom news", "Namespaced Atom")):
+        monkeypatch.setattr(newsradar.urllib.request, "urlopen", lambda request, timeout, body=payload: _Response(body))
+        result = newsradar.probe_source_config(_probe_source(), recent_days=30)
+        assert result["status"] == "success"
+        assert result["items"][0]["title"] == expected_title
+        assert result["returned_items"] == 1
+
+
+def test_probe_source_config_supports_gzip_and_gbk_xml(monkeypatch):
+    xml = '''<?xml version="1.0" encoding="GBK"?><rss><channel><item><title>中文资讯</title><link>https://news.example.test/gbk</link><pubDate>Mon, 17 Aug 2026 02:35:00 GMT</pubDate></item></channel></rss>'''.encode("gbk")
+    response = _Response(
+        gzip.compress(xml),
+        headers={"Content-Encoding": "gzip", "Content-Type": "application/rss+xml; charset=GBK"},
+    )
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", lambda request, timeout: response)
+
+    result = newsradar.probe_source_config(_probe_source(), recent_days=30)
+
+    assert result["status"] == "success"
+    assert result["items"][0]["title"] == "中文资讯"
+    assert result["content_type"] == "application/rss+xml; charset=GBK"
+
+
+def test_probe_source_config_reports_permanent_redirect(monkeypatch):
+    response = _Response(
+        _rss("已迁移资讯", "https://news.example.test/moved"),
+        url="https://feed.example.test/permanent.xml",
+        headers={"Content-Type": "application/rss+xml"},
+    )
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", lambda request, timeout: response)
+
+    result = newsradar.probe_source_config(_probe_source())
+
+    assert result["status"] == "partial"
+    assert result["error_type"] == "redirect"
+    assert result["redirected"] is True
+    assert result["final_url"] == "https://feed.example.test/permanent.xml"
+
+
+def test_probe_source_config_retries_http_429_once_and_honors_capped_retry_after(monkeypatch):
+    attempts = []
+    waits = []
+
+    def fake_open(request, timeout):
+        attempts.append((request, timeout))
+        if len(attempts) == 1:
+            raise urllib.error.HTTPError(request.full_url, 429, "limited", {"Retry-After": "9"}, None)
+        return _Response(_rss("重试成功", "https://news.example.test/retry"))
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    result = newsradar.probe_source_config(_probe_source(), timeout=3)
+
+    assert result["status"] == "success"
+    assert len(attempts) == 2
+    assert waits == [5.0]
+    assert all(call[1] == 3 for call in attempts)
+
+
+def test_probe_source_config_tls_retry_never_disables_verification(monkeypatch):
+    calls = []
+
+    def fake_open(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise ssl.SSLError("temporary handshake failure")
+        return _Response(_rss("TLS 恢复", "https://news.example.test/tls"))
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = newsradar.probe_source_config(_probe_source())
+
+    assert result["status"] == "success"
+    assert len(calls) == 2
+    assert all("context" not in kwargs for _args, kwargs in calls)
+
+
+def test_probe_source_config_parse_failure_and_empty_feed_do_not_retry(monkeypatch):
+    for payload, expected_error in ((b"<rss>", "parse"), (b"<rss><channel/></rss>", "empty_payload")):
+        calls = []
+
+        def fake_open(request, timeout, body=payload):
+            calls.append(request)
+            return _Response(body)
+
+        monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+        result = newsradar.probe_source_config(_probe_source())
+        assert result["status"] == "failure"
+        assert result["error_type"] == expected_error
+        assert len(calls) == 1
+
+
+def test_probe_source_config_redacts_failures_and_never_writes_radar_cache(tmp_path, monkeypatch):
+    cache = tmp_path / "radar.json"
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(
+            RuntimeError(
+                "https://x.test/feed?api_key=secret Authorization: Bearer abc "
+                r"C:\Users\26365\private\trace.log"
+            )
+        ),
+    )
+
+    result = newsradar.probe_source_config(_probe_source())
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == "unknown"
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "secret" not in serialized and "Bearer" not in serialized and "26365" not in serialized
+    assert not cache.exists()
 
 
 def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch):
