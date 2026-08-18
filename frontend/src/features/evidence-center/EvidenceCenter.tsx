@@ -13,6 +13,7 @@ type Sort = "latest" | "impact" | "holdings";
 const filters: Filter[] = ["全部", "已核验", "多源印证", "待核验", "存在冲突", "已证伪"];
 const tabs: Array<{ value: Tab; label: string }> = [{ value: "verification", label: "资讯核验" }, { value: "health", label: "数据源健康" }, { value: "corrections", label: "更正记录" }];
 const statusTone: Record<VerificationStatus, string> = { "已核验": "border-primary/50 bg-primary/10 text-primary", "多源印证": "border-sky-400/50 bg-sky-400/10 text-sky-300", "待核验": "border-slate-400/45 bg-slate-400/10 text-slate-300", "存在冲突": "border-orange-400/55 bg-orange-400/10 text-orange-300", "已证伪": "border-destructive/55 bg-destructive/10 text-destructive", "已更正": "border-primary/50 bg-primary/10 text-primary" };
+const holdingsPriority = { "直接关联": 0, "行业关联": 1, "待核验相关": 2 } as const;
 
 function PrototypeNotice({ message }: { message: string | null }) {
   return message ? <p role="status" className="rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary">{message}</p> : null;
@@ -62,7 +63,7 @@ export function EvidenceCenter() {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => { const eventId = new URLSearchParams(window.location.search).get("event_id"); const match = evidenceFixtures.find((event) => event.eventId === eventId); if (match) setSelected(match); }, []);
-  const visibleEvents = useMemo(() => evidenceFixtures.filter((event) => filter === "全部" || event.status === filter).sort((left, right) => sort === "impact" ? right.impact - left.impact : sort === "holdings" ? left.holdingsRelation.localeCompare(right.holdingsRelation, "zh-CN") : right.verifiedAt.localeCompare(left.verifiedAt)), [filter, sort]);
+  const visibleEvents = useMemo(() => evidenceFixtures.filter((event) => filter === "全部" || event.status === filter).sort((left, right) => sort === "impact" ? right.impact - left.impact : sort === "holdings" ? holdingsPriority[left.holdingsRelation] - holdingsPriority[right.holdingsRelation] : right.verifiedAt.localeCompare(left.verifiedAt)), [filter, sort]);
   const openEvent = (event: EvidenceFixture, trigger?: HTMLButtonElement | null, history = false) => { triggerRef.current = trigger || null; setFocusHistory(history); setSelected(event); };
   const closeEvent = () => { setSelected(null); setFocusHistory(false); triggerRef.current?.focus(); };
   const sourcePrototype = () => setNotice("当前为页面原型，尚未绑定正式原始文件。");

@@ -56,6 +56,15 @@ describe("EvidenceCenter", () => {
     expect(within(screen.getByRole("main")).getAllByRole("article")[0]).toHaveTextContent("星河科技发布算力中心建设公告");
   });
 
+  it("sorts holdings by direct, industry, then pending relevance", async () => {
+    const user = userEvent.setup();
+    render(<EvidenceCenter />);
+    await user.selectOptions(screen.getByLabelText("排序方式"), "holdings");
+
+    const relations = within(screen.getByRole("main")).getAllByRole("article").map((card) => card.textContent?.match(/持仓关联：(直接关联|行业关联|待核验相关)/)?.[1]);
+    expect(relations).toEqual(["直接关联", "直接关联", "行业关联", "行业关联", "行业关联", "待核验相关"]);
+  });
+
   it("shows only the explicit fictional multi-source fixture when filtering 多源印证", async () => {
     const user = userEvent.setup();
     render(<EvidenceCenter />);
@@ -72,6 +81,7 @@ describe("EvidenceCenter", () => {
     await user.click(trigger);
 
     expect(screen.getByRole("dialog", { name: "证据详情" })).toHaveTextContent("核心主张");
+    expect(screen.getByRole("dialog", { name: "证据详情" })).toHaveTextContent("关键字段");
     expect(screen.getByText("这些来源来自同一原始稿件，不重复计算为独立证据。")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "打开原始证据" }));
     expect(screen.getByText("当前为页面原型，尚未绑定正式原始文件。")).toBeInTheDocument();
@@ -103,5 +113,7 @@ describe("EvidenceCenter", () => {
     expect(drawer).toHaveTextContent("已更正");
     expect(drawer).toHaveTextContent("原始公告的建设周期说明已被更正");
     expect(drawer).toHaveTextContent("状态历史");
+    expect(drawer).toHaveTextContent("16:05 待核验");
+    expect(drawer).not.toHaveTextContent("13:46 已核验");
   });
 });
