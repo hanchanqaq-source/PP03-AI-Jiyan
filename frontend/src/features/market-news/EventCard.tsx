@@ -44,7 +44,7 @@ export function EventCard({ event, onOpenDetails, onViewEvidence }: { event: Mar
       <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
         <span className={cn("rounded-full border px-2 py-0.5 font-medium", relation.className)}>{relation.label}</span>
         <span className="rounded-full border border-border/60 bg-muted/25 px-2 py-0.5">{CATEGORY[event.category]}</span>
-        {hasPrototypeVerification && <><span className="rounded-full border border-primary/45 bg-primary/10 px-2 py-0.5 font-medium text-primary">{event.verification_status}</span><span className="rounded-full border border-primary/30 px-2 py-0.5 text-primary">前端演示 Fixture</span></>}
+        {hasPrototypeVerification && <span className="rounded-full border border-primary/45 bg-primary/10 px-2 py-0.5 font-medium text-primary">{event.verification_status} · 前端演示 Fixture</span>}
         <span>{STATUS[event.data_status] || "缓存数据"}</span>
         {hasTranslation && <button onClick={() => setLanguage(showChinese ? "original" : "zh")} aria-label={showChinese ? "查看原文" : "中文"} className="inline-flex items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 hover:border-primary/45 hover:text-primary"><Languages className="h-3 w-3" />{showChinese ? "查看原文" : "中文"}</button>}
         <span className="ml-auto inline-flex items-center gap-1 font-mono"><Clock3 className="h-3 w-3" />{shortDateTime(event.published_at_latest)}</span>

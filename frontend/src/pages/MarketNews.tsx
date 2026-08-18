@@ -22,7 +22,7 @@ import { usePageTags } from "@/features/tags/usePageTags";
 import { api } from "@/lib/api";
 import { loadLlm } from "@/lib/llm";
 import { cn } from "@/lib/utils";
-import { marketNewsPrototypeEvent } from "@/features/market-news/prototype";
+import { marketNewsDisplayEvents } from "@/features/market-news/prototype";
 
 const MODES: Array<{ value: MarketNewsMode; label: string }> = [
   { value: "my_focus", label: "我的关注" },
@@ -386,7 +386,7 @@ export function MarketNews() {
   const queryFailedWithoutCache = Boolean(error && !data && !noTags);
   const emptyReason = noTags ? "no_tags" : data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
   const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
-  const displayedEvents = data ? [...data.events, marketNewsPrototypeEvent] : [];
+  const displayedEvents = data ? marketNewsDisplayEvents(data.events, query) : [];
 
   return (
     <div>

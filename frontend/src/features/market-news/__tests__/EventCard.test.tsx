@@ -83,8 +83,8 @@ describe("MarketNews EventCard", () => {
     expect(screen.queryByRole("button", { name: "查看证据" })).not.toBeInTheDocument();
 
     rerender(<EventCard event={marketNewsPrototypeEvent} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
-    expect(screen.getByText("前端演示 Fixture")).toBeInTheDocument();
-    expect(screen.getByText("已核验")).toBeInTheDocument();
+    expect(screen.getByText("已核验 · 前端演示 Fixture")).toBeInTheDocument();
+    expect(screen.queryByText(/^前端演示 Fixture$/)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "查看证据" }));
     expect(onViewEvidence).toHaveBeenCalledWith(marketNewsPrototypeEvent);
