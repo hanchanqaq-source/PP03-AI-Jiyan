@@ -13,6 +13,7 @@ from source_health.probe_errors import (
     ProbeSchemaError,
     classify_probe_error,
     retry_delay_seconds,
+    retry_after_present,
 )
 
 
@@ -193,6 +194,7 @@ def _failure_result(
         "returned_items": 0,
         "data_as_of_date": None,
         "field_completeness_pct": completeness,
+        "retry_after_present": retry_after_present(error),
     }
 
 

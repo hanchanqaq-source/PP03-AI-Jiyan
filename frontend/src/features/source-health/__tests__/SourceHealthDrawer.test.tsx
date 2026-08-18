@@ -18,7 +18,7 @@ const sources = [
     probe_status: "success", error_type: "none", error_message_redacted: "", http_status: 200, returned_items: 1,
     data_as_of_date: "2026-08-18", freshness_seconds: 0, field_completeness_pct: 100, used_cache: false,
     cache_status: "not_used", fallback_available: true, redirected: false, final_reference: "https://fund.example.test/public",
-    rating_score: 96, rating: "healthy", rating_confidence: "initial", repair_value: "none", repair_reason: "无需处理", consecutive_failures: 0,
+    rating_score: 96, rating: "healthy", rating_confidence: "initial", repair_value: "none", repair_reason: "无需处理", consecutive_failures: 0, last_success_at: "2026-08-18T06:30:00+00:00",
   },
   {
     source_id: "news:finance", source_name: "财经资讯源", group: "news", capability: "公开资讯",
@@ -27,6 +27,7 @@ const sources = [
     data_as_of_date: null, freshness_seconds: null, field_completeness_pct: 0, used_cache: false,
     cache_status: "not_used", fallback_available: false, redirected: true, final_reference: "https://news.example.test/public",
     rating_score: 10, rating: "failed", rating_confidence: "initial", repair_value: "replace_candidate", repair_reason: "评估替换公开来源", consecutive_failures: 3,
+    last_success_at: "2026-08-17T10:00:00+00:00",
     headers: { Authorization: "Bearer secret-token" }, Cookie: "private-cookie", Token: "secret-token",
     stack: "C:\\Users\\private\\project\\backend.py line 9", local_path: "D:\\private\\debug.txt",
   },
@@ -70,6 +71,7 @@ describe("source health drawer through MarketNews", () => {
     await user.selectOptions(screen.getByRole("combobox", { name: "按状态过滤" }), "failed");
     expect(screen.queryByText("东方财富基金")).not.toBeInTheDocument();
     expect(screen.getByText("财经资讯源")).toBeInTheDocument();
+    expect(screen.getByText(/最近成功：/)).not.toHaveTextContent("暂无记录");
     await user.click(screen.getByRole("button", { name: "查看失败详情 财经资讯源" }));
     expect(screen.getByText("错误类型：超时")).toBeInTheDocument();
     expect(screen.getByText("脱敏原因：公开请求超时，未包含凭证")).toBeInTheDocument();

@@ -50,7 +50,7 @@ def advise_repair(
     if requires_tls_bypass:
         return RepairAdvice("replace_candidate", "修复需要绕过 TLS 校验，建议评估替代来源")
 
-    if status in {301, 308} and observation.redirected and permanent_redirect_same_public_source:
+    if observation.redirected and permanent_redirect_same_public_source:
         return RepairAdvice("immediate_fix", "永久跳转到同一公开来源的新地址")
     if missing_standard_request_headers:
         return RepairAdvice("immediate_fix", "缺少标准请求头且已确认导致失败")
@@ -62,6 +62,9 @@ def advise_repair(
         return RepairAdvice("immediate_fix", "存在完全相同的重复配置")
     if cache_status_mislabeled:
         return RepairAdvice("immediate_fix", "缓存状态误标")
+
+    if high_value_source and reproducible_failure and observation.error_type in {"schema_changed", "parse"}:
+        return RepairAdvice("worth_fixing", "高价值来源存在可复现的结构或解析失败")
 
     if status in {404, 410}:
         return RepairAdvice("replace_candidate", f"公开入口返回 HTTP {status}")
@@ -81,8 +84,6 @@ def advise_repair(
     if reliable_cache_available:
         return RepairAdvice("observe", "当前可使用可靠缓存")
 
-    if high_value_source and reproducible_failure and observation.error_type in {"schema_changed", "parse"}:
-        return RepairAdvice("worth_fixing", "高价值来源存在可复现的结构或解析失败")
     if public_entry_changed:
         return RepairAdvice("worth_fixing", "公开入口变化，需要有限适配")
     fallback = observation.fallback_available if reliable_fallback_available is None else reliable_fallback_available

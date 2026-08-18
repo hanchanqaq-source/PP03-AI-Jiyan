@@ -34,7 +34,7 @@ function formatTime(value: string | null): string {
 function SourceRow({ source }: { source: SourceHealthSource }) {
   const [expanded, setExpanded] = useState(false);
   const hasFailureDetails = source.probe_status === "failure" || source.rating === "failed";
-  const lastSuccess = source.probe_status === "success" ? formatTime(source.finished_at) : "暂无记录";
+  const lastSuccess = formatTime(source.last_success_at);
   return (
     <article className="rounded-xl border border-border/55 bg-background/45 p-4">
       <div className="flex flex-wrap items-start justify-between gap-2">

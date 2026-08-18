@@ -8,6 +8,7 @@ import time
 import pytest
 
 from source_health.models import SourceDescriptor
+from source_health.registry import build_news_descriptors
 from source_health.runner import SourceHealthRunner
 
 
@@ -22,6 +23,7 @@ def descriptor(
     group: str = "fund",
     capability: str = "profile",
     critical: bool = False,
+    freshness_max_age_seconds: int | None = None,
 ) -> SourceDescriptor:
     return SourceDescriptor(
         source_id=source_id,
@@ -34,6 +36,7 @@ def descriptor(
         requires_api_key=False,
         probe_kind="news_feed" if group == "news" else "provider",
         probe_args={"code": "000001"} if group != "news" else {"hint": "ai"},
+        freshness_max_age_seconds=freshness_max_age_seconds,
     )
 
 
@@ -196,3 +199,144 @@ def test_shutdown_closes_both_probe_pools():
 
     with pytest.raises(RuntimeError, match="shutdown"):
         runner.run("full")
+
+
+def test_runner_uses_history_for_confidence_failure_streak_and_last_success():
+    row = descriptor("news:history", source_name="history", group="news", capability="feed")
+    raw = successful_result("history")
+    raw.update({"status": "failure", "error_type": "timeout", "returned_items": 0})
+    history = [
+        {
+            "run_id": "old-container",
+            "observations": [
+                {
+                    "source_id": row.source_id,
+                    "probe_status": "success" if index == 0 else "failure",
+                    "finished_at": f"2026-08-{11 + index // 3:02d}T12:00:00+00:00",
+                    "error_type": "none" if index == 0 else "timeout",
+                }
+                for index in range(19)
+            ],
+        }
+    ]
+    runner = SourceHealthRunner(
+        [row], providers=[], news_sources={row.source_id: {"name": "history"}},
+        news_probe=lambda *_args, **_kwargs: raw, now=lambda: NOW,
+    )
+
+    [result] = runner.run("full", history_documents=history)
+
+    assert result.rating_confidence == "stable"
+    assert result.consecutive_failures == 19
+    assert result.last_success_at == "2026-08-11T12:00:00+00:00"
+    runner.shutdown()
+
+
+def test_runner_reaches_growing_confidence_at_three_dates_and_five_samples():
+    row = descriptor("news:growing", source_name="growing", group="news", capability="feed")
+    history = [
+        {"source_id": row.source_id, "probe_status": "success", "finished_at": stamp}
+        for stamp in (
+            "2026-08-16T10:00:00+00:00", "2026-08-16T11:00:00+00:00",
+            "2026-08-17T10:00:00+00:00", "2026-08-17T11:00:00+00:00",
+        )
+    ]
+    runner = SourceHealthRunner(
+        [row], providers=[], news_sources={row.source_id: {"name": "growing"}},
+        news_probe=lambda *_args, **_kwargs: successful_result("growing"), now=lambda: NOW,
+    )
+
+    [result] = runner.run("full", history_documents=history)
+
+    assert result.rating_confidence == "growing"
+    assert result.consecutive_failures == 0
+    assert result.last_success_at == NOW.isoformat()
+    runner.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("source_id", "critical", "raw_updates", "history", "expected"),
+    [
+        (
+            "news:redirect", False,
+            {"status": "partial", "error_type": "redirect", "http_status": 301, "redirected": True,
+             "final_reference": "https://public.example.test/new.xml"},
+            [], "immediate_fix",
+        ),
+        (
+            "news:limited", False,
+            {"status": "failure", "error_type": "rate_limit", "http_status": 429,
+             "retry_after_present": True, "returned_items": 0},
+            [], "observe",
+        ),
+        (
+            "news:multi-day", False,
+            {"status": "failure", "error_type": "timeout", "returned_items": 0},
+            [
+                {"source_id": "news:multi-day", "probe_status": "failure", "finished_at": "2026-08-16T12:00:00+00:00"},
+                {"source_id": "news:multi-day", "probe_status": "failure", "finished_at": "2026-08-17T12:00:00+00:00"},
+            ], "replace_candidate",
+        ),
+        (
+            "news:valuable-parse", True,
+            {"status": "failure", "error_type": "parse", "returned_items": 0},
+            [{"source_id": "news:valuable-parse", "probe_status": "failure", "error_type": "parse",
+              "finished_at": "2026-08-17T12:00:00+00:00"}], "worth_fixing",
+        ),
+        (
+            "news:cached", False,
+            {"status": "failure", "error_type": "http", "http_status": 500, "returned_items": 0,
+             "used_cache": True, "cache_status": "cache"},
+            [], "observe",
+        ),
+    ],
+)
+def test_runner_connects_runtime_repair_evidence(source_id, critical, raw_updates, history, expected):
+    row = descriptor(source_id, source_name=source_id, group="news", capability="feed", critical=critical)
+    companion = descriptor("news:companion", source_name="companion", group="news", capability="feed")
+    raw = successful_result(source_id)
+    raw.update(raw_updates)
+    runner = SourceHealthRunner(
+        [row, companion], providers=[],
+        news_sources={row.source_id: {"name": source_id}, companion.source_id: {"name": "companion"}},
+        news_probe=lambda source, **_kwargs: raw if source["name"] == source_id else successful_result("companion"),
+        now=lambda: NOW,
+    )
+
+    results = runner.run("full", history_documents=history)
+
+    result = next(item for item in results if item.source_id == source_id)
+    assert result.repair_value == expected
+    runner.shutdown()
+
+
+def test_runner_marks_exact_duplicate_registration_but_permission_rule_keeps_priority():
+    config = {"hint": "ai", "name": "duplicate", "url": "https://public.example.test/feed", "language": "zh-CN", "region": "CN"}
+    duplicate = build_news_descriptors({"sources": [config, dict(config)]})[0]
+    healthy = successful_result("duplicate")
+    runner = SourceHealthRunner(
+        [duplicate, duplicate], providers=[], news_sources={duplicate.source_id: {"name": "duplicate"}},
+        news_probe=lambda *_args, **_kwargs: healthy, now=lambda: NOW,
+    )
+    duplicate_results = runner.run("full", history_documents=[])
+    assert {row.repair_value for row in duplicate_results} == {"immediate_fix"}
+    runner.shutdown()
+
+    denied = successful_result("duplicate")
+    denied.update({"status": "failure", "error_type": "authentication", "http_status": 403})
+    priority_runner = SourceHealthRunner(
+        [duplicate, duplicate], providers=[], news_sources={duplicate.source_id: {"name": "duplicate"}},
+        news_probe=lambda *_args, **_kwargs: denied, now=lambda: NOW,
+    )
+    denied_results = priority_runner.run("full", history_documents=[])
+    assert {row.repair_value for row in denied_results} == {"replace_candidate"}
+    priority_runner.shutdown()
+
+    distinct = build_news_descriptors({"sources": [config, {**config, "region": "US"}]})
+    distinct_runner = SourceHealthRunner(
+        distinct, providers=[], news_sources={duplicate.source_id: {"name": "duplicate"}},
+        news_probe=lambda *_args, **_kwargs: healthy, now=lambda: NOW,
+    )
+    distinct_results = distinct_runner.run("full", history_documents=[])
+    assert {row.repair_value for row in distinct_results} == {"none"}
+    distinct_runner.shutdown()

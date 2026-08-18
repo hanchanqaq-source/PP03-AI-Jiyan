@@ -20,6 +20,18 @@ CAPABILITY_GROUPS: dict[str, SourceGroup] = {
     "stock_industry_classification": "industry",
 }
 
+_DAY_SECONDS = 24 * 60 * 60
+CAPABILITY_FRESHNESS_MAX_AGE_SECONDS: dict[str, int] = {
+    # Daily public market facts allow weekends and short market holidays.
+    "nav_history": 7 * _DAY_SECONDS,
+    "stock_snapshot": 3 * _DAY_SECONDS,
+    # Fund disclosures are normally quarterly; two quarters plus a small buffer is stale.
+    "holdings": 200 * _DAY_SECONDS,
+    "industry_allocation": 200 * _DAY_SECONDS,
+    # Public industry classifications change less frequently but still have dated evidence.
+    "stock_industry_classification": 400 * _DAY_SECONDS,
+}
+
 PROVIDER_REFERENCES = {
     "cninfo-industry": "https://webapi.cninfo.com.cn/",
     "eastmoney-direct": "https://fund.eastmoney.com/",
@@ -50,6 +62,15 @@ def news_source_id(hint: str, name: str, url: str) -> str:
     return "news:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _news_configuration_identity(source: dict[str, Any]) -> str:
+    exact_fields = tuple(
+        str(source.get(key) or "").strip()
+        for key in ("hint", "name", "url", "language", "region")
+    )
+    canonical = json.dumps(exact_fields, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def build_provider_descriptors(
     providers: Iterable[Any] | None = None,
 ) -> list[SourceDescriptor]:
@@ -77,6 +98,7 @@ def build_provider_descriptors(
                 critical=priority == minimum_priority[capability],
                 requires_api_key=False,
                 probe_kind="provider",
+                freshness_max_age_seconds=CAPABILITY_FRESHNESS_MAX_AGE_SECONDS.get(capability),
             ))
     return descriptors
 
@@ -99,7 +121,10 @@ def build_news_descriptors(news_config: dict[str, Any]) -> list[SourceDescriptor
             critical=False,
             requires_api_key=False,
             probe_kind="news_feed",
-            probe_args={"hint": hint},
+            probe_args={
+                "hint": hint,
+                "configuration_identity": _news_configuration_identity(source),
+            },
         ))
     return descriptors
 

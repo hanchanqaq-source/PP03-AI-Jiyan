@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import threading
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Mapping
+from urllib.parse import urlsplit
 
 from .models import ProbeObservation, SourceDescriptor
 from .probe_errors import classify_probe_error
@@ -16,6 +18,41 @@ from .scoring import score_observation
 
 RunScope = Literal["quick", "full"]
 ResultCallback = Callable[[ProbeObservation], None]
+
+
+def _history_observations(document: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
+    if document.get("source_id"):
+        yield dict(document)
+    for key in ("observation", "observations", "sources"):
+        nested = document.get(key)
+        rows = [nested] if isinstance(nested, Mapping) else nested if isinstance(nested, list) else []
+        for row in rows:
+            if isinstance(row, Mapping):
+                yield from _history_observations(row)
+
+
+def _history_timestamp(row: Mapping[str, Any]) -> datetime | None:
+    for key in ("finished_at", "observed_at", "started_at"):
+        value = row.get(key)
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _same_public_source(left: str | None, right: str | None) -> bool:
+    def host(value: str | None) -> str:
+        parts = urlsplit(str(value or ""))
+        if parts.scheme not in {"http", "https"}:
+            return ""
+        name = (parts.hostname or "").lower()
+        return name[4:] if name.startswith("www.") else name
+
+    return bool(host(left)) and host(left) == host(right)
 
 
 class SourceHealthRunner:
@@ -36,6 +73,15 @@ class SourceHealthRunner:
         sample_path: str | Path | None = None,
     ) -> None:
         self._descriptors = list(descriptors)
+        identities = [
+            (row.source_id, str(row.probe_args.get("configuration_identity") or ""))
+            for row in self._descriptors
+            if row.probe_args.get("configuration_identity")
+        ]
+        counts = Counter(identity for _source_id, identity in identities)
+        self._duplicate_source_ids = {
+            source_id for source_id, identity in identities if counts[identity] > 1
+        }
         self._providers = {
             str(getattr(provider, "name", type(provider).__name__)): provider
             for provider in providers
@@ -164,15 +210,77 @@ class SourceHealthRunner:
             redirected=bool(raw.get("redirected", False)),
             final_reference=raw.get("final_reference") or raw.get("final_url"),
         )
+        return observation
+
+    def _finalize_observation(
+        self,
+        descriptor: SourceDescriptor,
+        observation: ProbeObservation,
+        raw: Mapping[str, Any],
+        history_rows: list[dict[str, Any]],
+    ) -> ProbeObservation:
+        current = observation.to_dict()
+        records = [*history_rows, current]
+        records.sort(key=lambda row: _history_timestamp(row) or datetime.min.replace(tzinfo=timezone.utc))
+        trailing_failures: list[dict[str, Any]] = []
+        for row in reversed(records):
+            if row.get("probe_status") != "failure":
+                break
+            trailing_failures.append(row)
+        observation.consecutive_failures = len(trailing_failures)
+        successful = [row for row in records if row.get("probe_status") == "success" and _history_timestamp(row)]
+        if successful:
+            latest_success = max(successful, key=lambda row: _history_timestamp(row) or datetime.min.replace(tzinfo=timezone.utc))
+            observation.last_success_at = str(latest_success.get("finished_at") or latest_success.get("observed_at") or latest_success.get("started_at"))
+        observation_dates = [stamp.date() for row in records if (stamp := _history_timestamp(row)) is not None]
         score_observation(
             observation,
             freshness_max_age_seconds=descriptor.freshness_max_age_seconds,
             freshness_applicable=descriptor.freshness_max_age_seconds is not None,
             fallback_applicable=True,
+            observation_dates=observation_dates,
+            sample_count=len(records),
         )
-        return apply_repair_advice(observation)
+        failure_days = len({stamp.date() for row in trailing_failures if (stamp := _history_timestamp(row)) is not None})
+        prior_same_failure = any(
+            row.get("error_type") == observation.error_type and row.get("probe_status") == "failure"
+            for row in history_rows
+        )
+        redirect_status = raw.get("redirect_status")
+        if redirect_status is None and observation.http_status in {301, 308}:
+            redirect_status = observation.http_status
+        reliable_cache = bool(raw.get("reliable_cache_available")) or (
+            observation.used_cache and observation.cache_status in {"cache", "fresh", "realtime"}
+        )
+        return apply_repair_advice(
+            observation,
+            permanent_redirect_same_public_source=(
+                redirect_status in {301, 308}
+                and observation.redirected
+                and _same_public_source(descriptor.source_reference, observation.final_reference)
+            ),
+            missing_standard_request_headers=bool(raw.get("missing_standard_request_headers")),
+            confirmed_compatibility_issue=bool(raw.get("confirmed_compatibility_issue")),
+            source_id_conflict=bool(raw.get("source_id_conflict")),
+            duplicate_configuration=descriptor.source_id in self._duplicate_source_ids,
+            cache_status_mislabeled=bool(raw.get("cache_status_mislabeled")),
+            high_value_source=descriptor.critical,
+            reproducible_failure=prior_same_failure,
+            public_entry_changed=bool(raw.get("public_entry_changed")),
+            reliable_fallback_available=observation.fallback_available,
+            retry_after_present=bool(raw.get("retry_after_present")),
+            reliable_cache_available=reliable_cache,
+            domain_long_unresolvable=bool(raw.get("domain_long_unresolvable")),
+            public_feed_removed=bool(raw.get("public_feed_removed")),
+            failure_days=failure_days,
+            requires_permission_bypass=bool(raw.get("requires_permission_bypass")),
+            requires_tls_bypass=bool(raw.get("requires_tls_bypass")),
+            duplicate_without_independent_track=bool(raw.get("duplicate_without_independent_track")),
+            content_label_mismatch_long_term=bool(raw.get("content_label_mismatch_long_term")),
+            compliance_issue=bool(raw.get("compliance_issue")),
+        )
 
-    def _run_one(self, descriptor: SourceDescriptor) -> ProbeObservation:
+    def _run_one(self, descriptor: SourceDescriptor, history_rows: list[dict[str, Any]]) -> ProbeObservation:
         started_at = self._now()
         try:
             if descriptor.group == "news":
@@ -192,24 +300,33 @@ class SourceHealthRunner:
                 else:
                     with self._provider_locks[descriptor.source_name]:
                         raw = call()
-            return self._observation(descriptor, raw, started_at)
+            observation = self._observation(descriptor, raw, started_at)
+            return self._finalize_observation(descriptor, observation, raw, history_rows)
         except Exception as error:
             observation = self._failure(descriptor, started_at, error)
-            score_observation(
-                observation,
-                freshness_max_age_seconds=None,
-                freshness_applicable=False,
-                fallback_applicable=True,
-            )
-            return apply_repair_advice(observation)
+            return self._finalize_observation(descriptor, observation, {}, history_rows)
 
-    def run(self, scope: RunScope, *, on_result: ResultCallback | None = None) -> list[ProbeObservation]:
+    def run(
+        self,
+        scope: RunScope,
+        *,
+        on_result: ResultCallback | None = None,
+        history_documents: Iterable[Mapping[str, Any]] = (),
+    ) -> list[ProbeObservation]:
         if self._shutdown:
             raise RuntimeError("source-health runner is shutdown")
+        history_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for document in history_documents:
+            if not isinstance(document, Mapping):
+                continue
+            for row in _history_observations(document):
+                source_id = str(row.get("source_id") or "")
+                if source_id:
+                    history_by_source[source_id].append(row)
         futures: list[Future[ProbeObservation]] = []
         for descriptor in self.select(scope):
             pool = self._news_pool if descriptor.group == "news" else self._fund_pool
-            futures.append(pool.submit(self._run_one, descriptor))
+            futures.append(pool.submit(self._run_one, descriptor, history_by_source[descriptor.source_id]))
         observations: list[ProbeObservation] = []
         for future in as_completed(futures):
             observation = future.result()

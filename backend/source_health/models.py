@@ -80,6 +80,7 @@ class ProbeObservation:
     repair_value: RepairValue = "none"
     repair_reason: str = ""
     consecutive_failures: int = 0
+    last_success_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

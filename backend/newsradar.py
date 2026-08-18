@@ -33,6 +33,7 @@ from source_health.probe_errors import (
     redact_probe_message,
     redact_url,
     retry_delay_seconds,
+    retry_after_present,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +46,28 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 BEIJING = timezone(timedelta(hours=8))
 SOURCE_ERROR_TYPES = {"timeout", "http_status", "tls", "dns", "connection", "rss_parse", "unknown"}
+_ORIGINAL_URLOPEN = urllib.request.urlopen
+
+
+class _RecordingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.statuses: list[int] = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.statuses.append(int(code))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_public_url(request: urllib.request.Request, timeout: float):
+    # Preserve test and embedding injection of urlopen; real requests record redirect status
+    # without changing headers, TLS verification, retry count, or response parsing.
+    if urllib.request.urlopen is not _ORIGINAL_URLOPEN:
+        response = urllib.request.urlopen(request, timeout=timeout)
+        return response, tuple(getattr(response, "redirect_statuses", ()))
+    handler = _RecordingRedirectHandler()
+    response = urllib.request.build_opener(handler).open(request, timeout=timeout)
+    return response, tuple(handler.statuses)
 
 
 def source_id(source: dict) -> str:
@@ -234,7 +257,8 @@ def _request_decode_parse_source(
                 "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*",
                 "Accept-Encoding": "gzip",
             })
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            response, redirect_statuses = _open_public_url(req, timeout)
+            with response:
                 raw = response.read()
                 headers = getattr(response, "headers", {}) or {}
                 http_status = getattr(response, "status", None)
@@ -257,6 +281,7 @@ def _request_decode_parse_source(
                 "error_message_redacted": "",
                 "latency_ms": max(0, round((time.perf_counter() - started) * 1000)),
                 "redirected": str(final_url) != str(src["url"]),
+                "redirect_status": next((code for code in redirect_statuses if code in {301, 308}), None),
                 "final_url": redact_url(final_url),
                 "content_type": content_type,
                 "_valid_items_before_cutoff": valid_items_before_cutoff,
@@ -276,8 +301,10 @@ def _request_decode_parse_source(
                 "error_message_redacted": classified.message,
                 "latency_ms": max(0, round((time.perf_counter() - started) * 1000)),
                 "redirected": False,
+                "redirect_status": None,
                 "final_url": redact_url(src.get("url")),
                 "content_type": "",
+                "retry_after_present": retry_after_present(error),
             }
     raise AssertionError("unreachable")
 

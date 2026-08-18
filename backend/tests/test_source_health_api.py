@@ -12,6 +12,8 @@ import pytest
 import app as app_module
 import source_health
 from source_health.models import ProbeObservation
+from source_health.models import SourceDescriptor
+from source_health.runner import SourceHealthRunner
 from source_health.service import FullRunConflict, SourceHealthService
 from source_health.storage import SourceHealthStorage
 
@@ -57,7 +59,7 @@ class ImmediateRunner:
     def select(self, scope):
         return [object() for _ in self.rows]
 
-    def run(self, scope, *, on_result=None):
+    def run(self, scope, *, on_result=None, history_documents=()):
         self.calls.append(scope)
         for row in self.rows:
             if on_result:
@@ -74,11 +76,11 @@ class BlockingRunner(ImmediateRunner):
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def run(self, scope, *, on_result=None):
+    def run(self, scope, *, on_result=None, history_documents=()):
         self.calls.append(scope)
         self.started.set()
         self.release.wait(timeout=2)
-        return super().run(scope, on_result=on_result)
+        return super().run(scope, on_result=on_result, history_documents=history_documents)
 
 
 class ScopedRunner(ImmediateRunner):
@@ -90,7 +92,7 @@ class ScopedRunner(ImmediateRunner):
     def select(self, scope):
         return [object() for _ in (self.quick_rows if scope == "quick" else self.full_rows)]
 
-    def run(self, scope, *, on_result=None):
+    def run(self, scope, *, on_result=None, history_documents=()):
         rows = self.quick_rows if scope == "quick" else self.full_rows
         self.calls.append(scope)
         for row in rows:
@@ -468,3 +470,86 @@ def test_lifespan_service_construction_failure_never_blocks_api(monkeypatch):
 
     with TestClient(app_module.app) as client:
         assert client.get("/api/health").status_code == 200
+
+
+def test_history_survives_restart_and_exposes_recent_success_and_failure_streak(tmp_path):
+    clock = [NOW - timedelta(days=1)]
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: clock[0])
+    source = SourceDescriptor(
+        source_id="fund:runtime:profile", source_name="runtime", group="fund", capability="profile",
+        source_reference="https://public.example.test/profile", priority=10, critical=True,
+        requires_api_key=False, probe_kind="provider", probe_args={"code": "000001"},
+    )
+
+    class RuntimeProvider:
+        name = "runtime"
+
+    def make_runner(status):
+        raw = {
+            "status": status,
+            "source_name": "runtime",
+            "error_type": "none" if status == "success" else "timeout",
+            "error_message_redacted": "",
+            "latency_ms": 1,
+            "returned_items": 1 if status == "success" else 0,
+            "field_completeness_pct": 100.0 if status == "success" else 0.0,
+        }
+        return SourceHealthRunner(
+            [source], providers=[RuntimeProvider()], news_sources={},
+            provider_probe=lambda *_args, **_kwargs: raw, now=lambda: clock[0],
+        )
+
+    first = SourceHealthService(runner=make_runner("success"), storage=storage, now=lambda: clock[0])
+    first_run = first.start_run("full")
+    wait_for(first, first_run["run_id"])
+    first.shutdown()
+
+    clock[0] = NOW
+    restarted = SourceHealthService(runner=make_runner("failure"), storage=storage, now=lambda: clock[0])
+    second_run = restarted.start_run("full")
+    wait_for(restarted, second_run["run_id"])
+    row = restarted.list_sources()[0]
+
+    assert row["consecutive_failures"] == 1
+    assert row["last_success_at"] == (NOW - timedelta(days=1)).isoformat()
+    assert row["rating_confidence"] == "initial"
+    restarted.shutdown()
+
+
+def test_history_container_rows_upgrade_source_and_summary_confidence_at_threshold(tmp_path):
+    storage = SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW)
+    source_id = "fund:p1:profile"
+    observations = []
+    for index in range(19):
+        observed = NOW - timedelta(days=6 - index % 7)
+        observations.append({
+            "source_id": source_id,
+            "probe_status": "success",
+            "finished_at": observed.isoformat(),
+        })
+    storage.append_history({"run_id": "container", "summary": {}, "observations": observations}, observed_at=NOW)
+    source = SourceDescriptor(
+        source_id=source_id, source_name="p1", group="fund", capability="profile",
+        source_reference="https://public.example.test/profile", priority=10, critical=True,
+        requires_api_key=False, probe_kind="provider", probe_args={"code": "000001"},
+    )
+
+    class Provider:
+        name = "p1"
+
+    runner = SourceHealthRunner(
+        [source], providers=[Provider()], news_sources={},
+        provider_probe=lambda *_args, **_kwargs: {
+            "status": "success", "source_name": "p1", "error_type": "none",
+            "latency_ms": 1, "returned_items": 1, "field_completeness_pct": 100.0,
+        },
+        now=lambda: NOW,
+    )
+    service = SourceHealthService(runner=runner, storage=storage, now=lambda: NOW)
+
+    run = service.start_run("full")
+    wait_for(service, run["run_id"])
+
+    assert service.list_sources()[0]["rating_confidence"] == "stable"
+    assert service.get_summary()["rating_confidence"] == "stable"
+    service.shutdown()

@@ -163,3 +163,11 @@ def retry_delay_seconds(error: BaseException, *, default: float = 0.5, maximum: 
         except ValueError:
             delay = default
     return min(maximum, max(0.0, delay))
+
+
+def retry_after_present(error: BaseException) -> bool:
+    for item in _exception_chain(error):
+        headers = getattr(item, "headers", None) or getattr(getattr(item, "response", None), "headers", None)
+        if headers and headers.get("Retry-After") is not None:
+            return True
+    return False

@@ -46,6 +46,7 @@ export interface SourceHealthSource {
   repair_value: string;
   repair_reason: string;
   consecutive_failures: number;
+  last_success_at: string | null;
 }
 
 export interface SourceHealthRun {

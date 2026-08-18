@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 
+import source_health.registry as registry_module
 from source_health.models import ProbeObservation, SourceDescriptor
 from source_health.registry import (
     build_news_descriptors,
@@ -53,7 +54,7 @@ def test_models_expose_the_required_contract_fields():
     }
     assert {
         "probe_status", "error_type", "rating", "rating_confidence",
-        "repair_value", "consecutive_failures",
+        "repair_value", "consecutive_failures", "last_success_at",
     } <= observation_fields
 
 
@@ -88,6 +89,29 @@ def test_default_registry_preserves_actual_runtime_provider_order():
     assert actual == expected
 
 
+def test_registry_assigns_semantic_freshness_windows_without_staling_profile_or_search():
+    class ProviderWithAllCapabilities:
+        name = "semantic-provider"
+        priority = 10
+        capabilities = {
+            "search", "profile", "nav_history", "holdings",
+            "industry_allocation", "stock_snapshot", "stock_industry_classification",
+        }
+
+    by_capability = {
+        row.capability: row for row in build_provider_descriptors([ProviderWithAllCapabilities])
+    }
+
+    assert by_capability["search"].freshness_max_age_seconds is None
+    assert by_capability["profile"].freshness_max_age_seconds is None
+    for capability in (
+        "nav_history", "holdings", "industry_allocation",
+        "stock_snapshot", "stock_industry_classification",
+    ):
+        assert by_capability[capability].freshness_max_age_seconds == registry_module.CAPABILITY_FRESHNESS_MAX_AGE_SECONDS[capability]
+        assert by_capability[capability].freshness_max_age_seconds > 0
+
+
 def test_news_source_identity_includes_track_name_and_url():
     baseline = news_source_id("ai", "Same", "https://example.com/feed")
 
@@ -95,6 +119,29 @@ def test_news_source_identity_includes_track_name_and_url():
     assert baseline != news_source_id("ai", "Other", "https://example.com/feed")
     assert baseline != news_source_id("ai", "Same", "https://example.com/other")
     assert baseline.startswith("news:")
+
+
+def test_news_configuration_identity_is_unambiguous_when_fields_contain_delimiter():
+    rows = build_news_descriptors({
+        "sources": [
+            {
+                "hint": "ai|daily",
+                "name": "feed",
+                "url": "https://example.com/rss",
+                "language": "zh-CN",
+                "region": "CN",
+            },
+            {
+                "hint": "ai",
+                "name": "daily|feed",
+                "url": "https://example.com/rss",
+                "language": "zh-CN",
+                "region": "CN",
+            },
+        ]
+    })
+
+    assert rows[0].probe_args["configuration_identity"] != rows[1].probe_args["configuration_identity"]
 
 
 def test_news_identity_and_reference_remove_non_public_query_parameters():

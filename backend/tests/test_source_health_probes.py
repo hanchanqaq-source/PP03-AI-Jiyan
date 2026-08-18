@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import socket
 import ssl
 
@@ -9,14 +10,16 @@ import requests
 from fund_data.models import ProviderResult
 from source_health.probe_errors import classify_probe_error, redact_url
 from source_health.probes.fund_provider import probe_provider_capability
+from source_health.registry import build_provider_descriptors
 
 
 class FakeProvider:
     name = "public-test-provider"
 
-    def __init__(self, result=None, error: BaseException | None = None):
+    def __init__(self, result=None, error: BaseException | None = None, as_of_date: str = "2026-08-18"):
         self.result = result
         self.error = error
+        self.as_of_date = as_of_date
         self.calls: list[tuple[str, dict]] = []
 
     def fetch(self, capability: str, **kwargs):
@@ -28,7 +31,7 @@ class FakeProvider:
             source_name="公开测试源",
             source_reference="https://public.example.test/data",
             data_type=capability,
-            as_of_date="2026-08-18",
+            as_of_date=self.as_of_date,
             status="disclosed",
         )
 
@@ -102,6 +105,55 @@ def test_stock_snapshot_missing_optional_quotes_is_partial_without_fabricating_v
     assert result["field_completeness_pct"] == 50.0
     assert result["data"]["600000"]["price"] is None
     assert "change_pct" not in result["data"]["600000"]
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_status"),
+    [(60, "success"), (7 * 86400, "success"), (7 * 86400 + 1, "partial")],
+)
+def test_registry_nav_freshness_window_drives_fresh_boundary_and_stale(age_seconds, expected_status):
+    class NavProvider(FakeProvider):
+        name = "nav-provider"
+        priority = 10
+        capabilities = {"nav_history"}
+
+    current = datetime(2026, 8, 18, tzinfo=timezone.utc)
+    as_of = (current - timedelta(seconds=age_seconds)).isoformat()
+    provider = NavProvider(
+        {"points": [{"date": as_of[:10], "unit_nav": 1.2}], "latest": {"unit_nav": 1.2, "nav_date": as_of[:10]}},
+        as_of_date=as_of,
+    )
+    descriptor = build_provider_descriptors([provider])[0]
+
+    result = probe_provider_capability(
+        provider, "nav_history", probe_args={"code": "000001"},
+        freshness_max_age_seconds=descriptor.freshness_max_age_seconds, now=current,
+    )
+
+    assert result["status"] == expected_status
+    assert result["error_type"] == ("stale_data" if expected_status == "partial" else "none")
+
+
+def test_profile_has_no_freshness_window_and_is_not_misclassified_as_stale():
+    class ProfileProvider(FakeProvider):
+        name = "profile-provider"
+        priority = 10
+        capabilities = {"profile"}
+
+    provider = ProfileProvider(
+        {"code": "000001", "name": "示例基金", "fund_type": "混合型"},
+        as_of_date="2020-01-01",
+    )
+    descriptor = build_provider_descriptors([provider])[0]
+
+    result = probe_provider_capability(
+        provider, "profile", probe_args={"code": "000001"},
+        freshness_max_age_seconds=descriptor.freshness_max_age_seconds,
+        now=datetime(2026, 8, 18, tzinfo=timezone.utc),
+    )
+
+    assert descriptor.freshness_max_age_seconds is None
+    assert result["status"] == "success"
 
 
 def test_stock_snapshot_completeness_counts_every_requested_code():

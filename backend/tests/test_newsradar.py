@@ -125,6 +125,7 @@ def test_probe_source_config_reports_permanent_redirect(monkeypatch):
         url="https://feed.example.test/permanent.xml",
         headers={"Content-Type": "application/rss+xml"},
     )
+    response.redirect_statuses = (301,)
     monkeypatch.setattr(newsradar.urllib.request, "urlopen", lambda request, timeout: response)
 
     result = newsradar.probe_source_config(_probe_source())
@@ -133,6 +134,7 @@ def test_probe_source_config_reports_permanent_redirect(monkeypatch):
     assert result["error_type"] == "redirect"
     assert result["redirected"] is True
     assert result["final_url"] == "https://feed.example.test/permanent.xml"
+    assert result["redirect_status"] == 301
     assert result["field_completeness_pct"] == 100.0
 
 
@@ -173,6 +175,24 @@ def test_probe_source_config_retries_http_429_once_and_honors_capped_retry_after
     assert len(attempts) == 2
     assert waits == [5.0]
     assert all(call[1] == 3 for call in attempts)
+
+
+def test_probe_source_config_preserves_retry_after_evidence_after_retry_exhaustion(monkeypatch):
+    attempts = []
+
+    def fake_open(request, timeout):
+        attempts.append((request, timeout))
+        raise urllib.error.HTTPError(request.full_url, 429, "limited", {"Retry-After": "2"}, None)
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = newsradar.probe_source_config(_probe_source(), timeout=3)
+
+    assert len(attempts) == 2
+    assert result["status"] == "failure"
+    assert result["error_type"] == "rate_limit"
+    assert result["retry_after_present"] is True
 
 
 def test_probe_source_config_tls_retry_never_disables_verification(monkeypatch):

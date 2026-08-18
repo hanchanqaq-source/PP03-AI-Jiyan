@@ -189,8 +189,14 @@ class SourceHealthService:
         for source in sources:
             target = news if source.get("group") == "news" else fund
             target[str(source.get("rating") or "failed")] += 1
+        confidence_order = {"initial": 0, "growing": 1, "stable": 2}
+        confidence = min(
+            (str(source.get("rating_confidence") or "initial") for source in sources),
+            key=lambda value: confidence_order.get(value, 0),
+            default="initial",
+        )
         return {
-            "rating_confidence": "initial",
+            "rating_confidence": confidence,
             "last_run_at": finished_at,
             "fund": fund,
             "news": news,
@@ -204,7 +210,12 @@ class SourceHealthService:
             run["status"] = "running"
             scope: RunScope = run["scope"]
         try:
-            observations = self.runner.run(scope, on_result=lambda row: self._record_result(run_id, row))
+            history_documents = self.storage.load_history(now=self._now())
+            observations = self.runner.run(
+                scope,
+                on_result=lambda row: self._record_result(run_id, row),
+                history_documents=history_documents,
+            )
             finished_at = self._now().isoformat()
             refreshed_rows = [row.to_dict() for row in observations]
             with self._lock:
