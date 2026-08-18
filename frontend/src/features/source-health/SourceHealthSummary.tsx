@@ -4,11 +4,12 @@ import { ApiError, api } from "@/lib/api";
 import type { SourceHealthCounts, SourceHealthRun, SourceHealthSummaryData } from "./types";
 
 interface SourceHealthSummaryProps {
-  onOpenDetails: () => void;
+  onOpenDetails?: () => void;
   detailsButtonRef?: React.RefObject<HTMLButtonElement | null>;
   autoFocusDetails?: boolean;
   refreshToken?: number;
   onUpdated?: () => void;
+  variant?: "card" | "bar";
 }
 
 const NOOP = () => {};
@@ -28,11 +29,12 @@ function formatTime(value: string): string {
 }
 
 export function SourceHealthSummary({
-  onOpenDetails,
+  onOpenDetails = NOOP,
   detailsButtonRef,
   autoFocusDetails = false,
   refreshToken = 0,
   onUpdated = NOOP,
+  variant = "card",
 }: SourceHealthSummaryProps) {
   const [summary, setSummary] = useState<SourceHealthSummaryData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -93,6 +95,14 @@ export function SourceHealthSummary({
 
   const running = starting || run?.status === "queued" || run?.status === "running";
   const hasReport = Boolean(summary?.last_run_at && summary.total_sources > 0);
+  const compact = variant === "bar";
+  const compactStateMessage = loadError && !summary
+    ? "健康快照读取失败"
+    : loading && !summary
+      ? "尚未载入健康快照"
+      : !hasReport
+        ? "尚未完成数据源体检"
+        : null;
 
   const startFullRun = async () => {
     if (startingRef.current || running) return;
@@ -119,6 +129,58 @@ export function SourceHealthSummary({
       if (mountedRef.current) setStarting(false);
     }
   };
+
+  if (compact) {
+    return (
+      <section className="rounded-xl border border-primary/25 bg-primary/5 px-4 py-3" aria-label="数据源健康状态栏">
+        <div className="flex flex-wrap items-center gap-3 xl:flex-nowrap">
+          <div className="flex shrink-0 items-center gap-2">
+            <Activity className="h-4 w-4 text-primary" aria-hidden="true" />
+            <h3 className="text-sm font-semibold text-foreground">健康快照</h3>
+          </div>
+
+          {compactStateMessage ? (
+            <p className="min-w-[220px] flex-1 text-xs font-medium text-warning">{compactStateMessage}</p>
+          ) : (
+            <div className="grid min-w-0 flex-1 gap-2 text-xs sm:grid-cols-2 xl:grid-cols-4">
+              <div className="min-w-0 border-l border-border/60 pl-3">
+                <p className="font-medium text-foreground">基金与行情</p>
+                <p className="mt-0.5 leading-5 text-muted-foreground">{formatCounts(summary!.fund)}</p>
+              </div>
+              <div className="min-w-0 border-l border-border/60 pl-3">
+                <p className="font-medium text-foreground">资讯来源</p>
+                <p className="mt-0.5 leading-5 text-muted-foreground">{formatCounts(summary!.news)}</p>
+              </div>
+              <div className="border-l border-border/60 pl-3">
+                <p className="font-medium text-foreground">最后体检</p>
+                <p className="mt-0.5 text-muted-foreground">最后体检：{formatTime(summary!.last_run_at!)}</p>
+              </div>
+              <div className="border-l border-border/60 pl-3">
+                <p className="font-medium text-foreground">评级置信度</p>
+                <p className="mt-0.5 text-muted-foreground">{confidenceLabels[summary!.rating_confidence] || "评级状态未知"}</p>
+              </div>
+            </div>
+          )}
+
+          <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {running && (
+              <p className="inline-flex items-center gap-1.5 text-xs text-foreground" aria-live="polite">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                {starting && !run ? "体检中 · 等待任务启动" : `体检中 · ${run?.completed || 0} / ${run?.total || 0}`}
+              </p>
+            )}
+            {notice && <p role={notice.kind === "error" ? "alert" : "status"} className={`text-xs ${notice.kind === "error" ? "text-warning" : "text-primary"}`}>{notice.text}</p>}
+            <button
+              onClick={startFullRun}
+              disabled={running}
+              aria-label="运行全量体检"
+              className="rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >{running ? "体检中" : "运行全量体检"}</button>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="mt-5 rounded-xl border border-primary/25 bg-primary/5 p-4" aria-label="数据源健康">

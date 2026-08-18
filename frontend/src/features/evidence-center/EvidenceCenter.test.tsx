@@ -6,8 +6,8 @@ import { EvidenceCenter } from "./EvidenceCenter";
 vi.mock("@/features/source-health/SourceHealthSummary", () => ({
   SourceHealthSummary: ({ onOpenDetails }: { onOpenDetails: () => void }) => <button onClick={onOpenDetails}>A1 健康摘要</button>,
 }));
-vi.mock("@/features/source-health/SourceHealthDrawer", () => ({
-  SourceHealthDrawer: ({ open }: { open: boolean }) => open ? <div>数据源健康详情</div> : null,
+vi.mock("@/features/source-health/SourceHealthWorkspace", () => ({
+  SourceHealthWorkspace: () => <section aria-label="来源库直接清单">完整数据源清单</section>,
 }));
 
 describe("EvidenceCenter", () => {
@@ -27,15 +27,14 @@ describe("EvidenceCenter", () => {
     expect(screen.getAllByText("前端演示 Fixture").length).toBeGreaterThan(0);
   });
 
-  it("switches internal tabs and reuses the A1 source-health components", async () => {
+  it("switches internal tabs and renders the direct A1 source-health workspace", async () => {
     const user = userEvent.setup();
     render(<EvidenceCenter />);
     await user.click(screen.getByRole("tab", { name: "数据源健康" }));
 
     expect(screen.getByText(/来源能否访问、能否解析、是否新鲜/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "A1 健康摘要" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "A1 健康摘要" }));
-    expect(screen.getByText("数据源健康详情")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "来源库直接清单" })).toHaveTextContent("完整数据源清单");
+    expect(screen.queryByText("数据源健康详情")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("tab", { name: "更正记录" }));
     expect(screen.getByText("原始状态")).toBeInTheDocument();
