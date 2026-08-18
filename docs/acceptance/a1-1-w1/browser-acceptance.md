@@ -1,9 +1,13 @@
 # PP03 A1.1-W1 浏览器验收
 
-验收日期：2026-08-18  
-分支：`codex/pp03-a1-1-evidence-verification`  
-实现 Commit：`9a7cef1`  
-浏览器：Codex 内置 Browser Use  
+验收日期：2026-08-18
+
+分支：`codex/pp03-a1-1-evidence-verification`
+
+实现 Commit：`9a7cef1`
+
+浏览器：Codex 内置 Browser Use
+
 页面：`http://127.0.0.1:5899/market-news`、`http://127.0.0.1:5899/evidence-center`
 
 ## 隔离边界
@@ -44,4 +48,12 @@
 4. [更正记录](../../screenshots/a1-1-w1/04-corrections.jpg) — `3A0206C7B977948606CC71ECCC729D7159A44A977AAAB73A073312F1B2788664`
 5. [数据源健康回归](../../screenshots/a1-1-w1/05-source-health.jpg) — `F916B5ADF01C508BFDF3891F34C0A112B96792ADA378C99C2A1296E530CACD1E`
 
-验收完成后仅保留上述跟踪文档与截图；隔离服务进程和 `.tmp/acceptance/a1-1-w1` 数据在最终收口时清理。
+## 自动化与清理
+
+- 后端确定性全量：423 passed，13 个 live 用例按标记排除，1 个既有 Starlette 弃用警告。
+- 前端全量：26 files / 121 tests passed。
+- 旧版兼容：16 passed。
+- 生产构建：1912 modules transformed，构建成功；保留既有空 `vendor-charts` 与大于 500 kB chunk 提示。
+- 已停止本轮拥有的 backend/frontend 进程树；8900、5899 端口均已释放。
+- 已删除 `.tmp/acceptance/a1-1-w1`（17 files / 58,033 bytes）与 C 盘截图暂存目录（5 files / 393,450 bytes）。
+- 仅保留上述 Git 跟踪文档与 5 张正式截图。
