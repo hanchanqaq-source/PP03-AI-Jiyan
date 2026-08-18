@@ -113,7 +113,7 @@ describe("EvidenceCenter", () => {
     expect(drawer).toHaveTextContent("已更正");
     expect(drawer).toHaveTextContent("原始公告的建设周期说明已被更正");
     expect(drawer).toHaveTextContent("状态历史");
-    expect(drawer).toHaveTextContent("16:05 待核验");
+    expect(drawer).toHaveTextContent("16:05 已核验");
     expect(drawer).not.toHaveTextContent("13:46 已核验");
   });
 });

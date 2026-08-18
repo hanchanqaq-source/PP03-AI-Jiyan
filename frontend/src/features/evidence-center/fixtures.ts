@@ -69,7 +69,7 @@ export const evidenceFixtures: EvidenceFixture[] = [
       { label: "核心主张", value: "建设周期说明已更正", status: "已核验" }, { label: "原披露日期", value: "2026-08-18", status: "已核验" }, { label: "更正后周期", value: "分阶段披露", status: "已核验" },
     ], primaryCount: 1, independentCount: 1, reprintCount: 2, conflictCount: 0, impact: 58, holdingsRelation: "直接关联",
     primaryEvidence: ["公司更正公告 · 演示证据"], independentChains: ["独立来源链 A · 公开披露复核（演示）", "独立来源链 B · 尚未形成"],
-    conflictNote: "原始公告的建设周期说明已被更正，旧表述不应继续作为确定事实。", history: ["16:05 待核验", "16:20 更新为已更正"],
+    conflictNote: "原始公告的建设周期说明已被更正，旧表述不应继续作为确定事实。", history: ["16:05 已核验", "16:20 更新为已更正"],
   },
 ];
 
