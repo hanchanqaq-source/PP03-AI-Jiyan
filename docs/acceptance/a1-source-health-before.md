@@ -80,3 +80,10 @@ $env:VR_SOURCE_HEALTH_STARTUP="0"
 
 Before 有 12 个 RSS 已解析出条目却被记录为 0% 完整率，且最终公开地址没有进入 `final_reference`。
 这是健康诊断契约错配；其余 TLS、403、502、超时、连接、空载荷、陈旧数据和解析失败均保持真实失败／部分成功，未伪造 PASS。
+
+## Task 7 最终审阅痕迹
+
+- 本 Before run `73117ab8d7a324ed4671` 保持冻结；Task 7 没有重跑或改写 Before，也没有以页面验收时的公网结果替代同输入比较。
+- 最终自动验证：后端 `357 passed`（其中 13 个标记为 `live` 的联网测试在本次运行通过，不能外推为离线或长期 PASS）、0 failed、0 skipped、2 warnings；前端 Vitest `23 files / 97 tests passed`；legacy `16 passed`；生产构建 exit 0。
+- 基金行业合同回归另跑后端 `5 passed`、前端 `2 files / 5 tests passed`，确认官方行业配置、重仓股穿透、产业链标签保持独立，未知／未披露股票／非股票部分未归一化，且不按基金名或股票名生成行业事实。
+- 规格中的仓库根命令 `python -m uvicorn backend.app:app` 因 backend-local 顶层导入触发 `ModuleNotFoundError: astock`；未修改源码，改用仓库既有 README 方式从 `backend` cwd 启动 `app:app`，随后 backend health、summary、页面和 Vite proxy 均为 HTTP 200。

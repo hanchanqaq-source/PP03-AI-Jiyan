@@ -123,3 +123,10 @@
 | CleanTechnica<br>`news:f9eba45dd4121484` | `feed` | 0 | 否 | https://cleantechnica.com/feed/ | `success` / `healthy` / `none` | 赛道 `energy`；每源最多 2 条；近 30 天 | 2 | 2026-08-18T06:06:42+08:00 | 100.00% | 158 ms | 有 | 公开 RSS/Atom；无 Key；内容版权与再分发受发布方条款约束 | `none` |
 | eastmoney-direct<br>`quote:eastmoney-direct:stock_snapshot` | `stock_snapshot` | 10 | 否 | https://fund.eastmoney.com/ | `failure` / `failed` / `http` | 公开股票代码 `600000` | 0 | — | 0.00% | 2216 ms | 有 | 东方财富公开入口；无 Key；未取得再分发许可结论 | `observe` |
 | tencent-quote<br>`quote:tencent-quote:stock_snapshot` | `stock_snapshot` | 15 | 否 | https://qt.gtimg.cn/ | `success` / `healthy` / `none` | 公开股票代码 `600000` | 1 | — | 100.00% | 925 ms | 有 | 腾讯公开行情入口；无 Key；未取得再分发许可结论 | `none` |
+
+## Task 7 最终审阅
+
+- 本矩阵继续绑定 Task 6 的同输入权威 After run `7f744e9abe6eb7238238`；Task 7 页面验收 run `bd6d73cfe908309fd03a` 是另一时点的公网观测，不覆盖矩阵行或用作修复归因。
+- Task 7 current snapshot 仍有 119 个唯一 source_id（11 个基金／行情／行业能力、108 个资讯配置）；未新增 Provider、Key、源配置或优先级。
+- 页面已验证“基金与行情 Provider”和“资讯来源”分组、来源 × 能力、失败筛选、脱敏原因与 repair value。截图：[基金与行情详情](../screenshots/source-health-a1/02-fund-provider-details.png)、[资讯失败详情](../screenshots/source-health-a1/03-news-source-details.png)。
+- 最终审阅结论：矩阵内容保持 Task 6 冻结口径；Task 7 实时成功／失败变化只记录在 After 文档的验收观察区。

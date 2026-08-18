@@ -49,3 +49,19 @@ source_id、配置和样本哈希。计数与时延差异只记录为公网波�
 - 未发现请求头缺失的确定因果证据，因此没有新增请求头。
 
 除上述诊断契约、精确脱敏和指标修正外，无其他修复同时满足全部硬条件；未强行制造代码变更。
+
+## Task 7 最终数据合同与修复边界审阅
+
+| 不变式 | 回归证据 |
+|---|---|
+| 官方行业配置仍独立 | 后端 `test_analysis_separates_official_allocation_from_stock_lookthrough`；前端独立“官方行业配置”区域 |
+| 重仓股穿透仍独立 | 后端分类结果单独进入 `lookthrough`；前端独立“重仓股穿透后的行业暴露”区域 |
+| 产业链标签仍独立 | `industry_chain_tags` 独立断言与“产业链 / 主题标签”区域 |
+| 未知部分未归一化 | `test_analysis_distinguishes_other_from_unknown_constituents` 保留未知持仓原始权重 |
+| 未披露股票未归一化 | 后端保持 `undisclosed_stock_pct=20.0`；前端直接显示未披露股票资产比例 |
+| 非股票资产未归一化 | 后端保持 `non_stock_pct=20.0`；没有并入已识别行业 |
+| 不按基金名或股票名生成行业事实 | 腾讯行情回归保持 `industry=None`；前端明确显示“基金名称未参与行业事实判断” |
+
+聚焦合同命令结果为后端 `5 passed`、前端 `2 files / 5 tests passed`；它们已包含在更广的后端 `357 passed` 和前端 `97 passed` 中。Task 7 没有新增低风险修复：页面验收 run 的 TLS、认证、超时、连接、空载荷、解析和陈旧状态继续作为真实观测保留，不据此修改 URL、请求头、TLS、Provider 顺序或业务语义。
+
+启动审阅另发现任务书根目录 `backend.app:app` 命令与现有 backend-local import 方式不兼容；本轮只用 README 已有的 backend cwd `app:app` 入口完成验收，没有借机修改业务代码。浏览器证据与工具替代裁决见 [After 页面验收观测](a1-source-health-after.md#task-7-页面验收观测不覆盖权威-after)。

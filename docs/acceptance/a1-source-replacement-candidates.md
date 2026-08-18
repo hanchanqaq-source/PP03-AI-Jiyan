@@ -20,3 +20,10 @@
 
 这些候选不是已验证 Provider。需要 Key、积分、付费、个人使用限制、再分发限制、目标站条款或非等价数据语义的候选，
 均不满足 Task 6 自动接入边界。后续若评估，必须逐能力执行最小公开请求、检查字段／日期／shape，并重新做许可与缓存边界审查。
+
+## Task 7 最终审阅
+
+- 页面验收 run `bd6d73cfe908309fd03a` 在另一公网时点观察到 98 success、13 partial、8 failure；其中认证、TLS、超时、连接、空载荷、解析和陈旧状态均未被包装为 PASS。
+- 本次波动没有使任何候选满足“语义等价、公开可访问、许可清晰、无需用户凭据、确定性测试已覆盖”的接入门槛；候选仍只留在文档。
+- 浏览器已复核失败详情、公开 URL、备用来源与 repair value，未发现 API Key、Token、Cookie、Authorization、本地隐私路径或用户持仓。
+- 最终审阅未新增 Provider、未接入凭据、未调整主备优先级、未改变金融数据语义；截图证据见 [资讯失败详情](../screenshots/source-health-a1/03-news-source-details.png)。

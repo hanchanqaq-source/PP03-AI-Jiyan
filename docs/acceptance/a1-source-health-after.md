@@ -99,3 +99,46 @@ $env:VR_SOURCE_HEALTH_STARTUP="0"
 - TLS、502、连接失败、空载荷与解析失败均未绕过；此前 After 观察到的 403 在本轮公网请求中恢复，仅属于波动，不构成修复证明。
 - 12 个 301 未修改配置 URL：全局验收约束要求 Before/After 使用完全相同的配置与 source_id；另有跨域、HTTPS 降级或独立请求最终 403 的个案，不能合并视为无风险。
 - 实时审计只有一次 Before 和一次 After，评级必须继续显示 `initial`，不能推导长期可用性。
+
+## Task 7 页面验收观测（不覆盖权威 After）
+
+Task 7 通过页面启动一次 full run；它验证 API、轮询、禁用态和刷新链路，但发生在另一公网时点，不能覆盖上文同输入权威 After `7f744e9abe6eb7238238`，也不能用于宣称修复收益。
+
+| 指标 | Task 7 验收观测 |
+|---|---:|
+| run_id | `bd6d73cfe908309fd03a` |
+| 时间 | `2026-08-18T13:24:51.796909+08:00` 至 `2026-08-18T13:25:23.647447+08:00` |
+| 状态／进度 | `completed`，119 / 119 |
+| 成功／部分成功／失败 | 98 / 13 / 8 |
+| 基金与行情 | 11 健康 / 0 基本可用 / 0 降级 / 0 失败 |
+| 资讯 | 87 健康 / 12 基本可用 / 1 降级 / 8 失败 |
+| P50 / P95 | 962 ms / 4373 ms |
+| 平均字段完整率 | 92.44% |
+| 有日期的新鲜度样本 | 108 / 119 |
+| error 分布 | authentication 1、connection 1、empty_payload 2、none 98、parse 1、redirect 12、stale_data 1、timeout 1、tls 2 |
+| 评级置信度 | `initial` |
+
+运行前页面摘要为基金与行情 `10 / 0 / 0 / 1`、资讯 `89 / 12 / 1 / 6`；完成后更新为上表 `11 / 0 / 0 / 0` 与 `87 / 12 / 1 / 8`。变化仅说明页面确实刷新并反映本次公开网络观测，不代表数据源稳定性提升或退化。
+
+### 浏览器验收 12 步映射
+
+| 步骤 | 证据 |
+|---:|---|
+| 1 | 打开 `/market-news`，页面可达且没有新增一级导航。 |
+| 2 | 打开“数据说明”，资讯、持仓与 AI 边界说明可见。 |
+| 3 | 健康摘要显示基金与行情、资讯、最后体检和初始评级。 |
+| 4 | “查看详情”打开单一健康详情抽屉。 |
+| 5 | 基金与行情 Provider 分组显示来源 × 能力、响应、条数、日期、完整率和 repair value。 |
+| 6 | 资讯来源分组可见并可单独筛选。 |
+| 7 | 状态筛选选择“失败”，仅显示失败来源。 |
+| 8 | 展开 arXiv cs.AI：显示 TLS 连接失败、公开 URL、备用状态与 `observe` 建议；未显示凭据、堆栈或本地路径。 |
+| 9 | 启动一次 full；运行期间按钮立即禁用，未发生第二次 POST。 |
+| 10 | 进度可读地经过 0/0、96/119、115/119，最终完成 119/119。 |
+| 11 | 完成后摘要自动刷新为本次 11/0/0/0 与 87/12/1/8，且旧权威 After 文档未被覆盖。 |
+| 12 | 页面仍显示“初始评级 · 样本不足”；console error/warn 均为 `[]`；未见 API Key、Token、Cookie、Authorization、本地隐私路径或用户持仓。 |
+
+截图：[健康摘要](../screenshots/source-health-a1/01-health-summary.png)、[基金 Provider](../screenshots/source-health-a1/02-fund-provider-details.png)、[资讯失败详情](../screenshots/source-health-a1/03-news-source-details.png)、[体检进度](../screenshots/source-health-a1/04-audit-progress.png)、[完成后摘要](../screenshots/source-health-a1/05-before-after-summary.png)。
+
+### 浏览器工具裁决
+
+Windows Computer Use 两次都在首次窗口状态读取时因无法高置信确认浏览器 URL 而安全终止，没有继续交互。用户随后明确批准使用 Browser Use 插件完成上述替代验收。该证据在本次授权范围内有效；若审查方严格只接受 Windows Computer Use，则浏览器证据仍需在该工具可可靠识别 URL 后重做。
