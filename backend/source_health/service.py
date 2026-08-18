@@ -25,6 +25,53 @@ def _empty_counts() -> dict[str, int]:
     return {"healthy": 0, "usable": 0, "degraded": 0, "failed": 0}
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _load_reliable_news_cache_source_ids(cache_path: Path, *, now: datetime) -> set[str]:
+    try:
+        with CACHE_IO_LOCK:
+            document = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(document, dict) or document.get("cache_status") not in {"cache", "partial", "realtime"}:
+        return set()
+    generated_at = _parse_timestamp(document.get("generated_at"))
+    if generated_at is None:
+        return set()
+    current = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    try:
+        recent_days = max(1, int(document.get("recent_days") or 7))
+    except (TypeError, ValueError):
+        return set()
+    if current.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days):
+        return set()
+    reliable: set[str] = set()
+    for row in document.get("source_statuses") or []:
+        if not isinstance(row, dict):
+            continue
+        source_id = str(row.get("source_id") or "")
+        source_url = str(row.get("source_url") or "")
+        try:
+            item_count = int(row.get("item_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            source_id
+            and row.get("used_cached_items") is True
+            and item_count > 0
+            and _parse_timestamp(row.get("last_success_at")) is not None
+            and source_url.startswith(("http://", "https://"))
+        ):
+            reliable.add(source_id)
+    return reliable
+
+
 class SourceHealthService:
     def __init__(
         self,
@@ -50,6 +97,8 @@ class SourceHealthService:
         self._restore_state()
 
     def _default_runner(self) -> SourceHealthRunner:
+        import newsradar
+
         providers = default_fund_providers()
         news_config = load_news_config()
         news_sources = {
@@ -64,6 +113,9 @@ class SourceHealthService:
             news_sources=news_sources,
             news_timeout=timeout,
             now=self._now,
+            reliable_cache_source_ids=lambda: _load_reliable_news_cache_source_ids(
+                Path(newsradar.CACHE_FILE), now=self._now(),
+            ),
         )
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:

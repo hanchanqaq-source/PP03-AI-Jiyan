@@ -310,6 +310,72 @@ def test_runner_connects_runtime_repair_evidence(source_id, critical, raw_update
     runner.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("fallback_status", "expected"),
+    [("failure", "worth_fixing"), ("success", "none")],
+)
+def test_runner_uses_completed_observations_for_reliable_fallback_and_callback(
+    fallback_status,
+    expected,
+):
+    primary = descriptor(
+        "news:primary", source_name="primary", group="news", capability="feed",
+    )
+    fallback = descriptor(
+        "news:fallback", source_name="fallback", group="news", capability="feed",
+    )
+
+    def probe(source, **_kwargs):
+        raw = successful_result(source["name"])
+        if source["name"] == "primary" or fallback_status == "failure":
+            raw.update({
+                "status": "failure", "error_type": "unknown", "returned_items": 0,
+                "field_completeness_pct": 0.0,
+            })
+        return raw
+
+    callback_rows = []
+    runner = SourceHealthRunner(
+        [primary, fallback], providers=[],
+        news_sources={
+            primary.source_id: {"name": "primary"},
+            fallback.source_id: {"name": "fallback"},
+        },
+        news_probe=probe,
+        now=lambda: NOW,
+    )
+
+    results = runner.run("full", on_result=lambda row: callback_rows.append(row.to_dict()))
+
+    primary_result = next(row for row in results if row.source_id == primary.source_id)
+    primary_callback = next(row for row in callback_rows if row["source_id"] == primary.source_id)
+    assert primary_result.fallback_available is True
+    assert primary_result.repair_value == expected
+    assert primary_callback["repair_value"] == expected
+    runner.shutdown()
+
+
+def test_runner_does_not_accept_probe_raw_as_reliable_cache_evidence():
+    row = descriptor(
+        "news:raw-cache", source_name="raw-cache", group="news", capability="feed",
+    )
+    raw = successful_result("raw-cache")
+    raw.update({
+        "status": "failure", "error_type": "unknown", "returned_items": 0,
+        "field_completeness_pct": 0.0, "used_cache": True, "cache_status": "cache",
+        "reliable_cache_available": True,
+    })
+    runner = SourceHealthRunner(
+        [row], providers=[], news_sources={row.source_id: {"name": "raw-cache"}},
+        news_probe=lambda *_args, **_kwargs: raw, now=lambda: NOW,
+    )
+
+    [result] = runner.run("full")
+
+    assert result.repair_value == "worth_fixing"
+    runner.shutdown()
+
+
 def test_runner_marks_exact_duplicate_registration_but_permission_rule_keeps_priority():
     config = {"hint": "ai", "name": "duplicate", "url": "https://public.example.test/feed", "language": "zh-CN", "region": "CN"}
     duplicate = build_news_descriptors({"sources": [config, dict(config)]})[0]

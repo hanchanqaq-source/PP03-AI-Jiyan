@@ -10,9 +10,12 @@ from fastapi.testclient import TestClient
 import pytest
 
 import app as app_module
+import newsradar
 import source_health
+import source_health.service as service_module
 from source_health.models import ProbeObservation
 from source_health.models import SourceDescriptor
+from source_health.registry import news_source_id
 from source_health.runner import SourceHealthRunner
 from source_health.service import FullRunConflict, SourceHealthService
 from source_health.storage import SourceHealthStorage
@@ -109,6 +112,83 @@ def wait_for(service: SourceHealthService, run_id: str, status: str = "completed
             return current
         time.sleep(0.01)
     raise AssertionError(f"run {run_id} did not reach {status}")
+
+
+@pytest.mark.parametrize(
+    ("cache_case", "expected"),
+    [
+        ("fresh_match", "observe"),
+        ("stale", "worth_fixing"),
+        ("became_stale", "worth_fixing"),
+        ("mismatch", "worth_fixing"),
+        ("malformed", "worth_fixing"),
+    ],
+)
+def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_evidence(
+    tmp_path,
+    monkeypatch,
+    cache_case,
+    expected,
+):
+    source = {
+        "hint": "ai", "name": "Public feed",
+        "url": "https://public.example.test/rss", "language": "zh-CN", "region": "CN",
+    }
+    configured_id = news_source_id(source["hint"], source["name"], source["url"])
+    cache_source_id = "news:not-the-configured-source" if cache_case == "mismatch" else configured_id
+    generated_at = NOW - timedelta(days=8) if cache_case == "stale" else NOW
+    cache_path = tmp_path / "news" / "radar.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(json.dumps({
+        "generated_at": generated_at.isoformat(),
+        "recent_days": 7,
+        "cache_status": "partial",
+        "source_state": "partial_failure",
+        "source_statuses": [{
+            "source_id": cache_source_id,
+            "source_name": source["name"],
+            "source_url": source["url"],
+            "status": "failed",
+            "last_success_at": (NOW - timedelta(hours=1)).isoformat(),
+            "used_cached_items": True,
+            "item_count": "not-a-count" if cache_case == "malformed" else 1,
+        }],
+        "industries": [{
+            "key": source["hint"],
+            "items": [{
+                "title": "Cached public item", "source_name": source["name"],
+                "source_url": source["url"], "published_at": (NOW - timedelta(hours=2)).isoformat(),
+            }],
+        }],
+        "stats": {"industries": 1, "total_sources": 1, "failed_sources": 1},
+    }, ensure_ascii=False), encoding="utf-8")
+    original_cache = cache_path.read_bytes()
+    monkeypatch.setattr(service_module, "default_fund_providers", lambda: [])
+    monkeypatch.setattr(service_module, "load_news_config", lambda: {
+        "fetch": {"timeout": 1}, "sources": [source],
+    })
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache_path))
+    monkeypatch.setattr(newsradar, "probe_source_config", lambda *_args, **_kwargs: {
+        "status": "failure", "source_name": source["name"], "error_type": "unknown",
+        "error_message_redacted": "public source unavailable", "http_status": None,
+        "latency_ms": 1, "returned_items": 0, "data_as_of_date": None,
+        "field_completeness_pct": 0.0, "used_cache": False,
+        "cache_status": "not_used", "redirected": False, "final_url": source["url"],
+    })
+    clock = [NOW]
+    service = SourceHealthService(
+        storage=SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW),
+        now=lambda: clock[0],
+    )
+    if cache_case == "became_stale":
+        clock[0] = NOW + timedelta(days=8)
+
+    run = service.start_run("full")
+    wait_for(service, run["run_id"])
+
+    assert service.list_sources()[0]["repair_value"] == expected
+    assert cache_path.read_bytes() == original_cache
+    service.shutdown()
 
 
 def test_quick_cooldown_is_persisted_for_twenty_four_hours(tmp_path):

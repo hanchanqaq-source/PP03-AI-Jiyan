@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -18,6 +19,14 @@ from .scoring import score_observation
 
 RunScope = Literal["quick", "full"]
 ResultCallback = Callable[[ProbeObservation], None]
+
+
+@dataclass(frozen=True)
+class _ProbeOutcome:
+    descriptor: SourceDescriptor
+    observation: ProbeObservation
+    raw: Mapping[str, Any]
+    history_rows: list[dict[str, Any]]
 
 
 def _history_observations(document: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
@@ -71,6 +80,7 @@ class SourceHealthRunner:
         fund_workers: int = 4,
         news_workers: int = 20,
         sample_path: str | Path | None = None,
+        reliable_cache_source_ids: Iterable[str] | Callable[[], Iterable[str]] = (),
     ) -> None:
         self._descriptors = list(descriptors)
         identities = [
@@ -97,6 +107,11 @@ class SourceHealthRunner:
         self._shutdown = False
         self._sample_path = Path(sample_path) if sample_path else Path(__file__).with_name("source-health-samples.json")
         self._sample_code: str | None = None
+        if callable(reliable_cache_source_ids):
+            self._load_reliable_cache_source_ids = reliable_cache_source_ids
+        else:
+            configured_cache_source_ids = tuple(str(source_id) for source_id in reliable_cache_source_ids)
+            self._load_reliable_cache_source_ids = lambda: configured_cache_source_ids
 
     def select(self, scope: RunScope) -> list[SourceDescriptor]:
         if scope == "quick":
@@ -241,6 +256,26 @@ class SourceHealthRunner:
             observation_dates=observation_dates,
             sample_count=len(records),
         )
+        return observation
+
+    def _apply_advice(
+        self,
+        outcome: _ProbeOutcome,
+        *,
+        reliable_fallback_available: bool,
+        reliable_cache_source_ids: set[str],
+    ) -> ProbeObservation:
+        descriptor = outcome.descriptor
+        observation = outcome.observation
+        raw = outcome.raw
+        history_rows = outcome.history_rows
+        records = [*history_rows, observation.to_dict()]
+        records.sort(key=lambda row: _history_timestamp(row) or datetime.min.replace(tzinfo=timezone.utc))
+        trailing_failures: list[dict[str, Any]] = []
+        for row in reversed(records):
+            if row.get("probe_status") != "failure":
+                break
+            trailing_failures.append(row)
         failure_days = len({stamp.date() for row in trailing_failures if (stamp := _history_timestamp(row)) is not None})
         prior_same_failure = any(
             row.get("error_type") == observation.error_type and row.get("probe_status") == "failure"
@@ -249,9 +284,6 @@ class SourceHealthRunner:
         redirect_status = raw.get("redirect_status")
         if redirect_status is None and observation.http_status in {301, 308}:
             redirect_status = observation.http_status
-        reliable_cache = bool(raw.get("reliable_cache_available")) or (
-            observation.used_cache and observation.cache_status in {"cache", "fresh", "realtime"}
-        )
         return apply_repair_advice(
             observation,
             permanent_redirect_same_public_source=(
@@ -267,9 +299,9 @@ class SourceHealthRunner:
             high_value_source=descriptor.critical,
             reproducible_failure=prior_same_failure,
             public_entry_changed=bool(raw.get("public_entry_changed")),
-            reliable_fallback_available=observation.fallback_available,
+            reliable_fallback_available=reliable_fallback_available,
             retry_after_present=bool(raw.get("retry_after_present")),
-            reliable_cache_available=reliable_cache,
+            reliable_cache_available=descriptor.source_id in reliable_cache_source_ids,
             domain_long_unresolvable=bool(raw.get("domain_long_unresolvable")),
             public_feed_removed=bool(raw.get("public_feed_removed")),
             failure_days=failure_days,
@@ -280,7 +312,7 @@ class SourceHealthRunner:
             compliance_issue=bool(raw.get("compliance_issue")),
         )
 
-    def _run_one(self, descriptor: SourceDescriptor, history_rows: list[dict[str, Any]]) -> ProbeObservation:
+    def _run_one(self, descriptor: SourceDescriptor, history_rows: list[dict[str, Any]]) -> _ProbeOutcome:
         started_at = self._now()
         try:
             if descriptor.group == "news":
@@ -301,10 +333,12 @@ class SourceHealthRunner:
                     with self._provider_locks[descriptor.source_name]:
                         raw = call()
             observation = self._observation(descriptor, raw, started_at)
-            return self._finalize_observation(descriptor, observation, raw, history_rows)
+            self._finalize_observation(descriptor, observation, raw, history_rows)
+            return _ProbeOutcome(descriptor, observation, raw, history_rows)
         except Exception as error:
             observation = self._failure(descriptor, started_at, error)
-            return self._finalize_observation(descriptor, observation, {}, history_rows)
+            self._finalize_observation(descriptor, observation, {}, history_rows)
+            return _ProbeOutcome(descriptor, observation, {}, history_rows)
 
     def run(
         self,
@@ -315,6 +349,9 @@ class SourceHealthRunner:
     ) -> list[ProbeObservation]:
         if self._shutdown:
             raise RuntimeError("source-health runner is shutdown")
+        reliable_cache_source_ids = {
+            str(source_id) for source_id in self._load_reliable_cache_source_ids()
+        }
         history_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for document in history_documents:
             if not isinstance(document, Mapping):
@@ -323,13 +360,30 @@ class SourceHealthRunner:
                 source_id = str(row.get("source_id") or "")
                 if source_id:
                     history_by_source[source_id].append(row)
-        futures: list[Future[ProbeObservation]] = []
+        futures: list[Future[_ProbeOutcome]] = []
         for descriptor in self.select(scope):
             pool = self._news_pool if descriptor.group == "news" else self._fund_pool
             futures.append(pool.submit(self._run_one, descriptor, history_by_source[descriptor.source_id]))
-        observations: list[ProbeObservation] = []
+        outcomes: list[_ProbeOutcome] = []
         for future in as_completed(futures):
-            observation = future.result()
+            outcomes.append(future.result())
+        reliable_by_capability: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for outcome in outcomes:
+            observation = outcome.observation
+            if observation.rating in {"healthy", "usable"}:
+                reliable_by_capability[(observation.group, observation.capability)].add(observation.source_id)
+        observations: list[ProbeObservation] = []
+        for outcome in outcomes:
+            observation = outcome.observation
+            reliable_fallback_available = any(
+                source_id != observation.source_id
+                for source_id in reliable_by_capability[(observation.group, observation.capability)]
+            )
+            observation = self._apply_advice(
+                outcome,
+                reliable_fallback_available=reliable_fallback_available,
+                reliable_cache_source_ids=reliable_cache_source_ids,
+            )
             observations.append(observation)
             if on_result is not None:
                 on_result(observation)
