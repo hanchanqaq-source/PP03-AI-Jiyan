@@ -15,7 +15,7 @@ import { ResearchHome } from "@/pages/ResearchHome";
 import { MarketNews } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
 import { PortfolioAnalysis } from "@/pages/PortfolioAnalysis";
-import { EvidenceCenter } from "@/features/evidence-center/EvidenceCenter";
+import { EvidenceCenter } from "@/features/evidence-center/EvidenceCenterReal";
 
 export const APP_ROUTES: RouteObject[] = [
   {

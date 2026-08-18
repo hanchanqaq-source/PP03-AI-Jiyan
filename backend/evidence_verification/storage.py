@@ -107,6 +107,8 @@ def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
         "independent_evidence_count": len(event.independent_evidence),
         "syndicated_copy_count": len(event.syndicated_copies),
         "contradicting_evidence_count": len(event.contradicting_evidence),
+        "status_change_count": len(event.status_history),
+        "latest_transition": _transition_document(event.status_history[-1]) if event.status_history else None,
         "holding_relevance": event.holding_relevance,
     }
 

@@ -5,7 +5,7 @@ export type MarketNewsCategory = "policy" | "industry" | "company" | "fund_notic
 export type MarketNewsMode = "my_focus" | "my_holdings" | "global_tech" | "domestic_policy";
 export type MarketNewsSort = "importance" | "latest" | "holding_relevance";
 export type MarketNewsCategoryFilter = "all" | MarketNewsCategory;
-export type MarketNewsVerificationStatus = "已核验" | "多源印证" | "待核验" | "存在冲突" | "已证伪" | "已更正";
+export type MarketNewsVerificationStatus = "verified" | "corroborated" | "unverified" | "conflicting" | "corrected" | "disproved";
 
 export interface MarketNewsSource {
   source_name: string;
@@ -64,7 +64,9 @@ export interface MarketNewsEvent {
   translation_provider?: string | null;
   translated_at?: string | null;
   verification_status?: MarketNewsVerificationStatus;
-  verification_fixture?: "frontend_demo";
+  verification_reason?: string;
+  verified_at?: string;
+  verified_key_fields?: Array<Record<string, unknown>>;
 }
 
 export interface MarketNewsTranslation {
@@ -147,6 +149,7 @@ export interface MarketNewsResponse {
   focus_events: MarketNewsEvent[];
   impact_summary: MarketNewsImpactSummary | null;
   snapshot_id: string;
+  evidence_snapshot_id?: string;
   generated_at: string | null;
   data_status: string;
   source_summary: {
@@ -160,6 +163,7 @@ export interface MarketNewsResponse {
   portfolio_status: "ready" | "empty" | "error";
   ai_status: "available" | "unavailable";
   empty_reason: "no_tags" | "no_holdings" | "portfolio_error" | "no_events" | null;
+  empty_message?: string | null;
   filters: MarketNewsQuery;
   filter_options: { modes: MarketNewsMode[]; categories: MarketNewsCategoryFilter[]; days: number[]; sorts: MarketNewsSort[] };
 }

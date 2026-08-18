@@ -99,6 +99,14 @@ def test_summary_and_filtered_list_return_real_snapshot_counts(monkeypatch, tmp_
     assert summary.json()["data"]["field_counts"] == {"verified": 6, "corroborated": 0, "unverified": 6, "conflicting": 0}
     assert [row["verification_status"] for row in listing.json()["data"]["events"]] == ["verified"]
     assert listing.json()["data"]["snapshot_id"] == "a" * 20
+    row = listing.json()["data"]["events"][0]
+    assert row["status_change_count"] == 1
+    assert row["latest_transition"] == {
+        "from_status": None,
+        "to_status": "verified",
+        "changed_at": NOW.isoformat(),
+        "reason": "reason-verified",
+    }
 
 
 def test_detail_returns_complete_chains_fields_and_history(monkeypatch, tmp_path):

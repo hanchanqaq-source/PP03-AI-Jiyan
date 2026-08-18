@@ -26,6 +26,10 @@ export const directEvent: MarketNewsEvent = {
   impact_tendency: "unclear", impact_basis: ["新闻直接命中最新公开重仓公司"], confidence: "high",
   original_links: ["https://one.example.test/a", "https://two.example.test/b"], data_status: "cache",
   missing_information: ["AI摘要暂不可用"], importance_score: 502,
+  verification_status: "verified",
+  verification_reason: "测试夹具：明确官方证据",
+  verified_at: "2026-08-17T10:40:00+08:00",
+  verified_key_fields: [],
 };
 
 export const translatedEnglishEvent: MarketNewsEvent = {

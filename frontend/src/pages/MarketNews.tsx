@@ -22,7 +22,6 @@ import { usePageTags } from "@/features/tags/usePageTags";
 import { api } from "@/lib/api";
 import { loadLlm } from "@/lib/llm";
 import { cn } from "@/lib/utils";
-import { marketNewsDisplayEvents } from "@/features/market-news/prototype";
 
 const MODES: Array<{ value: MarketNewsMode; label: string }> = [
   { value: "my_focus", label: "我的关注" },
@@ -163,7 +162,7 @@ function preserveSameSnapshotTranslations(
   };
 }
 
-function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_reason"]; onAddTag: () => void }) {
+function EmptyState({ reason, message, onAddTag }: { reason: MarketNewsResponse["empty_reason"]; message?: string | null; onAddTag: () => void }) {
   if (reason === "no_tags") {
     return <div className="py-16 text-center"><p className="font-semibold">还没有选择关注行业</p><p className="mt-2 text-sm text-muted-foreground">添加半导体、存储、机器人、医疗等标签后开始跟踪资讯</p><button onClick={onAddTag} className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">添加标签</button></div>;
   }
@@ -173,7 +172,7 @@ function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_re
   if (reason === "portfolio_error") {
     return <div className="py-16 text-center"><p className="font-semibold text-warning">持仓数据读取失败，暂无法计算关联</p><p className="mt-2 text-sm text-muted-foreground">资讯仍可查看；持仓关联与影响统计暂不可用。</p></div>;
   }
-  return <div className="py-16 text-center"><p className="font-semibold">当前筛选暂无可靠资讯</p><p className="mt-2 text-sm text-muted-foreground">可以扩大时间范围、切换标签或刷新公开来源</p><p className="mt-1 text-xs text-muted-foreground">系统不会用 AI 生成新闻。</p></div>;
+  return <div className="py-16 text-center"><p className="font-semibold">{message || "当前筛选暂无可靠资讯"}</p><p className="mt-2 text-sm text-muted-foreground">可以扩大时间范围、切换标签或刷新公开来源</p><p className="mt-1 text-xs text-muted-foreground">系统不会用 AI 生成新闻，也不会展示待核验内容。</p></div>;
 }
 
 function QueryFailureState() {
@@ -384,7 +383,7 @@ export function MarketNews() {
   const noTags = mode === "my_focus" && query.tag_ids.length === 0;
   const error = queryError?.queryKey === queryKey ? queryError.message : null;
   const queryFailedWithoutCache = Boolean(error && !data && !noTags);
-  const displayedEvents = data ? marketNewsDisplayEvents(data.events, query) : [];
+  const displayedEvents = data ? data.events.filter((event) => event.verification_status === "verified" || event.verification_status === "corroborated") : [];
   const backendEmptyReason = data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
   const emptyReason = noTags ? "no_tags" : backendEmptyReason === "no_events" && displayedEvents.length > 0 ? null : backendEmptyReason;
   const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
@@ -429,7 +428,7 @@ export function MarketNews() {
 
       {error && <div role="alert" className="mb-4 flex items-center gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4 shrink-0" />{error}</div>}
 
-      {queryFailedWithoutCache ? <div className="rounded-2xl border border-destructive/30 bg-destructive/5"><QueryFailureState /></div> : loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
+      {queryFailedWithoutCache ? <div className="rounded-2xl border border-destructive/30 bg-destructive/5"><QueryFailureState /></div> : loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} message={data?.empty_message} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
         <main className="rounded-2xl border border-border/70 bg-gradient-to-b from-slate-950/55 to-background/45 px-5" aria-label="市场资讯事件列表">
           {loading && <p className="border-b border-border/45 py-2 text-xs text-muted-foreground">正在更新筛选结果…</p>}
           {displayedEvents.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id, event: selectedEvent })} onViewEvidence={(selectedEvent) => openEvidenceCenter(selectedEvent.event_id)} />)}

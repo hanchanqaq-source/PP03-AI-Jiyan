@@ -3,7 +3,6 @@ import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { EventCard } from "@/features/market-news/EventCard";
 import { directEvent, translatedEnglishEvent } from "./fixtures";
-import { marketNewsPrototypeEvent } from "@/features/market-news/prototype";
 
 describe("MarketNews EventCard", () => {
   it("shows every required evidence summary and actions", async () => {
@@ -74,19 +73,21 @@ describe("MarketNews EventCard", () => {
     expect(screen.getByText("中文翻译暂不可用")).toBeInTheDocument();
   });
 
-  it("only offers evidence navigation for the explicit frontend prototype fixture", async () => {
+  it("only offers evidence navigation for a trusted backend verification", async () => {
     const user = userEvent.setup();
     const onViewEvidence = vi.fn();
-    const { rerender } = render(<EventCard event={directEvent} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
+    const unverified = { ...directEvent, verification_status: "unverified" as const };
+    const { rerender } = render(<EventCard event={unverified} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
 
     expect(screen.queryByText("已核验")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "查看证据" })).not.toBeInTheDocument();
 
-    rerender(<EventCard event={marketNewsPrototypeEvent} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
-    expect(screen.getByText("已核验 · 前端演示 Fixture")).toBeInTheDocument();
-    expect(screen.queryByText(/^前端演示 Fixture$/)).not.toBeInTheDocument();
+    const verified = { ...directEvent, verification_status: "verified" as const, verification_reason: "已有明确官方证据", verified_at: "2026-08-18T08:30:00+00:00", verified_key_fields: [] };
+    rerender(<EventCard event={verified} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
+    expect(screen.getByText("已核验")).toBeInTheDocument();
+    expect(screen.queryByText(/前端演示 Fixture/)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "查看证据" }));
-    expect(onViewEvidence).toHaveBeenCalledWith(marketNewsPrototypeEvent);
+    expect(onViewEvidence).toHaveBeenCalledWith(verified);
   });
 });

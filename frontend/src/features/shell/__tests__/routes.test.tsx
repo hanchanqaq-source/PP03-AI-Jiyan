@@ -15,14 +15,12 @@ describe("PP03 shell routing", () => {
     expect(screen.getByRole("link", { name: "05 证据中心" })).toHaveAttribute("href", "/evidence-center");
   });
 
-  it("opens Evidence Center directly and restores the requested evidence drawer from its event query", async () => {
-    window.history.replaceState({}, "", "/evidence-center?event_id=galaxy-compute-center");
-    const router = createMemoryRouter(APP_ROUTES, { initialEntries: ["/evidence-center?event_id=galaxy-compute-center"] });
+  it("opens the real Evidence Center route directly", async () => {
+    const router = createMemoryRouter(APP_ROUTES, { initialEntries: ["/evidence-center"] });
     render(<RouterProvider router={router} />);
 
     expect(await screen.findByRole("heading", { name: "证据中心" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "05 证据中心" })).toHaveClass("text-primary");
-    expect(await screen.findByRole("dialog", { name: "证据详情" })).toHaveTextContent("星河科技发布算力中心建设公告");
   });
 
   it("keeps an original Vibe-Research page reachable", async () => {

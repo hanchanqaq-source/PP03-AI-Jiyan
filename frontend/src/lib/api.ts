@@ -25,6 +25,12 @@ import type {
   SourceHealthSource,
   SourceHealthSummaryData,
 } from "@/features/source-health/types";
+import type {
+  EvidenceEventDetail,
+  EvidenceEventList,
+  EvidenceEventQuery,
+  EvidenceSummaryData,
+} from "@/features/evidence-center/types";
 
 export type {
   DataMeta,
@@ -128,6 +134,16 @@ function marketNewsPath(path: string, query: MarketNewsQuery): string {
   });
   query.tag_ids.forEach((tagId) => params.append("tag_id", tagId));
   return `${path}?${params.toString()}`;
+}
+
+function evidenceEventsPath(query: EvidenceEventQuery): string {
+  const params = new URLSearchParams();
+  if (query.verification_status) params.set("verification_status", query.verification_status);
+  if (query.tag_id) params.set("tag_id", query.tag_id);
+  if (query.category) params.set("category", query.category);
+  params.set("days", String(query.days ?? 7));
+  if (query.holding_relevance) params.set("holding_relevance", query.holding_relevance);
+  return `/evidence/events?${params.toString()}`;
 }
 
 export interface Quote {
@@ -315,6 +331,10 @@ export const api = {
   marketNewsEvent: (eventId: string, snapshotId?: string) => get<MarketNewsEvent>(
     `/market-news/events/${encodeURIComponent(eventId)}${snapshotId ? `?snapshot_id=${encodeURIComponent(snapshotId)}` : ""}`,
   ),
+  evidenceSummary: () => get<EvidenceSummaryData>("/evidence/summary"),
+  evidenceEvents: (query: EvidenceEventQuery = {}) => get<EvidenceEventList>(evidenceEventsPath(query)),
+  evidenceEvent: (eventId: string) => get<EvidenceEventDetail>(`/evidence/events/${encodeURIComponent(eventId)}`),
+  evidenceRefresh: () => request<EvidenceSummaryData>("/evidence/refresh", "POST"),
   cacheStatus: () => get<CacheStatus>("/cache/status"),
   cacheCleanupExpired: () => request<CacheCleanupResult>("/cache/cleanup-expired", "POST"),
   sourceHealthSummary: () => get<SourceHealthSummaryData>("/source-health/summary"),
