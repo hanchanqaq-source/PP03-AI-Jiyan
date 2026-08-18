@@ -142,3 +142,12 @@ Task 7 通过页面启动一次 full run；它验证 API、轮询、禁用态和
 ### 浏览器工具裁决
 
 Windows Computer Use 两次都在首次窗口状态读取时因无法高置信确认浏览器 URL 而安全终止，没有继续交互。用户随后明确批准使用 Browser Use 插件完成上述替代验收。该证据在本次授权范围内有效；若审查方严格只接受 Windows Computer Use，则浏览器证据仍需在该工具可可靠识别 URL 后重做。
+
+## 最终分支验证（不覆盖权威 After）
+
+- 最终验证 HEAD：`194f1adde2329d82e6087a07e885c88f23e98f9a`。
+- Root fresh full backend：`393 passed`、2 warnings；其中 13 个 `live` 测试只是该次公网观察，不等同于 Task 6 权威 After，也不证明长期稳定性。
+- Frontend：Vitest `23 files / 97 tests passed`；legacy `16 passed`；生产 build exit 0。
+- 三轮 final-branch scoped re-review 最终 `PASS`，0 个新增 Critical 或 Important；修复范围和提交映射见 [Final branch review fixes](a1-source-repair-decisions.md#final-branch-review-fixes)。
+- 5 个 deferred Minor 继续非阻塞：Provider profile wrapper 状态校验、history retention 文件名解析一致性、process-global service 生命周期、`wait=False` 下已运行 probe 的退出证明、前端时间格式／零来源报告边界。
+- Task 6 同输入权威 After 仍是 run `7f744e9abe6eb7238238`；最终分支验证没有重跑、改写或覆盖该快照及其 Before／After 数字。

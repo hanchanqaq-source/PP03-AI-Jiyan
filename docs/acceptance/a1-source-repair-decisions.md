@@ -62,6 +62,16 @@ source_id、配置和样本哈希。计数与时延差异只记录为公网波�
 | 非股票资产未归一化 | 后端保持 `non_stock_pct=20.0`；没有并入已识别行业 |
 | 不按基金名或股票名生成行业事实 | 腾讯行情回归保持 `industry=None`；前端明确显示“基金名称未参与行业事实判断” |
 
-聚焦合同命令结果为后端 `5 passed`、前端 `2 files / 5 tests passed`；它们已包含在更广的后端 `357 passed` 和前端 `97 passed` 中。Task 7 没有新增低风险修复：页面验收 run 的 TLS、认证、超时、连接、空载荷、解析和陈旧状态继续作为真实观测保留，不据此修改 URL、请求头、TLS、Provider 顺序或业务语义。
+聚焦合同命令结果为后端 `5 passed`、前端 `2 files / 5 tests passed`；它们已包含在 Task 7 页面验收前运行的更广后端 `357 passed` 和前端 `97 passed` 中。Task 7 没有新增低风险修复：页面验收 run 的 TLS、认证、超时、连接、空载荷、解析和陈旧状态继续作为真实观测保留，不据此修改 URL、请求头、TLS、Provider 顺序或业务语义。
 
 启动审阅另发现任务书根目录 `backend.app:app` 命令与现有 backend-local import 方式不兼容；本轮只用 README 已有的 backend cwd `app:app` 入口完成验收，没有借机修改业务代码。浏览器证据与工具替代裁决见 [After 页面验收观测](a1-source-health-after.md#task-7-页面验收观测不覆盖权威-after)。
+
+## Final branch review fixes
+
+最终分支审查只修正诊断与观测证据链，没有修改 Provider、Provider 顺序、来源配置、金融业务合同或 Task 6 权威 Before／After 数字：
+
+1. `cb9eb26` `fix(pp03): connect source health evidence`：补齐 90 天历史、评级置信度、连续失败和 `last_success_at` 证据；按能力设置 freshness；把生产探测证据接入 repair advisor。
+2. `b1a6199` `fix(pp03): resolve source health fallback evidence`：以整轮实际观测计算可靠备用，并只读正式 radar cache 元数据形成可靠缓存证据；拒绝 probe 自报或陈旧、错配、畸形缓存。
+3. `194f1ad` `fix(pp03): align source health runtime evidence`：用真实 radar ID 映射 health ID 与 canonical URL；分离增量 probe progress 和最终 advice callback；对正式 radar cache 做有界、fail-closed 解析。
+
+三轮 scoped re-review 最终 `PASS`，0 个新增 Critical 或 Important。以下 5 个 deferred Minor 维持非阻塞且未在本轮扩展范围：Provider profile wrapper 状态校验；history retention 文件名解析一致性；process-global service 生命周期；`wait=False` 时已运行 probe 的退出证明；前端时间格式／零来源报告边界。它们不改变上述诊断链路修复结论，也未触发公网重跑或覆盖权威 After。
