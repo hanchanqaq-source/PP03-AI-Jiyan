@@ -74,6 +74,14 @@ def test_redirect_handler_rejects_private_destination_before_following_it():
         handler.redirect_request(request, None, 302, "Found", {}, "http://127.0.0.1/private")
 
 
+def test_redirect_handler_rejects_cross_publisher_official_redirect():
+    handler = SafeRedirectHandler(resolver=public_resolver, max_redirects=3)
+    request = Request("https://www.sec.gov/report")
+
+    with pytest.raises(PermissionError, match="official publisher"):
+        handler.redirect_request(request, None, 302, "Found", {}, "https://www.nasa.gov/report")
+
+
 def test_fetcher_rejects_oversize_and_unsupported_content_without_returning_partial_evidence():
     oversize = Opener(Response(b"x" * 1025))
     with pytest.raises(ValueError, match="size limit"):

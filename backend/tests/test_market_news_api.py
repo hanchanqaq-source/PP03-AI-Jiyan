@@ -94,11 +94,22 @@ def _portfolio() -> dict:
     }
 
 
+def _admit_all(events):
+    for event in events:
+        event.verification_status = "verified"
+        event.verification_reason = "测试中的既有市场资讯行为"
+        event.verified_at = NOW.isoformat()
+        event.verified_key_fields = []
+    return "e" * 20, events
+
+
 def _service(*, portfolio_loader=None, radar_refresher=None) -> MarketNewsService:
     return MarketNewsService(
         radar_loader=_radar,
         radar_refresher=radar_refresher or _radar,
         portfolio_loader=portfolio_loader or (lambda: _portfolio()),
+        evidence_admitter=_admit_all,
+        evidence_version=lambda: "e" * 20,
         now=lambda: NOW,
     )
 
@@ -191,6 +202,8 @@ def test_snapshot_identity_changes_when_time_filter_ages_events_out():
         radar_loader=_radar,
         radar_refresher=_radar,
         portfolio_loader=_portfolio,
+        evidence_admitter=_admit_all,
+        evidence_version=lambda: "e" * 20,
         now=lambda: clock[0],
     )
 
@@ -337,6 +350,8 @@ def test_unknown_publication_time_is_excluded_from_time_window_and_filter_focus(
         radar_loader=lambda: radar,
         radar_refresher=lambda: radar,
         portfolio_loader=_portfolio,
+        evidence_admitter=_admit_all,
+        evidence_version=lambda: "e" * 20,
         now=lambda: NOW,
     )
     monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: service)

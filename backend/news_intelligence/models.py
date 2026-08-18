@@ -64,6 +64,10 @@ class MarketNewsEvent:
     confidence: str = "unavailable"
     missing_information: list[str] = field(default_factory=lambda: ["AI摘要暂不可用"])
     importance_score: int = 0
+    verification_status: str | None = None
+    verification_reason: str | None = None
+    verified_at: str | None = None
+    verified_key_fields: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def source_count(self) -> int:
@@ -93,4 +97,8 @@ class MarketNewsEvent:
             "data_status": self.data_status,
             "missing_information": self.missing_information,
             "importance_score": self.importance_score,
+            "verification_status": self.verification_status,
+            "verification_reason": self.verification_reason,
+            "verified_at": self.verified_at,
+            "verified_key_fields": self.verified_key_fields,
         }

@@ -31,6 +31,19 @@ def _default_portfolio_loader() -> dict[str, Any]:
     return fund_service.get_service().get_portfolio_analysis(holdings)
 
 
+def _default_evidence_admitter(events: list[Any]) -> tuple[str, list[Any]]:
+    from evidence_verification.service import get_service
+
+    return get_service().admit(events)
+
+
+def _default_evidence_version() -> str:
+    from evidence_verification.service import get_service
+
+    snapshot = get_service().get_snapshot()
+    return snapshot.snapshot_id if snapshot else "unavailable"
+
+
 class MarketNewsService:
     def __init__(
         self,
@@ -38,11 +51,15 @@ class MarketNewsService:
         radar_loader: Callable[[], dict] = newsradar.get_radar,
         radar_refresher: Callable[[], dict] = newsradar.fetch_radar,
         portfolio_loader: Callable[[], dict] = _default_portfolio_loader,
+        evidence_admitter: Callable[[list[Any]], tuple[str, list[Any]]] = _default_evidence_admitter,
+        evidence_version: Callable[[], str] = _default_evidence_version,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self.radar_loader = radar_loader
         self.radar_refresher = radar_refresher
         self.portfolio_loader = portfolio_loader
+        self.evidence_admitter = evidence_admitter
+        self.evidence_version = evidence_version
         self.now = now
         self._snapshot_lock = threading.RLock()
         self._base_snapshots: OrderedDict[str, list[Any]] = OrderedDict()
@@ -100,21 +117,40 @@ class MarketNewsService:
         portfolio: dict[str, Any],
         portfolio_status: str,
         now: datetime,
-    ) -> tuple[str, list[Any]]:
+    ) -> tuple[str, str, list[Any]]:
+        evidence_snapshot_id = self.evidence_version()
         base_key = self._fingerprint({
             "radar": self._stable_facts(radar, drop_updated_at=False),
             "portfolio": (
                 self._stable_facts(portfolio, drop_updated_at=True)
                 if portfolio_status == "ready" else {"status": portfolio_status}
             ),
+            "evidence_snapshot_id": evidence_snapshot_id,
         })
         with self._snapshot_lock:
             cached = self._base_snapshots.get(base_key)
             if cached is not None:
                 self._base_snapshots.move_to_end(base_key)
-                return base_key, copy.deepcopy(cached)
+                return base_key, evidence_snapshot_id, copy.deepcopy(cached)
 
-        events = cluster_items(normalize_radar(radar, now=now))
+        raw_events = cluster_items(normalize_radar(radar, now=now))
+        actual_evidence_snapshot_id, admitted_events = self.evidence_admitter(raw_events)
+        if actual_evidence_snapshot_id != evidence_snapshot_id:
+            evidence_snapshot_id = actual_evidence_snapshot_id
+            base_key = self._fingerprint({
+                "radar": self._stable_facts(radar, drop_updated_at=False),
+                "portfolio": (
+                    self._stable_facts(portfolio, drop_updated_at=True)
+                    if portfolio_status == "ready" else {"status": portfolio_status}
+                ),
+                "evidence_snapshot_id": evidence_snapshot_id,
+            })
+            with self._snapshot_lock:
+                cached = self._base_snapshots.get(base_key)
+                if cached is not None:
+                    self._base_snapshots.move_to_end(base_key)
+                    return base_key, evidence_snapshot_id, copy.deepcopy(cached)
+        events = admitted_events
         relate_events(events, portfolio if portfolio_status == "ready" else None, [])
         events = rank_events(events, "importance")
         with self._snapshot_lock:
@@ -122,7 +158,7 @@ class MarketNewsService:
             self._base_snapshots.move_to_end(base_key)
             while len(self._base_snapshots) > 4:
                 self._base_snapshots.popitem(last=False)
-        return base_key, events
+        return base_key, evidence_snapshot_id, events
 
     def _remember_details(self, snapshot_id: str, events: list[Any]) -> None:
         details = {event.event_id: event.to_dict() for event in events}
@@ -158,7 +194,7 @@ class MarketNewsService:
         now = self.now()
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
-        base_key, all_events = self._base_events(radar, portfolio, portfolio_status, now)
+        base_key, evidence_snapshot_id, all_events = self._base_events(radar, portfolio, portfolio_status, now)
         apply_watch_relations(all_events, selected_tags)
 
         # One canonical query pipeline: time -> category -> mode -> article tags -> sort.
@@ -205,6 +241,10 @@ class MarketNewsService:
         filtered = rank_events(filtered, sort)
         if not filtered and empty_reason is None:
             empty_reason = "no_events"
+        empty_message = (
+            "当前筛选暂无完成核验的资讯，可前往证据中心查看待核验内容。"
+            if empty_reason == "no_events" else None
+        )
 
         normalized_query = {
             "mode": mode,
@@ -258,8 +298,10 @@ class MarketNewsService:
             },
             "portfolio_status": portfolio_status,
             "snapshot_id": snapshot_id,
+            "evidence_snapshot_id": evidence_snapshot_id,
             "ai_status": "unavailable",
             "empty_reason": empty_reason,
+            "empty_message": empty_message,
             "filters": normalized_query,
             "filter_options": {
                 "modes": sorted(MODES), "categories": sorted(CATEGORIES), "days": [1, 3, 7, 30], "sorts": sorted(SORTS),

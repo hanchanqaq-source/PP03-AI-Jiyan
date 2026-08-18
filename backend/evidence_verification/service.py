@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
+from collections import Counter
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from html.parser import HTMLParser
 import ipaddress
 import json
+import re
 import socket
+import threading
 from typing import Callable
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -15,9 +19,9 @@ import newsradar
 from news_intelligence.clustering import cluster_items
 from news_intelligence.normalizer import normalize_radar
 
-from .models import EvidenceItem, EvidenceSnapshot, SourceRole
+from .models import EvidenceItem, EvidenceSnapshot, FieldVerificationStatus, SourceRole, VerificationStatus
 from .source_identity import OFFICIAL_PUBLISHERS, canonicalize_public_url, identify_evidence, official_content_source
-from .storage import EvidenceStorage
+from .storage import EvidenceStorage, field_document
 from .verifier import verify_event
 
 
@@ -92,6 +96,9 @@ class SafeRedirectHandler(HTTPRedirectHandler):
         if len(redirects) >= self._max_redirects:
             raise PermissionError("public document redirect limit exceeded")
         safe_url = _validate_public_network_url(newurl, self._resolver)
+        origin_publisher = official_content_source(req.full_url)
+        if origin_publisher is None or official_content_source(safe_url) != origin_publisher:
+            raise PermissionError("redirect changed the official publisher identity")
         return super().redirect_request(req, fp, code, msg, headers, safe_url)
 
 
@@ -236,3 +243,121 @@ class EvidenceVerificationService:
         if snapshot is None:
             return None
         return next((event for event in snapshot.events if event.event_id == event_id), None)
+
+    def get_snapshot(self) -> EvidenceSnapshot | None:
+        return self.storage.load_current()
+
+    def get_summary(self) -> dict:
+        snapshot = self.storage.load_current()
+        last_refresh = self.storage.load_last_refresh()
+        if snapshot is None:
+            return {
+                "loaded": False,
+                "snapshot_id": None,
+                "generated_at": None,
+                "counts": None,
+                "field_counts": None,
+                "admitted_count": None,
+                "isolated_count": None,
+                "last_refresh": last_refresh,
+            }
+        counts = Counter(event.verification_status.value for event in snapshot.events)
+        field_counts = Counter(field.verification_status.value for event in snapshot.events for field in event.key_fields)
+        trusted = {VerificationStatus.VERIFIED.value, VerificationStatus.CORROBORATED.value}
+        admitted_count = sum(counts[value] for value in trusted)
+        return {
+            "loaded": True,
+            "snapshot_id": snapshot.snapshot_id,
+            "generated_at": snapshot.generated_at.isoformat(),
+            "counts": {value.value: counts[value.value] for value in VerificationStatus},
+            "field_counts": {value.value: field_counts[value.value] for value in FieldVerificationStatus},
+            "admitted_count": admitted_count,
+            "isolated_count": len(snapshot.events) - admitted_count,
+            "last_refresh": last_refresh,
+        }
+
+    def list_events(
+        self,
+        *,
+        verification_status: str | None = None,
+        tag_id: str | None = None,
+        category: str | None = None,
+        days: int = 7,
+        holding_relevance: str | None = None,
+    ) -> list:
+        if verification_status is not None and verification_status not in {value.value for value in VerificationStatus}:
+            raise ValueError("invalid verification_status")
+        if days not in {1, 3, 7, 30}:
+            raise ValueError("days must be one of 1, 3, 7, 30")
+        snapshot = self.storage.load_current()
+        if snapshot is None:
+            return []
+        current = self._now()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        cutoff = current - timedelta(days=days)
+        rows = [event for event in snapshot.events if event.published_at is not None and event.published_at >= cutoff]
+        if verification_status is not None:
+            rows = [event for event in rows if event.verification_status.value == verification_status]
+        if tag_id is not None:
+            rows = [event for event in rows if tag_id in {key for key, _ in event.related_tags}]
+        if category is not None:
+            rows = [event for event in rows if event.category == category]
+        if holding_relevance is not None:
+            rows = [event for event in rows if event.holding_relevance == holding_relevance]
+        return sorted(rows, key=lambda event: (event.verified_at, event.event_id), reverse=True)
+
+    def admit(self, events: list) -> tuple[str, list]:
+        snapshot = self.storage.load_current()
+        if snapshot is None:
+            return "unavailable", []
+        trusted_statuses = {VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED}
+        evidence_by_id = {
+            event.event_id: event for event in snapshot.events if event.verification_status in trusted_statuses
+        }
+        admitted = []
+        trusted_field_statuses = {FieldVerificationStatus.VERIFIED, FieldVerificationStatus.CORROBORATED}
+        for raw in events:
+            evidence = evidence_by_id.get(raw.event_id)
+            if evidence is None:
+                continue
+            projected = copy.deepcopy(raw)
+            untrusted_values = sorted({
+                field.raw_value for field in evidence.key_fields
+                if field.verification_status not in trusted_field_statuses and field.raw_value
+            }, key=len, reverse=True)
+            for value in untrusted_values:
+                projected.title = projected.title.replace(value, "")
+                projected.summary = projected.summary.replace(value, "")
+            projected.title = re.sub(r"\s{2,}", " ", projected.title).strip()
+            projected.summary = re.sub(r"\s{2,}", " ", projected.summary).strip()
+            projected.impact_basis = [
+                basis for basis in getattr(projected, "impact_basis", [])
+                if not any(value in basis for value in untrusted_values)
+            ]
+            projected.verification_status = evidence.verification_status.value
+            projected.verification_reason = evidence.verification_reason
+            projected.verified_at = evidence.verified_at.isoformat()
+            projected.verified_key_fields = [
+                field_document(field) for field in evidence.key_fields if field.verification_status in trusted_field_statuses
+            ]
+            admitted.append(projected)
+        return snapshot.snapshot_id, admitted
+
+
+_service: EvidenceVerificationService | None = None
+_service_lock = threading.Lock()
+
+
+def get_service() -> EvidenceVerificationService:
+    global _service
+    with _service_lock:
+        if _service is None:
+            _service = EvidenceVerificationService()
+        return _service
+
+
+def reset_service() -> None:
+    global _service
+    with _service_lock:
+        _service = None

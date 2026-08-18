@@ -89,3 +89,21 @@ def test_status_history_is_append_only_across_publishes(tmp_path):
         (None, "unverified"),
         ("unverified", "verified"),
     ]
+
+
+def test_history_ledger_failure_after_current_publish_does_not_relabel_completed_snapshot(monkeypatch, tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    snapshot = EvidenceSnapshot(
+        "a" * 20,
+        NOW,
+        (evidence_event(status=VerificationStatus.VERIFIED, history_hours=(12,)),),
+    )
+    monkeypatch.setattr(storage, "_append_transitions", lambda *_: (_ for _ in ()).throw(OSError("history denied")))
+
+    storage.publish(snapshot)
+
+    assert storage.load_current() == snapshot
+    marker = storage.load_last_refresh()
+    assert marker["status"] == "completed"
+    assert marker["history_status"] == "failed"
+    assert marker["history_error"] == "OSError"

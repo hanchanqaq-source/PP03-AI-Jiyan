@@ -44,7 +44,7 @@ def _evidence_document(item: EvidenceItem) -> dict[str, Any]:
     }
 
 
-def _field_document(field: KeyField) -> dict[str, Any]:
+def field_document(field: KeyField) -> dict[str, Any]:
     return {
         "field_name": field.field_name,
         "raw_value": field.raw_value,
@@ -77,12 +77,36 @@ def event_document(event: EvidenceEvent) -> dict[str, Any]:
         "verification_reason": event.verification_reason,
         "verified_at": event.verified_at.isoformat(),
         "evidence_as_of": event.evidence_as_of.isoformat(),
-        "key_fields": [_field_document(row) for row in event.key_fields],
+        "key_fields": [field_document(row) for row in event.key_fields],
         "primary_evidence": [_evidence_document(row) for row in event.primary_evidence],
         "independent_evidence": [_evidence_document(row) for row in event.independent_evidence],
         "syndicated_copies": [_evidence_document(row) for row in event.syndicated_copies],
         "contradicting_evidence": [_evidence_document(row) for row in event.contradicting_evidence],
         "status_history": [_transition_document(row) for row in event.status_history],
+        "holding_relevance": event.holding_relevance,
+    }
+
+
+def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
+    trusted = {FieldVerificationStatus.VERIFIED, FieldVerificationStatus.CORROBORATED}
+    return {
+        "event_id": event.event_id,
+        "title": event.title,
+        "published_at": _timestamp(event.published_at),
+        "verified_at": event.verified_at.isoformat(),
+        "evidence_as_of": event.evidence_as_of.isoformat(),
+        "category": event.category,
+        "related_tags": [{"id": key, "name": name} for key, name in event.related_tags],
+        "core_claim": event.core_claim,
+        "verification_status": event.verification_status.value,
+        "verification_reason": event.verification_reason,
+        "verified_key_fields": [field_document(field) for field in event.key_fields if field.verification_status in trusted],
+        "pending_key_field_count": sum(field.verification_status == FieldVerificationStatus.UNVERIFIED for field in event.key_fields),
+        "conflicting_key_field_count": sum(field.verification_status == FieldVerificationStatus.CONFLICTING for field in event.key_fields),
+        "primary_evidence_count": len(event.primary_evidence),
+        "independent_evidence_count": len(event.independent_evidence),
+        "syndicated_copy_count": len(event.syndicated_copies),
+        "contradicting_evidence_count": len(event.contradicting_evidence),
         "holding_relevance": event.holding_relevance,
     }
 
@@ -216,6 +240,9 @@ class EvidenceStorage:
         except (KeyError, TypeError, ValueError):
             return None
 
+    def load_last_refresh(self) -> dict[str, Any] | None:
+        return self._read_json(self.last_refresh_path)
+
     def history_path(self, observed_at: datetime) -> Path:
         return self.history_root / f"{observed_at.date().isoformat()}.jsonl"
 
@@ -239,12 +266,20 @@ class EvidenceStorage:
         with CACHE_IO_LOCK:
             previous = self.load_current()
             self._atomic_write(self.current_path, snapshot_document(snapshot))
-            self._append_transitions(snapshot, previous)
+            history_status = "completed"
+            history_error = None
+            try:
+                self._append_transitions(snapshot, previous)
+            except Exception as error:
+                history_status = "failed"
+                history_error = type(error).__name__
             self._atomic_write(self.last_refresh_path, {
                 "status": "completed",
                 "attempted_at": snapshot.generated_at.isoformat(),
                 "last_successful_refresh_at": snapshot.generated_at.isoformat(),
                 "error": None,
+                "history_status": history_status,
+                "history_error": history_error,
             })
 
     def record_failure(self, error: object) -> None:

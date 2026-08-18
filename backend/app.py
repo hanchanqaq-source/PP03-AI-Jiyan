@@ -31,6 +31,8 @@ import news_translation
 import portfolio as pf
 import fund_portfolio as fpf
 import source_health
+from evidence_verification import service as evidence_service
+from evidence_verification.storage import event_document, event_summary_document
 from fund_data import service as fund_service
 from news_intelligence import service as market_news_service
 import market
@@ -568,6 +570,9 @@ MarketNewsMode = Literal["my_focus", "my_holdings", "global_tech", "domestic_pol
 MarketNewsCategory = Literal["all", "policy", "industry", "company", "fund_notice", "deep_content"]
 MarketNewsSort = Literal["importance", "latest", "holding_relevance"]
 MarketNewsDays = int
+EvidenceVerificationStatus = Literal["verified", "corroborated", "unverified", "conflicting", "corrected", "disproved"]
+EvidenceCategory = Literal["policy", "industry", "company", "fund_notice", "deep_content"]
+EvidenceHoldingRelevance = Literal["direct_holding", "industry_relation", "watch_tag", "none"]
 
 
 class MarketNewsTranslationItem(BaseModel):
@@ -580,6 +585,64 @@ class MarketNewsTranslationItem(BaseModel):
 class MarketNewsTranslationReq(BaseModel):
     items: list[MarketNewsTranslationItem] = Field(default_factory=list, max_length=20)
     llm: LLMConfig | None = None
+
+
+@app.get("/api/evidence/summary")
+def evidence_summary():
+    return {"data": evidence_service.get_service().get_summary()}
+
+
+@app.get("/api/evidence/events")
+def evidence_events(
+    verification_status: EvidenceVerificationStatus | None = None,
+    tag_id: str | None = Query(default=None, max_length=120),
+    category: EvidenceCategory | None = None,
+    days: int = 7,
+    holding_relevance: EvidenceHoldingRelevance | None = None,
+):
+    service = evidence_service.get_service()
+    try:
+        rows = service.list_events(
+            verification_status=verification_status,
+            tag_id=tag_id,
+            category=category,
+            days=days,
+            holding_relevance=holding_relevance,
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    snapshot = service.get_snapshot()
+    return {"data": {
+        "events": [event_summary_document(row) for row in rows],
+        "snapshot_id": snapshot.snapshot_id if snapshot else None,
+        "generated_at": snapshot.generated_at.isoformat() if snapshot else None,
+        "total": len(rows),
+        "filters": {
+            "verification_status": verification_status,
+            "tag_id": tag_id,
+            "category": category,
+            "days": days,
+            "holding_relevance": holding_relevance,
+        },
+    }}
+
+
+@app.get("/api/evidence/events/{event_id}")
+def evidence_event(event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$")):
+    row = evidence_service.get_service().get_event(event_id)
+    if row is None:
+        raise HTTPException(404, "证据事件不存在或尚未完成核验")
+    return {"data": event_document(row)}
+
+
+@app.post("/api/evidence/refresh")
+def evidence_refresh():
+    service = evidence_service.get_service()
+    try:
+        service.refresh()
+    except Exception as error:
+        raise HTTPException(502, f"证据核验刷新失败：{type(error).__name__}") from error
+    return {"data": service.get_summary()}
 
 
 def _market_news_payload(
