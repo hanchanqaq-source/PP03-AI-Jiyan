@@ -32,6 +32,14 @@ export const evidenceFixtures: EvidenceFixture[] = [
     conflictNote: "当前未发现可靠冲突证据", history: ["13:20 待核验", "13:45 取得公司正式公告", "13:46 升级为已核验"],
   },
   {
+    eventId: "yunling-capacity-plan", title: "云岭半导体产能规划获多源印证", publishedAt: "2026-08-18 14:05", verifiedAt: "2026-08-18 14:40", status: "多源印证",
+    claim: "云岭半导体的扩产规划获得两条独立来源链支持。", fields: [
+      { label: "核心主张", value: "扩产规划获独立印证", status: "已核验" }, { label: "规划日期", value: "2026-08-18", status: "已核验" }, { label: "具体产能", value: "待后续披露", status: "待核验" },
+    ], primaryCount: 1, independentCount: 2, reprintCount: 5, conflictCount: 0, impact: 82, holdingsRelation: "行业关联",
+    primaryEvidence: ["公司公开说明 · 演示证据"], independentChains: ["独立来源链 A · 行业协会公开材料（演示）", "独立来源链 B · 供应链公开访谈（演示）"],
+    conflictNote: "当前未发现可靠冲突证据；转载来源不重复计入独立来源。", history: ["14:05 待核验", "14:30 取得第一条独立来源链", "14:40 升级为多源印证"],
+  },
+  {
     eventId: "yunling-memory-pricing", title: "云岭半导体披露存储产品价格调整计划", publishedAt: "2026-08-18 12:10", verifiedAt: "2026-08-18 15:10", status: "已证伪",
     claim: "云岭半导体计划调整部分存储产品报价。", fields: [
       { label: "核心主张", value: "官方更正为不成立", status: "已核验" }, { label: "调整比例", value: "不适用", status: "已核验" }, { label: "生效日期", value: "不适用", status: "已核验" },
@@ -55,10 +63,19 @@ export const evidenceFixtures: EvidenceFixture[] = [
     primaryEvidence: ["尚未取得一手证据 · 演示状态"], independentChains: ["独立来源链 A · 行业公开观察（演示）", "独立来源链 B · 尚未形成"],
     conflictNote: "当前证据不足，不能据此生成投资影响结论", history: ["10:05 待核验", "10:30 记录独立线索，保持待核验"],
   },
+  {
+    eventId: "galaxy-compute-center-correction", title: "星河科技更正算力中心公告细节", publishedAt: "2026-08-18 16:05", verifiedAt: "2026-08-18 16:20", status: "已更正",
+    claim: "原始公告的建设周期说明已被更正。", fields: [
+      { label: "核心主张", value: "建设周期说明已更正", status: "已核验" }, { label: "原披露日期", value: "2026-08-18", status: "已核验" }, { label: "更正后周期", value: "分阶段披露", status: "已核验" },
+    ], primaryCount: 1, independentCount: 1, reprintCount: 2, conflictCount: 0, impact: 58, holdingsRelation: "直接关联",
+    primaryEvidence: ["公司更正公告 · 演示证据"], independentChains: ["独立来源链 A · 公开披露复核（演示）", "独立来源链 B · 尚未形成"],
+    conflictNote: "原始公告的建设周期说明已被更正，旧表述不应继续作为确定事实。", history: ["13:46 已核验", "16:05 取得更正公告", "16:20 更新为已更正"],
+  },
 ];
 
 export const correctionFixtures = [
   { eventId: "galaxy-compute-center", title: "星河科技发布算力中心建设公告", from: "待核验", to: "已核验", type: "取得一手证据", at: "2026-08-18 13:46", source: "公司正式公告（演示）" },
   { eventId: "beichen-robot-policy", title: "北辰机器人产业政策解读出现分歧", from: "多源印证", to: "存在冲突", type: "可靠来源分歧", at: "2026-08-18 09:21", source: "行业协会公开说明（演示）" },
   { eventId: "yunling-memory-pricing", title: "云岭半导体披露存储产品价格调整计划", from: "待核验", to: "已证伪", type: "官方更正", at: "2026-08-18 15:10", source: "更正说明（演示）" },
+  { eventId: "galaxy-compute-center-correction", title: "星河科技更正算力中心公告细节", from: "已核验", to: "已更正", type: "公告细节更正", at: "2026-08-18 16:20", source: "公司更正公告（演示）" },
 ];

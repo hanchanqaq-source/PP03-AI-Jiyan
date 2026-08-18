@@ -56,6 +56,15 @@ describe("EvidenceCenter", () => {
     expect(within(screen.getByRole("main")).getAllByRole("article")[0]).toHaveTextContent("星河科技发布算力中心建设公告");
   });
 
+  it("shows only the explicit fictional multi-source fixture when filtering 多源印证", async () => {
+    const user = userEvent.setup();
+    render(<EvidenceCenter />);
+    await user.click(screen.getByRole("button", { name: "多源印证" }));
+
+    expect(screen.getByText("云岭半导体产能规划获多源印证")).toBeInTheDocument();
+    expect(screen.queryByText("星河科技发布算力中心建设公告")).not.toBeInTheDocument();
+  });
+
   it("shows evidence, explains reprints, restores focus on Escape, and keeps source actions as a prototype", async () => {
     const user = userEvent.setup();
     render(<EvidenceCenter />);
@@ -82,5 +91,17 @@ describe("EvidenceCenter", () => {
     expect(screen.getByText("真实性核验能力将在 A1.1-W1 接入")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "数据说明" }));
     expect(screen.getByText("AI 翻译、AI 摘要和来源数量不会自动提高核验等级。", { exact: false })).toBeInTheDocument();
+  });
+
+  it("opens the matching 已核验 to 已更正 correction fixture in the shared evidence drawer", async () => {
+    const user = userEvent.setup();
+    render(<EvidenceCenter />);
+    await user.click(screen.getByRole("tab", { name: "更正记录" }));
+    await user.click(screen.getByRole("button", { name: "查看记录 星河科技更正算力中心公告细节" }));
+
+    const drawer = screen.getByRole("dialog", { name: "证据详情" });
+    expect(drawer).toHaveTextContent("已更正");
+    expect(drawer).toHaveTextContent("原始公告的建设周期说明已被更正");
+    expect(drawer).toHaveTextContent("状态历史");
   });
 });
