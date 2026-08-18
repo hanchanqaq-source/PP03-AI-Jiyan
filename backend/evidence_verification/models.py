@@ -85,6 +85,13 @@ class EvidenceEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceSnapshot:
+    snapshot_id: str
+    generated_at: datetime
+    events: tuple[EvidenceEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class MatchResult:
     key_fields: tuple[KeyField, ...]
     primary_evidence: tuple[EvidenceItem, ...]

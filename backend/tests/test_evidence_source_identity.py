@@ -64,6 +64,18 @@ def test_explicit_existing_official_domain_is_primary_evidence():
     assert evidence.content_source == "sec.gov"
 
 
+def test_ordinary_collector_linking_to_official_host_requires_document_attestation():
+    evidence = identify_evidence(source(
+        name="普通资讯采集器",
+        feed="https://collector.example/feed",
+        article="https://www.sec.gov/Archives/edgar/data/1/report.htm",
+    ))
+
+    assert evidence.content_source == "sec.gov"
+    assert evidence.is_official is False
+    assert evidence.source_role.value == "independent"
+
+
 def test_private_local_credentialed_and_secret_query_urls_fail_closed():
     assert canonicalize_public_url("http://127.0.0.1/report") is None
     assert canonicalize_public_url("http://[::1]/report") is None
