@@ -12,6 +12,7 @@ const summary: SourceHealthSummaryData = {
   news: { healthy: 1, usable: 0, degraded: 1, failed: 1 },
   total_sources: 5,
   reclaimable_bytes: 0,
+  group_status: { fund: { registered: 2, observed: 2, loaded: true }, news: { registered: 3, observed: 3, loaded: true } },
 };
 
 function source(overrides: Partial<SourceHealthSource>): SourceHealthSource {
@@ -102,6 +103,19 @@ describe("SourceHealthWorkspace", () => {
     expect(within(bar).getByText("尚未载入健康快照")).toBeInTheDocument();
     expect(within(bar).queryByText(/0 健康 \/ 0 基本可用/)).not.toBeInTheDocument();
     expect(await screen.findByText("财经资讯源")).toBeInTheDocument();
+  });
+
+  it("does not turn a missing registered news group snapshot into zero counts", async () => {
+    vi.spyOn(api, "sourceHealthSummary").mockResolvedValue({
+      ...summary,
+      news: { healthy: 0, usable: 0, degraded: 0, failed: 0 },
+      total_sources: 2,
+      group_status: { fund: { registered: 2, observed: 2, loaded: true }, news: { registered: 108, observed: 0, loaded: false } },
+    });
+    render(<SourceHealthWorkspace />);
+    const bar = await screen.findByRole("region", { name: "数据源健康状态栏" });
+    expect(within(bar).getByText("尚未载入资讯来源健康快照")).toBeInTheDocument();
+    expect(within(bar).queryByText("0 健康 / 0 基本可用 / 0 降级 / 0 失败")).not.toBeInTheDocument();
   });
 
   it("distinguishes summary load failure from a snapshot that is still loading", async () => {

@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 import { MarketNews } from "@/pages/MarketNews";
 import { directEvent, marketNewsResponse } from "./fixtures";
 
-const verified = { ...directEvent, event_id: "11111111111111111111", verification_status: "verified" as const, verification_reason: "已有明确官方证据", verified_at: "2026-08-18T08:30:00+00:00", verified_key_fields: [] };
+const verified = { ...directEvent, event_id: "11111111111111111111", title: "交易所公告：星河科技建设存储算力中心", summary: "两个相互独立的来源链提供了一致证据。", verification_status: "verified" as const, verification_reason: "两个相互独立的来源链提供了一致证据。", verified_at: "2026-08-18T08:30:00+00:00", verified_key_fields: [] };
 const unverified = { ...directEvent, event_id: "22222222222222222222", title: "未核验金额 12亿元", summary: "未经核验的 12亿元", verification_status: "unverified" as const };
 
 describe("MarketNews trusted evidence admission", () => {
@@ -16,7 +16,7 @@ describe("MarketNews trusted evidence admission", () => {
     vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [verified, unverified], focus_events: [verified], evidence_snapshot_id: "e".repeat(20), filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
     render(<MarketNews />);
     const card = await screen.findByRole("article", { name: `${verified.title}事件卡` });
-    expect(within(card).getByText("已核验")).toBeInTheDocument(); expect(screen.queryByText("未核验金额 12亿元")).not.toBeInTheDocument(); expect(screen.queryByText(/前端演示 Fixture/)).not.toBeInTheDocument();
+    expect(within(card).getByText("已核验")).toBeInTheDocument(); expect(within(card).getByText("两个相互独立的来源链提供了一致证据。")).toBeInTheDocument(); expect(card).not.toHaveTextContent("12亿元"); expect(screen.queryByText("未核验金额 12亿元")).not.toBeInTheDocument(); expect(screen.queryByText(/origin cluster/i)).not.toBeInTheDocument(); expect(screen.queryByText(/前端演示 Fixture/)).not.toBeInTheDocument();
     await user.click(within(card).getByRole("button", { name: "查看证据" }));
     expect(window.location.pathname).toBe("/evidence-center"); expect(window.location.search).toBe("?event_id=11111111111111111111");
   });

@@ -11,6 +11,7 @@ const emptySummary: SourceHealthSummaryData = {
   fund: { healthy: 0, usable: 0, degraded: 0, failed: 0 },
   news: { healthy: 0, usable: 0, degraded: 0, failed: 0 },
   total_sources: 0, reclaimable_bytes: 0,
+  group_status: { fund: { registered: 0, observed: 0, loaded: true }, news: { registered: 0, observed: 0, loaded: true } },
 };
 
 const previousSummary: SourceHealthSummaryData = {
@@ -18,6 +19,7 @@ const previousSummary: SourceHealthSummaryData = {
   fund: { healthy: 8, usable: 2, degraded: 1, failed: 0 },
   news: { healthy: 100, usable: 2, degraded: 3, failed: 3 },
   total_sources: 119, reclaimable_bytes: 0,
+  group_status: { fund: { registered: 11, observed: 11, loaded: true }, news: { registered: 108, observed: 108, loaded: true } },
 };
 
 const cacheStatus = { total_bytes: 0, file_count: 0, expired_count: 0, reclaimable_bytes: 0, categories: {}, last_auto_cleanup_at: null, limit_bytes: 0, over_limit_bytes: 0 };
@@ -51,6 +53,28 @@ describe("source health summary in DataInfoDialog", () => {
     expect(screen.getByText(/最后体检：.*2026/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "查看详情" }));
     expect(openDetails).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows missing news snapshot honestly while retaining the loaded fund summary", async () => {
+    installHealthApi({
+      ...previousSummary,
+      news: { healthy: 0, usable: 0, degraded: 0, failed: 0 },
+      total_sources: 11,
+      group_status: { fund: { registered: 11, observed: 11, loaded: true }, news: { registered: 108, observed: 0, loaded: false } },
+    });
+    render(<DataInfoDialog open onClose={() => {}} onOpenSourceHealth={() => {}} />);
+    expect(await screen.findByText("尚未载入资讯来源健康快照")).toBeInTheDocument();
+    expect(screen.queryByText("0 健康 / 0 基本可用 / 0 降级 / 0 失败")).not.toBeInTheDocument();
+  });
+
+  it("shows zero news counts only when the registry truly has no news sources", async () => {
+    installHealthApi({
+      ...emptySummary,
+      last_run_at: "2026-08-18T06:30:00+00:00",
+    });
+    render(<DataInfoDialog open onClose={() => {}} onOpenSourceHealth={() => {}} />);
+    expect(await screen.findAllByText("0 健康 / 0 基本可用 / 0 降级 / 0 失败")).toHaveLength(2);
+    expect(screen.queryByText("尚未载入资讯来源健康快照")).not.toBeInTheDocument();
   });
 
   it("starts once, polls every two seconds, reads progress, and refreshes the successful report", async () => {

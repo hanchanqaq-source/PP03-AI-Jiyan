@@ -21,7 +21,7 @@ from news_intelligence.normalizer import normalize_radar
 
 from .models import EvidenceItem, EvidenceSnapshot, FieldVerificationStatus, SourceRole, VerificationStatus
 from .source_identity import OFFICIAL_PUBLISHERS, canonicalize_public_url, identify_evidence, official_content_source
-from .storage import EvidenceStorage, field_document
+from .storage import EvidenceStorage, field_document, trusted_event_text
 from .verifier import verify_event
 
 
@@ -326,11 +326,8 @@ class EvidenceVerificationService:
                 field.raw_value for field in evidence.key_fields
                 if field.verification_status not in trusted_field_statuses and field.raw_value
             }, key=len, reverse=True)
-            for value in untrusted_values:
-                projected.title = projected.title.replace(value, "")
-                projected.summary = projected.summary.replace(value, "")
-            projected.title = re.sub(r"\s{2,}", " ", projected.title).strip()
-            projected.summary = re.sub(r"\s{2,}", " ", projected.summary).strip()
+            projected.title = trusted_event_text(evidence, projected.title)
+            projected.summary = trusted_event_text(evidence, projected.summary)
             projected.impact_basis = [
                 basis for basis in getattr(projected, "impact_basis", [])
                 if not any(value in basis for value in untrusted_values)

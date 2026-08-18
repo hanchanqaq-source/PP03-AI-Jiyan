@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Callable
 
@@ -55,6 +56,27 @@ def field_document(field: KeyField) -> dict[str, Any]:
     }
 
 
+_TRUSTED_FIELD_STATUSES = {
+    FieldVerificationStatus.VERIFIED,
+    FieldVerificationStatus.CORROBORATED,
+}
+
+
+def trusted_event_text(event: EvidenceEvent, value: str) -> str:
+    """Remove key-field values that are not independently trusted from display text."""
+    projected = value
+    untrusted_values = sorted({
+        field.raw_value
+        for field in event.key_fields
+        if field.verification_status not in _TRUSTED_FIELD_STATUSES and field.raw_value
+    }, key=len, reverse=True)
+    for raw_value in untrusted_values:
+        projected = projected.replace(raw_value, "")
+    projected = re.sub(r"\s{2,}", " ", projected).strip()
+    projected = re.sub(r"\s+([，。；：、！？])", r"\1", projected)
+    return projected
+
+
 def _transition_document(row: StatusTransition) -> dict[str, Any]:
     return {
         "from_status": row.from_status.value if row.from_status else None,
@@ -67,12 +89,12 @@ def _transition_document(row: StatusTransition) -> dict[str, Any]:
 def event_document(event: EvidenceEvent) -> dict[str, Any]:
     return {
         "event_id": event.event_id,
-        "title": event.title,
-        "summary": event.summary,
+        "title": trusted_event_text(event, event.title),
+        "summary": trusted_event_text(event, event.summary),
         "category": event.category,
         "related_tags": [{"id": key, "name": name} for key, name in event.related_tags],
         "published_at": _timestamp(event.published_at),
-        "core_claim": event.core_claim,
+        "core_claim": trusted_event_text(event, event.core_claim),
         "verification_status": event.verification_status.value,
         "verification_reason": event.verification_reason,
         "verified_at": event.verified_at.isoformat(),
@@ -88,19 +110,18 @@ def event_document(event: EvidenceEvent) -> dict[str, Any]:
 
 
 def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
-    trusted = {FieldVerificationStatus.VERIFIED, FieldVerificationStatus.CORROBORATED}
     return {
         "event_id": event.event_id,
-        "title": event.title,
+        "title": trusted_event_text(event, event.title),
         "published_at": _timestamp(event.published_at),
         "verified_at": event.verified_at.isoformat(),
         "evidence_as_of": event.evidence_as_of.isoformat(),
         "category": event.category,
         "related_tags": [{"id": key, "name": name} for key, name in event.related_tags],
-        "core_claim": event.core_claim,
+        "core_claim": trusted_event_text(event, event.core_claim),
         "verification_status": event.verification_status.value,
         "verification_reason": event.verification_reason,
-        "verified_key_fields": [field_document(field) for field in event.key_fields if field.verification_status in trusted],
+        "verified_key_fields": [field_document(field) for field in event.key_fields if field.verification_status in _TRUSTED_FIELD_STATUSES],
         "pending_key_field_count": sum(field.verification_status == FieldVerificationStatus.UNVERIFIED for field in event.key_fields),
         "conflicting_key_field_count": sum(field.verification_status == FieldVerificationStatus.CONFLICTING for field in event.key_fields),
         "primary_evidence_count": len(event.primary_evidence),

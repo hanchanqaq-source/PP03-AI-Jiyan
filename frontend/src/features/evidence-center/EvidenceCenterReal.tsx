@@ -22,6 +22,13 @@ function Metric({ label, value, note }: { label: string; value: string; note: st
   return <article className="rounded-xl border border-border/60 bg-gradient-to-b from-slate-950/55 to-background/45 p-3"><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-2xl font-bold">{value}</p><p className="mt-1 text-[11px] text-muted-foreground">{note}</p></article>;
 }
 
+function snapshotLabel(snapshotId: string | null): string {
+  if (!snapshotId) return "核验快照未知";
+  return snapshotId.toLowerCase().startsWith("acceptance")
+    ? "隔离验收快照"
+    : `核验快照 ${snapshotId.slice(0, 8)}`;
+}
+
 export function EvidenceCenter() {
   const [tab, setTab] = useState<Tab>("verification");
   const [filter, setFilter] = useState<Filter>("all");
@@ -91,11 +98,11 @@ export function EvidenceCenter() {
 
   return <div className="pb-8">
     <PageHeader title="证据中心" subtitle="查看资讯的核验状态、一手证据、独立来源与更正记录" actions={<><button aria-label="数据说明" onClick={() => setExplanationOpen((value) => !value)} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:border-primary/45 hover:text-foreground"><Database className="h-4 w-4" />数据说明</button><button aria-label="运行核验" onClick={refresh} disabled={refreshing} className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}{refreshing ? "核验中" : "运行核验"}</button></>} />
-    {explanationOpen && <section role="dialog" aria-label="数据说明" className="mb-4 rounded-xl border border-primary/25 bg-primary/5 p-4 text-xs text-muted-foreground"><p className="font-semibold text-foreground">真实性核验与数据源健康是两套独立机制。</p><p className="mt-2">仅明确官方证据或两个不同 origin cluster 的一致证据可进入可信资讯流。</p><p className="mt-1">待核验金额、比例、数量和日期不会进入摘要、持仓影响或情绪判断。</p><p className="mt-1">AI 翻译、AI 摘要和来源数量不会自动提高核验等级。</p></section>}
+    {explanationOpen && <section role="dialog" aria-label="数据说明" className="mb-4 rounded-xl border border-primary/25 bg-primary/5 p-4 text-xs text-muted-foreground"><p className="font-semibold text-foreground">真实性核验与数据源健康是两套独立机制。</p><p className="mt-2">仅明确官方证据或两个相互独立的来源链提供的一致证据可进入可信资讯流。</p><p className="mt-1">待核验金额、比例、数量和日期不会进入摘要、持仓影响或情绪判断。</p><p className="mt-1">AI 翻译、AI 摘要和来源数量不会自动提高核验等级。</p></section>}
     {notice && <p role="status" className="mb-4 rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary">{notice}</p>}
     {error && <p role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{error}</p>}
 
-    {loading && !summary ? <section className="rounded-xl border border-border/60 p-4 text-sm text-muted-foreground"><Loader2 className="mr-2 inline h-4 w-4 animate-spin" />正在载入核验快照…</section> : !summary?.loaded ? <section className="rounded-xl border border-border/60 bg-muted/10 p-4"><p className="font-semibold">尚无已完成的核验快照</p><p className="mt-1 text-xs text-muted-foreground">运行核验后才会显示真实计数；未加载状态不会显示为全部为 0。</p></section> : <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-label="真实核验概览"><Metric label="核验覆盖率" value={coverage} note="准入事件占当前核验事件比例，不代表资讯整体为真" /><Metric label="已核验" value={String(summary.counts?.verified ?? 0)} note="有明确官方或一手证据" /><Metric label="多源印证" value={String(summary.counts?.corroborated ?? 0)} note="至少两个独立 origin cluster" /><Metric label="待核验" value={String(summary.counts?.unverified ?? 0)} note="证据不足，不进入可信资讯流" /><Metric label="冲突 / 更正" value={String((summary.counts?.conflicting ?? 0) + (summary.counts?.corrected ?? 0) + (summary.counts?.disproved ?? 0))} note={`快照 ${summary.snapshot_id?.slice(0, 8)} · ${summary.generated_at ? new Date(summary.generated_at).toLocaleString("zh-CN", { hour12: false }) : "时间未知"}`} /></section>}
+    {loading && !summary ? <section className="rounded-xl border border-border/60 p-4 text-sm text-muted-foreground"><Loader2 className="mr-2 inline h-4 w-4 animate-spin" />正在载入核验快照…</section> : !summary?.loaded ? <section className="rounded-xl border border-border/60 bg-muted/10 p-4"><p className="font-semibold">尚无已完成的核验快照</p><p className="mt-1 text-xs text-muted-foreground">运行核验后才会显示真实计数；未加载状态不会显示为全部为 0。</p></section> : <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-label="真实核验概览"><Metric label="核验覆盖率" value={coverage} note="准入事件占当前核验事件比例，不代表资讯整体为真" /><Metric label="已核验" value={String(summary.counts?.verified ?? 0)} note="有明确官方或一手证据" /><Metric label="多源印证" value={String(summary.counts?.corroborated ?? 0)} note="至少两个相互独立的来源链" /><Metric label="待核验" value={String(summary.counts?.unverified ?? 0)} note="证据不足，不进入可信资讯流" /><Metric label="冲突 / 更正" value={String((summary.counts?.conflicting ?? 0) + (summary.counts?.corrected ?? 0) + (summary.counts?.disproved ?? 0))} note={`${snapshotLabel(summary.snapshot_id)} · ${summary.generated_at ? new Date(summary.generated_at).toLocaleString("zh-CN", { hour12: false }) : "时间未知"}`} /></section>}
 
     <div role="tablist" aria-label="证据中心内容" className="mt-5 flex flex-wrap gap-1 border-b border-border/55">{tabs.map((item) => <button key={item.value} role="tab" aria-selected={tab === item.value} onClick={() => setTab(item.value)} className={cn("rounded-t-lg px-3 py-2 text-sm", tab === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}</div>
 

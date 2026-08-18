@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
@@ -124,6 +125,45 @@ def test_detail_returns_complete_chains_fields_and_history(monkeypatch, tmp_path
     assert len(data["syndicated_copies"]) == 1
     assert data["status_history"][0]["to_status"] == "corroborated"
     assert client.get(f"/api/evidence/events/{'f' * 20}").status_code == 404
+
+
+def test_trusted_api_projection_keeps_unverified_amount_only_in_key_fields(monkeypatch, tmp_path):
+    pending_amount = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.UNVERIFIED,
+        (),
+        "金额尚无确定性证据",
+    )
+    target = replace(
+        event(1, VerificationStatus.VERIFIED),
+        title="交易所公告：星河科技建设存储算力中心 12亿元",
+        summary="交易所公告确认星河科技建设存储算力中心，项目金额12亿元尚待核验。",
+        core_claim="星河科技建设存储算力中心，涉及金额12亿元。",
+        key_fields=(pending_amount,),
+    )
+    storage = EvidenceStorage(root=tmp_path / "projection", now=lambda: NOW)
+    storage.publish(EvidenceSnapshot("b" * 20, NOW, (target,)))
+    service = EvidenceVerificationService(storage=storage, event_loader=lambda: [], now=lambda: NOW)
+    monkeypatch.setattr(app_module.evidence_service, "get_service", lambda: service)
+
+    listing = client.get("/api/evidence/events?days=7").json()["data"]["events"][0]
+    detail = client.get(f"/api/evidence/events/{target.event_id}").json()["data"]
+
+    assert listing["title"] == "交易所公告：星河科技建设存储算力中心"
+    assert "12亿元" not in listing["core_claim"]
+    assert "12亿元" not in detail["title"]
+    assert "12亿元" not in detail["summary"]
+    assert "12亿元" not in detail["core_claim"]
+    assert detail["key_fields"] == [{
+        "field_name": "money",
+        "raw_value": "12亿元",
+        "normalized_value": "CNY:1200000000",
+        "verification_status": "unverified",
+        "evidence_ids": [],
+        "reason": "金额尚无确定性证据",
+    }]
 
 
 def test_no_snapshot_is_explicitly_unloaded_and_does_not_invent_zero_counts(monkeypatch, tmp_path):

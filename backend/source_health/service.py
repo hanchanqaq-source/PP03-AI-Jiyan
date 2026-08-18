@@ -370,7 +370,33 @@ class SourceHealthService:
 
     def get_summary(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._summary, ensure_ascii=False))
+            summary = json.loads(json.dumps(self._summary, ensure_ascii=False))
+            observed = {
+                "fund": sum(row.get("group") != "news" for row in self._sources),
+                "news": sum(row.get("group") == "news" for row in self._sources),
+            }
+        registered = {"fund": 0, "news": 0}
+        registry_known = True
+        try:
+            descriptors = self.runner.select("full")
+        except Exception:
+            descriptors = []
+            registry_known = False
+        for descriptor in descriptors:
+            group = getattr(descriptor, "group", None)
+            if group not in {"fund", "quote", "industry", "news"}:
+                registry_known = False
+                continue
+            registered["news" if group == "news" else "fund"] += 1
+        summary["group_status"] = {
+            group: {
+                "registered": registered[group] if registry_known else None,
+                "observed": observed[group],
+                "loaded": observed[group] > 0 or (registry_known and registered[group] == 0),
+            }
+            for group in ("fund", "news")
+        }
+        return summary
 
     def list_sources(
         self,

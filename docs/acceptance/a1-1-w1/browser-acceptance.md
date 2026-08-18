@@ -1,12 +1,18 @@
 # PP03 A1.1-W1 浏览器验收
 
-验收日期：2026-08-18
+初次验收日期：2026-08-18
+
+本轮重新验收日期：2026-08-19
 
 分支：`codex/pp03-a1-1-evidence-verification`
 
-实现 Commit：`9a7cef1`
+本轮重新验收基线 HEAD：`1ac7241edc63c925c331fd198a738c2913d0b605`
 
-浏览器：Codex 内置 Browser Use
+初次验收浏览器：Codex 内置 Browser Use
+
+本轮重新验收工具：临时隔离 Playwright `1.62.1` / Chromium `151.0.7922.34`
+
+本轮 Codex Browser Use 因 workspace policy 禁用，未重试 Computer Use、Browser Use、`browser-service.mjs` 或 Full CDP，也未修改或绕过工作区安全策略。
 
 页面：`http://127.0.0.1:5899/market-news`、`http://127.0.0.1:5899/evidence-center`
 
@@ -22,7 +28,7 @@
 | # | 验收项 | 结果 | 证据 |
 |---|---|---|---|
 | 1 | 有官方证据的“已核验”事件 | PASS | 证据详情显示交易所一手证据，事件状态为“已核验” |
-| 2 | 两个独立来源的“多源印证”事件 | PASS | GitHub Blog 与 Google Research 属于两个不同 origin cluster |
+| 2 | 两个独立来源的“多源印证”事件 | PASS | 两个相互独立的来源链提供了一致证据 |
 | 3 | “待核验”事件不进入市场资讯主流 | PASS | 主资讯流只有已核验与多源印证两条事件 |
 | 4 | 未核验关键金额在市场资讯隐藏 | PASS | 原始 `12亿元` 未进入可信标题、摘要、影响依据或情绪判断 |
 | 5 | 冲突事件只在证据中心出现 | PASS | 冲突事件在核验列表与更正记录可见，在市场资讯不可见 |
@@ -47,13 +53,33 @@
 3. [市场资讯可信准入](../../screenshots/a1-1-w1/03-market-news-admission.jpg) — `0FEC2588DF223E6B835B725D86114ECBF3DC8D0D6C258788396791F43CC883CD`
 4. [更正记录](../../screenshots/a1-1-w1/04-corrections.jpg) — `3A0206C7B977948606CC71ECCC729D7159A44A977AAAB73A073312F1B2788664`
 5. [数据源健康回归](../../screenshots/a1-1-w1/05-source-health.jpg) — `F916B5ADF01C508BFDF3891F34C0A112B96792ADA378C99C2A1296E530CACD1E`
+6. [待核验字段隔离](../../screenshots/a1-1-w1/06-unverified-field-isolation.png) — `201374439B0FA836898719D8BE83921DB5B140D267DFF400A16F801172F9C022`
+7. [中文用户文案](../../screenshots/a1-1-w1/07-chinese-evidence-copy.png) — `56FFB6D14530B260B6F951E700C65ED9C3B2EC51487D697DBFD0EDB8058EFACC`
+8. [资讯健康快照状态](../../screenshots/a1-1-w1/08-news-health-snapshot-state.png) — `9AEB84A3CEA42EE1A1F17A67CE22B4E3623C6181FF486B1C5BA05FA1607B513C`
 
-## 自动化与清理
+## 2026-08-19 重新验收
 
-- 后端确定性全量：423 passed，13 个 live 用例按标记排除，1 个既有 Starlette 弃用警告。
-- 前端全量：26 files / 121 tests passed。
+| 场景 | 结果 | 可见断言 |
+|---|---|---|
+| 待核验字段隔离 | PASS | 已核验事件标题、核心主张、摘要和市场资讯卡片不含 `12亿元`；该值仅在证据详情“关键字段”显示并标记“待核验” |
+| 中文用户文案 | PASS | 页面可见“独立来源链”“确定性证据”“隔离验收快照”，不显示 `origin cluster`、`DETERMINISTIC EVIDENCE`、`acceptance` 或 `acceptance snapshot` |
+| 资讯健康真实观测 | PASS | 隔离 API 返回 `registered=108`、`observed=2`、`loaded=true`，页面显示健康 1、降级 1，其余为 0 |
+| 资讯健康缺失快照 | PASS | 隔离 API 返回 `registered=108`、`observed=0`、`loaded=false`；数据源健康页和证据中心右侧摘要均显示“尚未载入资讯来源健康快照”，未显示 `0/0/0/0` |
+
+本轮 Playwright 使用全新无状态 Chromium context，只访问 `127.0.0.1:5899`；未连接用户 Chrome/Edge 会话，未读取账号、历史记录、Cookie 或登录状态。脚本以页面文字、角色和语义区域定位，不使用固定坐标；断言失败会返回非 0 退出码。
+
+事件与健康状态来自 `.tmp/acceptance/a1-1-w1` 的虚构隔离数据：事件快照为 `acceptancew1snapshot`；健康统计先用两条隔离 news 观测验证真实统计，再重启隔离后端验证 news 组缺失状态。未读取用户持仓金额、成本、备注、账号、凭据或正式缓存。
+
+浏览器遥测：`console error=0`、`console warn=0`、`pageerror=0`、`failed request=0`。三项场景均通过；没有静默删除真实失败。
+
+## 本轮 fresh 自动化与清理
+
+- 受影响后端测试：174 passed，1 个既有 Starlette 弃用警告。
+- 前端全量：26 files / 124 tests passed。
 - 旧版兼容：16 passed。
 - 生产构建：1912 modules transformed，构建成功；保留既有空 `vendor-charts` 与大于 500 kB chunk 提示。
-- 已停止本轮拥有的 backend/frontend 进程树；8900、5899 端口均已释放。
-- 已删除 `.tmp/acceptance/a1-1-w1`（17 files / 58,033 bytes）与 C 盘截图暂存目录（5 files / 393,450 bytes）。
-- 仅保留上述 Git 跟踪文档与 5 张正式截图。
+- 已停止本轮拥有的 backend/frontend 服务；8900、5899 端口均已释放。
+- Playwright、npm cache、Chromium、测试结果和临时截图均只位于 `.tmp/acceptance-tools/a1-1-w1-playwright`；该目录已删除（808 files / 792,758,499 bytes）。
+- 隔离验收数据 `.tmp/acceptance/a1-1-w1` 已删除（10 files / 20,775 bytes）。
+- 临时工具未加入项目依赖；`frontend/package.json` 与 `frontend/package-lock.json` 哈希保持 `18CCC9E...1426F` / `3B5D77F...356EF`，且没有 Git diff。
+- 仅保留实现、正式测试、本文档与上述 8 张正式截图。

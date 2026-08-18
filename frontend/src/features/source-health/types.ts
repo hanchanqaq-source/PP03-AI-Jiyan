@@ -17,6 +17,10 @@ export interface SourceHealthSummaryData {
   news: SourceHealthCounts;
   total_sources: number;
   reclaimable_bytes: number;
+  group_status?: {
+    fund: { registered: number | null; observed: number; loaded: boolean };
+    news: { registered: number | null; observed: number; loaded: boolean };
+  };
 }
 
 export interface SourceHealthSource {

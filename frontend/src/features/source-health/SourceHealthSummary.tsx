@@ -24,6 +24,12 @@ function formatCounts(counts: SourceHealthCounts): string {
   return `${counts.healthy} 健康 / ${counts.usable} 基本可用 / ${counts.degraded} 降级 / ${counts.failed} 失败`;
 }
 
+function hasLoadedNewsGroup(summary: SourceHealthSummaryData): boolean {
+  const state = summary.group_status?.news;
+  if (state) return state.loaded;
+  return Object.values(summary.news).some((count) => count > 0);
+}
+
 function formatTime(value: string): string {
   return new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
 }
@@ -94,7 +100,8 @@ export function SourceHealthSummary({
   }, [loadSummary, run]);
 
   const running = starting || run?.status === "queued" || run?.status === "running";
-  const hasReport = Boolean(summary?.last_run_at && summary.total_sources > 0);
+  const hasReport = Boolean(summary?.last_run_at);
+  const newsLoaded = summary ? hasLoadedNewsGroup(summary) : false;
   const compact = variant === "bar";
   const compactStateMessage = loadError && !summary
     ? "健康快照读取失败"
@@ -149,7 +156,7 @@ export function SourceHealthSummary({
               </div>
               <div className="min-w-0 border-l border-border/60 pl-3">
                 <p className="font-medium text-foreground">资讯来源</p>
-                <p className="mt-0.5 leading-5 text-muted-foreground">{formatCounts(summary!.news)}</p>
+                <p className="mt-0.5 leading-5 text-muted-foreground">{newsLoaded ? formatCounts(summary!.news) : "尚未载入资讯来源健康快照"}</p>
               </div>
               <div className="border-l border-border/60 pl-3">
                 <p className="font-medium text-foreground">最后体检</p>
@@ -206,7 +213,7 @@ export function SourceHealthSummary({
           </div>
           <div className="rounded-lg border border-border/50 bg-background/35 p-3">
             <p className="font-medium text-foreground">资讯来源</p>
-            <p className="mt-1 text-muted-foreground">{formatCounts(summary.news)}</p>
+            <p className="mt-1 text-muted-foreground">{newsLoaded ? formatCounts(summary.news) : "尚未载入资讯来源健康快照"}</p>
           </div>
           <p>最后体检：{formatTime(summary.last_run_at!)}</p>
           <p>评级状态：{confidenceLabels[summary.rating_confidence] || "评级状态未知"}</p>

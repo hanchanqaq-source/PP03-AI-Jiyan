@@ -113,6 +113,31 @@ class ScopedRunner(ImmediateRunner):
         return list(rows)
 
 
+class RegisteredRunner(ImmediateRunner):
+    def __init__(self, rows, descriptors):
+        self.rows = list(rows)
+        self.descriptors = list(descriptors)
+        self.calls = []
+        self.shutdown_called = False
+
+    def select(self, scope):
+        return list(self.descriptors)
+
+
+def descriptor(source_id: str, *, group: str) -> SourceDescriptor:
+    return SourceDescriptor(
+        source_id=source_id,
+        source_name=source_id,
+        group=group,
+        capability="feed" if group == "news" else "profile",
+        source_reference="https://example.test/public",
+        priority=1,
+        critical=False,
+        requires_api_key=False,
+        probe_kind="test",
+    )
+
+
 def wait_for(service: SourceHealthService, run_id: str, status: str = "completed"):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -395,6 +420,45 @@ def test_completed_run_persists_last_run_summary_and_history(tmp_path):
     assert len(history) == 2
     assert {row["run_id"] for row in history} == {run["run_id"]}
     assert service.list_sources(group="news", rating="failed")[0]["source_id"] == "news:n1"
+    service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("rows", "descriptors", "expected"),
+    [
+        (
+            [observation("news:n1", group="news")],
+            [descriptor("news:n1", group="news")],
+            {"registered": 1, "observed": 1, "loaded": True},
+        ),
+        (
+            [observation("fund:p1", group="fund")],
+            [descriptor("fund:p1", group="fund"), descriptor("news:n1", group="news")],
+            {"registered": 1, "observed": 0, "loaded": False},
+        ),
+        (
+            [],
+            [],
+            {"registered": 0, "observed": 0, "loaded": True},
+        ),
+    ],
+)
+def test_summary_distinguishes_observed_missing_and_truly_unregistered_news_group(
+    tmp_path,
+    rows,
+    descriptors,
+    expected,
+):
+    service = SourceHealthService(
+        runner=RegisteredRunner(rows, descriptors),
+        storage=SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW),
+        now=lambda: NOW,
+    )
+
+    run = service.start_run("full")
+    wait_for(service, run["run_id"])
+
+    assert service.get_summary()["group_status"]["news"] == expected
     service.shutdown()
 
 
