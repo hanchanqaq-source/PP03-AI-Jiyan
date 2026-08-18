@@ -384,9 +384,10 @@ export function MarketNews() {
   const noTags = mode === "my_focus" && query.tag_ids.length === 0;
   const error = queryError?.queryKey === queryKey ? queryError.message : null;
   const queryFailedWithoutCache = Boolean(error && !data && !noTags);
-  const emptyReason = noTags ? "no_tags" : data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
-  const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
   const displayedEvents = data ? marketNewsDisplayEvents(data.events, query) : [];
+  const backendEmptyReason = data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
+  const emptyReason = noTags ? "no_tags" : backendEmptyReason === "no_events" && displayedEvents.length > 0 ? null : backendEmptyReason;
+  const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
 
   return (
     <div>

@@ -48,6 +48,16 @@ describe("MarketNews evidence-center prototype entry", () => {
       .toEqual([directEvent.event_id, marketNewsPrototypeEvent.event_id]);
   });
 
+  it("renders the eligible explicit prototype instead of the backend no-events empty state", async () => {
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [], focus_events: [], empty_reason: "no_events", filters: query() });
+    render(<MarketNews />);
+
+    expect(await screen.findByRole("heading", { name: marketNewsPrototypeEvent.title })).toBeInTheDocument();
+    expect(screen.getByText("已核验 · 前端演示 Fixture")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "查看证据" })).toBeInTheDocument();
+    expect(screen.queryByText("当前筛选暂无可靠资讯")).not.toBeInTheDocument();
+  });
+
   it("keeps backend events unverified and routes only the explicit demo fixture to its matching evidence drawer", async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, "", "/market-news");
