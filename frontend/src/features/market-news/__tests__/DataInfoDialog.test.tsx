@@ -57,4 +57,17 @@ describe("MarketNews DataInfoDialog cache management", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("缓存状态暂不可用");
     expect(screen.getByRole("button", { name: "关闭数据说明" })).toBeEnabled();
   });
+
+  it("explains that source health and concrete-claim verification are separate prototype-only mechanisms", async () => {
+    vi.spyOn(api as any, "cacheStatus").mockResolvedValue(cacheStatus);
+    (api as any).sourceHealthSummary = vi.fn().mockResolvedValue({ rating_confidence: "initial", last_run_at: null, fund: { healthy: 0, usable: 0, degraded: 0, failed: 0 }, news: { healthy: 0, usable: 0, degraded: 0, failed: 0 }, total_sources: 0, reclaimable_bytes: 0 });
+    render(<DataInfoDialog open onClose={() => {}} />);
+
+    await screen.findByText("尚未完成数据源体检");
+    expect(screen.getByText("资讯核验与数据源健康是两套不同机制。")).toBeInTheDocument();
+    expect(screen.getByText(/数据源健康只表示来源当前是否可访问、可解析和足够新鲜/)).toBeInTheDocument();
+    expect(screen.getByText(/资讯核验表示事件的核心主张是否有一手证据或独立来源支持/)).toBeInTheDocument();
+    expect(screen.getByText(/AI 翻译、AI 摘要和来源数量不会自动提高核验等级/)).toBeInTheDocument();
+    expect(screen.getByText(/实际核验能力将在 A1.1-W1 实现/)).toBeInTheDocument();
+  });
 });

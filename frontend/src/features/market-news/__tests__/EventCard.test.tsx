@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { EventCard } from "@/features/market-news/EventCard";
 import { directEvent, translatedEnglishEvent } from "./fixtures";
+import { marketNewsPrototypeEvent } from "@/features/market-news/prototype";
 
 describe("MarketNews EventCard", () => {
   it("shows every required evidence summary and actions", async () => {
@@ -71,5 +72,21 @@ describe("MarketNews EventCard", () => {
 
     expect(screen.getByRole("heading", { name: "Micron launches HBM3E" })).toBeInTheDocument();
     expect(screen.getByText("中文翻译暂不可用")).toBeInTheDocument();
+  });
+
+  it("only offers evidence navigation for the explicit frontend prototype fixture", async () => {
+    const user = userEvent.setup();
+    const onViewEvidence = vi.fn();
+    const { rerender } = render(<EventCard event={directEvent} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
+
+    expect(screen.queryByText("已核验")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看证据" })).not.toBeInTheDocument();
+
+    rerender(<EventCard event={marketNewsPrototypeEvent} onOpenDetails={() => {}} onViewEvidence={onViewEvidence} />);
+    expect(screen.getByText("前端演示 Fixture")).toBeInTheDocument();
+    expect(screen.getByText("已核验")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "查看证据" }));
+    expect(onViewEvidence).toHaveBeenCalledWith(marketNewsPrototypeEvent);
   });
 });

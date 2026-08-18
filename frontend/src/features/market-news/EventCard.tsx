@@ -24,7 +24,7 @@ function shortDateTime(value: string | null) {
   }).format(date).replace("/", "-");
 }
 
-export function EventCard({ event, onOpenDetails }: { event: MarketNewsEvent; onOpenDetails: (event: MarketNewsEvent) => void }) {
+export function EventCard({ event, onOpenDetails, onViewEvidence }: { event: MarketNewsEvent; onOpenDetails: (event: MarketNewsEvent) => void; onViewEvidence?: (event: MarketNewsEvent) => void }) {
   const relation = RELATION[event.relation_level];
   const originalUrl = event.original_links[0] || event.sources[0]?.original_url || "";
   const hasTranslation = event.translation_status === "translated" && Boolean(event.translated_title_zh);
@@ -35,6 +35,7 @@ export function EventCard({ event, onOpenDetails }: { event: MarketNewsEvent; on
   const showChinese = hasTranslation && language === "zh";
   const displayTitle = showChinese ? event.translated_title_zh || event.title : event.title;
   const displaySummary = showChinese ? event.translated_summary_zh || event.summary : event.summary;
+  const hasPrototypeVerification = event.verification_fixture === "frontend_demo" && Boolean(event.verification_status);
   return (
     <article className="group relative border-b border-border/55 py-5 pl-7 pr-1 last:border-b-0" aria-label={`${displayTitle}事件卡`}>
       <span className="absolute left-0 top-7 h-2.5 w-2.5 rounded-full border-2 border-background bg-primary shadow-[0_0_14px_hsl(var(--primary)/0.55)]" />
@@ -43,6 +44,7 @@ export function EventCard({ event, onOpenDetails }: { event: MarketNewsEvent; on
       <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
         <span className={cn("rounded-full border px-2 py-0.5 font-medium", relation.className)}>{relation.label}</span>
         <span className="rounded-full border border-border/60 bg-muted/25 px-2 py-0.5">{CATEGORY[event.category]}</span>
+        {hasPrototypeVerification && <><span className="rounded-full border border-primary/45 bg-primary/10 px-2 py-0.5 font-medium text-primary">{event.verification_status}</span><span className="rounded-full border border-primary/30 px-2 py-0.5 text-primary">前端演示 Fixture</span></>}
         <span>{STATUS[event.data_status] || "缓存数据"}</span>
         {hasTranslation && <button onClick={() => setLanguage(showChinese ? "original" : "zh")} aria-label={showChinese ? "查看原文" : "中文"} className="inline-flex items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 hover:border-primary/45 hover:text-primary"><Languages className="h-3 w-3" />{showChinese ? "查看原文" : "中文"}</button>}
         <span className="ml-auto inline-flex items-center gap-1 font-mono"><Clock3 className="h-3 w-3" />{shortDateTime(event.published_at_latest)}</span>
@@ -67,6 +69,7 @@ export function EventCard({ event, onOpenDetails }: { event: MarketNewsEvent; on
         <span className="rounded-full border border-border/70 px-2.5 py-1">{IMPACT[event.impact_tendency]}</span>
         <span className="rounded-full border border-border/70 px-2.5 py-1 text-muted-foreground">{CONFIDENCE[event.confidence]}</span>
         <div className="ml-auto flex items-center gap-2">
+          {hasPrototypeVerification && onViewEvidence && <button onClick={() => onViewEvidence(event)} aria-label="查看证据" className="rounded-lg border border-primary/45 px-3 py-1.5 font-medium text-primary hover:bg-primary/10">查看证据</button>}
           <button onClick={() => onOpenDetails(event)} aria-label={`查看事件详情 ${displayTitle}`} className="rounded-lg border border-border px-3 py-1.5 font-medium text-foreground hover:border-primary/45 hover:text-primary">查看事件详情</button>
           {originalUrl && <a href={originalUrl} target="_blank" rel="noreferrer" aria-label={`打开原始来源 ${displayTitle}`} className="inline-flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 font-semibold text-primary-foreground hover:bg-primary/90">打开原始来源<ExternalLink className="h-3 w-3" /></a>}
         </div>

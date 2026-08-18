@@ -15,6 +15,7 @@ import { ResearchHome } from "@/pages/ResearchHome";
 import { MarketNews } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
 import { PortfolioAnalysis } from "@/pages/PortfolioAnalysis";
+import { EvidenceCenter } from "@/features/evidence-center/EvidenceCenter";
 
 export const APP_ROUTES: RouteObject[] = [
   {
@@ -25,6 +26,7 @@ export const APP_ROUTES: RouteObject[] = [
       { path: "/market-news", element: <MarketNews /> },
       { path: "/industry-research", element: <IndustryResearch /> },
       { path: "/portfolio-analysis", element: <PortfolioAnalysis /> },
+      { path: "/evidence-center", element: <EvidenceCenter /> },
       { path: "/daily-review", element: <DailyReview /> },
       { path: "/intel", element: <Intel /> },
       { path: "/sectors", element: <Sectors /> },

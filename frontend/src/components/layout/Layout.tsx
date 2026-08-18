@@ -4,7 +4,7 @@ import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, LineChart, Github, UserRound,
   Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords,
-  House, BookOpenText, Newspaper,
+  House, BookOpenText, Newspaper, ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
@@ -25,6 +25,7 @@ const PRIMARY_NAV = [
   { to: "/market-news", icon: Newspaper, label: "02 市场资讯" },
   { to: "/industry-research", icon: BookOpenText, label: "03 行业研究" },
   { to: "/portfolio-analysis", icon: Wallet, label: "04 持仓分析" },
+  { to: "/evidence-center", icon: ShieldCheck, label: "05 证据中心" },
 ];
 
 const LEGACY_NAV = [

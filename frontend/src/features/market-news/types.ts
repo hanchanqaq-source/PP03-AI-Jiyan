@@ -5,6 +5,7 @@ export type MarketNewsCategory = "policy" | "industry" | "company" | "fund_notic
 export type MarketNewsMode = "my_focus" | "my_holdings" | "global_tech" | "domestic_policy";
 export type MarketNewsSort = "importance" | "latest" | "holding_relevance";
 export type MarketNewsCategoryFilter = "all" | MarketNewsCategory;
+export type MarketNewsVerificationStatus = "已核验" | "多源印证" | "待核验" | "存在冲突" | "已证伪" | "已更正";
 
 export interface MarketNewsSource {
   source_name: string;
@@ -62,6 +63,8 @@ export interface MarketNewsEvent {
   translation_status?: "translated" | "unavailable" | "not_required";
   translation_provider?: string | null;
   translated_at?: string | null;
+  verification_status?: MarketNewsVerificationStatus;
+  verification_fixture?: "frontend_demo";
 }
 
 export interface MarketNewsTranslation {

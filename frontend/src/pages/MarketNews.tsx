@@ -22,6 +22,7 @@ import { usePageTags } from "@/features/tags/usePageTags";
 import { api } from "@/lib/api";
 import { loadLlm } from "@/lib/llm";
 import { cn } from "@/lib/utils";
+import { marketNewsPrototypeEvent } from "@/features/market-news/prototype";
 
 const MODES: Array<{ value: MarketNewsMode; label: string }> = [
   { value: "my_focus", label: "我的关注" },
@@ -177,6 +178,12 @@ function EmptyState({ reason, onAddTag }: { reason: MarketNewsResponse["empty_re
 
 function QueryFailureState() {
   return <div className="py-16 text-center"><p className="font-semibold text-destructive">当前筛选加载失败</p><p className="mt-2 text-sm text-muted-foreground">该筛选还没有可回用的成功结果，请稍后重试。</p></div>;
+}
+
+function openEvidenceCenter(eventId: string) {
+  const target = `/evidence-center?event_id=${encodeURIComponent(eventId)}`;
+  window.history.pushState({}, "", target);
+  window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
 export function MarketNews() {
@@ -379,6 +386,7 @@ export function MarketNews() {
   const queryFailedWithoutCache = Boolean(error && !data && !noTags);
   const emptyReason = noTags ? "no_tags" : data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
   const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
+  const displayedEvents = data ? [...data.events, marketNewsPrototypeEvent] : [];
 
   return (
     <div>
@@ -423,7 +431,7 @@ export function MarketNews() {
       {queryFailedWithoutCache ? <div className="rounded-2xl border border-destructive/30 bg-destructive/5"><QueryFailureState /></div> : loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
         <main className="rounded-2xl border border-border/70 bg-gradient-to-b from-slate-950/55 to-background/45 px-5" aria-label="市场资讯事件列表">
           {loading && <p className="border-b border-border/45 py-2 text-xs text-muted-foreground">正在更新筛选结果…</p>}
-          {data.events.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id, event: selectedEvent })} />)}
+          {displayedEvents.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id, event: selectedEvent })} onViewEvidence={(selectedEvent) => openEvidenceCenter(selectedEvent.event_id)} />)}
         </main>
         <MarketNewsSidebar focus={data.focus_events} impact={data.impact_summary} days={data.filters.days} />
       </div>}
