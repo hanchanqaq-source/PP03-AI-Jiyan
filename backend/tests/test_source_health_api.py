@@ -62,11 +62,13 @@ class ImmediateRunner:
     def select(self, scope):
         return [object() for _ in self.rows]
 
-    def run(self, scope, *, on_result=None, history_documents=()):
+    def run(self, scope, *, on_probe_complete=None, on_final_result=None, history_documents=()):
         self.calls.append(scope)
         for row in self.rows:
-            if on_result:
-                on_result(row)
+            if on_probe_complete:
+                on_probe_complete(row)
+            if on_final_result:
+                on_final_result(row)
         return list(self.rows)
 
     def shutdown(self):
@@ -79,11 +81,16 @@ class BlockingRunner(ImmediateRunner):
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def run(self, scope, *, on_result=None, history_documents=()):
+    def run(self, scope, *, on_probe_complete=None, on_final_result=None, history_documents=()):
         self.calls.append(scope)
         self.started.set()
         self.release.wait(timeout=2)
-        return super().run(scope, on_result=on_result, history_documents=history_documents)
+        return super().run(
+            scope,
+            on_probe_complete=on_probe_complete,
+            on_final_result=on_final_result,
+            history_documents=history_documents,
+        )
 
 
 class ScopedRunner(ImmediateRunner):
@@ -95,12 +102,14 @@ class ScopedRunner(ImmediateRunner):
     def select(self, scope):
         return [object() for _ in (self.quick_rows if scope == "quick" else self.full_rows)]
 
-    def run(self, scope, *, on_result=None, history_documents=()):
+    def run(self, scope, *, on_probe_complete=None, on_final_result=None, history_documents=()):
         rows = self.quick_rows if scope == "quick" else self.full_rows
         self.calls.append(scope)
         for row in rows:
-            if on_result:
-                on_result(row)
+            if on_probe_complete:
+                on_probe_complete(row)
+            if on_final_result:
+                on_final_result(row)
         return list(rows)
 
 
@@ -114,6 +123,16 @@ def wait_for(service: SourceHealthService, run_id: str, status: str = "completed
     raise AssertionError(f"run {run_id} did not reach {status}")
 
 
+def wait_for_terminal(service: SourceHealthService, run_id: str):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        current = service.get_run(run_id)
+        if current and current["status"] in {"completed", "failed"}:
+            return current
+        time.sleep(0.01)
+    raise AssertionError(f"run {run_id} did not reach a terminal status")
+
+
 @pytest.mark.parametrize(
     ("cache_case", "expected"),
     [
@@ -121,7 +140,17 @@ def wait_for(service: SourceHealthService, run_id: str, status: str = "completed
         ("stale", "worth_fixing"),
         ("became_stale", "worth_fixing"),
         ("mismatch", "worth_fixing"),
-        ("malformed", "worth_fixing"),
+        ("url_mismatch", "worth_fixing"),
+        ("malformed_item_count", "worth_fixing"),
+        ("fractional_item_count", "worth_fixing"),
+        ("malformed_last_success", "worth_fixing"),
+        ("malformed_generated_at", "worth_fixing"),
+        ("zero_recent_days", "worth_fixing"),
+        ("fractional_recent_days", "worth_fixing"),
+        ("unbounded_recent_days", "worth_fixing"),
+        ("future_generated_at", "worth_fixing"),
+        ("nested_cache_status", "worth_fixing"),
+        ("nested_source_statuses", "worth_fixing"),
     ],
 )
 def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_evidence(
@@ -132,27 +161,52 @@ def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_eviden
 ):
     source = {
         "hint": "ai", "name": "Public feed",
-        "url": "https://public.example.test/rss", "language": "zh-CN", "region": "CN",
+        "url": "https://public.example.test/rss?mid=21&code=opaque-code-value",
+        "language": "zh-CN", "region": "CN",
     }
-    configured_id = news_source_id(source["hint"], source["name"], source["url"])
-    cache_source_id = "news:not-the-configured-source" if cache_case == "mismatch" else configured_id
-    generated_at = NOW - timedelta(days=8) if cache_case == "stale" else NOW
+    health_source_id = news_source_id(source["hint"], source["name"], source["url"])
+    radar_source_id = newsradar.source_id(source)
+    other_source = {**source, "url": "https://other.example.test/rss"}
+    cache_source_id = newsradar.source_id(other_source) if cache_case == "mismatch" else radar_source_id
+    cache_source_url = other_source["url"] if cache_case == "url_mismatch" else source["url"]
+    if cache_case == "stale":
+        generated_at = NOW - timedelta(days=8)
+    elif cache_case == "future_generated_at":
+        generated_at = NOW + timedelta(seconds=1)
+    elif cache_case == "malformed_generated_at":
+        generated_at = "not-a-time"
+    else:
+        generated_at = NOW
+    if cache_case == "zero_recent_days":
+        recent_days = 0
+    elif cache_case == "fractional_recent_days":
+        recent_days = 7.5
+    elif cache_case == "unbounded_recent_days":
+        recent_days = 10_000
+    else:
+        recent_days = 7
+    last_success_at = "not-a-time" if cache_case == "malformed_last_success" else (NOW - timedelta(hours=1)).isoformat()
     cache_path = tmp_path / "news" / "radar.json"
     cache_path.parent.mkdir(parents=True)
+    status_row = {
+        "source_id": cache_source_id,
+        "source_name": source["name"],
+        "source_url": cache_source_url,
+        "status": "failed",
+        "last_success_at": last_success_at,
+        "used_cached_items": True,
+        "item_count": (
+            "not-a-count" if cache_case == "malformed_item_count"
+            else 1.5 if cache_case == "fractional_item_count"
+            else 1
+        ),
+    }
     cache_path.write_text(json.dumps({
-        "generated_at": generated_at.isoformat(),
-        "recent_days": 7,
-        "cache_status": "partial",
+        "generated_at": generated_at.isoformat() if isinstance(generated_at, datetime) else generated_at,
+        "recent_days": recent_days,
+        "cache_status": {"nested": ["partial"]} if cache_case == "nested_cache_status" else "partial",
         "source_state": "partial_failure",
-        "source_statuses": [{
-            "source_id": cache_source_id,
-            "source_name": source["name"],
-            "source_url": source["url"],
-            "status": "failed",
-            "last_success_at": (NOW - timedelta(hours=1)).isoformat(),
-            "used_cached_items": True,
-            "item_count": "not-a-count" if cache_case == "malformed" else 1,
-        }],
+        "source_statuses": {"nested": [status_row]} if cache_case == "nested_source_statuses" else [status_row],
         "industries": [{
             "key": source["hint"],
             "items": [{
@@ -173,7 +227,8 @@ def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_eviden
         "error_message_redacted": "public source unavailable", "http_status": None,
         "latency_ms": 1, "returned_items": 0, "data_as_of_date": None,
         "field_completeness_pct": 0.0, "used_cache": False,
-        "cache_status": "not_used", "redirected": False, "final_url": source["url"],
+        "cache_status": "not_used", "redirected": False,
+        "final_url": "https://public.example.test/rss?mid=21",
     })
     clock = [NOW]
     service = SourceHealthService(
@@ -184,11 +239,72 @@ def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_eviden
         clock[0] = NOW + timedelta(days=8)
 
     run = service.start_run("full")
-    wait_for(service, run["run_id"])
+    terminal = wait_for_terminal(service, run["run_id"])
 
-    assert service.list_sources()[0]["repair_value"] == expected
+    assert terminal["status"] == "completed"
+    health_row = service.list_sources()[0]
+    assert health_row["source_id"] == health_source_id
+    assert health_source_id != radar_source_id
+    assert health_row["repair_value"] == expected
+    assert "opaque-code-value" not in str(health_row)
     assert cache_path.read_bytes() == original_cache
     service.shutdown()
+
+
+def test_service_increments_progress_before_the_slowest_probe_finishes(tmp_path):
+    fast_finished = threading.Event()
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    rows = [
+        SourceDescriptor(
+            source_id=f"news:{name}", source_name=name, group="news", capability="feed",
+            source_reference=f"https://{name}.example.test/rss", priority=0, critical=False,
+            requires_api_key=False, probe_kind="news_feed", probe_args={"hint": "ai"},
+        )
+        for name in ("fast", "slow")
+    ]
+
+    def probe(source, **_kwargs):
+        if source["name"] == "slow":
+            slow_started.set()
+            release_slow.wait(timeout=2)
+        else:
+            fast_finished.set()
+        return {
+            "status": "success", "source_name": source["name"], "error_type": "none",
+            "error_message_redacted": "", "http_status": 200, "latency_ms": 1,
+            "returned_items": 1, "data_as_of_date": NOW.isoformat(),
+            "field_completeness_pct": 100.0, "used_cache": False,
+            "cache_status": "not_used", "redirected": False, "final_url": None,
+        }
+
+    runner = SourceHealthRunner(
+        rows, providers=[],
+        news_sources={row.source_id: {"name": row.source_name} for row in rows},
+        news_probe=probe, now=lambda: NOW,
+    )
+    service = SourceHealthService(
+        runner=runner,
+        storage=SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW),
+        now=lambda: NOW,
+    )
+
+    run = service.start_run("full")
+    assert slow_started.wait(timeout=1)
+    assert fast_finished.wait(timeout=1)
+    deadline = time.monotonic() + 1
+    completed_while_slow = 0
+    while time.monotonic() < deadline:
+        completed_while_slow = service.get_run(run["run_id"])["completed"]
+        if completed_while_slow:
+            break
+        time.sleep(0.01)
+    release_slow.set()
+    completed_run = wait_for(service, run["run_id"])
+    service.shutdown()
+
+    assert completed_while_slow == 1
+    assert completed_run["completed"] == completed_run["total"] == 2
 
 
 def test_quick_cooldown_is_persisted_for_twenty_four_hours(tmp_path):

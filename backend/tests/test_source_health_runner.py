@@ -152,7 +152,9 @@ def test_progress_reports_every_result_and_source_failure_does_not_fail_run():
         now=lambda: NOW,
     )
 
-    observations = runner.run("full", on_result=lambda item: updates.append(item.to_dict()))
+    observations = runner.run(
+        "full", on_probe_complete=lambda item: updates.append(item.to_dict()),
+    )
 
     assert len(updates) == 2
     assert {row.probe_status for row in observations} == {"success", "failure"}
@@ -334,7 +336,8 @@ def test_runner_uses_completed_observations_for_reliable_fallback_and_callback(
             })
         return raw
 
-    callback_rows = []
+    progress_rows = []
+    final_rows = []
     runner = SourceHealthRunner(
         [primary, fallback], providers=[],
         news_sources={
@@ -345,13 +348,19 @@ def test_runner_uses_completed_observations_for_reliable_fallback_and_callback(
         now=lambda: NOW,
     )
 
-    results = runner.run("full", on_result=lambda row: callback_rows.append(row.to_dict()))
+    results = runner.run(
+        "full",
+        on_probe_complete=lambda row: progress_rows.append(row.to_dict()),
+        on_final_result=lambda row: final_rows.append(row.to_dict()),
+    )
 
     primary_result = next(row for row in results if row.source_id == primary.source_id)
-    primary_callback = next(row for row in callback_rows if row["source_id"] == primary.source_id)
+    primary_progress = next(row for row in progress_rows if row["source_id"] == primary.source_id)
+    primary_final = next(row for row in final_rows if row["source_id"] == primary.source_id)
     assert primary_result.fallback_available is True
     assert primary_result.repair_value == expected
-    assert primary_callback["repair_value"] == expected
+    assert primary_progress["repair_value"] == "none"
+    assert primary_final["repair_value"] == expected
     runner.shutdown()
 
 

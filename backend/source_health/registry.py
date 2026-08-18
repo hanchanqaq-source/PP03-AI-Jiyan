@@ -43,7 +43,7 @@ PROVIDER_REFERENCES = {
 _PUBLIC_QUERY_NAMES = {"mid"}
 
 
-def _public_reference(url: str) -> str:
+def public_source_reference(url: str) -> str:
     """Keep only explicitly public routing parameters and discard all others."""
     parts = urlsplit(url.strip())
     query = [
@@ -58,7 +58,7 @@ def _public_reference(url: str) -> str:
 
 
 def news_source_id(hint: str, name: str, url: str) -> str:
-    raw = f"{hint.strip()}|{name.strip()}|{_public_reference(url)}"
+    raw = f"{hint.strip()}|{name.strip()}|{public_source_reference(url)}"
     return "news:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -116,7 +116,7 @@ def build_news_descriptors(news_config: dict[str, Any]) -> list[SourceDescriptor
             source_name=name,
             group="news",
             capability="feed",
-            source_reference=_public_reference(url),
+            source_reference=public_source_reference(url),
             priority=0,
             critical=False,
             requires_api_key=False,

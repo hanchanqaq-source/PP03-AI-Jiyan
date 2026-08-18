@@ -344,7 +344,8 @@ class SourceHealthRunner:
         self,
         scope: RunScope,
         *,
-        on_result: ResultCallback | None = None,
+        on_probe_complete: ResultCallback | None = None,
+        on_final_result: ResultCallback | None = None,
         history_documents: Iterable[Mapping[str, Any]] = (),
     ) -> list[ProbeObservation]:
         if self._shutdown:
@@ -366,7 +367,10 @@ class SourceHealthRunner:
             futures.append(pool.submit(self._run_one, descriptor, history_by_source[descriptor.source_id]))
         outcomes: list[_ProbeOutcome] = []
         for future in as_completed(futures):
-            outcomes.append(future.result())
+            outcome = future.result()
+            outcomes.append(outcome)
+            if on_probe_complete is not None:
+                on_probe_complete(outcome.observation)
         reliable_by_capability: dict[tuple[str, str], set[str]] = defaultdict(set)
         for outcome in outcomes:
             observation = outcome.observation
@@ -385,8 +389,8 @@ class SourceHealthRunner:
                 reliable_cache_source_ids=reliable_cache_source_ids,
             )
             observations.append(observation)
-            if on_result is not None:
-                on_result(observation)
+            if on_final_result is not None:
+                on_final_result(observation)
         return observations
 
     def shutdown(self) -> None:

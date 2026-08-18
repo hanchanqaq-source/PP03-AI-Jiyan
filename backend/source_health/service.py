@@ -6,13 +6,13 @@ import json
 from pathlib import Path
 import secrets
 import threading
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from cache_io_lock import CACHE_IO_LOCK
 from fund_data.service import default_fund_providers
 
 from .models import ProbeObservation
-from .registry import build_registry, load_news_config, news_source_id
+from .registry import build_registry, load_news_config, news_source_id, public_source_reference
 from .runner import RunScope, SourceHealthRunner
 from .storage import SourceHealthStorage
 
@@ -33,42 +33,64 @@ def _parse_timestamp(value: Any) -> datetime | None:
         return None
 
 
-def _load_reliable_news_cache_source_ids(cache_path: Path, *, now: datetime) -> set[str]:
+def _load_reliable_news_cache_source_ids(
+    cache_path: Path,
+    *,
+    now: datetime,
+    radar_source_identities: Mapping[str, tuple[str, str]],
+) -> set[str]:
     try:
         with CACHE_IO_LOCK:
             document = json.loads(cache_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         return set()
-    if not isinstance(document, dict) or document.get("cache_status") not in {"cache", "partial", "realtime"}:
+    if not isinstance(document, dict):
+        return set()
+    cache_status = document.get("cache_status")
+    if not isinstance(cache_status, str) or cache_status not in {"cache", "partial", "realtime"}:
         return set()
     generated_at = _parse_timestamp(document.get("generated_at"))
     if generated_at is None:
         return set()
     current = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-    try:
-        recent_days = max(1, int(document.get("recent_days") or 7))
-    except (TypeError, ValueError):
+    raw_recent_days = document.get("recent_days")
+    if not isinstance(raw_recent_days, int) or isinstance(raw_recent_days, bool):
         return set()
-    if current.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days):
+    recent_days = raw_recent_days
+    if not 1 <= recent_days <= 90:
+        return set()
+    cache_age = current.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc)
+    if cache_age < timedelta(0) or cache_age > timedelta(days=recent_days):
+        return set()
+    source_statuses = document.get("source_statuses")
+    if not isinstance(source_statuses, list):
         return set()
     reliable: set[str] = set()
-    for row in document.get("source_statuses") or []:
+    for row in source_statuses:
         if not isinstance(row, dict):
             continue
-        source_id = str(row.get("source_id") or "")
+        radar_source_id = str(row.get("source_id") or "")
+        identity = radar_source_identities.get(radar_source_id)
+        if identity is None:
+            continue
+        health_source_id, expected_public_reference = identity
         source_url = str(row.get("source_url") or "")
         try:
-            item_count = int(row.get("item_count") or 0)
-        except (TypeError, ValueError):
+            actual_public_reference = public_source_reference(source_url)
+        except ValueError:
             continue
+        if actual_public_reference != expected_public_reference:
+            continue
+        raw_item_count = row.get("item_count")
+        if not isinstance(raw_item_count, int) or isinstance(raw_item_count, bool):
+            continue
+        item_count = raw_item_count
         if (
-            source_id
-            and row.get("used_cached_items") is True
+            row.get("used_cached_items") is True
             and item_count > 0
             and _parse_timestamp(row.get("last_success_at")) is not None
-            and source_url.startswith(("http://", "https://"))
         ):
-            reliable.add(source_id)
+            reliable.add(health_source_id)
     return reliable
 
 
@@ -101,20 +123,38 @@ class SourceHealthService:
 
         providers = default_fund_providers()
         news_config = load_news_config()
+        descriptors = build_registry(providers, news_config)
         news_sources = {
             news_source_id(str(row.get("hint") or ""), str(row.get("name") or ""), str(row.get("url") or "")): row
             for row in news_config.get("sources") or []
             if row.get("hint") and row.get("name") and row.get("url")
         }
+        descriptors_by_id = {descriptor.source_id: descriptor for descriptor in descriptors}
+        radar_source_identities: dict[str, tuple[str, str]] = {}
+        for source in news_config.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            hint = str(source.get("hint") or "")
+            name = str(source.get("name") or "")
+            url = str(source.get("url") or "")
+            health_source_id = news_source_id(hint, name, url)
+            descriptor = descriptors_by_id.get(health_source_id)
+            if descriptor is not None:
+                radar_source_identities[newsradar.source_id(source)] = (
+                    health_source_id,
+                    descriptor.source_reference,
+                )
         timeout = float((news_config.get("fetch") or {}).get("timeout") or 15)
         return SourceHealthRunner(
-            build_registry(providers, news_config),
+            descriptors,
             providers=providers,
             news_sources=news_sources,
             news_timeout=timeout,
             now=self._now,
             reliable_cache_source_ids=lambda: _load_reliable_news_cache_source_ids(
-                Path(newsradar.CACHE_FILE), now=self._now(),
+                Path(newsradar.CACHE_FILE),
+                now=self._now(),
+                radar_source_identities=radar_source_identities,
             ),
         )
 
@@ -265,7 +305,7 @@ class SourceHealthService:
             history_documents = self.storage.load_history(now=self._now())
             observations = self.runner.run(
                 scope,
-                on_result=lambda row: self._record_result(run_id, row),
+                on_probe_complete=lambda row: self._record_result(run_id, row),
                 history_documents=history_documents,
             )
             finished_at = self._now().isoformat()
