@@ -31,6 +31,7 @@ import news_translation
 import portfolio as pf
 import fund_portfolio as fpf
 import source_health
+from data_sources.api import router as data_sources_router
 from evidence_verification import service as evidence_service
 from evidence_verification.storage import event_document, event_summary_document
 from fund_data import service as fund_service
@@ -71,6 +72,7 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
+app.include_router(data_sources_router)
 
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)
