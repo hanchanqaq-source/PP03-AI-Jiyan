@@ -116,10 +116,15 @@ function costFor(adapter: AdapterView): DataSourceCostResponse {
   };
 }
 
-function mockReads(adapter: AdapterView, config = configFor(adapter)) {
+function mockReads(
+  adapter: AdapterView,
+  config = configFor(adapter),
+  usage = usageFor(adapter),
+  cost = costFor(adapter),
+) {
   vi.spyOn(api, "dataSourceConfig").mockResolvedValue(config);
-  vi.spyOn(api, "dataSourceUsage").mockResolvedValue(usageFor(adapter));
-  vi.spyOn(api, "dataSourceCost").mockResolvedValue(costFor(adapter));
+  vi.spyOn(api, "dataSourceUsage").mockResolvedValue(usage);
+  vi.spyOn(api, "dataSourceCost").mockResolvedValue(cost);
 }
 
 function ControlledDrawer({ adapter = paidAdapter }: { adapter?: AdapterView }) {
@@ -265,6 +270,70 @@ describe("SourceConfigurationDrawer", () => {
     expect(screen.queryByText("凭据已保存")).not.toBeInTheDocument();
     await user.type(reopened, "new-secret-after-stale-result");
     expect(screen.getByRole("button", { name: "保存凭据" })).toBeEnabled();
+  });
+
+  it.each(["resolve", "reject"] as const)("preserves a reopened secret when stale credential A settles by %s under StrictMode", async (outcome) => {
+    const pendingA = deferred<{ configured: boolean; status: string; last_validated_at: null; credential_source: string }>();
+    mockReads(paidAdapter);
+    vi.spyOn(api, "dataSourcePutCredential").mockReturnValue(pendingA.promise);
+    const user = userEvent.setup();
+    render(<StrictMode><ControlledDrawer /></StrictMode>);
+    const opener = screen.getByRole("button", { name: "打开配置" });
+
+    await user.click(opener);
+    await user.type(await screen.findByLabelText("Provider 凭据"), "stale-secret-a");
+    await user.click(screen.getByRole("button", { name: "保存凭据" }));
+    await user.keyboard("{Escape}");
+    await user.click(opener);
+    const reopened = await screen.findByLabelText("Provider 凭据") as HTMLInputElement;
+    await user.type(reopened, "fresh-secret-b");
+
+    if (outcome === "resolve") pendingA.resolve({ configured: true, status: "stored", last_validated_at: null, credential_source: "keyring" });
+    else pendingA.reject(new Error("stale credential A failure"));
+    await waitFor(() => expect(api.dataSourcePutCredential).toHaveBeenCalledTimes(1));
+
+    expect(reopened).toHaveValue("fresh-secret-b");
+    expect(screen.getByRole("button", { name: "保存凭据" })).toBeEnabled();
+    expect(screen.queryByText("凭据已保存")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "配置 Financial Modeling Prep" })).toBeInTheDocument();
+  });
+
+  it("keeps a newer Free-only operation when an older drawer operation finishes last", async () => {
+    const pendingA = deferred<DataSourceConfigurationResponse>();
+    const pendingB = deferred<DataSourceConfigurationResponse>();
+    mockReads(freeAdapter);
+    vi.spyOn(api, "dataSourceUpdateFreeOnly")
+      .mockReturnValueOnce(pendingA.promise)
+      .mockReturnValueOnce(pendingB.promise);
+    const user = userEvent.setup();
+    render(<ControlledDrawer adapter={freeAdapter} />);
+    const opener = screen.getByRole("button", { name: "打开配置" });
+
+    await user.click(opener);
+    await user.click(await screen.findByRole("checkbox", { name: "Free-only 模式" }));
+    await user.keyboard("{Escape}");
+    await user.click(opener);
+    const currentToggle = await screen.findByRole("checkbox", { name: "Free-only 模式" });
+    expect(currentToggle).toBeEnabled();
+    await user.click(currentToggle);
+    expect(api.dataSourceUpdateFreeOnly).toHaveBeenCalledTimes(2);
+
+    pendingB.resolve({ ...configFor(freeAdapter), free_only: false });
+    await waitFor(() => expect(currentToggle).not.toBeChecked());
+    pendingA.resolve({ ...configFor(freeAdapter), free_only: true });
+    await waitFor(() => expect(currentToggle).not.toBeChecked());
+    expect(screen.getByText("Free-only 已关闭")).toBeInTheDocument();
+  });
+
+  it("requires matching built-in UTC values from usage and cost", async () => {
+    const usage = { ...usageFor(paidAdapter), timezone: "UTC" };
+    const cost = { ...costFor(paidAdapter), timezone: "Asia/Shanghai" };
+    mockReads(paidAdapter, configFor(paidAdapter), usage, cost);
+    render(<SourceConfigurationDrawer open adapter={paidAdapter} onClose={vi.fn()} />);
+    expect(await screen.findByText(/时区未知/)).toBeInTheDocument();
+    expect(screen.queryByText(/Asia\/Shanghai/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/时区 UTC/)).not.toBeInTheDocument();
   });
 
   it("traps focus, closes with Escape, and restores the opener", async () => {

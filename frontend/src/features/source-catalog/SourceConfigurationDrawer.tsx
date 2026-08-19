@@ -19,6 +19,16 @@ interface ConfigurationBundle {
   cost: DataSourceCostResponse;
 }
 
+type OperationKind = "load" | "credential" | "delete" | "budget" | "free-only" | "action";
+
+interface OperationIdentity {
+  adapterId: string;
+  drawerEpoch: number;
+  sequence: number;
+}
+
+const operationKinds: OperationKind[] = ["load", "credential", "delete", "budget", "free-only", "action"];
+
 const inFlightReads = new Map<string, Promise<ConfigurationBundle>>();
 
 function readConfiguration(adapterId: string): Promise<ConfigurationBundle> {
@@ -101,10 +111,22 @@ export function SourceConfigurationDrawer({
   const secretInputRef = useRef<HTMLInputElement>(null);
   const openRef = useRef(open);
   const mountedRef = useRef(true);
-  const mutationEpochRef = useRef(0);
+  const adapterIdentityRef = useRef<string | null>(open ? adapter?.adapter_id ?? null : null);
+  const drawerEpochRef = useRef(0);
+  const operationSequenceRef = useRef(0);
+  const latestMutationSequenceRef = useRef(0);
+  const operationTokensRef = useRef<Record<OperationKind, OperationIdentity | null>>({
+    load: null,
+    credential: null,
+    delete: null,
+    budget: null,
+    "free-only": null,
+    action: null,
+  });
   const [configuration, setConfiguration] = useState<AdapterConfigurationView | null>(null);
   const [usage, setUsage] = useState<AdapterUsageView | null>(null);
   const [cost, setCost] = useState<AdapterCostView | null>(null);
+  const [verifiedTimezone, setVerifiedTimezone] = useState<"UTC" | null>(null);
   const [freeOnly, setFreeOnly] = useState(true);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -121,6 +143,33 @@ export function SourceConfigurationDrawer({
   const [licenseNotice, setLicenseNotice] = useState(false);
 
   openRef.current = open;
+  adapterIdentityRef.current = open ? adapter?.adapter_id ?? null : null;
+
+  const invalidateOperations = useCallback(() => {
+    drawerEpochRef.current += 1;
+    latestMutationSequenceRef.current = ++operationSequenceRef.current;
+    for (const kind of operationKinds) operationTokensRef.current[kind] = null;
+  }, []);
+
+  const beginOperation = useCallback((kind: OperationKind, adapterId: string) => {
+    const token: OperationIdentity = {
+      adapterId,
+      drawerEpoch: drawerEpochRef.current,
+      sequence: ++operationSequenceRef.current,
+    };
+    operationTokensRef.current[kind] = token;
+    latestMutationSequenceRef.current = token.sequence;
+    return token;
+  }, []);
+
+  const isCurrentOperation = useCallback((kind: OperationKind, token: OperationIdentity, requireLatest = false) => (
+    mountedRef.current
+    && openRef.current
+    && adapterIdentityRef.current === token.adapterId
+    && drawerEpochRef.current === token.drawerEpoch
+    && operationTokensRef.current[kind]?.sequence === token.sequence
+    && (!requireLatest || latestMutationSequenceRef.current === token.sequence)
+  ), []);
 
   const clearSecret = useCallback((updateState = true) => {
     if (secretInputRef.current) secretInputRef.current.value = "";
@@ -129,27 +178,46 @@ export function SourceConfigurationDrawer({
 
   useLayoutEffect(() => {
     mountedRef.current = true;
+    invalidateOperations();
     if (!open) {
+      if (secretInputRef.current) secretInputRef.current.value = "";
       setSecret("");
+      setCredentialPending(false);
+      setDeletePending(false);
+      setFreeOnlyPending(false);
+      setActionPending(false);
       return;
     }
+    adapterIdentityRef.current = adapter?.adapter_id ?? null;
+    setCredentialPending(false);
+    setDeletePending(false);
+    setFreeOnlyPending(false);
+    setActionPending(false);
     return () => {
-      mutationEpochRef.current += 1;
+      invalidateOperations();
       if (secretInputRef.current) secretInputRef.current.value = "";
     };
-  }, [open]);
+  }, [adapter?.adapter_id, invalidateOperations, open]);
 
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const closeDrawer = useCallback(() => {
-    mutationEpochRef.current += 1;
+    invalidateOperations();
+    adapterIdentityRef.current = null;
     clearSecret();
+    setCredentialPending(false);
+    setDeletePending(false);
+    setFreeOnlyPending(false);
+    setActionPending(false);
     setFeedback(null);
     setError(null);
     setConfirmDelete(false);
     setConfirmation(false);
     onClose();
-  }, [clearSecret, onClose]);
+  }, [clearSecret, invalidateOperations, onClose]);
 
   useEffect(() => {
     if (!open || !adapter) return;
@@ -176,21 +244,24 @@ export function SourceConfigurationDrawer({
     };
   }, [adapter, closeDrawer, open]);
 
-  const applyBundle = useCallback((bundle: ConfigurationBundle, adapterId: string) => {
-    const row = bundle.configuration.adapters.find((item) => item.adapter_id === adapterId);
+  const applyBundle = useCallback((bundle: ConfigurationBundle, token: OperationIdentity) => {
+    if (!isCurrentOperation("load", token, true)) return;
+    const row = bundle.configuration.adapters.find((item) => item.adapter_id === token.adapterId);
     if (!row) throw new Error("missing adapter configuration");
     setConfiguration(row);
-    setUsage(bundle.usage.adapters.find((item) => item.adapter_id === adapterId) || null);
-    setCost(bundle.cost.adapters.find((item) => item.adapter_id === adapterId) || null);
+    setUsage(bundle.usage.adapters.find((item) => item.adapter_id === token.adapterId) || null);
+    setCost(bundle.cost.adapters.find((item) => item.adapter_id === token.adapterId) || null);
+    setVerifiedTimezone(bundle.usage.timezone === "UTC" && bundle.cost.timezone === "UTC" ? "UTC" : null);
     setFreeOnly(bundle.configuration.free_only);
-  }, []);
+  }, [isCurrentOperation]);
 
   useEffect(() => {
     if (!open || !adapter) return;
-    let active = true;
+    const token = beginOperation("load", adapter.adapter_id);
     setConfiguration(null);
     setUsage(null);
     setCost(null);
+    setVerifiedTimezone(null);
     setFreeOnly(true);
     setLoading(true);
     setLoadError(false);
@@ -199,107 +270,127 @@ export function SourceConfigurationDrawer({
     setLicenseNotice(false);
     setConfirmation(false);
     readConfiguration(adapter.adapter_id).then((bundle) => {
-      if (!active) return;
-      try { applyBundle(bundle, adapter.adapter_id); }
-      catch { setLoadError(true); }
-    }).catch(() => { if (active) setLoadError(true); }).finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [adapter, applyBundle, open]);
+      if (!isCurrentOperation("load", token, true)) return;
+      try { applyBundle(bundle, token); }
+      catch { if (isCurrentOperation("load", token, true)) setLoadError(true); }
+    }).catch(() => {
+      if (isCurrentOperation("load", token, true)) setLoadError(true);
+    }).finally(() => {
+      if (isCurrentOperation("load", token)) setLoading(false);
+    });
+  }, [adapter, applyBundle, beginOperation, isCurrentOperation, open]);
 
   const saveCredential = async () => {
     if (!adapter || !secret || credentialPending) return;
-    const epoch = ++mutationEpochRef.current;
+    const token = beginOperation("credential", adapter.adapter_id);
     let submitted = secret;
     setCredentialPending(true);
     setFeedback(null);
     setError(null);
     try {
-      const state = await api.dataSourcePutCredential(adapter.adapter_id, submitted);
-      if (mountedRef.current && openRef.current && mutationEpochRef.current === epoch) {
+      const state = await api.dataSourcePutCredential(token.adapterId, submitted);
+      if (isCurrentOperation("credential", token, true)) {
         setConfiguration((current) => current ? { ...current, credential: state, enabled: false } : current);
         setFeedback("凭据已保存");
       }
     } catch {
-      if (mountedRef.current && openRef.current && mutationEpochRef.current === epoch) setError(boundedActionError("credential"));
+      if (isCurrentOperation("credential", token, true)) setError(boundedActionError("credential"));
     } finally {
       submitted = "";
-      clearSecret();
-      if (mountedRef.current) setCredentialPending(false);
+      if (isCurrentOperation("credential", token)) {
+        clearSecret();
+        setCredentialPending(false);
+      }
     }
   };
 
   const deleteCredential = async () => {
     if (!adapter || deletePending) return;
     if (!confirmDelete) { setConfirmDelete(true); return; }
-    const epoch = ++mutationEpochRef.current;
+    const token = beginOperation("delete", adapter.adapter_id);
     setDeletePending(true);
     setFeedback(null);
     setError(null);
     try {
-      const state = await api.dataSourceDeleteCredential(adapter.adapter_id);
-      if (mountedRef.current && openRef.current && mutationEpochRef.current === epoch) {
+      const state = await api.dataSourceDeleteCredential(token.adapterId);
+      if (isCurrentOperation("delete", token, true)) {
         setConfiguration((current) => current ? { ...current, credential: state, enabled: false } : current);
         setConfirmDelete(false);
         setFeedback("凭据已删除");
       }
     } catch {
-      if (mountedRef.current && openRef.current && mutationEpochRef.current === epoch) setError(boundedActionError("delete"));
+      if (isCurrentOperation("delete", token, true)) setError(boundedActionError("delete"));
     } finally {
-      clearSecret();
-      if (mountedRef.current && openRef.current && mutationEpochRef.current === epoch) setDeletePending(false);
+      if (isCurrentOperation("delete", token)) {
+        clearSecret();
+        setDeletePending(false);
+      }
     }
   };
 
   const saveBudget = async (updates: { daily_budget: string; monthly_budget: string; per_request_budget: string }) => {
     if (!adapter) return;
+    const token = beginOperation("budget", adapter.adapter_id);
     try {
-      await api.dataSourceUpdateAdapterConfig(adapter.adapter_id, updates);
-      setConfiguration((current) => current ? { ...current, ...updates } : current);
-      setFeedback("预算已保存");
-      setError(null);
+      await api.dataSourceUpdateAdapterConfig(token.adapterId, updates);
+      if (isCurrentOperation("budget", token, true)) {
+        setConfiguration((current) => current ? { ...current, ...updates } : current);
+        setFeedback("预算已保存");
+        setError(null);
+      }
     } catch {
-      setError(boundedActionError("budget"));
+      if (isCurrentOperation("budget", token, true)) setError(boundedActionError("budget"));
       throw new Error("budget save failed");
     }
   };
 
   const updateFreeOnly = async (next: boolean) => {
-    if (freeOnlyPending) return;
+    if (!adapter || freeOnlyPending) return;
+    const token = beginOperation("free-only", adapter.adapter_id);
     setFreeOnlyPending(true);
     setFeedback(null);
     setError(null);
     try {
       const document = await api.dataSourceUpdateFreeOnly(next);
-      setFreeOnly(document.free_only);
-      const row = adapter && document.adapters.find((item) => item.adapter_id === adapter.adapter_id);
-      if (row) setConfiguration(row);
-      setFeedback(document.free_only ? "Free-only 已开启" : "Free-only 已关闭");
+      if (isCurrentOperation("free-only", token, true)) {
+        setFreeOnly(document.free_only);
+        const row = document.adapters.find((item) => item.adapter_id === token.adapterId);
+        if (row) setConfiguration(row);
+        setFeedback(document.free_only ? "Free-only 已开启" : "Free-only 已关闭");
+      }
     } catch {
-      setFreeOnly(true);
-      setError(boundedActionError("free-only"));
+      if (isCurrentOperation("free-only", token, true)) {
+        setFreeOnly(true);
+        setError(boundedActionError("free-only"));
+      }
     } finally {
-      setFreeOnlyPending(false);
+      if (isCurrentOperation("free-only", token)) setFreeOnlyPending(false);
     }
   };
 
   const runAction = async (action: "enable" | "disable" | "validate") => {
     if (!adapter || actionPending) return;
+    const token = beginOperation("action", adapter.adapter_id);
     setActionPending(true);
     setFeedback(null);
     setError(null);
     try {
       const result = action === "enable"
-        ? await api.dataSourceEnable(adapter.adapter_id, confirmation)
+        ? await api.dataSourceEnable(token.adapterId, confirmation)
         : action === "disable"
-          ? await api.dataSourceDisable(adapter.adapter_id)
-          : await api.dataSourceValidate(adapter.adapter_id);
-      if (action !== "validate" && typeof result.enabled === "boolean") setConfiguration((current) => current ? { ...current, enabled: result.enabled! } : current);
-      setFeedback(action === "validate" ? (result.status === "unconfigured" ? "未配置" : "配置验证完成") : action === "enable" ? "数据源已启用；连接状态仍以实际观测为准" : "数据源已停用");
+          ? await api.dataSourceDisable(token.adapterId)
+          : await api.dataSourceValidate(token.adapterId);
+      if (isCurrentOperation("action", token, true)) {
+        if (action !== "validate" && typeof result.enabled === "boolean") setConfiguration((current) => current ? { ...current, enabled: result.enabled! } : current);
+        setFeedback(action === "validate" ? (result.status === "unconfigured" ? "未配置" : "配置验证完成") : action === "enable" ? "数据源已启用；连接状态仍以实际观测为准" : "数据源已停用");
+      }
     } catch (reason) {
-      if (action === "validate" && reason instanceof ApiError && reason.status === 409) setError("传输方式尚未支持");
-      else setError(boundedActionError("action"));
+      if (isCurrentOperation("action", token, true)) {
+        if (action === "validate" && reason instanceof ApiError && reason.status === 409) setError("传输方式尚未支持");
+        else setError(boundedActionError("action"));
+      }
     } finally {
-      setActionPending(false);
+      if (isCurrentOperation("action", token)) setActionPending(false);
     }
   };
 
@@ -359,7 +450,7 @@ export function SourceConfigurationDrawer({
               <div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={saveCredential} disabled={!secret || credentialPending} className="inline-flex items-center gap-2 rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-45">{credentialPending && <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />}保存凭据</button>{configuration.credential.configured && <button type="button" onClick={deleteCredential} disabled={deletePending} className="inline-flex items-center gap-1 rounded-lg border border-destructive/45 px-3 py-2 text-xs font-medium text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive disabled:opacity-45"><Trash2 className="h-3.5 w-3.5" aria-hidden="true" />{confirmDelete ? "确认删除凭据" : "删除凭据"}</button>}</div>
             </section>}
 
-            {paid && <CostBudgetPanel configuration={configuration} usage={usage} cost={cost} onSave={saveBudget} onGateChange={setBudgetGate} />}
+            {paid && <CostBudgetPanel configuration={configuration} usage={usage} cost={cost} timezone={verifiedTimezone} onSave={saveBudget} onGateChange={setBudgetGate} />}
 
             <section className="rounded-xl border border-border/60 bg-muted/10 p-4">
               <h3 className="text-sm font-semibold">保护与操作</h3>

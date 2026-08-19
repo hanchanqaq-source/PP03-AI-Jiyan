@@ -44,12 +44,14 @@ export function CostBudgetPanel({
   configuration,
   usage,
   cost,
+  timezone,
   onSave,
   onGateChange,
 }: {
   configuration: AdapterConfigurationView;
   usage: AdapterUsageView | null;
   cost: AdapterCostView | null;
+  timezone: "UTC" | null;
   onSave: (updates: Required<Pick<AdapterConfigUpdate, "daily_budget" | "monthly_budget" | "per_request_budget">>) => Promise<void>;
   onGateChange?: (gate: BudgetGateState) => void;
 }) {
@@ -117,7 +119,7 @@ export function CostBudgetPanel({
     </div>
 
     <div className="mt-4 border-t border-border/50 pt-4">
-      <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-xs font-semibold text-foreground">已观测用量</h4><p className="text-[11px] text-muted-foreground">日 {usage?.day ?? cost?.day ?? "未知"} · 月 {usage?.month ?? cost?.month ?? "未知"}</p></div>
+      <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-xs font-semibold text-foreground">已观测用量</h4><p className="text-[11px] text-muted-foreground">日 {usage?.day ?? cost?.day ?? "未知"} · 月 {usage?.month ?? cost?.month ?? "未知"} · {timezone === "UTC" ? "时区 UTC" : "时区未知"}</p></div>
       {!observed ? <p className="mt-2 text-sm text-muted-foreground">用量尚未观测</p> : <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2">
         <p className="rounded-lg border border-border/50 bg-background/45 p-3"><span className="text-muted-foreground">当日费用</span><strong className="mt-1 block text-base text-foreground">{money(usage?.daily_cost ?? null)}</strong></p>
         <p className="rounded-lg border border-border/50 bg-background/45 p-3"><span className="text-muted-foreground">当月费用</span><strong className="mt-1 block text-base text-foreground">{money(usage?.monthly_cost ?? null)}</strong></p>

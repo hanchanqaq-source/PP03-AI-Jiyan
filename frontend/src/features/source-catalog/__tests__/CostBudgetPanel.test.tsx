@@ -66,10 +66,12 @@ const unobservedCost: AdapterCostView = {
 function Harness({
   usage = unobservedUsage,
   cost = unobservedCost,
+  timezone = "UTC",
   onSave = vi.fn().mockResolvedValue(undefined),
 }: {
   usage?: AdapterUsageView;
   cost?: AdapterCostView;
+  timezone?: "UTC" | null;
   onSave?: (updates: { daily_budget: string; monthly_budget: string; per_request_budget: string }) => Promise<void>;
 }) {
   const [gate, setGate] = useState<BudgetGateState>({ valid: false, saved: false });
@@ -78,6 +80,7 @@ function Harness({
       configuration={configuration}
       usage={usage}
       cost={cost}
+      timezone={timezone}
       onSave={onSave}
       onGateChange={setGate}
     />
@@ -92,6 +95,7 @@ describe("CostBudgetPanel", () => {
     expect(screen.queryByText("¥0")).not.toBeInTheDocument();
     expect(screen.getByText(/2026-08-20/)).toBeInTheDocument();
     expect(screen.getByText(/2026-08/)).toBeInTheDocument();
+    expect(screen.getByText(/时区 UTC/)).toBeInTheDocument();
   });
 
   it("renders an observed true zero with period metadata", () => {
@@ -101,6 +105,23 @@ describe("CostBudgetPanel", () => {
     />);
     expect(screen.getAllByText("¥0")).toHaveLength(2);
     expect(screen.queryByText("用量尚未观测")).not.toBeInTheDocument();
+    expect(screen.getByText(/时区 UTC/)).toBeInTheDocument();
+  });
+
+  it("shows nonzero observed costs with UTC period context", () => {
+    render(<Harness
+      usage={{ ...unobservedUsage, usage_status: "observed", daily_cost: "1.25", monthly_cost: "20.00000001", daily_request_count: 2, monthly_request_count: 4, daily_units: "2", monthly_units: "4", open_reservations: 0 }}
+      cost={{ ...unobservedCost, usage_status: "observed", daily_cost: "1.25", monthly_cost: "20.00000001", daily_remaining: "8.75", monthly_remaining: "79.99999999", open_reservations: 0 }}
+    />);
+    expect(screen.getByText("¥1.25")).toBeInTheDocument();
+    expect(screen.getByText("¥20.00000001")).toBeInTheDocument();
+    expect(screen.getByText(/时区 UTC/)).toBeInTheDocument();
+  });
+
+  it("shows unknown timezone without implying UTC", () => {
+    render(<Harness timezone={null} />);
+    expect(screen.getByText(/时区未知/)).toBeInTheDocument();
+    expect(screen.queryByText(/时区 UTC/)).not.toBeInTheDocument();
   });
 
   it("rejects non-canonical, zero, and over-bound decimal budgets", async () => {
