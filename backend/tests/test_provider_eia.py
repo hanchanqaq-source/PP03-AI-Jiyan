@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
-from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy
+from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy, BudgetValidationError
 from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.models import BillingModel
 from data_sources.usage_store import UsageStore
 
 
@@ -74,6 +76,17 @@ class TrapValue:
     __eq__ = __bool__ = __str__ = explode
 
 
+class TrapScalar:
+    def __init__(self):
+        self.called = False
+
+    def explode(self, *_args, **_kwargs):
+        self.called = True
+        raise AssertionError("attacker-controlled response scalar executed")
+
+    __eq__ = __ne__ = __hash__ = __str__ = explode
+
+
 def credentials(configured=True):
     store = MemoryCredentialStore({"eia": ("EIA_API_KEY",)})
     if configured:
@@ -133,6 +146,42 @@ def test_eia_rejects_mutated_budget_decision_before_using_hostile_field():
     assert trap.called is False
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("estimated_cost", Decimal("0E+13")),
+        ("reservation_id", "token-secret-reservation"),
+        ("reason", "free_only"),
+        ("health_failure", True),
+    ],
+)
+def test_eia_revalidates_every_mutated_budget_decision_field_before_transport(field, value):
+    from data_sources.providers.eia import EiaAdapter
+
+    decision = BudgetDecision(True, "authorized", None, Decimal("0"))
+    object.__setattr__(decision, field, value)
+    budget = type("MutatedBudget", (), {"authorize": lambda *_args, **_kwargs: decision})()
+    http = FakeHttp([fixture()])
+
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid"):
+        EiaAdapter(http=http, credentials=credentials(), budget_guard=budget, fetched_at=lambda: NOW).fetch(request())
+    assert http.calls == []
+
+
+def test_eia_normalizes_budget_validation_error_without_leaking_or_transport():
+    from data_sources.providers.eia import EiaAdapter
+
+    class InvalidBudget:
+        def authorize(self, *_args, **_kwargs):
+            raise BudgetValidationError(f"token={SECRET}")
+
+    http = FakeHttp([fixture()])
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid") as captured:
+        EiaAdapter(http=http, credentials=credentials(), budget_guard=InvalidBudget(), fetched_at=lambda: NOW).fetch(request())
+    assert SECRET not in str(captured.value)
+    assert http.calls == []
+
+
 def test_eia_preserves_series_name_unit_frequency_period_actual_forecast_and_reference():
     from data_sources.providers.eia import EiaAdapter
 
@@ -162,6 +211,21 @@ def test_eia_trusted_free_key_catalog_is_zero_cost_under_real_free_only_guard(tm
     assert len(rows) == 2
     assert len(http.calls) == 1
     assert guard.usage_store.records(now=NOW)[0].estimated_cost == Decimal("0")
+
+
+def test_eia_missing_guard_allows_only_its_exact_trusted_free_key_descriptor():
+    from data_sources.providers.eia import EiaAdapter
+
+    http = FakeHttp([fixture()])
+    adapter = EiaAdapter(http=http, credentials=credentials(), fetched_at=lambda: NOW)
+    adapter.descriptor = replace(adapter.descriptor, billing_model=BillingModel.FREEMIUM)
+
+    assert adapter.probe("macro_series", parameters=request().parameters) == {
+        "status": "budget_guard_unavailable",
+        "connected": False,
+        "health_failure": False,
+    }
+    assert http.calls == []
 
 
 @pytest.mark.parametrize(
@@ -212,6 +276,19 @@ def test_eia_rejects_hostile_scalars_future_dates_and_resource_abuse(payload):
 
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
         EiaAdapter(http=FakeHttp([payload]), credentials=credentials(), fetched_at=lambda: NOW).fetch(request())
+
+
+@pytest.mark.parametrize("field", ["series", "type"])
+def test_eia_rejects_malicious_identity_scalars_before_comparison_hash_or_format(field):
+    from data_sources.providers.eia import EiaAdapter
+
+    trap = TrapScalar()
+    payload = fixture()
+    payload["response"]["data"][0][field] = trap
+
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        EiaAdapter(http=FakeHttp([payload]), credentials=credentials(), fetched_at=lambda: NOW).fetch(request())
+    assert trap.called is False
 
 
 def test_eia_marks_stale_actual_and_preserves_unknown_unit():

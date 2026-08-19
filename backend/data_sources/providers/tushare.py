@@ -25,6 +25,7 @@ _MAX_NUMBER_TEXT = 128
 _FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _PARAMETER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _CACHEABLE = {"timeout", "tls", "dns", "connection", "server_error", "rate_limited"}
+_SENSITIVE_RESERVATION_MARKERS = ("api_key", "bearer", "credential", "password", "secret", "token")
 # This is an authorization sentinel, not a provider price. It classifies an
 # unqualified plan/points request as cost-bearing for Free-only enforcement and
 # is reconciled to zero without transport when no trusted entitlement exists.
@@ -82,14 +83,42 @@ def _public_scalar(value: object) -> object:
     raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
 
 
+def _budget_snapshot(decision: object, expected_cost: Decimal) -> tuple[bool, str, str | None]:
+    if type(decision) is not BudgetDecision:
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+    try:
+        snapshot = decision.to_dict()
+    except Exception:
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
+    if (
+        type(snapshot) is not dict
+        or set(snapshot) != {"allowed", "reason", "reservation_id", "estimated_cost", "health_failure"}
+        or type(snapshot["allowed"]) is not bool
+        or type(snapshot["reason"]) is not str
+        or (snapshot["reservation_id"] is not None and type(snapshot["reservation_id"]) is not str)
+        or type(snapshot["estimated_cost"]) is not str
+        or type(snapshot["health_failure"]) is not bool
+        or snapshot["estimated_cost"] != format(expected_cost, "f")
+        or snapshot["health_failure"] is not False
+        or snapshot["allowed"] is not (snapshot["reason"] == "authorized")
+        or (not snapshot["allowed"] and snapshot["reservation_id"] is not None)
+    ):
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+    reservation_id = snapshot["reservation_id"]
+    if reservation_id is not None and any(marker in reservation_id.lower() for marker in _SENSITIVE_RESERVATION_MARKERS):
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+    return snapshot["allowed"], snapshot["reason"], reservation_id
+
+
 class TushareAdapter(BaseProvider):
     """Tushare Pro parser and account-capability boundary.
 
     The official endpoint is POST-only. The current shared SafeHttpClient is
-    deliberately GET-only, so a configured production instance reports
-    ``unsupported_transport`` until a separately reviewed safe POST transport
-    exists. Deterministic tests inject a bounded ``post_json`` fake; this class
-    never falls back to GET or direct requests.
+    deliberately GET-only, and plan/points cost is not yet backed by a trusted
+    entitlement. A configured instance therefore fails closed at
+    ``budget_guard_unavailable`` or ``cost_unknown`` before request payload or
+    transport. Pure request/parser tests use bounded fixtures; this class never
+    falls back to GET or direct requests.
     """
 
     descriptor = AdapterDescriptor(
@@ -134,34 +163,32 @@ class TushareAdapter(BaseProvider):
 
     def _authorize(self, now: datetime) -> str | None:
         if self._budget_guard is None:
-            return None
-        decision = self._budget_guard.authorize(
-            self.descriptor,
-            estimated_cost=_PLAN_DEPENDENT_PREFLIGHT_COST,
-            now=now,
-        )
-        if (
-            type(decision) is not BudgetDecision
-            or type(decision.allowed) is not bool
-            or type(decision.reason) is not str
-            or type(decision.estimated_cost) is not Decimal
-            or (decision.reservation_id is not None and type(decision.reservation_id) is not str)
-            or decision.estimated_cost != _PLAN_DEPENDENT_PREFLIGHT_COST
-        ):
+            return "budget_guard_unavailable"
+        try:
+            decision = self._budget_guard.authorize(
+                self.descriptor,
+                estimated_cost=_PLAN_DEPENDENT_PREFLIGHT_COST,
+                now=now,
+            )
+        except Exception:
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
+        allowed, reason, reservation_id = _budget_snapshot(decision, _PLAN_DEPENDENT_PREFLIGHT_COST)
+        if not allowed:
+            return reason
+        if reservation_id is None:
             raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-        if not decision.allowed:
-            return str(decision.reason)
-        if decision.reservation_id is None:
-            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-        self._budget_guard.record(
-            self.descriptor.adapter_id,
-            reservation_id=decision.reservation_id,
-            actual_cost=Decimal("0"),
-            request_count=0,
-            status="cost_unknown",
-            units=Decimal("0"),
-            now=now,
-        )
+        try:
+            self._budget_guard.record(
+                self.descriptor.adapter_id,
+                reservation_id=reservation_id,
+                actual_cost=Decimal("0"),
+                request_count=0,
+                status="cost_unknown",
+                units=Decimal("0"),
+                now=now,
+            )
+        except Exception:
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
         return "cost_unknown"
 
     @staticmethod

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 from decimal import Decimal
 import json
 
 import pytest
 
-from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy
+from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy, BudgetValidationError
 from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.models import BillingModel
 from data_sources.usage_store import UsageStore
 
 
@@ -160,6 +162,42 @@ def test_fred_rejects_mutated_budget_decision_before_using_hostile_field():
     assert trap.called is False
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("estimated_cost", Decimal("0E+13")),
+        ("reservation_id", "api_key-secret-reservation"),
+        ("reason", "disabled"),
+        ("health_failure", True),
+    ],
+)
+def test_fred_revalidates_every_mutated_budget_decision_field_before_transport(field, value):
+    from data_sources.providers.fred import FredAdapter
+
+    decision = BudgetDecision(True, "authorized", None, Decimal("0"))
+    object.__setattr__(decision, field, value)
+    budget = type("MutatedBudget", (), {"authorize": lambda *_args, **_kwargs: decision})()
+    http = FakeHttp([fixture()])
+
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid"):
+        FredAdapter(http=http, credentials=credentials(), budget_guard=budget, fetched_at=lambda: NOW).fetch(request())
+    assert http.calls == []
+
+
+def test_fred_normalizes_budget_validation_error_without_leaking_or_transport():
+    from data_sources.providers.fred import FredAdapter
+
+    class InvalidBudget:
+        def authorize(self, *_args, **_kwargs):
+            raise BudgetValidationError(f"api_key={SECRET}")
+
+    http = FakeHttp([fixture()])
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid") as captured:
+        FredAdapter(http=http, credentials=credentials(), budget_guard=InvalidBudget(), fetched_at=lambda: NOW).fetch(request())
+    assert SECRET not in str(captured.value)
+    assert http.calls == []
+
+
 def test_fred_preserves_series_dates_unit_frequency_reference_and_missing_value():
     from data_sources.providers.fred import FredAdapter
 
@@ -194,6 +232,21 @@ def test_fred_trusted_free_key_catalog_is_zero_cost_under_real_free_only_guard(t
     assert len(rows) == 2
     assert len(http.calls) == 1
     assert guard.usage_store.records(now=NOW)[0].estimated_cost == Decimal("0")
+
+
+def test_fred_missing_guard_allows_only_its_exact_trusted_free_key_descriptor():
+    from data_sources.providers.fred import FredAdapter
+
+    http = FakeHttp([fixture()])
+    adapter = FredAdapter(http=http, credentials=credentials(), fetched_at=lambda: NOW)
+    adapter.descriptor = replace(adapter.descriptor, billing_model=BillingModel.FREEMIUM)
+
+    assert adapter.probe("macro_series", parameters=request().parameters) == {
+        "status": "budget_guard_unavailable",
+        "connected": False,
+        "health_failure": False,
+    }
+    assert http.calls == []
 
 
 @pytest.mark.parametrize(

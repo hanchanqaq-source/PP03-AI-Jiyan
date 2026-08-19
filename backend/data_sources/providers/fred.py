@@ -29,6 +29,7 @@ _FREQUENCIES = {
     "daily": "daily",
 }
 _CACHEABLE = {"timeout", "tls", "dns", "connection", "server_error", "rate_limited"}
+_SENSITIVE_RESERVATION_MARKERS = ("api_key", "bearer", "credential", "password", "secret", "token")
 
 
 def _now() -> datetime:
@@ -78,17 +79,47 @@ def _max_age(parameters: Mapping[str, object]) -> int | None:
     return value
 
 
+def _budget_snapshot(decision: object, expected_cost: Decimal) -> tuple[bool, str]:
+    if type(decision) is not BudgetDecision:
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+    try:
+        snapshot = decision.to_dict()
+    except Exception:
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
+    if (
+        type(snapshot) is not dict
+        or set(snapshot) != {"allowed", "reason", "reservation_id", "estimated_cost", "health_failure"}
+        or type(snapshot["allowed"]) is not bool
+        or type(snapshot["reason"]) is not str
+        or (snapshot["reservation_id"] is not None and type(snapshot["reservation_id"]) is not str)
+        or type(snapshot["estimated_cost"]) is not str
+        or type(snapshot["health_failure"]) is not bool
+        or snapshot["estimated_cost"] != format(expected_cost, "f")
+        or snapshot["health_failure"] is not False
+        or snapshot["allowed"] is not (snapshot["reason"] == "authorized")
+        or (not snapshot["allowed"] and snapshot["reservation_id"] is not None)
+    ):
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+    reservation_id = snapshot["reservation_id"]
+    if reservation_id is not None and any(marker in reservation_id.lower() for marker in _SENSITIVE_RESERVATION_MARKERS):
+        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+    return snapshot["allowed"], snapshot["reason"]
+
+
+_TRUSTED_FREE_KEY_DESCRIPTOR = AdapterDescriptor(
+    "fred", "FRED", "fred", "http_client", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK),
+    ("macro_series",), BillingModel.FREE_KEY, "api_key", (_ENV_NAME,), False,
+    "FRED API key required; public data terms apply.",
+    "Free-key macro series adapter; no paid request or automatic upgrade.",
+    "以 FRED 发布和修订为准", "以账户实际配额为准", "免费密钥；本适配器不预留或消费付费预算",
+    _REFERENCE, 20, CatalogStatus.UNCONFIGURED,
+)
+
+
 class FredAdapter(BaseProvider):
     """FRED observations adapter with credential-first, zero-cost preflight."""
 
-    descriptor = AdapterDescriptor(
-        "fred", "FRED", "fred", "http_client", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK),
-        ("macro_series",), BillingModel.FREE_KEY, "api_key", (_ENV_NAME,), False,
-        "FRED API key required; public data terms apply.",
-        "Free-key macro series adapter; no paid request or automatic upgrade.",
-        "以 FRED 发布和修订为准", "以账户实际配额为准", "免费密钥；本适配器不预留或消费付费预算",
-        _REFERENCE, 20, CatalogStatus.UNCONFIGURED,
-    )
+    descriptor = _TRUSTED_FREE_KEY_DESCRIPTOR
 
     def __init__(
         self,
@@ -114,18 +145,13 @@ class FredAdapter(BaseProvider):
 
     def _authorize(self, now: datetime) -> str | None:
         if self._budget_guard is None:
-            return None
-        decision = self._budget_guard.authorize(self.descriptor, estimated_cost=Decimal("0"), now=now)
-        if (
-            type(decision) is not BudgetDecision
-            or type(decision.allowed) is not bool
-            or type(decision.reason) is not str
-            or type(decision.estimated_cost) is not Decimal
-            or (decision.reservation_id is not None and type(decision.reservation_id) is not str)
-            or decision.estimated_cost != Decimal("0")
-        ):
-            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-        return None if decision.allowed else str(decision.reason)
+            return None if self.descriptor is _TRUSTED_FREE_KEY_DESCRIPTOR else "budget_guard_unavailable"
+        try:
+            decision = self._budget_guard.authorize(self.descriptor, estimated_cost=Decimal("0"), now=now)
+        except Exception:
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
+        allowed, reason = _budget_snapshot(decision, Decimal("0"))
+        return None if allowed else reason
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[dict[str, object], int | None]:

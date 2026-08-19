@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy
+from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy, BudgetValidationError
 from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.provider_contract import ProviderRequest
@@ -99,6 +99,22 @@ def fixture():
     }
 
 
+def parse_payload(payload, *, active_request=None, cached=False):
+    from data_sources.providers.tushare import TushareAdapter
+
+    adapter = TushareAdapter(http=FakeHttp([]), credentials=credentials(), fetched_at=lambda: NOW)
+    active_request = request() if active_request is None else active_request
+    _, _, frequency, max_age_days = adapter._request(active_request)
+    return adapter._parse(
+        payload,
+        active_request,
+        now=NOW,
+        frequency=frequency,
+        max_age_days=max_age_days,
+        cached=cached,
+    )
+
+
 def permission_fixture():
     return {"request_id": "safe-id", "code": -2001, "msg": "抱歉，您没有访问该接口的权限"}
 
@@ -132,6 +148,88 @@ def test_tushare_rejects_mutated_budget_decision_before_using_hostile_field():
     with pytest.raises(ProviderUnavailable, match="budget_status_invalid"):
         TushareAdapter(http=FakeHttp([]), credentials=credentials(), budget_guard=budget, fetched_at=lambda: NOW).fetch(request())
     assert trap.called is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("reservation_id", "credential-secret-reservation"),
+        ("reason", "free_only"),
+        ("health_failure", True),
+    ],
+)
+def test_tushare_revalidates_every_mutated_budget_decision_field_before_record_or_post(field, value):
+    from data_sources.providers.tushare import TushareAdapter
+
+    decision = BudgetDecision(True, "authorized", "safe-reservation", Decimal("0.01"))
+    object.__setattr__(decision, field, value)
+
+    class MutatedBudget:
+        def __init__(self):
+            self.record_calls = []
+
+        def authorize(self, *_args, **_kwargs):
+            return decision
+
+        def record(self, *_args, **kwargs):
+            self.record_calls.append(kwargs)
+
+    budget, http = MutatedBudget(), FakeHttp([fixture()])
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid"):
+        TushareAdapter(http=http, credentials=credentials(), budget_guard=budget, fetched_at=lambda: NOW).fetch(request())
+    assert budget.record_calls == []
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("failure_stage", ["authorize", "record"])
+def test_tushare_normalizes_budget_validation_error_without_leaking_or_post(failure_stage):
+    from data_sources.providers.tushare import TushareAdapter
+
+    class InvalidBudget:
+        def authorize(self, *_args, **_kwargs):
+            if failure_stage == "authorize":
+                raise BudgetValidationError(f"token={SECRET}")
+            return BudgetDecision(True, "authorized", "safe-reservation", Decimal("0.01"))
+
+        def record(self, *_args, **_kwargs):
+            raise BudgetValidationError(f"credential={SECRET}")
+
+    http = FakeHttp([fixture()])
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid") as captured:
+        TushareAdapter(http=http, credentials=credentials(), budget_guard=InvalidBudget(), fetched_at=lambda: NOW).fetch(request())
+    assert SECRET not in str(captured.value)
+    assert http.calls == []
+
+
+def test_tushare_configured_missing_guard_fails_closed_before_payload_or_post():
+    from data_sources.providers.tushare import TushareAdapter
+
+    http = FakeHttp([fixture()])
+    adapter = TushareAdapter(http=http, credentials=credentials(), fetched_at=lambda: NOW)
+
+    assert adapter.probe("fund_holdings", parameters=request().parameters) == {
+        "status": "budget_guard_unavailable",
+        "connected": False,
+        "health_failure": False,
+        "capability_id": "fund_holdings",
+    }
+    with pytest.raises(ProviderUnavailable, match="budget_guard_unavailable"):
+        adapter.fetch(request())
+    assert http.calls == []
+
+
+def test_tushare_registry_default_configured_adapter_never_posts_without_guard():
+    from data_sources.provider_registry import ProviderRegistry
+
+    http = FakeHttp([fixture()])
+    registry = ProviderRegistry(
+        build_catalog({"sources": []}),
+        http_factory=lambda: http,
+        credential_factory=lambda _scope: credentials(),
+    )
+
+    assert registry.adapter("tushare").probe("fund_holdings", parameters=request().parameters)["status"] == "budget_guard_unavailable"
+    assert http.calls == []
 
 
 def test_tushare_real_free_only_guard_blocks_unknown_plan_cost_before_post(tmp_path):
@@ -172,37 +270,35 @@ def test_tushare_configured_state_refuses_get_only_safe_client_without_network()
     http = GetOnlySafeClient()
     result = TushareAdapter(http=http, credentials=credentials(), fetched_at=lambda: NOW).probe("fund_holdings", parameters=request().parameters)
 
-    assert result == {"status": "unsupported_transport", "connected": False, "health_failure": False, "capability_id": "fund_holdings"}
+    assert result == {"status": "budget_guard_unavailable", "connected": False, "health_failure": False, "capability_id": "fund_holdings"}
     assert http.calls == []
 
 
-def test_tushare_capability_denial_is_account_permission_not_failure_and_stays_scoped():
+def test_tushare_capability_denial_parser_is_plan_unavailable_without_promoting_capabilities():
     from data_sources.providers.tushare import TushareAdapter
 
-    adapter = TushareAdapter(http=FakeHttp([permission_fixture()]), credentials=credentials(), fetched_at=lambda: NOW)
-    result = adapter.probe("fund_holdings", parameters=request().parameters)
-
-    assert result == {"status": "plan_unavailable", "connected": False, "health_failure": False, "capability_id": "fund_holdings"}
-    assert adapter.capability_status("fund_holdings") == "plan_unavailable"
+    adapter = TushareAdapter(http=FakeHttp([]), credentials=credentials(), fetched_at=lambda: NOW)
+    with pytest.raises(ProviderUnavailable, match="plan_unavailable") as captured:
+        adapter._parse(permission_fixture(), request(), now=NOW, frequency="quarterly", max_age_days=None, cached=False)
+    assert captured.value.code == "plan_unavailable"
+    assert adapter.capability_status("fund_holdings") == "unprobed"
     assert adapter.capability_status("stock_history") == "unprobed"
 
 
-def test_tushare_fetch_records_only_the_denied_capability_before_raising():
+def test_tushare_public_fetch_blocks_before_account_response_without_guard():
     from data_sources.providers.tushare import TushareAdapter
 
-    adapter = TushareAdapter(http=FakeHttp([permission_fixture()]), credentials=credentials(), fetched_at=lambda: NOW)
-    with pytest.raises(ProviderUnavailable, match="plan_unavailable"):
+    http = FakeHttp([permission_fixture()])
+    adapter = TushareAdapter(http=http, credentials=credentials(), fetched_at=lambda: NOW)
+    with pytest.raises(ProviderUnavailable, match="budget_guard_unavailable"):
         adapter.fetch(request())
-
-    assert adapter.capability_status("fund_holdings") == "plan_unavailable"
+    assert http.calls == []
+    assert adapter.capability_status("fund_holdings") == "unprobed"
     assert adapter.capability_status("stock_history") == "unprobed"
 
 
 def test_tushare_parses_capability_payload_and_preserves_public_period_unit_source():
-    from data_sources.providers.tushare import TushareAdapter
-
-    http = FakeHttp([fixture()])
-    rows = TushareAdapter(http=http, credentials=credentials(), fetched_at=lambda: NOW).fetch(request())
+    rows = parse_payload(fixture())
     row = rows[0]
     assert row.value == {"ts_code": "510300.SH", "symbol": "600000.SH", "end_date": "20250630", "mkv": Decimal("123.4"), "stk_mkv_ratio": Decimal("1.25")}
     assert row.as_of_date.isoformat() == "2025-06-30"
@@ -212,45 +308,37 @@ def test_tushare_parses_capability_payload_and_preserves_public_period_unit_sour
     assert row.unit == "provider_native"
     assert row.frequency == "quarterly"
     assert row.source_metadata == {"api_name": "fund_portfolio", "period": "20250630", "source_reference": "https://api.tushare.pro/", "plan_status": "available"}
-    assert SECRET not in repr(row) and SECRET not in repr(http.calls)
+    assert SECRET not in repr(row)
 
 
-def test_tushare_capability_availability_does_not_promote_other_capabilities():
+def test_tushare_pure_parser_does_not_claim_capability_availability():
     from data_sources.providers.tushare import TushareAdapter
 
-    adapter = TushareAdapter(http=FakeHttp([fixture()]), credentials=credentials(), fetched_at=lambda: NOW)
-    result = adapter.probe("fund_holdings", parameters=request().parameters)
-    assert result["status"] == "available"
-    assert adapter.capability_status("fund_holdings") == "available"
+    adapter = TushareAdapter(http=FakeHttp([]), credentials=credentials(), fetched_at=lambda: NOW)
+    rows = adapter._parse(fixture(), request(), now=NOW, frequency="quarterly", max_age_days=None, cached=False)
+    assert len(rows) == 1
+    assert adapter.capability_status("fund_holdings") == "unprobed"
     assert adapter.capability_status("stock_financials") == "unprobed"
 
 
 @pytest.mark.parametrize(
-    "response,status,health_failure",
+    "payload,error_type,error_code",
     [
-        (ProviderUnavailable("authentication"), "authentication_failed", False),
-        (ProviderRateLimited(retry_after_seconds=12), "rate_limited", False),
-        (ProviderUnavailable("timeout"), "timeout", True),
-        (ProviderUnavailable("tls"), "tls", True),
-        ({"code": -2002, "msg": "token无效"}, "authentication_failed", False),
-        ({"code": 0, "msg": "", "data": {"fields": ["ts_code"], "items": []}}, "empty_result", False),
-        ({"code": 0, "msg": "", "data": {"fields": "bad", "items": []}}, "schema_changed", True),
+        ({"code": -2002, "msg": "token无效"}, ProviderUnavailable, "authentication"),
+        ({"code": 429, "msg": "rate limit"}, ProviderRateLimited, "rate_limited"),
+        (permission_fixture(), ProviderUnavailable, "plan_unavailable"),
+        ({"code": 0, "msg": "", "data": {"fields": ["ts_code"], "items": []}}, ProviderUnavailable, "empty_result"),
+        ({"code": 0, "msg": "", "data": {"fields": "bad", "items": []}}, ProviderSchemaChanged, "schema_changed"),
     ],
 )
-def test_tushare_probe_distinguishes_auth_rate_timeout_empty_and_schema(response, status, health_failure):
-    from data_sources.providers.tushare import TushareAdapter
-
-    result = TushareAdapter(http=FakeHttp([response]), credentials=credentials(), fetched_at=lambda: NOW).probe("fund_holdings", parameters=request().parameters)
-    assert result["status"] == status
-    assert result["health_failure"] is health_failure
+def test_tushare_pure_parser_distinguishes_auth_rate_permission_empty_and_schema(payload, error_type, error_code):
+    with pytest.raises(error_type) as captured:
+        parse_payload(payload)
+    assert captured.value.code == error_code
 
 
-def test_tushare_timeout_cache_fallback_is_explicit():
-    from data_sources.providers.tushare import TushareAdapter
-
-    rows = TushareAdapter(
-        http=FakeHttp([ProviderUnavailable("timeout")]), credentials=credentials(), cache_getter=lambda _request: fixture(), fetched_at=lambda: NOW
-    ).fetch(request())
+def test_tushare_cached_parser_result_is_explicit():
+    rows = parse_payload(fixture(), cached=True)
     assert rows[0].data_status == "cached"
     assert rows[0].source_metadata["cache_status"] == "fallback"
 
@@ -269,20 +357,13 @@ def test_tushare_timeout_cache_fallback_is_explicit():
     ],
 )
 def test_tushare_rejects_unbounded_hostile_nested_and_future_payloads(payload):
-    from data_sources.providers.tushare import TushareAdapter
-
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        TushareAdapter(http=FakeHttp([payload]), credentials=credentials(), fetched_at=lambda: NOW).fetch(request())
+        parse_payload(payload)
 
 
 def test_tushare_marks_stale_period_without_fabricating_permission_for_others():
-    from data_sources.providers.tushare import TushareAdapter
-
-    adapter = TushareAdapter(http=FakeHttp([fixture()]), credentials=credentials(), fetched_at=lambda: NOW)
-    row = adapter.fetch(request(max_age_days=30))[0]
+    row = parse_payload(fixture(), active_request=request(max_age_days=30))[0]
     assert row.data_status == "stale"
-    assert adapter.capability_status("fund_holdings") == "available"
-    assert adapter.capability_status("stock_history") == "unprobed"
 
 
 def test_tushare_rejects_custom_response_containers_without_executing_methods():
@@ -302,7 +383,7 @@ def test_tushare_rejects_custom_response_containers_without_executing_methods():
     ]
     for payload, traps in variants:
         with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-            TushareAdapter(http=FakeHttp([payload]), credentials=credentials(), fetched_at=lambda: NOW).fetch(request())
+            parse_payload(payload)
         assert all(trap.called is False for trap in traps)
 
 
@@ -311,7 +392,7 @@ def test_tushare_rejects_custom_request_mapping_without_executing_methods():
 
     parameters = TrapDict({"ts_code": "510300.SH", "period": "20250630"})
     with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
-        TushareAdapter(http=FakeHttp([]), credentials=credentials(), fetched_at=lambda: NOW).fetch(ProviderRequest("fund_holdings", parameters))
+        TushareAdapter(http=FakeHttp([]), credentials=credentials(), fetched_at=lambda: NOW)._request(ProviderRequest("fund_holdings", parameters))
     assert parameters.called is False
 
 
