@@ -67,15 +67,17 @@ class CapabilityRouter:
         capability_id: str,
         personal_research: bool,
     ) -> tuple[Any, ...]:
-        requested_families = set(family_ids)
         rows = []
-        for adapter in self._catalog.adapters:
-            if adapter.source_family_id not in requested_families or capability_id not in adapter.capability_ids:
-                continue
-            if not self._eligible(adapter, personal_research):
-                continue
-            rows.append(adapter)
-        return tuple(sorted(rows, key=lambda adapter: (adapter.current_provider_priority, adapter.adapter_id)))
+        emitted_ids: set[str] = set()
+        for family_id in family_ids:
+            for adapter in self._catalog.adapters_for_family(family_id):
+                if capability_id not in adapter.capability_ids:
+                    continue
+                if adapter.adapter_id in emitted_ids or not self._eligible(adapter, personal_research):
+                    continue
+                emitted_ids.add(adapter.adapter_id)
+                rows.append(adapter)
+        return tuple(rows)
 
     @staticmethod
     def _eligible(adapter: Any, personal_research: bool) -> bool:

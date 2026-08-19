@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import threading
 from typing import Any, Callable, Mapping
 
 from .catalog import build_catalog
@@ -46,6 +47,7 @@ class ProviderRegistry:
             raise ValueError(f"Provider registry IDs missing from Catalog: {', '.join(sorted(unknown))}")
         self._http_factory = http_factory
         self._instances: dict[str, Any] = {}
+        self._instance_lock = threading.RLock()
 
     def available_adapter_ids(self) -> tuple[str, ...]:
         return tuple(sorted(_FACTORIES))
@@ -55,13 +57,14 @@ class ProviderRegistry:
         factory = _FACTORIES.get(normalized)
         if factory is None:
             raise KeyError(f"unknown provider adapter: {normalized}")
-        if normalized not in self._instances:
-            module = importlib.import_module(factory.module_name)
-            adapter_type = getattr(module, factory.class_name)
-            kwargs = {"http": self._http_factory()} if factory.requires_http else {}
-            adapter = adapter_type(**kwargs)
-            descriptor = getattr(adapter, "descriptor", None)
-            if getattr(descriptor, "adapter_id", None) != normalized:
-                raise ValueError(f"Provider implementation does not match Catalog adapter: {normalized}")
-            self._instances[normalized] = adapter
-        return self._instances[normalized]
+        with self._instance_lock:
+            if normalized not in self._instances:
+                module = importlib.import_module(factory.module_name)
+                adapter_type = getattr(module, factory.class_name)
+                kwargs = {"http": self._http_factory()} if factory.requires_http else {}
+                adapter = adapter_type(**kwargs)
+                descriptor = getattr(adapter, "descriptor", None)
+                if getattr(descriptor, "adapter_id", None) != normalized:
+                    raise ValueError(f"Provider implementation does not match Catalog adapter: {normalized}")
+                self._instances[normalized] = adapter
+            return self._instances[normalized]

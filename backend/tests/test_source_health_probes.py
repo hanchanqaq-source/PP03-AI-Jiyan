@@ -379,3 +379,61 @@ def test_data_source_adapter_probe_keeps_catalog_only_as_a_non_connection_barrie
     assert result["error_type"] == "none"
     assert result["connection_status"] == "catalog_only"
     assert result["final_reference"] is None
+
+
+@pytest.mark.parametrize(
+    ("adapter_status", "expected_error_type"),
+    [
+        ("schema_changed", "schema_changed"),
+        ("rate_limited", "rate_limit"),
+        ("authentication", "authentication"),
+        ("optional_dependency_unavailable", "unknown"),
+        ("timeout", "timeout"),
+        ("unavailable_upstream", "unknown"),
+    ],
+)
+def test_data_source_adapter_probe_maps_known_returned_statuses_without_leaking_raw_messages(
+    adapter_status,
+    expected_error_type,
+):
+    class Descriptor:
+        adapter_id = "test-adapter"
+        adapter_name = "Test adapter"
+        configured_reference = "https://public.example.test/?token=redact-me"
+
+    class Adapter:
+        descriptor = Descriptor()
+
+        def probe(self, _capability_id):
+            return {
+                "status": adapter_status,
+                "connected": False,
+                "error_message": "token=redact-me C:\\private\\trace.log",
+            }
+
+    result = probe_data_source_adapter(Adapter(), "test")
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == expected_error_type
+    assert "redact-me" not in result["error_message_redacted"]
+    assert "private" not in result["error_message_redacted"].lower()
+
+
+@pytest.mark.parametrize("adapter_status", ["catalog_only", "disabled", "license_required", "unconfigured"])
+def test_data_source_adapter_probe_keeps_non_connection_barriers_out_of_failure_taxonomy(adapter_status):
+    class Descriptor:
+        adapter_id = "test-adapter"
+        adapter_name = "Test adapter"
+        configured_reference = "https://public.example.test/"
+
+    class Adapter:
+        descriptor = Descriptor()
+
+        def probe(self, _capability_id):
+            return {"status": adapter_status, "connected": False}
+
+    result = probe_data_source_adapter(Adapter(), "test")
+
+    assert result["status"] == "partial"
+    assert result["error_type"] == "none"
+    assert result["error_message_redacted"] == ""

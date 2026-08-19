@@ -19,6 +19,20 @@ _BARRIER_STATUSES = {
     "unexamined",
 }
 
+_RETURNED_STATUS_ERROR_TYPES = {
+    "authentication": "authentication",
+    "connection": "connection",
+    "dns": "dns",
+    "empty_payload": "empty_payload",
+    "http": "http",
+    "parse": "parse",
+    "rate_limited": "rate_limit",
+    "schema_changed": "schema_changed",
+    "stale_data": "stale_data",
+    "timeout": "timeout",
+    "tls": "tls",
+}
+
 
 def _reference(value: object) -> str | None:
     try:
@@ -72,7 +86,7 @@ def probe_data_source_adapter(adapter: Any, capability_id: str) -> dict[str, Any
     elif barrier:
         status, error_type, completeness = "partial", "none", None
     else:
-        status, error_type, completeness = "failure", "unknown", 0.0
+        status, error_type, completeness = "failure", _RETURNED_STATUS_ERROR_TYPES.get(connection_status, "unknown"), 0.0
     observed_reference = _reference(raw.get("final_reference") or raw.get("observed_final_reference")) if connected else None
     return {
         "status": status,
