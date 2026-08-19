@@ -6,7 +6,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 import re
 
-from data_sources.budgets import BudgetDecision
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
@@ -21,8 +20,6 @@ _MAX_TEXT = 4_096
 _MAX_NUMBER_TEXT = 128
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _ROUTE = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+){0,8}$")
-_CACHEABLE = {"timeout", "tls", "dns", "connection", "server_error", "rate_limited"}
-_SENSITIVE_RESERVATION_MARKERS = ("api_key", "bearer", "credential", "password", "secret", "token")
 
 
 def _now() -> datetime:
@@ -78,33 +75,6 @@ def _max_age(parameters: Mapping[str, object]) -> int | None:
     return value
 
 
-def _budget_snapshot(decision: object, expected_cost: Decimal) -> tuple[bool, str]:
-    if type(decision) is not BudgetDecision:
-        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-    try:
-        snapshot = decision.to_dict()
-    except Exception:
-        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
-    if (
-        type(snapshot) is not dict
-        or set(snapshot) != {"allowed", "reason", "reservation_id", "estimated_cost", "health_failure"}
-        or type(snapshot["allowed"]) is not bool
-        or type(snapshot["reason"]) is not str
-        or (snapshot["reservation_id"] is not None and type(snapshot["reservation_id"]) is not str)
-        or type(snapshot["estimated_cost"]) is not str
-        or type(snapshot["health_failure"]) is not bool
-        or snapshot["estimated_cost"] != format(expected_cost, "f")
-        or snapshot["health_failure"] is not False
-        or snapshot["allowed"] is not (snapshot["reason"] == "authorized")
-        or (not snapshot["allowed"] and snapshot["reservation_id"] is not None)
-    ):
-        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-    reservation_id = snapshot["reservation_id"]
-    if reservation_id is not None and any(marker in reservation_id.lower() for marker in _SENSITIVE_RESERVATION_MARKERS):
-        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-    return snapshot["allowed"], snapshot["reason"]
-
-
 _TRUSTED_FREE_KEY_DESCRIPTOR = AdapterDescriptor(
     "eia", "U.S. EIA", "eia", "http_client", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK),
     ("macro_series",), BillingModel.FREE_KEY, "api_key", (_ENV_NAME,), False,
@@ -139,18 +109,8 @@ class EiaAdapter(BaseProvider):
             return None
         return value if type(value) is str and value.strip() else None
 
-    def _authorize(self, now: datetime) -> str | None:
-        if self._budget_guard is None:
-            return None if self.descriptor is _TRUSTED_FREE_KEY_DESCRIPTOR else "budget_guard_unavailable"
-        try:
-            decision = self._budget_guard.authorize(self.descriptor, estimated_cost=Decimal("0"), now=now)
-        except Exception:
-            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
-        allowed, reason = _budget_snapshot(decision, Decimal("0"))
-        return None if allowed else reason
-
     @staticmethod
-    def _request(request: ProviderRequest) -> tuple[str, dict[str, object], int | None]:
+    def _validate_request(request: ProviderRequest) -> None:
         if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if request.capability_id != "macro_series":
@@ -160,15 +120,26 @@ class EiaAdapter(BaseProvider):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if type(series_id) is not str or not _IDENTIFIER.fullmatch(series_id):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        params: dict[str, object] = {"frequency": "monthly", "data[0]": "value", "facets[series][]": series_id}
-        for source, target in (("start", "start"), ("end", "end")):
+        for source in ("start", "end"):
             value = request.parameters.get(source)
             if value is not None:
                 if type(value) is not str or len(value) > 32:
                     raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-                params[target] = value
-        if "start" in params and "end" in params and params["start"] > params["end"]:
+        start = request.parameters.get("start")
+        end = request.parameters.get("end")
+        if start is not None and end is not None and start > end:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        _max_age(request.parameters)
+
+    @staticmethod
+    def _request(request: ProviderRequest) -> tuple[str, dict[str, object], int | None]:
+        EiaAdapter._validate_request(request)
+        route = request.parameters["route"]
+        series_id = request.parameters["series_id"]
+        params: dict[str, object] = {"frequency": "monthly", "data[0]": "value", "facets[series][]": series_id}
+        for source in ("start", "end"):
+            if request.parameters.get(source) is not None:
+                params[source] = request.parameters[source]
         return route, params, _max_age(request.parameters)
 
     @staticmethod
@@ -232,50 +203,25 @@ class EiaAdapter(BaseProvider):
             rows.append(ProviderValue(value, "eia", "eia", request.capability_id, as_of, now, status, "EIA public API terms apply", 20, None, raw_unit or "unknown", raw_frequency, metadata))
         return tuple(rows)
 
-    def _execute(self, request: ProviderRequest, credential: str, now: datetime) -> tuple[ProviderValue, ...]:
-        route, params, max_age_days = self._request(request)
-        transport_params = dict(params)
-        transport_params["api_key"] = credential
-        try:
-            payload = self._http.get_json(f"{_REFERENCE}{route}/data/", headers={"Accept": "application/json"}, params=transport_params)
-        except ProviderUnavailable as error:
-            if self._cache_getter is None or error.code not in _CACHEABLE:
-                raise
-            cached = self._cache_getter(request)
-            if cached is None:
-                raise
-            return self._parse(cached, request, now=now, max_age_days=max_age_days, cached=True)
-        return self._parse(payload, request, now=now, max_age_days=max_age_days, cached=False)
-
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         credential = self._credential()
         if credential is None:
             raise ProviderUnavailable("unconfigured", reference=_REFERENCE)
-        now = self._fetched_at()
-        blocked = self._authorize(now)
-        if blocked is not None:
-            raise ProviderUnavailable(blocked, reference=_REFERENCE)
-        return self._execute(request, credential, now)
+        self._validate_request(request)
+        del credential
+        raise ProviderUnavailable("unsupported_credential_transport", reference=_REFERENCE)
 
     def probe(self, capability_id: str, *, parameters: Mapping[str, object] | None = None) -> Mapping[str, object]:
         credential = self._credential()
         if credential is None:
             return {"status": "unconfigured", "connected": False, "health_failure": False}
-        now = self._fetched_at()
-        blocked = self._authorize(now)
-        if blocked is not None:
-            return {"status": blocked, "connected": False, "health_failure": False}
         request = ProviderRequest(capability_id, {"route": "electricity/retail-sales", "series_id": "RES-ALL-M"} if parameters is None else parameters)
         try:
-            rows = self._execute(request, credential, now)
-        except ProviderRateLimited as error:
-            return {"status": "rate_limited", "connected": False, "health_failure": False, "retry_after_seconds": error.retry_after_seconds}
-        except ProviderSchemaChanged:
-            return {"status": "schema_changed", "connected": False, "health_failure": True}
+            self._validate_request(request)
         except ProviderUnavailable as error:
-            status = "authentication_failed" if error.code == "authentication" else error.code
-            return {"status": status, "connected": False, "health_failure": error.code not in {"authentication", "empty_result", "unconfigured", "disabled"}}
-        return {"status": "available", "connected": True, "health_failure": False, "returned_count": len(rows)}
+            return {"status": error.code, "connected": False, "health_failure": False}
+        del credential
+        return {"status": "unsupported_credential_transport", "connected": False, "health_failure": False, "capability_id": capability_id}
 
 
 __all__ = ["EiaAdapter"]
