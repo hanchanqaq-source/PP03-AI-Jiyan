@@ -243,6 +243,7 @@ class SafeHttpClient:
         )
         return (
             normalized in _GENERIC_SENSITIVE_HEADERS
+            or (normalized.startswith("xauth") and normalized.endswith("key"))
             or any(term in normalized for term in _SENSITIVE_HEADER_TERMS)
         )
 

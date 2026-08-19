@@ -1,10 +1,12 @@
 # A2-W1 Phase 2 Task 7 — free Provider and connector matrix
 
-This qualification is fixed to `08b4b72ab41be9c513824e118010e9ddcf617fb3`
-before the Task 7 documentation/safety-fix commit. `registered` / Catalog
-state, connector implementation, optional dependency availability, and
-`connected` are deliberately separate. Connected means one successful bounded
-public request; it is neither finance truth nor evidence admission.
+Task 6's corrected audit-data point is
+`08b4b72ab41be9c513824e118010e9ddcf617fb3`. Task 7 qualification code/tests
+base is `547b2a72c1312f6f853edc81e9b091d67cf91df2`; the final qualification
+HEAD is this document's commit. `registered` / Catalog state, connector
+implementation, optional dependency availability, and `connected` are
+deliberately separate. Connected means one successful bounded public request;
+it is neither finance truth nor evidence admission.
 
 | Adapter | Family | Catalog state | Task 6 observation | Connected | Qualification boundary |
 | --- | --- | --- | --- | --- | --- |
