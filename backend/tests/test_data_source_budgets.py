@@ -19,6 +19,25 @@ from data_sources.usage_store import UsageStore
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
 
 
+class _SpoofedIdentifier(str):
+    def __hash__(self) -> int:
+        return hash("paid-test")
+
+    def __eq__(self, other: object) -> bool:
+        return other in {"paid-test", "other-id"}
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class _CustomMapping(dict):
+    pass
+
+
+class _SpoofedInteger(int):
+    pass
+
+
 def _adapter(adapter_id: str = "paid-test", billing_model: BillingModel = BillingModel.PAID_API):
     return _trusted_adapter(adapter_id, billing_model)
 
@@ -426,3 +445,70 @@ def test_guard_snapshots_descriptor_primitives_against_object_setattr_mutation(t
     )
     assert unchanged.allowed is False
     assert unchanged.reason == "free_only"
+
+
+def test_budget_policy_rejects_custom_string_adapter_identity():
+    with pytest.raises(BudgetValidationError):
+        _policy(adapter_id=_SpoofedIdentifier("paid-test"))
+
+
+def test_guard_rejects_custom_mapping_and_mapping_key_before_hash_or_equality(tmp_path):
+    descriptor = _trusted_adapter()
+    policy = _policy()
+
+    with pytest.raises(BudgetValidationError):
+        BudgetGuard(
+            UsageStore(tmp_path / "custom-map"),
+            _CustomMapping({"paid-test": policy}),
+            trusted_adapters={"paid-test": descriptor},
+        )
+
+    with pytest.raises(BudgetValidationError):
+        BudgetGuard(
+            UsageStore(tmp_path / "custom-key"),
+            {_SpoofedIdentifier("paid-test"): policy},
+            trusted_adapters={"paid-test": descriptor},
+        )
+
+
+def test_guard_rejects_descriptor_with_custom_string_identity(tmp_path):
+    descriptor = _trusted_adapter()
+    object.__setattr__(descriptor, "adapter_id", _SpoofedIdentifier("paid-test"))
+
+    with pytest.raises(BudgetValidationError):
+        BudgetGuard(
+            UsageStore(tmp_path / "data"),
+            {"paid-test": _policy()},
+            trusted_adapters={"paid-test": descriptor},
+        )
+
+
+def test_budget_decision_rejects_custom_reason_and_reservation_strings():
+    with pytest.raises(BudgetValidationError):
+        BudgetDecision(
+            False, _SpoofedIdentifier("authorized"), None, Decimal("0")
+        )
+    with pytest.raises(BudgetValidationError):
+        BudgetDecision(
+            True, "authorized", _SpoofedIdentifier("paid-test"), Decimal("0")
+        )
+
+
+def test_guard_rejects_descriptor_integer_subclass_before_identity_snapshot(tmp_path):
+    descriptor = _trusted_adapter()
+    object.__setattr__(descriptor, "current_provider_priority", _SpoofedInteger(10))
+
+    with pytest.raises(BudgetValidationError):
+        BudgetGuard(
+            UsageStore(tmp_path / "data"),
+            {"paid-test": _policy()},
+            trusted_adapters={"paid-test": descriptor},
+        )
+
+
+def test_budget_decision_revalidates_exact_string_type_when_serialized():
+    decision = BudgetDecision(False, "free_only", None, Decimal("0"))
+    object.__setattr__(decision, "reason", _SpoofedIdentifier("free_only"))
+
+    with pytest.raises(BudgetValidationError):
+        decision.to_dict()

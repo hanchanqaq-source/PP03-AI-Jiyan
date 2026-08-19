@@ -73,7 +73,7 @@ def _validate_decimal(value: object, field: str) -> Decimal:
         raise UsageValidationError(f"{field} must be a finite non-negative Decimal")
     sign, digits, exponent = value.as_tuple()
     if (
-        not isinstance(exponent, int)
+        type(exponent) is not int
         or exponent < -_MAX_DECIMAL_PLACES
         or exponent > _MAX_DECIMAL_POSITIVE_EXPONENT
         or len(digits) > _MAX_DECIMAL_DIGITS
@@ -89,23 +89,23 @@ def _decimal_text(value: Decimal) -> str:
 
 
 def _validate_identifier(value: object, field: str) -> str:
-    if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
+    if type(value) is not str or not _SAFE_IDENTIFIER.fullmatch(value):
         raise UsageValidationError(f"{field} is invalid")
     if field == "reservation_id" and any(marker in value.lower() for marker in _CREDENTIAL_TERMS):
         raise UsageValidationError(f"{field} is invalid")
-    return value
+    return value.encode("utf-8").decode("utf-8")
 
 
 def _validate_status(value: object) -> str:
-    if not isinstance(value, str) or not _SAFE_STATUS.fullmatch(value):
+    if type(value) is not str or not _SAFE_STATUS.fullmatch(value):
         raise UsageValidationError("status is invalid")
     if any(marker in value.lower() for marker in _CREDENTIAL_TERMS) or value == "reserved":
         raise UsageValidationError("status is invalid")
-    return value
+    return value.encode("utf-8").decode("utf-8")
 
 
 def _utc_datetime(value: object, field: str = "now") -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise UsageValidationError(f"{field} must be a timezone-aware datetime")
     try:
         return value.astimezone(timezone.utc)
@@ -119,7 +119,7 @@ def _timestamp_text(value: datetime) -> str:
 
 def _parse_timestamp(value: object, field: str) -> datetime:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) > _MAX_TIMESTAMP_LENGTH
         or not value.endswith("Z")
     ):
@@ -134,7 +134,7 @@ def _parse_timestamp(value: object, field: str) -> datetime:
 
 
 def _parse_decimal_text(value: object, field: str) -> Decimal:
-    if not isinstance(value, str) or not value or len(value) > _MAX_DECIMAL_TEXT_LENGTH:
+    if type(value) is not str or not value or len(value) > _MAX_DECIMAL_TEXT_LENGTH:
         raise UsageValidationError(f"{field} must be a decimal string")
     try:
         parsed = Decimal(value)
@@ -159,8 +159,8 @@ class UsageRecord:
     units: Decimal
 
     def __post_init__(self) -> None:
-        _validate_identifier(self.reservation_id, "reservation_id")
-        _validate_identifier(self.adapter_id, "adapter_id")
+        object.__setattr__(self, "reservation_id", _validate_identifier(self.reservation_id, "reservation_id"))
+        object.__setattr__(self, "adapter_id", _validate_identifier(self.adapter_id, "adapter_id"))
         authorized_at = _utc_datetime(self.authorized_at, "authorized_at")
         recorded_at = (
             None if self.recorded_at is None else _utc_datetime(self.recorded_at, "recorded_at")
@@ -169,24 +169,31 @@ class UsageRecord:
         if self.actual_cost is not None:
             _validate_decimal(self.actual_cost, "actual_cost")
         if (
-            isinstance(self.request_count, bool)
-            or not isinstance(self.request_count, int)
+            type(self.request_count) is not int
             or self.request_count < 0
             or self.request_count > _MAX_REQUEST_COUNT
         ):
             raise UsageValidationError("request_count is invalid")
         _validate_decimal(self.units, "units")
         if self.actual_cost is None:
-            if recorded_at is not None or self.request_count != 0 or self.status != "reserved" or self.units != 0:
+            if (
+                recorded_at is not None
+                or self.request_count != 0
+                or type(self.status) is not str
+                or self.status != "reserved"
+                or self.units != 0
+            ):
                 raise UsageValidationError("open reservation state is invalid")
+            object.__setattr__(self, "status", "reserved")
         else:
-            _validate_status(self.status)
+            object.__setattr__(self, "status", _validate_status(self.status))
             if recorded_at is None or recorded_at < authorized_at:
                 raise UsageValidationError("reconciled timestamp is invalid")
         object.__setattr__(self, "authorized_at", authorized_at)
         object.__setattr__(self, "recorded_at", recorded_at)
 
     def to_dict(self) -> dict[str, object]:
+        self.__post_init__()
         return {
             "reservation_id": self.reservation_id,
             "adapter_id": self.adapter_id,
@@ -201,7 +208,10 @@ class UsageRecord:
 
     @classmethod
     def from_dict(cls, value: object) -> "UsageRecord":
-        if not isinstance(value, Mapping) or set(value) != _RECORD_FIELDS:
+        if type(value) is not dict:
+            raise UsageValidationError("usage record schema is invalid")
+        keys = tuple(value.keys())
+        if any(type(key) is not str for key in keys) or set(keys) != _RECORD_FIELDS:
             raise UsageValidationError("usage record schema is invalid")
         reservation_id = _validate_identifier(value["reservation_id"], "reservation_id")
         adapter_id = _validate_identifier(value["adapter_id"], "adapter_id")
@@ -213,8 +223,7 @@ class UsageRecord:
         actual_cost = None if actual_raw is None else _parse_decimal_text(actual_raw, "actual_cost")
         request_count = value["request_count"]
         if (
-            isinstance(request_count, bool)
-            or not isinstance(request_count, int)
+            type(request_count) is not int
             or request_count < 0
             or request_count > _MAX_REQUEST_COUNT
         ):
@@ -247,24 +256,26 @@ class UsageSummary:
     monthly_units: Decimal
 
     def __post_init__(self) -> None:
-        _validate_identifier(self.adapter_id, "adapter_id")
-        if not isinstance(self.day, str) or not _SAFE_DAY.fullmatch(self.day):
+        object.__setattr__(self, "adapter_id", _validate_identifier(self.adapter_id, "adapter_id"))
+        if type(self.day) is not str or not _SAFE_DAY.fullmatch(self.day):
             raise UsageValidationError("summary day is invalid")
-        if not isinstance(self.month, str) or not _SAFE_MONTH.fullmatch(self.month):
+        if type(self.month) is not str or not _SAFE_MONTH.fullmatch(self.month):
             raise UsageValidationError("summary month is invalid")
+        object.__setattr__(self, "day", self.day.encode("utf-8").decode("utf-8"))
+        object.__setattr__(self, "month", self.month.encode("utf-8").decode("utf-8"))
         for field in ("daily_cost", "monthly_cost", "daily_units", "monthly_units"):
             object.__setattr__(self, field, _validate_decimal(getattr(self, field), field))
         for field in ("daily_request_count", "monthly_request_count"):
             value = getattr(self, field)
             if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
+                type(value) is not int
                 or value < 0
                 or value > _MAX_REQUEST_COUNT * _MAX_RECORDS
             ):
                 raise UsageValidationError(f"{field} is invalid")
 
     def to_dict(self) -> dict[str, object]:
+        self.__post_init__()
         return {
             "adapter_id": self.adapter_id,
             "day": self.day,
@@ -295,7 +306,7 @@ class UsageStore:
                 if configured and configured.strip()
                 else Path(os.environ.get("USERPROFILE") or Path.home()) / ".vibe-research"
             )
-        if isinstance(lock_timeout_seconds, bool) or not isinstance(lock_timeout_seconds, (int, float)):
+        if type(lock_timeout_seconds) not in (int, float):
             raise UsageValidationError("lock timeout is invalid")
         try:
             timeout = float(lock_timeout_seconds)
@@ -304,8 +315,7 @@ class UsageStore:
         if not math.isfinite(timeout) or timeout <= 0:
             raise UsageValidationError("lock timeout is invalid")
         if (
-            isinstance(max_ledger_bytes, bool)
-            or not isinstance(max_ledger_bytes, int)
+            type(max_ledger_bytes) is not int
             or max_ledger_bytes <= 0
             or max_ledger_bytes > _MAX_LEDGER_BYTES
         ):
@@ -437,10 +447,6 @@ class UsageStore:
                 os.close(descriptor)
             except OSError:
                 pass
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
             if isinstance(exc, UsageStoreError):
                 raise
             raise UsageStoreError("usage ledger could not be written") from None
@@ -457,10 +463,11 @@ class UsageStore:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise UsageStoreError("usage ledger is corrupt") from None
         if (
-            not isinstance(document, Mapping)
+            type(document) is not dict
             or set(document) != {"version", "records"}
+            or type(document.get("version")) is not int
             or document.get("version") != _LEDGER_VERSION
-            or not isinstance(document.get("records"), list)
+            or type(document.get("records")) is not list
         ):
             raise UsageStoreError("usage ledger schema is invalid")
         if len(document["records"]) > _MAX_RECORDS:
@@ -581,8 +588,7 @@ class UsageStore:
         normalized_reservation = _validate_identifier(reservation_id, "reservation_id")
         actual = _validate_decimal(actual_cost, "actual_cost")
         if (
-            isinstance(request_count, bool)
-            or not isinstance(request_count, int)
+            type(request_count) is not int
             or request_count < 0
             or request_count > _MAX_REQUEST_COUNT
         ):

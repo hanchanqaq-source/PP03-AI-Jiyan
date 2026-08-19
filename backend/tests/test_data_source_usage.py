@@ -27,6 +27,25 @@ from data_sources.usage_store import (
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
 
 
+class _SpoofedText(str):
+    def __hash__(self) -> int:
+        return hash("paid-test")
+
+    def __eq__(self, other: object) -> bool:
+        return other in {"paid-test", "other-id", "succeeded"}
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class _SpoofedInt(int):
+    pass
+
+
+class _CustomRecordMapping(dict):
+    pass
+
+
 @pytest.fixture
 def store(tmp_path) -> UsageStore:
     return UsageStore(tmp_path / "data", lock_timeout_seconds=0.05)
@@ -84,6 +103,35 @@ def test_reservation_identifier_cannot_smuggle_credential_markers(
 ):
     with pytest.raises(UsageValidationError):
         _reserve(store, reservation_id=reservation_id)
+
+    assert not store.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adapter_id", _SpoofedText("paid-test")),
+        ("reservation_id", _SpoofedText("reservation-1")),
+    ],
+)
+def test_usage_reservation_rejects_custom_string_identities(
+    store: UsageStore, field: str, value: str
+):
+    arguments: dict[str, object] = {
+        "adapter_id": "paid-test",
+        "estimated_cost": Decimal("0.10"),
+        "daily_budget": Decimal("1.00"),
+        "monthly_budget": Decimal("5.00"),
+        "now": NOW,
+        "reservation_id": "reservation-1",
+    }
+    arguments[field] = value
+
+    with pytest.raises(UsageValidationError):
+        store.reserve(
+            arguments.pop("adapter_id"),
+            **arguments,
+        )
 
     assert not store.path.exists()
 
@@ -260,6 +308,82 @@ def test_reconcile_rejects_unsafe_status_or_units(store: UsageStore, field: str,
 
     with pytest.raises(UsageValidationError):
         store.reconcile("paid-test", **arguments)
+
+
+def test_reconcile_rejects_custom_status_and_integer_subclasses(store: UsageStore):
+    _reserve(store)
+    base: dict[str, object] = {
+        "reservation_id": "reservation-1",
+        "actual_cost": Decimal("0.10"),
+        "request_count": 1,
+        "status": "succeeded",
+        "units": Decimal("1"),
+        "now": NOW + timedelta(seconds=1),
+    }
+
+    with pytest.raises(UsageValidationError):
+        store.reconcile(
+            "paid-test", **{**base, "status": _SpoofedText("succeeded")}
+        )
+    with pytest.raises(UsageValidationError):
+        store.reconcile(
+            "paid-test", **{**base, "request_count": _SpoofedInt(1)}
+        )
+
+
+def test_usage_record_parser_rejects_custom_mapping_before_key_equality():
+    row = _CustomRecordMapping(
+        {
+            "reservation_id": "reservation-1",
+            "adapter_id": "paid-test",
+            "authorized_at": "2026-08-19T12:00:00Z",
+            "recorded_at": None,
+            "estimated_cost": "0.10",
+            "actual_cost": None,
+            "request_count": 0,
+            "status": "reserved",
+            "units": "0",
+        }
+    )
+
+    with pytest.raises(UsageValidationError):
+        UsageRecord.from_dict(row)
+
+
+def test_usage_record_revalidates_exact_scalar_types_when_serialized():
+    record = UsageRecord(
+        reservation_id="reservation-1",
+        adapter_id="paid-test",
+        authorized_at=NOW,
+        recorded_at=NOW + timedelta(seconds=1),
+        estimated_cost=Decimal("0.10"),
+        actual_cost=Decimal("0.10"),
+        request_count=1,
+        status="succeeded",
+        units=Decimal("1"),
+    )
+    object.__setattr__(record, "status", _SpoofedText("succeeded"))
+
+    with pytest.raises(UsageValidationError):
+        record.to_dict()
+
+
+def test_usage_summary_revalidates_exact_scalar_types_when_serialized():
+    summary = UsageSummary(
+        adapter_id="paid-test",
+        day="2026-08-19",
+        month="2026-08",
+        daily_cost=Decimal("0.10"),
+        monthly_cost=Decimal("0.10"),
+        daily_request_count=1,
+        monthly_request_count=1,
+        daily_units=Decimal("1"),
+        monthly_units=Decimal("1"),
+    )
+    object.__setattr__(summary, "daily_request_count", _SpoofedInt(1))
+
+    with pytest.raises(UsageValidationError):
+        summary.to_dict()
 
 
 @pytest.mark.parametrize("now", [datetime(2026, 8, 19, 12, 0), "2026-08-19T12:00:00Z", None])
@@ -503,19 +627,79 @@ def test_unknown_or_secret_bearing_fields_in_ledger_fail_closed(store: UsageStor
     assert "secret-value" not in repr(store)
 
 
-def test_atomic_replace_failure_preserves_existing_ledger_and_removes_temp(store: UsageStore, monkeypatch: pytest.MonkeyPatch):
+def test_atomic_replace_failure_preserves_existing_ledger_and_leaves_temp_without_unlink(
+    store: UsageStore, monkeypatch: pytest.MonkeyPatch
+):
     _reserve(store)
     original = store.path.read_bytes()
 
     def fail_replace(_source, _destination):
         raise OSError("simulated replacement failure")
 
+    def forbidden_unlink(_path, *_args, **_kwargs):
+        raise AssertionError("failed-write path must not unlink an unowned pathname")
+
     monkeypatch.setattr("data_sources.usage_store.os.replace", fail_replace)
+    monkeypatch.setattr("data_sources.usage_store.Path.unlink", forbidden_unlink)
     with pytest.raises(UsageStoreError):
         _reserve(store, reservation_id="reservation-2")
 
     assert store.path.read_bytes() == original
-    assert list(store.path.parent.glob(".usage.*.tmp")) == []
+    assert len(list(store.path.parent.glob(".usage.*.tmp"))) == 1
+
+
+def test_replace_race_foreign_regular_file_remains_after_failure(
+    store: UsageStore, monkeypatch: pytest.MonkeyPatch
+):
+    _reserve(store)
+    captured: list[Path] = []
+
+    def replace_with_foreign(source, _destination):
+        candidate = Path(source)
+        candidate.unlink()
+        candidate.write_text("foreign replacement", encoding="utf-8")
+        captured.append(candidate)
+        raise PermissionError("simulated replacement race")
+
+    monkeypatch.setattr("data_sources.usage_store.os.replace", replace_with_foreign)
+
+    with pytest.raises(UsageStoreError):
+        _reserve(store, reservation_id="reservation-2")
+
+    assert len(captured) == 1
+    assert captured[0].read_text(encoding="utf-8") == "foreign replacement"
+
+
+def test_fsync_failure_leaves_current_temp_path_for_operator_cleanup(
+    store: UsageStore, monkeypatch: pytest.MonkeyPatch
+):
+    def fail_fsync(_descriptor):
+        raise PermissionError("simulated fsync denial")
+
+    monkeypatch.setattr("data_sources.usage_store.os.fsync", fail_fsync)
+
+    with pytest.raises(UsageStoreError):
+        _reserve(store)
+
+    assert len(list(store.path.parent.glob(".usage.*.tmp"))) == 1
+
+
+def test_successful_atomic_replace_consumes_its_temp_path(
+    store: UsageStore, monkeypatch: pytest.MonkeyPatch
+):
+    original_replace = os.replace
+    sources: list[Path] = []
+
+    def capture_replace(source, destination):
+        sources.append(Path(source))
+        original_replace(source, destination)
+
+    monkeypatch.setattr("data_sources.usage_store.os.replace", capture_replace)
+
+    _reserve(store)
+
+    assert len(sources) == 1
+    assert not sources[0].exists()
 
 
 @pytest.mark.parametrize("mode,attributes", [(stat.S_IFLNK, 0), (stat.S_IFDIR, 0x400)])
