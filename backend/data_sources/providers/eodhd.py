@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -67,10 +66,6 @@ def _request_date(value: object) -> str:
     return value
 
 
-def _context_seal(*parts: object) -> str:
-    return hashlib.sha256("\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class _EodhdRequestContext:
     adapter_id: str
@@ -80,24 +75,6 @@ class _EodhdRequestContext:
     end_date: date
     max_age_days: int | None
     period: str
-    seal: str
-
-
-def _validated_context(value: object) -> _EodhdRequestContext:
-    if type(value) is not _EodhdRequestContext:
-        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
-    if (
-        type(value.adapter_id) is not str or value.adapter_id != "eodhd"
-        or type(value.capability_id) is not str or value.capability_id != "stock_history"
-        or type(value.symbol) is not str or not _SYMBOL.fullmatch(value.symbol)
-        or type(value.start_date) is not date or type(value.end_date) is not date or value.start_date > value.end_date
-        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
-        or type(value.period) is not str or value.period != "d"
-        or type(value.seal) is not str
-        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.period)
-    ):
-        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
-    return value
 
 
 class EodhdAdapter(BaseProvider):
@@ -124,7 +101,9 @@ class EodhdAdapter(BaseProvider):
 
     @staticmethod
     def _context(request: ProviderRequest) -> _EodhdRequestContext:
-        if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
+        if type(request) is not ProviderRequest:
+            raise TypeError("exact ProviderRequest required")
+        if type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "max_age_days"}):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
@@ -139,14 +118,11 @@ class EodhdAdapter(BaseProvider):
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         period = "d"
-        return _EodhdRequestContext(
-            "eodhd", request.capability_id, symbol, start, end, max_age, period,
-            _context_seal("eodhd", request.capability_id, symbol, start.isoformat(), end.isoformat(), max_age, period),
-        )
+        return _EodhdRequestContext("eodhd", request.capability_id, symbol, start, end, max_age, period)
 
     @staticmethod
-    def _request(context: _EodhdRequestContext) -> tuple[str, dict[str, str]]:
-        context = _validated_context(context)
+    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+        context = EodhdAdapter._context(request)
         return _ENDPOINT, {
             "symbol": context.symbol,
             "from": context.start_date.isoformat(),
@@ -156,8 +132,8 @@ class EodhdAdapter(BaseProvider):
         }
 
     @staticmethod
-    def _parse(payload: object, context: _EodhdRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        context = _validated_context(context)
+    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = EodhdAdapter._context(request)
         now = _utc_now(now)
         if type(payload) is not list:
             raise _schema()
@@ -170,8 +146,14 @@ class EodhdAdapter(BaseProvider):
         for item in payload:
             if type(item) is not dict:
                 raise _schema()
-            symbol, raw_date = item.get("code"), item.get("date")
-            if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or symbol != context.symbol or type(raw_date) is not str:
+            raw_date = item.get("date")
+            if "code" not in item or item["code"] is None:
+                symbol = context.symbol
+            else:
+                symbol = item["code"]
+                if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or symbol != context.symbol:
+                    raise _schema()
+            if type(raw_date) is not str:
                 raise _schema()
             try:
                 as_of = date.fromisoformat(raw_date)

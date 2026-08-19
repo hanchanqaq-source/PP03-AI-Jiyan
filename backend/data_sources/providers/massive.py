@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -69,10 +68,6 @@ def _iso_date(value: object) -> date:
         raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE) from None
 
 
-def _context_seal(*parts: object) -> str:
-    return hashlib.sha256("\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class _MassiveRequestContext:
     adapter_id: str
@@ -82,24 +77,6 @@ class _MassiveRequestContext:
     end_date: date
     max_age_days: int | None
     adjusted: bool
-    seal: str
-
-
-def _validated_context(value: object) -> _MassiveRequestContext:
-    if type(value) is not _MassiveRequestContext:
-        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
-    if (
-        type(value.adapter_id) is not str or value.adapter_id != "massive"
-        or type(value.capability_id) is not str or value.capability_id != "stock_history"
-        or type(value.symbol) is not str or not _SYMBOL.fullmatch(value.symbol)
-        or type(value.start_date) is not date or type(value.end_date) is not date or value.start_date > value.end_date
-        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
-        or type(value.adjusted) is not bool or value.adjusted is not True
-        or type(value.seal) is not str
-        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.adjusted)
-    ):
-        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
-    return value
 
 
 class MassiveAdapter(BaseProvider):
@@ -126,7 +103,9 @@ class MassiveAdapter(BaseProvider):
 
     @staticmethod
     def _context(request: ProviderRequest) -> _MassiveRequestContext:
-        if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
+        if type(request) is not ProviderRequest:
+            raise TypeError("exact ProviderRequest required")
+        if type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "max_age_days"}):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
@@ -139,14 +118,11 @@ class MassiveAdapter(BaseProvider):
         max_age = request.parameters.get("max_age_days")
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return _MassiveRequestContext(
-            "massive", request.capability_id, symbol, start, end, max_age, True,
-            _context_seal("massive", request.capability_id, symbol, start.isoformat(), end.isoformat(), max_age, True),
-        )
+        return _MassiveRequestContext("massive", request.capability_id, symbol, start, end, max_age, True)
 
     @staticmethod
-    def _request(context: _MassiveRequestContext) -> tuple[str, dict[str, str]]:
-        context = _validated_context(context)
+    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+        context = MassiveAdapter._context(request)
         return _ENDPOINT, {
             "symbol": context.symbol,
             "from": context.start_date.isoformat(),
@@ -155,8 +131,8 @@ class MassiveAdapter(BaseProvider):
         }
 
     @staticmethod
-    def _parse(payload: object, context: _MassiveRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        context = _validated_context(context)
+    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = MassiveAdapter._context(request)
         now = _utc_now(now)
         if type(payload) is not dict or type(payload.get("status")) is not str or payload.get("status") != "OK" or type(payload.get("results")) is not list:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -175,9 +151,12 @@ class MassiveAdapter(BaseProvider):
         for item in items:
             if type(item) is not dict:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
-            symbol = _text(item.get("T"), 32)
-            if not _SYMBOL.fullmatch(symbol) or symbol != context.symbol:
-                raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+            if "T" not in item or item["T"] is None:
+                symbol = context.symbol
+            else:
+                symbol = item["T"]
+                if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or symbol != context.symbol:
+                    raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             timestamp = item.get("t")
             if type(timestamp) is not int or not 0 <= timestamp <= 4_102_444_800_000:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)

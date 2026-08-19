@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -69,10 +68,6 @@ def _request_date(value: object) -> str:
     return value
 
 
-def _context_seal(*parts: object) -> str:
-    return hashlib.sha256("\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class _DatabentoRequestContext:
     adapter_id: str
@@ -83,25 +78,6 @@ class _DatabentoRequestContext:
     max_age_days: int | None
     dataset: str
     schema: str
-    seal: str
-
-
-def _validated_context(value: object) -> _DatabentoRequestContext:
-    if type(value) is not _DatabentoRequestContext:
-        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
-    if (
-        type(value.adapter_id) is not str or value.adapter_id != "databento"
-        or type(value.capability_id) is not str or value.capability_id != "stock_history"
-        or type(value.symbol) is not str or not _SYMBOL.fullmatch(value.symbol)
-        or type(value.start_date) is not date or type(value.end_date) is not date or value.start_date > value.end_date
-        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
-        or type(value.dataset) is not str or not _DATASET.fullmatch(value.dataset)
-        or type(value.schema) is not str or not _SCHEMA.fullmatch(value.schema)
-        or type(value.seal) is not str
-        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.dataset, value.schema)
-    ):
-        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
-    return value
 
 
 class DatabentoAdapter(BaseProvider):
@@ -128,7 +104,9 @@ class DatabentoAdapter(BaseProvider):
 
     @staticmethod
     def _context(request: ProviderRequest) -> _DatabentoRequestContext:
-        if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
+        if type(request) is not ProviderRequest:
+            raise TypeError("exact ProviderRequest required")
+        if type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "dataset", "schema", "max_age_days"}):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
@@ -142,14 +120,11 @@ class DatabentoAdapter(BaseProvider):
         max_age = request.parameters.get("max_age_days")
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return _DatabentoRequestContext(
-            "databento", request.capability_id, symbol, start, end, max_age, dataset, schema,
-            _context_seal("databento", request.capability_id, symbol, start.isoformat(), end.isoformat(), max_age, dataset, schema),
-        )
+        return _DatabentoRequestContext("databento", request.capability_id, symbol, start, end, max_age, dataset, schema)
 
     @staticmethod
-    def _request(context: _DatabentoRequestContext) -> tuple[str, dict[str, str]]:
-        context = _validated_context(context)
+    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+        context = DatabentoAdapter._context(request)
         return _ENDPOINT, {
             "dataset": context.dataset,
             "symbols": context.symbol,
@@ -159,8 +134,8 @@ class DatabentoAdapter(BaseProvider):
         }
 
     @staticmethod
-    def _parse(payload: object, context: _DatabentoRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        context = _validated_context(context)
+    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = DatabentoAdapter._context(request)
         now = _utc_now(now)
         if type(payload) is not dict or type(payload.get("metadata")) is not dict or type(payload.get("data")) is not list:
             raise _schema()
@@ -187,14 +162,12 @@ class DatabentoAdapter(BaseProvider):
         for item in items:
             if type(item) is not dict:
                 raise _schema()
-            row_dataset = item.get("dataset")
-            row_schema = item.get("schema")
+            row_dataset, row_schema = item.get("dataset"), item.get("schema")
             if (
-                row_dataset is not None
-                and (type(row_dataset) is not str or row_dataset != context.dataset)
-            ) or (
-                row_schema is not None
-                and (type(row_schema) is not str or row_schema != context.schema)
+                type(row_dataset) is not str
+                or row_dataset != context.dataset
+                or type(row_schema) is not str
+                or row_schema != context.schema
             ):
                 raise _schema()
             symbol, raw_date = item.get("symbol"), item.get("ts_event")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from decimal import Decimal
 import copy
@@ -93,7 +93,17 @@ CASES = (
         "DATABENTO_API_KEY",
         "stock_history",
         {"symbol": "AAPL", "start_date": "2025-07-01", "end_date": "2025-07-01", "dataset": "XNAS.ITCH", "schema": "ohlcv-1d"},
-        {"metadata": {"dataset": "XNAS.ITCH", "schema": "ohlcv-1d"}, "data": [{"symbol": "AAPL", "ts_event": "2025-07-01T00:00:00Z", "close": "123.45", "volume": 1000}]},
+        {
+            "metadata": {"dataset": "XNAS.ITCH", "schema": "ohlcv-1d"},
+            "data": [{
+                "symbol": "AAPL",
+                "dataset": "XNAS.ITCH",
+                "schema": "ohlcv-1d",
+                "ts_event": "2025-07-01T00:00:00Z",
+                "close": "123.45",
+                "volume": 1000,
+            }],
+        },
         {"symbol": "AAPL", "close": Decimal("123.45"), "volume": Decimal("1000")},
         "unknown",
         "daily",
@@ -119,6 +129,16 @@ class HostileDict(dict):
 
 class HostileString(str):
     pass
+
+
+class HostileProviderRequest(ProviderRequest):
+    pass
+
+
+@dataclass(frozen=True)
+class LookalikeProviderRequest:
+    capability_id: str
+    parameters: dict[str, object]
 
 
 class ExplodingBudget:
@@ -150,10 +170,8 @@ def make_adapter(case: PaidCase, *, configured: bool = True, http=None, budget_g
     )
 
 
-def request_context(case: PaidCase, active=None, parameters: dict[str, object] | None = None):
-    provider = active or make_adapter(case)
-    request = ProviderRequest(case.capability_id, dict(case.parameters if parameters is None else parameters))
-    return provider._context(request)
+def provider_request(case: PaidCase, parameters: dict[str, object] | None = None) -> ProviderRequest:
+    return ProviderRequest(case.capability_id, dict(case.parameters if parameters is None else parameters))
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
@@ -209,8 +227,8 @@ def test_paid_adapter_configured_path_fails_closed_before_budget_or_transport(ca
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
 def test_paid_adapter_pure_request_builder_is_fixed_https_bounded_and_secret_free(case: PaidCase):
     active = make_adapter(case)
-    context = request_context(case, active)
-    url, params = active._request(context)
+    request = provider_request(case)
+    url, params = active._request(request)
     serialized = json.dumps({"url": url, "params": params}, sort_keys=True)
 
     assert url.startswith("https://")
@@ -225,7 +243,7 @@ def test_paid_adapter_pure_request_builder_is_fixed_https_bounded_and_secret_fre
 
 def test_paid_provider_request_builders_use_unique_fixed_provider_endpoints():
     urls = {
-        case.adapter_id: make_adapter(case)._request(request_context(case))[0]
+        case.adapter_id: make_adapter(case)._request(provider_request(case))[0]
         for case in CASES
     }
     assert len(set(urls.values())) == len(CASES)
@@ -241,7 +259,7 @@ def test_paid_request_builder_rejects_string_subclass_identity_before_lookup(cas
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
 def test_paid_provider_unique_fixture_parser_preserves_date_unit_currency_source_and_coverage(case: PaidCase):
     active = make_adapter(case)
-    rows = active._parse(case.payload, request_context(case, active), now=NOW, cached=False)
+    rows = active._parse(case.payload, provider_request(case), now=NOW, cached=False)
 
     assert len(rows) == 1
     row = rows[0]
@@ -268,7 +286,7 @@ def test_paid_provider_unique_fixture_parser_preserves_date_unit_currency_source
 def test_paid_provider_parsers_fail_closed_on_empty_schema_and_hostile_container(case: PaidCase, payload: object):
     active = make_adapter(case)
     with pytest.raises((ProviderSchemaChanged, ProviderUnavailable)):
-        active._parse(payload, request_context(case, active), now=NOW, cached=False)
+        active._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
@@ -286,14 +304,14 @@ def test_paid_provider_parser_rejects_future_and_unbounded_numeric_data(case: Pa
         future = {**case.payload, "data": [{**case.payload["data"][0], "ts_event": "2099-01-01T00:00:00Z", "close": Decimal("1e999999")}]}
 
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        active._parse(future, request_context(case, active), now=NOW, cached=False)
+        active._parse(future, provider_request(case), now=NOW, cached=False)
 
 
 def test_massive_parser_rejects_non_symbol_response_value():
     case = next(row for row in CASES if row.adapter_id == "massive")
     payload = {"status": "OK", "results": [{**case.payload["results"][0], "T": "not a symbol"}]}
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("adapter_id", ["tiingo", "databento"])
@@ -304,7 +322,7 @@ def test_iso_timestamp_parser_rejects_date_prefix_with_invalid_time(adapter_id: 
     else:
         payload = {**case.payload, "data": [{**case.payload["data"][0], "ts_event": "2025-07-01Tnot-a-time"}]}
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 def _payload_rows(case: PaidCase, payload: object) -> list[dict[str, object]]:
@@ -348,7 +366,7 @@ def test_paid_parser_rejects_wrong_valid_symbol_and_mixed_symbols(case: PaidCase
     wrong = _row_with_symbol(case, base, "MSFT")
     payload = _payload_with_rows(case, [base, wrong])
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
@@ -357,49 +375,103 @@ def test_paid_parser_rejects_rows_outside_inclusive_requested_date_range(case: P
     base = copy.deepcopy(_payload_rows(case, case.payload)[0])
     payload = _payload_with_rows(case, [_row_with_date(case, base, day)])
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
 def test_paid_parser_accepts_requested_boundary_and_rejects_duplicate_observation_key(case: PaidCase):
     active = make_adapter(case)
-    context = request_context(case, active)
-    accepted = active._parse(case.payload, context, now=NOW, cached=False)
+    request = provider_request(case)
+    accepted = active._parse(case.payload, request, now=NOW, cached=False)
     assert [row.as_of_date.isoformat() for row in accepted] == ["2025-07-01"]
 
     base = copy.deepcopy(_payload_rows(case, case.payload)[0])
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        active._parse(_payload_with_rows(case, [base, copy.deepcopy(base)]), context, now=NOW, cached=False)
+        active._parse(_payload_with_rows(case, [base, copy.deepcopy(base)]), request, now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
 def test_paid_parser_normalizes_unsorted_observations_to_ascending_chronology(case: PaidCase):
     parameters = {**case.parameters, "start_date": "2025-06-30", "end_date": "2025-07-01"}
     active = make_adapter(case)
-    context = request_context(case, active, parameters)
+    request = provider_request(case, parameters)
     latest = copy.deepcopy(_payload_rows(case, case.payload)[0])
     earlier = _row_with_date(case, latest, "2025-06-30")
-    rows = active._parse(_payload_with_rows(case, [latest, earlier]), context, now=NOW, cached=False)
+    rows = active._parse(_payload_with_rows(case, [latest, earlier]), request, now=NOW, cached=False)
     assert [row.as_of_date.isoformat() for row in rows] == ["2025-06-30", "2025-07-01"]
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
-def test_paid_parser_requires_sealed_context_and_context_survives_request_mapping_mutation(case: PaidCase):
+def test_paid_parser_and_request_builder_reject_all_caller_supplied_internal_contexts(case: PaidCase):
     active = make_adapter(case)
-    parameters = dict(case.parameters)
-    context = active._context(ProviderRequest(case.capability_id, parameters))
-    parameters["symbol"] = "MSFT"
-    parameters["start_date"] = "2025-06-30"
+    internal = active._context(provider_request(case))
+    direct = type(internal)(**{field.name: getattr(internal, field.name) for field in fields(internal)})
+    forged_values = {field.name: getattr(internal, field.name) for field in fields(internal)}
+    forged_values["symbol"] = "MSFT"
+    forged = type(internal)(**forged_values)
+    case_index = CASES.index(case)
+    other_case = CASES[(case_index + 1) % len(CASES)]
+    cross_provider = make_adapter(other_case)._context(provider_request(other_case))
+    row = _row_with_symbol(case, copy.deepcopy(_payload_rows(case, case.payload)[0]), "MSFT")
+    forged_payload = _payload_with_rows(case, [row])
 
-    rows = active._parse(case.payload, context, now=NOW, cached=False)
-    expected_symbol = "AAPL.US" if case.adapter_id == "eodhd" else "AAPL"
-    assert rows[0].source_metadata["requested_symbol"] == expected_symbol
-    with pytest.raises(ProviderUnavailable, match="invalid_request_context"):
-        active._parse(case.payload, object(), now=NOW, cached=False)
+    for untrusted in (internal, direct, forged, cross_provider):
+        with pytest.raises(TypeError, match="exact ProviderRequest required"):
+            active._request(untrusted)
+        with pytest.raises(TypeError, match="exact ProviderRequest required"):
+            active._parse(forged_payload, untrusted, now=NOW, cached=False)
 
-    object.__setattr__(context, "symbol", "MSFT")
-    with pytest.raises(ProviderUnavailable, match="invalid_request_context"):
-        active._parse(case.payload, context, now=NOW, cached=False)
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
+def test_paid_parser_revalidates_exact_provider_request_type_and_fields(case: PaidCase):
+    active = make_adapter(case)
+    lookalike = LookalikeProviderRequest(case.capability_id, dict(case.parameters))
+    subclass = HostileProviderRequest(case.capability_id, dict(case.parameters))
+    hostile_parameters = ProviderRequest(case.capability_id, HostileDict(case.parameters))
+    hostile_capability = ProviderRequest(HostileString(case.capability_id), dict(case.parameters))
+
+    for untrusted in (lookalike, subclass, object()):
+        with pytest.raises(TypeError, match="exact ProviderRequest required"):
+            active._parse(case.payload, untrusted, now=NOW, cached=False)
+    for untrusted in (hostile_parameters, hostile_capability):
+        with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
+            active._parse(case.payload, untrusted, now=NOW, cached=False)
+
+
+@pytest.mark.parametrize("case", CASES[:-1], ids=lambda case: case.adapter_id)
+@pytest.mark.parametrize("identity_value", [pytest.param(None, id="null"), pytest.param(..., id="missing")])
+def test_non_databento_rows_derive_missing_identity_only_from_validated_request(
+    case: PaidCase,
+    identity_value: object,
+):
+    base = copy.deepcopy(_payload_rows(case, case.payload)[0])
+    key = {"fmp": "symbol", "massive": "T", "tiingo": "ticker", "eodhd": "code"}[case.adapter_id]
+    if identity_value is ...:
+        base.pop(key)
+    else:
+        base[key] = identity_value
+    row = make_adapter(case)._parse(
+        _payload_with_rows(case, [base]),
+        provider_request(case),
+        now=NOW,
+        cached=False,
+    )[0]
+    assert row.value["symbol"] == case.parameters["symbol"]
+
+
+@pytest.mark.parametrize("case", CASES[:-1], ids=lambda case: case.adapter_id)
+@pytest.mark.parametrize("identity_value", ["", 7, HostileString("AAPL")])
+def test_non_databento_rows_reject_present_noncanonical_identity(case: PaidCase, identity_value: object):
+    base = copy.deepcopy(_payload_rows(case, case.payload)[0])
+    key = {"fmp": "symbol", "massive": "T", "tiingo": "ticker", "eodhd": "code"}[case.adapter_id]
+    base[key] = identity_value
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        make_adapter(case)._parse(
+            _payload_with_rows(case, [base]),
+            provider_request(case),
+            now=NOW,
+            cached=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -409,13 +481,15 @@ def test_paid_parser_requires_sealed_context_and_context_survives_request_mappin
         {"dataset": "XNAS.ITCH", "schema": "trades"},
         {"dataset": "XNAS.ITCH"},
         HostileDict({"dataset": "XNAS.ITCH", "schema": "ohlcv-1d"}),
+        {"dataset": HostileString("XNAS.ITCH"), "schema": "ohlcv-1d"},
+        {"dataset": "XNAS.ITCH", "schema": HostileString("ohlcv-1d")},
     ],
 )
 def test_databento_parser_binds_exact_requested_dataset_and_schema(metadata: object):
     case = next(row for row in CASES if row.adapter_id == "databento")
     payload = {**case.payload, "metadata": metadata}
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
@@ -423,7 +497,7 @@ def test_paid_parser_rejects_naive_datetime_before_utc_comparison(case: PaidCase
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
         make_adapter(case)._parse(
             case.payload,
-            request_context(case),
+            provider_request(case),
             now=datetime(2025, 7, 2, 12),
             cached=False,
         )
@@ -442,28 +516,42 @@ def test_databento_parser_rejects_conflicting_row_dataset_or_schema(row_fields: 
     row = {**case.payload["data"][0], **row_fields}
     payload = {**case.payload, "data": [row]}
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
+
+
+@pytest.mark.parametrize("field_name", ["dataset", "schema", "symbol"])
+@pytest.mark.parametrize("field_value", [pytest.param(..., id="missing"), pytest.param(None, id="null")])
+def test_databento_parser_requires_row_identity_dataset_and_schema(field_name: str, field_value: object):
+    case = next(row for row in CASES if row.adapter_id == "databento")
+    row = copy.deepcopy(case.payload["data"][0])
+    if field_value is ...:
+        row.pop(field_name)
+    else:
+        row[field_name] = field_value
+    payload = {**case.payload, "data": [row]}
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 def test_massive_parser_rejects_conflicting_response_level_ticker():
     case = next(row for row in CASES if row.adapter_id == "massive")
     payload = {**case.payload, "ticker": "MSFT"}
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 def test_databento_parser_rejects_conflicting_metadata_instrument():
     case = next(row for row in CASES if row.adapter_id == "databento")
     payload = {**case.payload, "metadata": {**case.payload["metadata"], "symbol": "MSFT"}}
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        make_adapter(case)._parse(payload, request_context(case), now=NOW, cached=False)
+        make_adapter(case)._parse(payload, provider_request(case), now=NOW, cached=False)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
 def test_paid_provider_cached_fixture_is_explicit_and_never_claimed_live(case: PaidCase):
     row = make_adapter(case)._parse(
         case.payload,
-        request_context(case, parameters={**case.parameters, "max_age_days": 0}),
+        provider_request(case, parameters={**case.parameters, "max_age_days": 0}),
         now=NOW,
         cached=True,
     )[0]
@@ -520,11 +608,11 @@ def _isolated_fixture_run(
     if os.environ.get("VR_ALLOW_PAID_PROVIDER_TESTS") != "1":
         guard.record(case.adapter_id, reservation_id=decision.reservation_id, actual_cost=Decimal("0"), request_count=0, status="test_gate_blocked", units=Decimal("0"), now=NOW)
         return "paid_test_gate", fake, store
-    context = request_context(case, active)
-    url, params = active._request(context)
+    request = provider_request(case)
+    url, params = active._request(request)
     try:
         response = fake.get_json(url, headers={"Accept": "application/json"}, params=params)
-        rows = active._parse(response, context, now=NOW, cached=False)
+        rows = active._parse(response, request, now=NOW, cached=False)
     except Exception:
         guard.record(case.adapter_id, reservation_id=decision.reservation_id, actual_cost=Decimal("0.01"), request_count=1, status="fixture_failed", units=Decimal("0"), now=NOW)
         raise
