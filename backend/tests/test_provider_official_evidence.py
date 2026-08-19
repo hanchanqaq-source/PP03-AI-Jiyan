@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import pytest
+import requests
+from requests.adapters import BaseAdapter
+from requests.structures import CaseInsensitiveDict
 
+from data_sources.http import SafeHttpClient
 from data_sources.provider_errors import ProviderUnavailable
 
 
@@ -15,6 +19,37 @@ class FakeDocumentHttp:
         if isinstance(self.response, BaseException):
             raise self.response
         return self.response
+
+
+class RedirectResponse:
+    def __init__(self, *, status_code: int, headers=None, content: bytes = b"") -> None:
+        self.status_code = status_code
+        self.headers = CaseInsensitiveDict(headers or {})
+        self._content = content
+
+    def iter_content(self, chunk_size: int):
+        del chunk_size
+        yield self._content
+
+    def close(self) -> None:
+        pass
+
+
+class RedirectAdapter(BaseAdapter):
+    def __init__(self, responses: list[RedirectResponse]) -> None:
+        self.responses = responses
+        self.requests: list[object] = []
+
+    def send(self, request, **kwargs):
+        del kwargs
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        response.request = request
+        response.url = request.url
+        return response
+
+    def close(self) -> None:
+        pass
 
 
 def document(*, final_url: str, content_type: str = "application/pdf", body: bytes = b"public filing", headers=None):
@@ -110,6 +145,33 @@ def test_official_link_rejects_secret_query_before_transport():
 
 
 @pytest.mark.parametrize(
+    "target",
+    [
+        "https://www.sse.com.cn/notice/final.pdf?access_token=secret",
+        "https://www.evil.example/notice/final.pdf",
+        "http://www.sse.com.cn/notice/final.pdf",
+        "https://www.sse.com.cn:444/notice/final.pdf",
+        "https://www.sse.com.cn/login",
+        "https://www.sse.com.cn/captcha",
+    ],
+)
+def test_official_link_rejects_every_forbidden_redirect_before_sending_target(target: str):
+    """Catches an unsafe redirect target being fetched before the official-link policy rejects it."""
+    from data_sources.providers.official_evidence import OfficialEvidenceLinkAdapter
+
+    session = requests.Session()
+    transport = RedirectAdapter([RedirectResponse(status_code=302, headers={"Location": target})])
+    session.mount("https://", transport)
+
+    result = OfficialEvidenceLinkAdapter(http=SafeHttpClient(session=session)).validate(
+        "https://www.sse.com.cn/notice/start.pdf"
+    )
+
+    assert result["official_evidence_eligible"] is False
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
     ("final_url", "content_type", "body", "expected"),
     [
         ("http://www.sse.com.cn/notice/final.pdf", "application/pdf", b"x", "rejected_insecure_redirect"),
@@ -132,6 +194,18 @@ def test_official_link_fails_closed_for_unsafe_redirect_or_protected_content(
     )
 
     assert adapter.validate("https://www.sse.com.cn/notice/start.pdf")["status"] == expected
+
+
+def test_official_link_detects_protected_marker_anywhere_in_bounded_html():
+    """Catches a padded login or CAPTCHA page escaping a prefix-only protected-content scan."""
+    from data_sources.providers.official_evidence import OfficialEvidenceLinkAdapter
+
+    body = b" " * 20_000 + b"<form>login</form>"
+    result = OfficialEvidenceLinkAdapter(http=FakeDocumentHttp(document(
+        final_url="https://www.sse.com.cn/notice/protected.html", content_type="text/html", body=body
+    ))).validate("https://www.sse.com.cn/notice/start.html")
+
+    assert result["status"] == "rejected_protected_content"
 
 
 def test_official_link_does_not_claim_connection_when_safe_transport_fails():

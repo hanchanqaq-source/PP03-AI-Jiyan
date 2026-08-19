@@ -81,6 +81,23 @@ class SafeHttpClient:
         self._allow_http_test_urls = allow_http_test_urls
         self._max_retry_after_seconds = float(max_retry_after_seconds)
 
+    @property
+    def user_agent(self) -> str:
+        """The immutable client identity applied to every request."""
+        return self._user_agent
+
+    def with_user_agent(self, user_agent: str) -> "SafeHttpClient":
+        """Create a sibling safe client with a fixed, caller-independent public identity."""
+        return SafeHttpClient(
+            session=self._session,
+            timeout_seconds=self._timeout,
+            max_bytes=self._max_bytes,
+            user_agent=user_agent,
+            max_redirects=self._max_redirects,
+            allow_http_test_urls=self._allow_http_test_urls,
+            max_retry_after_seconds=self._max_retry_after_seconds,
+        )
+
     def get_json(
         self,
         url: str,

@@ -104,8 +104,8 @@ class OfficialEvidenceLinkAdapter:
     def _protected(url: str, body: bytes) -> bool:
         parts = urlsplit(url)
         target = f"{parts.path}?{parts.query}".lower()
-        excerpt = body[:16_384].decode("utf-8", errors="ignore").lower()
-        return any(term in target or term in excerpt for term in _PROTECTED_TERMS)
+        document_text = body.decode("utf-8", errors="ignore").lower()
+        return any(term in target or term in document_text for term in _PROTECTED_TERMS)
 
     @staticmethod
     def _has_sensitive_query(url: str) -> bool:
@@ -119,6 +119,13 @@ class OfficialEvidenceLinkAdapter:
                 return True
         return False
 
+    def _safe_redirect_target(self, initial_identity: str, target: str) -> bool:
+        return (
+            not self._has_sensitive_query(target)
+            and self._identity(target) == initial_identity
+            and not self._protected(target, b"")
+        )
+
     def validate(self, url: str) -> dict[str, object]:
         if self._has_sensitive_query(url):
             return {"status": "rejected_unsafe_reference", "official_evidence_eligible": False}
@@ -130,7 +137,7 @@ class OfficialEvidenceLinkAdapter:
             if isinstance(self._http, SafeHttpClient):
                 document = self._http.get_document(
                     url,
-                    redirect_validator=lambda _current, target: self._identity(target) == initial_identity,
+                    redirect_validator=lambda _current, target: self._safe_redirect_target(initial_identity, target),
                 )
             else:
                 document = self._http.get_document(url)

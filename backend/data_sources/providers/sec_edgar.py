@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
+from data_sources.http import SafeHttpClient
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
 
@@ -20,7 +21,17 @@ _MINIMUM_INTERVAL_SECONDS = 0.125
 _MAX_RETRY_AFTER_SECONDS = 60.0
 _ACCESSION = re.compile(r"^[0-9]{10}-[0-9]{2}-[0-9]{6}$")
 _FILING_FORMS = {"10-K", "10-Q", "8-K", "13F"}
-_SUPPORTED_CAPABILITIES = {"company_submissions", "filing_index", "filing_metadata", "company_facts"}
+_INTERNAL_CAPABILITIES = {"company_submissions", "filing_index", "filing_metadata", "company_facts"}
+_CAPABILITY_ALIASES = {
+    "sec_company_submissions": ("company_submissions", None),
+    "sec_filing_index_metadata": ("filing_index", None),
+    "sec_10k_metadata": ("filing_metadata", "10-K"),
+    "sec_10q_metadata": ("filing_metadata", "10-Q"),
+    "sec_8k_metadata": ("filing_metadata", "8-K"),
+    "sec_13f_metadata": ("filing_metadata", "13F"),
+    "sec_company_facts": ("company_facts", None),
+}
+_SUPPORTED_CAPABILITIES = _INTERNAL_CAPABILITIES | set(_CAPABILITY_ALIASES)
 
 
 def _utc_now() -> datetime:
@@ -41,7 +52,7 @@ class SecEdgarAdapter(BaseProvider):
     ) -> None:
         if not isinstance(contact_identifier, str) or "@" in contact_identifier or not contact_identifier.strip():
             raise ValueError("SEC contact identifier must be a public non-email project identifier")
-        self._http = http
+        self._http = http.with_user_agent(contact_identifier.strip()) if isinstance(http, SafeHttpClient) else http
         self._clock = clock
         self._sleeper = sleeper
         self._fetched_at = fetched_at
@@ -50,7 +61,21 @@ class SecEdgarAdapter(BaseProvider):
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {"User-Agent": self._contact_identifier, "Accept": "application/json"}
+        return {"Accept": "application/json"}
+
+    @staticmethod
+    def _normalise_capability(request: ProviderRequest) -> tuple[str, str, dict[str, object]]:
+        parameters = dict(request.parameters)
+        alias = _CAPABILITY_ALIASES.get(request.capability_id)
+        if alias is None:
+            return request.capability_id, request.capability_id, parameters
+        capability, expected_form = alias
+        if expected_form is not None:
+            supplied_form = parameters.get("form")
+            if supplied_form is not None and supplied_form != expected_form:
+                raise ProviderUnavailable("invalid_request_parameter", reference=_ARCHIVES_REFERENCE)
+            parameters["form"] = expected_form
+        return request.capability_id, capability, parameters
 
     @staticmethod
     def _cik(parameters: Mapping[str, object]) -> tuple[str, str]:
@@ -103,9 +128,46 @@ class SecEdgarAdapter(BaseProvider):
         compact_accession = accession.replace("-", "")
         return cik, accession, f"https://www.sec.gov/Archives/edgar/data/{archive_cik}/{compact_accession}/index.json"
 
+    @staticmethod
+    def _mapping(payload: object, reference: str) -> Mapping[str, object]:
+        if not isinstance(payload, Mapping) or not payload:
+            raise ProviderSchemaChanged("schema_changed", reference=reference)
+        return payload
+
+    @classmethod
+    def _submissions(cls, payload: object, *, cik: str, reference: str) -> Mapping[str, object]:
+        data = cls._mapping(payload, reference)
+        if str(data.get("cik") or "").zfill(10) != cik:
+            raise ProviderSchemaChanged("schema_changed", reference=reference)
+        filings = data.get("filings")
+        recent = filings.get("recent") if isinstance(filings, Mapping) else None
+        accessions = recent.get("accessionNumber") if isinstance(recent, Mapping) else None
+        forms = recent.get("form") if isinstance(recent, Mapping) else None
+        if not isinstance(accessions, list) or not isinstance(forms, list) or not accessions or len(accessions) != len(forms):
+            raise ProviderSchemaChanged("schema_changed", reference=reference)
+        return recent
+
+    @classmethod
+    def _company_facts(cls, payload: object, *, cik: str, reference: str) -> None:
+        data = cls._mapping(payload, reference)
+        if str(data.get("cik") or "").zfill(10) != cik or not isinstance(data.get("facts"), Mapping):
+            raise ProviderSchemaChanged("schema_changed", reference=reference)
+
+    @classmethod
+    def _index(cls, payload: object, *, reference: str) -> None:
+        data = cls._mapping(payload, reference)
+        directory = data.get("directory")
+        items = directory.get("item") if isinstance(directory, Mapping) else None
+        if not isinstance(items, list) or any(not isinstance(item, Mapping) for item in items):
+            raise ProviderSchemaChanged("schema_changed", reference=reference)
+
+    @staticmethod
+    def _assert_requested_form(recent: Mapping[str, object], *, accession: str, form: str, reference: str) -> None:
+        pairs = zip(recent["accessionNumber"], recent["form"])
+        if not any(candidate_accession == accession and candidate_form == form for candidate_accession, candidate_form in pairs):
+            raise ProviderSchemaChanged("schema_changed", reference=reference)
+
     def _value(self, capability_id: str, payload: object, *, canonical_url: str, value: dict[str, object]) -> ProviderValue:
-        if not isinstance(payload, Mapping):
-            raise ProviderSchemaChanged("schema_changed", reference=canonical_url)
         return ProviderValue(
             value={**value, "canonical_url": canonical_url, "official_evidence_eligible": True},
             source_family_id="sec_edgar",
@@ -122,22 +184,29 @@ class SecEdgarAdapter(BaseProvider):
         )
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
-        capability = request.capability_id
-        if capability not in _SUPPORTED_CAPABILITIES:
+        output_capability, capability, parameters = self._normalise_capability(request)
+        if capability not in _INTERNAL_CAPABILITIES:
             raise ProviderUnavailable("unsupported_capability", reference=_DATA_REFERENCE)
         if capability == "company_submissions":
-            cik, _archive_cik = self._cik(request.parameters)
+            cik, _archive_cik = self._cik(parameters)
             url = f"https://data.sec.gov/submissions/CIK{cik}.json"
             payload = self._one_retry_json(url)
-            return (self._value(capability, payload, canonical_url=url, value={"cik": cik, "record_type": "submissions"}),)
+            self._submissions(payload, cik=cik, reference=url)
+            return (self._value(output_capability, payload, canonical_url=url, value={"cik": cik, "record_type": "submissions"}),)
         if capability == "company_facts":
-            cik, _archive_cik = self._cik(request.parameters)
+            cik, _archive_cik = self._cik(parameters)
             url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
             payload = self._one_retry_json(url)
-            return (self._value(capability, payload, canonical_url=url, value={"cik": cik, "record_type": "company_facts"}),)
-        cik, accession, url = self._index_url(request.parameters)
-        form = self._form(request.parameters) if capability == "filing_metadata" else None
+            self._company_facts(payload, cik=cik, reference=url)
+            return (self._value(output_capability, payload, canonical_url=url, value={"cik": cik, "record_type": "company_facts"}),)
+        cik, accession, url = self._index_url(parameters)
+        form = self._form(parameters) if capability == "filing_metadata" else None
+        if form is not None:
+            submissions_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+            recent = self._submissions(self._one_retry_json(submissions_url), cik=cik, reference=submissions_url)
+            self._assert_requested_form(recent, accession=accession, form=form, reference=submissions_url)
         payload = self._one_retry_json(url)
+        self._index(payload, reference=url)
         details: dict[str, object] = {
             "cik": cik,
             "accession": accession,
@@ -146,7 +215,7 @@ class SecEdgarAdapter(BaseProvider):
         }
         if form is not None:
             details["form"] = form
-        return (self._value(capability, payload, canonical_url=url, value=details),)
+        return (self._value(output_capability, payload, canonical_url=url, value=details),)
 
     def probe(self, capability_id: str) -> Mapping[str, object]:
         if capability_id not in _SUPPORTED_CAPABILITIES:
