@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -13,7 +13,7 @@ import source_health
 
 from cache_io_lock import CACHE_IO_LOCK
 from .catalog import DataSourceCatalog, build_catalog
-from .budgets import BudgetGuard, BudgetPolicy, BudgetValidationError
+from .budgets import BudgetDecision, BudgetGuard, BudgetPolicy, BudgetValidationError
 from .config_store import ConfigValidationError, DataSourceConfigStore
 from .credentials import (
     CredentialState,
@@ -27,7 +27,7 @@ from .provider_registry import ProviderRegistry
 from .routing import CapabilityRoute, CapabilityRouter, effective_adapter_enabled
 from source_health.probes.data_source_adapter import probe_data_source_adapter
 from .references import public_source_reference
-from .usage_store import UsageStore, UsageStoreError
+from .usage_store import UsageConflictError, UsageStore, UsageStoreError
 
 
 _EXCLUDED_HEALTH_STATUSES = {"unconfigured", "license_required", "catalog_only", "disabled"}
@@ -99,11 +99,26 @@ class _DefaultCredentialStore:
         return keyring_state if keyring_state.status == "credential_store_unavailable" else environment_state
 
 
+_MAX_AUTHORIZATION_CONTEXTS = 4_096
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizationContext:
+    adapter_id: str
+    reservation_id: str
+    decision: BudgetDecision
+    guard: BudgetGuard
+    usage_store: UsageStore
+
+
 class _ServerAuthorizationGuard:
     """Build an authorization snapshot only from the owning Service's stores."""
 
     def __init__(self, service: "DataSourceService") -> None:
         self._service = service
+        self._context_lock = threading.RLock()
+        self._contexts: dict[str, _AuthorizationContext] = {}
+        self._completed_contexts: set[str] = set()
 
     @property
     def usage_store(self) -> UsageStore:
@@ -155,11 +170,64 @@ class _ServerAuthorizationGuard:
             trusted_adapters={adapter_id: adapter},
         )
 
+    def _prune_completed_context(self) -> None:
+        if len(self._contexts) < _MAX_AUTHORIZATION_CONTEXTS:
+            return
+        for reservation_id in tuple(self._contexts):
+            if reservation_id in self._completed_contexts:
+                self._contexts.pop(reservation_id)
+                self._completed_contexts.remove(reservation_id)
+                return
+
     def authorize(self, adapter: Any, **kwargs: Any):
-        return self._snapshot(adapter.adapter_id).authorize(adapter, **kwargs)
+        if "reservation_id" in kwargs:
+            raise BudgetValidationError("caller reservation authority is not accepted")
+        with self._context_lock:
+            self._prune_completed_context()
+            if len(self._contexts) >= _MAX_AUTHORIZATION_CONTEXTS:
+                raise BudgetValidationError("authorization context capacity is exhausted")
+            guard = self._snapshot(adapter.adapter_id)
+            decision = guard.authorize(adapter, **kwargs)
+            if decision.allowed:
+                reservation_id = decision.reservation_id
+                if type(reservation_id) is not str or reservation_id in self._contexts:
+                    raise BudgetValidationError("authorization context is invalid")
+                self._contexts[reservation_id] = _AuthorizationContext(
+                    adapter.adapter_id,
+                    reservation_id,
+                    decision,
+                    guard,
+                    guard.usage_store,
+                )
+            return decision
 
     def record(self, adapter_id: str, **kwargs: Any):
-        return self._snapshot(adapter_id).record(adapter_id, **kwargs)
+        reservation_id = kwargs.get("reservation_id")
+        if type(adapter_id) is not str or type(reservation_id) is not str:
+            raise BudgetValidationError("authorization context is unavailable")
+        with self._context_lock:
+            context = self._contexts.get(reservation_id)
+            if (
+                context is None
+                or context.adapter_id != adapter_id
+                or context.reservation_id != reservation_id
+                or context.decision.allowed is not True
+                or context.decision.reason != "authorized"
+                or context.decision.reservation_id != reservation_id
+                or context.guard.usage_store is not context.usage_store
+            ):
+                raise BudgetValidationError("authorization context is unavailable")
+            try:
+                record = context.guard.record(adapter_id, **kwargs)
+            except UsageConflictError:
+                raise
+            except UsageStoreError:
+                # One bounded retry closes both pre-write transient failures and
+                # post-write ambiguous failures via UsageStore idempotency. A
+                # persistent failure keeps the reservation open and fail-closed.
+                record = context.guard.record(adapter_id, **kwargs)
+            self._completed_contexts.add(reservation_id)
+            return record
 
 
 def _document(value: Any) -> Any:

@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
+from fastapi.testclient import TestClient
 
+import app as app_module
+import data_sources.api as api_module
+from data_sources.budgets import BudgetValidationError
 from data_sources.catalog import DataSourceCatalog, build_catalog
 from data_sources.config_store import ConfigValidationError, DataSourceConfigStore
 from data_sources.credentials import MemoryCredentialStore
@@ -19,7 +23,7 @@ from data_sources.models import (
 )
 from data_sources.routing import CapabilityRouter
 from data_sources.service import DataSourceService
-from data_sources.usage_store import UsageStore
+from data_sources.usage_store import UsageStore, UsageStoreError
 
 
 NOW = datetime(2026, 8, 20, tzinfo=timezone.utc)
@@ -98,6 +102,58 @@ def _routing_catalog() -> DataSourceCatalog:
     )
 
 
+def _yahoo_catalog(
+    *,
+    status: CatalogStatus = CatalogStatus.CONFIGURED,
+    default_enabled: bool = False,
+) -> DataSourceCatalog:
+    capability_id = "overseas_stock_history"
+    return DataSourceCatalog(
+        families=(SourceFamily(
+            "yahoo",
+            "Yahoo Finance",
+            "reference",
+            "test",
+            (SourceRole.FALLBACK_DATA,),
+            False,
+            "personal research only",
+            status,
+        ),),
+        adapters=(AdapterDescriptor(
+            "yahoo-finance",
+            "Yahoo Finance",
+            "yahoo",
+            "reference",
+            (SourceRole.FALLBACK_DATA,),
+            (capability_id,),
+            BillingModel.FREE_NO_KEY,
+            "none",
+            (),
+            default_enabled,
+            "personal research only",
+            "test",
+            "test",
+            "test",
+            "test",
+            "https://finance.yahoo.com/",
+            1,
+            status,
+        ),),
+        capabilities=(CapabilityDescriptor(
+            capability_id,
+            "overseas stock history",
+            "test",
+            None,
+            True,
+            "test",
+            "test",
+            (),
+            ("yahoo",),
+            (),
+        ),),
+    )
+
+
 def _service(
     catalog: DataSourceCatalog,
     store: DataSourceConfigStore,
@@ -170,6 +226,95 @@ def test_service_routing_restart_keeps_the_registered_provider_catalog_count(tmp
     assert restarted.catalog_document()["registration"]["adapters"] == registered_before
 
 
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        {"free_only": True, "adapters": {}},
+        {"free_only": True, "adapters": {"yahoo-finance": {"enabled": False}}},
+        {"free_only": True, "adapters": {"yahoo-finance": {"enabled": True}}},
+    ],
+    ids=("absent", "explicit-false", "explicit-true-catalog-disabled"),
+)
+def test_default_yahoo_personal_research_never_bypasses_enablement_or_catalog_disabled(
+    configuration,
+):
+    route = CapabilityRouter(
+        build_catalog({"sources": []}), configuration=configuration,
+    ).route("overseas_stock_history", personal_research=True)
+
+    assert "yahoo-finance" not in route.fallback_adapter_ids
+    assert "yahoo-finance" not in route.evidence_adapter_ids
+
+
+@pytest.mark.parametrize(
+    ("configuration", "expected"),
+    [
+        ({"free_only": True, "adapters": {}}, ()),
+        ({"free_only": True, "adapters": {"yahoo-finance": {"enabled": False}}}, ()),
+        (
+            {"free_only": True, "adapters": {"yahoo-finance": {"enabled": True}}},
+            ("yahoo-finance",),
+        ),
+    ],
+    ids=("absent", "explicit-false", "explicit-true"),
+)
+def test_configured_yahoo_requires_explicit_enabled_and_personal_research(
+    configuration, expected,
+):
+    catalog = _yahoo_catalog()
+    router = CapabilityRouter(catalog, configuration=configuration)
+
+    assert router.route(
+        "overseas_stock_history", personal_research=True,
+    ).fallback_adapter_ids == expected
+    assert router.route(
+        "overseas_stock_history", personal_research=False,
+    ).fallback_adapter_ids == ()
+
+
+def test_yahoo_static_default_cannot_replace_explicit_server_owned_enablement():
+    route = CapabilityRouter(
+        _yahoo_catalog(default_enabled=True),
+        configuration={"free_only": True, "adapters": {}},
+    ).route("overseas_stock_history", personal_research=True)
+
+    assert route.fallback_adapter_ids == ()
+
+
+def test_server_owned_yahoo_enablement_survives_restart_and_disable_removes_route(tmp_path):
+    catalog = _yahoo_catalog()
+    root = tmp_path / "config"
+    first = _service(
+        catalog,
+        DataSourceConfigStore(root, catalog=catalog),
+        UsageStore(tmp_path / "usage"),
+        provider_registry=object(),
+    )
+    first.enable_adapter("yahoo-finance")
+
+    restarted = _service(
+        catalog,
+        DataSourceConfigStore(root, catalog=catalog),
+        UsageStore(tmp_path / "usage"),
+        provider_registry=object(),
+    )
+    enabled = restarted.capability_route(
+        "overseas_stock_history", personal_research=True,
+    )
+    restarted.disable_adapter("yahoo-finance")
+    disabled = _service(
+        catalog,
+        DataSourceConfigStore(root, catalog=catalog),
+        UsageStore(tmp_path / "usage"),
+        provider_registry=object(),
+    ).capability_route("overseas_stock_history", personal_research=True)
+
+    assert enabled.fallback_adapter_ids == ("yahoo-finance",)
+    assert enabled.evidence_adapter_ids == ()
+    assert disabled.fallback_adapter_ids == ()
+    assert len(catalog.adapters) == 1
+
+
 class _BoundedProbe:
     def __init__(self, descriptor: AdapterDescriptor, outcomes: list[object]) -> None:
         self.descriptor = descriptor
@@ -179,6 +324,8 @@ class _BoundedProbe:
     def probe(self, capability_id: str):
         self.calls.append(capability_id)
         outcome = self._outcomes.pop(0)
+        if callable(outcome):
+            outcome = outcome()
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -213,7 +360,9 @@ def _success(returned_items: int = 1) -> dict[str, object]:
 
 def _validation_service(tmp_path, outcomes: list[object], *, daily_limit: int | None = None):
     catalog = build_catalog({"sources": []})
-    config = DataSourceConfigStore(tmp_path / "config", catalog=catalog)
+    config = DataSourceConfigStore(
+        tmp_path / "config", catalog=catalog, lock_timeout_seconds=0.01,
+    )
     if daily_limit is not None:
         config.update_adapter("world-bank", {"daily_request_limit": daily_limit})
     usage = UsageStore(tmp_path / "usage")
@@ -303,6 +452,189 @@ def test_free_no_key_zero_request_limit_blocks_before_registry_or_probe(tmp_path
     assert registry.available_calls == 0
     assert registry.adapter_calls == 0
     assert usage.records(now=NOW) == ()
+
+
+@pytest.mark.parametrize(
+    ("probe_outcome", "expected_status", "usage_status"),
+    [
+        (None, "success", "validation_success"),
+        (TimeoutError("bounded timeout"), "failure", "validation_failure"),
+        (ValueError("bounded parser failure"), "failure", "validation_failure"),
+        (ConnectionError("bounded transport failure"), "failure", "validation_failure"),
+    ],
+    ids=("success", "timeout", "parser", "transport"),
+)
+def test_validation_reconciles_bound_authorization_after_config_corrupts(
+    tmp_path, probe_outcome, expected_status: str, usage_status: str,
+):
+    service, config, usage, provider, _registry = _validation_service(tmp_path, [None])
+    corrupt = "{corrupt-after-authorization"
+
+    def mutate_config_after_authorization():
+        config.path.write_text(corrupt, encoding="utf-8")
+        if probe_outcome is not None:
+            raise probe_outcome
+        return _success(2)
+
+    provider._outcomes = [mutate_config_after_authorization]
+
+    result = service.validate_adapter("world-bank")
+    records = usage.records(now=NOW)
+
+    assert result["status"] == expected_status
+    assert provider.calls == ["macro_indicator"]
+    assert len(records) == 1
+    assert records[0].actual_cost == Decimal("0")
+    assert records[0].request_count == 1
+    assert records[0].status == usage_status
+    assert config.path.read_text(encoding="utf-8") == corrupt
+
+
+def test_validation_reconciles_bound_authorization_after_config_lock_timeout(tmp_path):
+    service, config, usage, provider, _registry = _validation_service(tmp_path, [None])
+
+    def block_config_after_authorization():
+        config._try_lock_file = lambda _handle: False
+        return _success()
+
+    provider._outcomes = [block_config_after_authorization]
+
+    result = service.validate_adapter("world-bank")
+    records = usage.records(now=NOW)
+
+    assert result["status"] == "success"
+    assert len(records) == 1
+    assert records[0].status == "validation_success"
+    assert records[0].actual_cost == Decimal("0")
+
+
+def test_transient_reconcile_error_retries_idempotently_without_open_reservation(tmp_path):
+    service, _config, usage, _provider, _registry = _validation_service(tmp_path, [_success()])
+    original_reconcile = usage.reconcile
+    calls = 0
+
+    def flaky_reconcile(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise UsageStoreError("bounded transient reconcile failure")
+        return original_reconcile(*args, **kwargs)
+
+    usage.reconcile = flaky_reconcile
+
+    result = service.validate_adapter("world-bank")
+    records = usage.records(now=NOW)
+
+    assert result["status"] == "success"
+    assert calls == 2
+    assert len(records) == 1
+    assert records[0].actual_cost == Decimal("0")
+    assert records[0].request_count == 1
+
+
+def test_permanent_reconcile_error_is_redacted_and_preserves_fail_closed_reservation(
+    tmp_path, monkeypatch,
+):
+    service, _config, usage, provider, _registry = _validation_service(tmp_path, [_success()])
+    calls = 0
+    internal_error = "bounded-internal-reconcile-marker"
+    original_reconcile = usage.reconcile
+
+    def broken_reconcile(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise UsageStoreError(internal_error)
+
+    usage.reconcile = broken_reconcile
+    monkeypatch.setattr(api_module, "_service", service)
+    client = TestClient(app_module.app, base_url="http://127.0.0.1:8900")
+
+    response = client.post(
+        "/api/data-sources/world-bank/validate",
+        json={},
+        headers={"X-PP03-Write-Intent": "1"},
+    )
+    records = usage.records(now=NOW)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "usage_store_unavailable"
+    assert internal_error not in response.text
+    assert calls == 2
+    assert provider.calls == ["macro_indicator"]
+    assert len(records) == 1
+    assert records[0].actual_cost is None
+    assert records[0].status == "reserved"
+
+    usage.reconcile = original_reconcile
+    recovered = service._budget_guard.record(
+        "world-bank",
+        reservation_id=records[0].reservation_id,
+        actual_cost=Decimal("0"),
+        request_count=1,
+        status="validation_success",
+        units=Decimal("1"),
+        now=NOW,
+    )
+    assert recovered.actual_cost == Decimal("0")
+    assert recovered.request_count == 1
+    assert len(usage.records(now=NOW)) == 1
+
+
+def test_double_record_uses_original_context_after_config_corruption(tmp_path):
+    service, config, usage, _provider, _registry = _validation_service(tmp_path, [_success(2)])
+    service.validate_adapter("world-bank")
+    first = usage.records(now=NOW)[0]
+    config.path.write_text("{corrupt-after-completion", encoding="utf-8")
+
+    duplicate = service._budget_guard.record(
+        "world-bank",
+        reservation_id=first.reservation_id,
+        actual_cost=Decimal("0"),
+        request_count=1,
+        status="validation_success",
+        units=Decimal("2"),
+        now=NOW,
+    )
+
+    assert duplicate == first
+    assert usage.records(now=NOW) == (first,)
+
+
+def test_another_service_cannot_reconcile_caller_supplied_reservation_authority(tmp_path):
+    catalog = build_catalog({"sources": []})
+    config_root = tmp_path / "config"
+    usage_root = tmp_path / "usage"
+    first = _service(
+        catalog,
+        DataSourceConfigStore(config_root, catalog=catalog),
+        UsageStore(usage_root),
+    )
+    second = _service(
+        catalog,
+        DataSourceConfigStore(config_root, catalog=catalog),
+        UsageStore(usage_root),
+    )
+    first._ensure_configuration_dependencies()
+    second._ensure_configuration_dependencies()
+    decision = first._budget_guard.authorize(
+        catalog.adapter("world-bank"), estimated_cost=Decimal("0"), now=NOW,
+    )
+
+    with pytest.raises(BudgetValidationError, match="authorization context"):
+        second._budget_guard.record(
+            "world-bank",
+            reservation_id=decision.reservation_id,
+            actual_cost=Decimal("0"),
+            request_count=1,
+            status="validation_success",
+            units=Decimal("1"),
+            now=NOW,
+        )
+
+    records = UsageStore(usage_root).records(now=NOW)
+    assert len(records) == 1
+    assert records[0].actual_cost is None
+    assert records[0].status == "reserved"
 
 
 class _ExplodingMapping(Mapping):

@@ -51,12 +51,12 @@ def test_router_prioritizes_sec_official_capabilities_and_keeps_gdelt_candidate_
     assert discovery.evidence_adapter_ids == ()
 
 
-def test_router_allows_yahoo_only_for_personal_research_and_never_as_evidence():
+def test_router_keeps_catalog_disabled_yahoo_out_even_for_personal_research():
     router = _router(build_catalog({"sources": []}))
 
     assert router.route("overseas_stock_history").fallback_adapter_ids == ()
     research = router.route("overseas_stock_history", personal_research=True)
-    assert research.fallback_adapter_ids == ("yahoo-finance",)
+    assert research.fallback_adapter_ids == ()
     assert research.evidence_adapter_ids == ()
 
 

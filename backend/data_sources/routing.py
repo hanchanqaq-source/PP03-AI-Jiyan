@@ -103,11 +103,28 @@ class CapabilityRouter:
 
     def _eligible(self, adapter: Any, personal_research: bool) -> bool:
         status = getattr(adapter.catalog_status, "value", adapter.catalog_status)
-        if status in {CatalogStatus.UNCONFIGURED.value, CatalogStatus.CATALOG_ONLY.value, CatalogStatus.LICENSE_REQUIRED.value}:
+        if status in {
+            CatalogStatus.UNCONFIGURED.value,
+            CatalogStatus.CATALOG_ONLY.value,
+            CatalogStatus.LICENSE_REQUIRED.value,
+            CatalogStatus.DISABLED.value,
+        }:
+            return False
+        if not effective_adapter_enabled(adapter, self._configuration):
             return False
         if adapter.adapter_id == "yahoo-finance":
-            return personal_research
-        return (
-            effective_adapter_enabled(adapter, self._configuration)
-            and status != CatalogStatus.DISABLED.value
-        )
+            # Personal-research access is an exception to evidence use, not an
+            # exception to server-owned enablement. Never inherit a static
+            # Catalog default for this special case.
+            try:
+                entries = self._configuration.get("adapters", {})
+                entry = entries.get(adapter.adapter_id, {})
+            except (AttributeError, TypeError):
+                return False
+            return (
+                personal_research
+                and type(entries) is dict
+                and type(entry) is dict
+                and entry.get("enabled") is True
+            )
+        return True
