@@ -30,14 +30,6 @@ class PipelineCounts:
 
 
 @dataclass(frozen=True, slots=True)
-class PipelineAuthority:
-    token: str
-    generation: int
-    expires_at: datetime
-    diagnostic_name: str
-
-
-@dataclass(frozen=True, slots=True)
 class PipelineRun:
     run_id: str
     raw_snapshot_id: str
@@ -49,8 +41,6 @@ class PipelineRun:
     updated_at: datetime
     redacted_error: str | None
     displayed_trusted_snapshot_id: str | None
-    owner_id: str | None = None
-    lease_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

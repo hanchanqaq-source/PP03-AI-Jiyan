@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 from typing import Any, Callable
 
@@ -24,6 +25,78 @@ from .models import (
 
 
 _MAX_EVIDENCE_DOCUMENT_BYTES = 1_048_576
+_EVENT_KEYS = {
+    "event_id",
+    "title",
+    "summary",
+    "category",
+    "related_tags",
+    "published_at",
+    "core_claim",
+    "verification_status",
+    "verification_reason",
+    "verified_at",
+    "evidence_as_of",
+    "key_fields",
+    "primary_evidence",
+    "independent_evidence",
+    "syndicated_copies",
+    "contradicting_evidence",
+    "status_history",
+    "holding_relevance",
+}
+_EVIDENCE_KEYS = {
+    "evidence_id",
+    "content_source",
+    "collector_source",
+    "canonical_url",
+    "published_at",
+    "source_role",
+    "origin_cluster",
+    "supports_claim",
+    "supports_fields",
+    "contradicts_claim",
+    "is_official",
+    "title",
+    "excerpt",
+}
+_KEY_FIELD_KEYS = {
+    "field_name",
+    "raw_value",
+    "normalized_value",
+    "verification_status",
+    "evidence_ids",
+    "reason",
+}
+_TRANSITION_KEYS = {"from_status", "to_status", "changed_at", "reason"}
+_TAG_KEYS = {"id", "name"}
+
+
+def _replace_durable(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        import ctypes
+
+        move_file_ex = ctypes.windll.kernel32.MoveFileExW
+        move_file_ex.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        move_file_ex.restype = ctypes.c_int
+        if not move_file_ex(str(source), str(destination), 0x1 | 0x8):
+            raise ctypes.WinError()
+        return
+    os.replace(source, destination)
+    descriptor = os.open(str(destination.parent), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_owned_temp(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        current = path.lstat()
+        if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+            path.unlink()
+    except (FileNotFoundError, OSError):
+        return
 
 
 def _strict_json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -49,7 +122,11 @@ def _reject_json_number(_raw: str) -> float:
 
 
 def _timestamp(value: datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
+    if value is None:
+        return None
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp timezone is required")
+    return value.isoformat()
 
 
 def _evidence_document(item: EvidenceItem) -> dict[str, Any]:
@@ -106,7 +183,7 @@ def _transition_document(row: StatusTransition) -> dict[str, Any]:
     return {
         "from_status": row.from_status.value if row.from_status else None,
         "to_status": row.to_status.value,
-        "changed_at": row.changed_at.isoformat(),
+        "changed_at": _timestamp(row.changed_at),
         "reason": row.reason,
     }
 
@@ -122,8 +199,8 @@ def event_document(event: EvidenceEvent) -> dict[str, Any]:
         "core_claim": trusted_event_text(event, event.core_claim),
         "verification_status": event.verification_status.value,
         "verification_reason": event.verification_reason,
-        "verified_at": event.verified_at.isoformat(),
-        "evidence_as_of": event.evidence_as_of.isoformat(),
+        "verified_at": _timestamp(event.verified_at),
+        "evidence_as_of": _timestamp(event.evidence_as_of),
         "key_fields": [field_document(row) for row in event.key_fields],
         "primary_evidence": [_evidence_document(row) for row in event.primary_evidence],
         "independent_evidence": [_evidence_document(row) for row in event.independent_evidence],
@@ -139,8 +216,8 @@ def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
         "event_id": event.event_id,
         "title": trusted_event_text(event, event.title),
         "published_at": _timestamp(event.published_at),
-        "verified_at": event.verified_at.isoformat(),
-        "evidence_as_of": event.evidence_as_of.isoformat(),
+        "verified_at": _timestamp(event.verified_at),
+        "evidence_as_of": _timestamp(event.evidence_as_of),
         "category": event.category,
         "related_tags": [{"id": key, "name": name} for key, name in event.related_tags],
         "core_claim": trusted_event_text(event, event.core_claim),
@@ -160,16 +237,21 @@ def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
 
 
 def snapshot_document(snapshot: EvidenceSnapshot) -> dict[str, Any]:
+    if type(snapshot.snapshot_id) is not str or type(snapshot.raw_snapshot_id) is not str:
+        raise ValueError("invalid evidence snapshot identity")
+    if type(snapshot.recovery_metadata) is not dict:
+        raise ValueError("invalid recovery metadata")
     document = {
         "schema_version": 1,
         "snapshot_id": snapshot.snapshot_id,
-        "generated_at": snapshot.generated_at.isoformat(),
+        "generated_at": _timestamp(snapshot.generated_at),
         "events": [event_document(event) for event in snapshot.events],
     }
     if snapshot.raw_snapshot_id:
         document["raw_snapshot_id"] = snapshot.raw_snapshot_id
     if snapshot.recovery_metadata:
         document["recovery_metadata"] = dict(snapshot.recovery_metadata)
+    _exact_builtin(document)
     return document
 
 
@@ -182,59 +264,115 @@ def _parse_datetime(value: Any) -> datetime:
     return parsed
 
 
+def _exact_row(value: object, keys: set[str], name: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != keys:
+        raise ValueError(f"invalid {name} schema")
+    return value
+
+
+def _string(value: object, name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _string_list(value: object, name: str) -> tuple[str, ...]:
+    if type(value) is not list or any(type(item) is not str for item in value):
+        raise ValueError(f"invalid {name}")
+    return tuple(value)
+
+
 def _evidence_from_document(row: dict[str, Any]) -> EvidenceItem:
+    row = _exact_row(row, _EVIDENCE_KEYS, "evidence")
+    published_at = row["published_at"]
+    if published_at is not None and type(published_at) is not str:
+        raise ValueError("invalid evidence published_at")
+    for name in ("supports_claim", "contradicts_claim", "is_official"):
+        if type(row[name]) is not bool:
+            raise ValueError(f"invalid evidence {name}")
     return EvidenceItem(
-        evidence_id=str(row["evidence_id"]),
-        content_source=str(row["content_source"]),
-        collector_source=str(row["collector_source"]),
-        canonical_url=str(row["canonical_url"]),
-        published_at=_parse_datetime(row["published_at"]) if row.get("published_at") else None,
-        source_role=SourceRole(str(row["source_role"])),
-        origin_cluster=str(row["origin_cluster"]),
-        supports_claim=row.get("supports_claim") is True,
-        supports_fields=tuple(str(value) for value in row.get("supports_fields") or []),
-        contradicts_claim=row.get("contradicts_claim") is True,
-        is_official=row.get("is_official") is True,
-        title=str(row.get("title") or ""),
-        excerpt=str(row.get("excerpt") or ""),
+        evidence_id=_string(row["evidence_id"], "evidence_id"),
+        content_source=_string(row["content_source"], "content_source"),
+        collector_source=_string(row["collector_source"], "collector_source"),
+        canonical_url=_string(row["canonical_url"], "canonical_url"),
+        published_at=_parse_datetime(published_at) if published_at is not None else None,
+        source_role=SourceRole(_string(row["source_role"], "source_role")),
+        origin_cluster=_string(row["origin_cluster"], "origin_cluster"),
+        supports_claim=row["supports_claim"],
+        supports_fields=_string_list(row["supports_fields"], "supports_fields"),
+        contradicts_claim=row["contradicts_claim"],
+        is_official=row["is_official"],
+        title=_string(row["title"], "evidence title"),
+        excerpt=_string(row["excerpt"], "evidence excerpt"),
     )
 
 
 def _event_from_document(row: dict[str, Any]) -> EvidenceEvent:
     def evidence_list(key: str) -> tuple[EvidenceItem, ...]:
-        return tuple(_evidence_from_document(value) for value in row.get(key) or [] if isinstance(value, dict))
+        value = row[key]
+        if type(value) is not list:
+            raise ValueError(f"invalid {key}")
+        return tuple(_evidence_from_document(item) for item in value)
+
+    row = _exact_row(row, _EVENT_KEYS, "event")
+    related_tags = row["related_tags"]
+    key_fields = row["key_fields"]
+    status_history = row["status_history"]
+    if type(related_tags) is not list or type(key_fields) is not list or type(status_history) is not list:
+        raise ValueError("invalid event collections")
+    published_at = row["published_at"]
+    if published_at is not None and type(published_at) is not str:
+        raise ValueError("invalid event published_at")
+
+    parsed_tags: list[tuple[str, str]] = []
+    for value in related_tags:
+        tag = _exact_row(value, _TAG_KEYS, "tag")
+        parsed_tags.append((_string(tag["id"], "tag id"), _string(tag["name"], "tag name")))
+
+    parsed_fields: list[KeyField] = []
+    for value in key_fields:
+        field = _exact_row(value, _KEY_FIELD_KEYS, "key field")
+        parsed_fields.append(KeyField(
+            field_name=_string(field["field_name"], "field_name"),
+            raw_value=_string(field["raw_value"], "raw_value"),
+            normalized_value=_string(field["normalized_value"], "normalized_value"),
+            verification_status=FieldVerificationStatus(_string(field["verification_status"], "field verification_status")),
+            evidence_ids=_string_list(field["evidence_ids"], "evidence_ids"),
+            reason=_string(field["reason"], "field reason"),
+        ))
+
+    parsed_history: list[StatusTransition] = []
+    for value in status_history:
+        transition = _exact_row(value, _TRANSITION_KEYS, "transition")
+        from_status = transition["from_status"]
+        if from_status is not None and type(from_status) is not str:
+            raise ValueError("invalid transition from_status")
+        parsed_history.append(StatusTransition(
+            from_status=VerificationStatus(from_status) if from_status is not None else None,
+            to_status=VerificationStatus(_string(transition["to_status"], "transition to_status")),
+            changed_at=_parse_datetime(transition["changed_at"]),
+            reason=_string(transition["reason"], "transition reason"),
+        ))
 
     return EvidenceEvent(
-        event_id=str(row["event_id"]),
-        title=str(row.get("title") or ""),
-        summary=str(row.get("summary") or ""),
-        category=str(row.get("category") or "industry"),
-        related_tags=tuple((str(value.get("id") or ""), str(value.get("name") or "")) for value in row.get("related_tags") or [] if isinstance(value, dict) and value.get("id")),
-        published_at=_parse_datetime(row["published_at"]) if row.get("published_at") else None,
-        core_claim=str(row.get("core_claim") or ""),
-        verification_status=VerificationStatus(str(row["verification_status"])),
-        verification_reason=str(row.get("verification_reason") or ""),
+        event_id=_string(row["event_id"], "event_id"),
+        title=_string(row["title"], "event title"),
+        summary=_string(row["summary"], "event summary"),
+        category=_string(row["category"], "event category"),
+        related_tags=tuple(parsed_tags),
+        published_at=_parse_datetime(published_at) if published_at is not None else None,
+        core_claim=_string(row["core_claim"], "core_claim"),
+        verification_status=VerificationStatus(_string(row["verification_status"], "verification_status")),
+        verification_reason=_string(row["verification_reason"], "verification_reason"),
         verified_at=_parse_datetime(row["verified_at"]),
         evidence_as_of=_parse_datetime(row["evidence_as_of"]),
-        key_fields=tuple(KeyField(
-            field_name=str(value["field_name"]),
-            raw_value=str(value.get("raw_value") or ""),
-            normalized_value=str(value.get("normalized_value") or ""),
-            verification_status=FieldVerificationStatus(str(value["verification_status"])),
-            evidence_ids=tuple(str(item) for item in value.get("evidence_ids") or []),
-            reason=str(value.get("reason") or ""),
-        ) for value in row.get("key_fields") or [] if isinstance(value, dict)),
+        key_fields=tuple(parsed_fields),
         primary_evidence=evidence_list("primary_evidence"),
         independent_evidence=evidence_list("independent_evidence"),
         syndicated_copies=evidence_list("syndicated_copies"),
         contradicting_evidence=evidence_list("contradicting_evidence"),
-        status_history=tuple(StatusTransition(
-            from_status=VerificationStatus(str(value["from_status"])) if value.get("from_status") else None,
-            to_status=VerificationStatus(str(value["to_status"])),
-            changed_at=_parse_datetime(value["changed_at"]),
-            reason=str(value.get("reason") or ""),
-        ) for value in row.get("status_history") or [] if isinstance(value, dict)),
-        holding_relevance=str(row.get("holding_relevance") or "none"),
+        status_history=tuple(parsed_history),
+        holding_relevance=_string(row["holding_relevance"], "holding_relevance"),
     )
 
 
@@ -289,6 +427,9 @@ def evidence_snapshot_from_document(document: dict[str, Any]) -> EvidenceSnapsho
     metadata = dict(recovery_metadata) if recovery_metadata is not None else {}
     if raw_snapshot_id is not None and type(raw_snapshot_id) is not str:
         raise ValueError("invalid raw snapshot identity")
+    events = document["events"]
+    if any(type(row) is not dict for row in events):
+        raise ValueError("invalid evidence event")
     if not raw_snapshot_id:
         raw_snapshot_id = snapshot_id
         metadata["legacy_identity"] = True
@@ -296,7 +437,7 @@ def evidence_snapshot_from_document(document: dict[str, Any]) -> EvidenceSnapsho
         snapshot_id=snapshot_id,
         raw_snapshot_id=raw_snapshot_id,
         generated_at=_parse_datetime(document["generated_at"]),
-        events=tuple(_event_from_document(row) for row in document.get("events") or [] if isinstance(row, dict)),
+        events=tuple(_event_from_document(row) for row in events),
         recovery_metadata=metadata,
     )
 
@@ -318,25 +459,27 @@ class EvidenceStorage:
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def _atomic_write(self, path: Path, document: dict[str, Any]) -> None:
+        _exact_builtin(document)
+        payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if len(payload) > _MAX_EVIDENCE_DOCUMENT_BYTES:
+            raise ValueError("evidence document is too large")
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         temp_path = Path(raw_path)
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(document, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, path)
+            _replace_durable(temp_path, path)
         except BaseException:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
+            _cleanup_owned_temp(temp_path, identity)
             raise
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:

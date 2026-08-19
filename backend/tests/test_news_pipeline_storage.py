@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import inspect
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -89,12 +94,12 @@ def test_explicit_recovery_marks_all_nonterminal_runs_interrupted(tmp_path):
 
     restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=31))
     assert restarted.load_run("run-1").phase is PipelinePhase.QUEUED
-    restarted.recover_incomplete_runs(recovery_owner_id="restart-owner")
+    restarted.recover_incomplete_runs()
     recovered = restarted.load_run("run-1")
 
     assert recovered.phase is PipelinePhase.INTERRUPTED
     assert recovered.displayed_trusted_snapshot_id == "old"
-    assert recovered.redacted_error == "运行在完成前中断"
+    assert recovered.redacted_error == "pipeline_interrupted"
 
 
 def test_legacy_evidence_identity_cannot_be_published_as_a_new_pipeline_artifact(tmp_path):
@@ -183,38 +188,29 @@ def test_terminal_run_cannot_be_revived(tmp_path):
         storage.write_run(replace(failed, phase=PipelinePhase.FETCHING), expected_phase=PipelinePhase.FAILED)
 
 
-def test_constructor_does_not_interrupt_active_owner_but_explicit_stale_recovery_does(tmp_path):
-    owner = "owner-a"
-    active = NewsPipelineStorage(tmp_path, owner_id=owner, now=lambda: NOW)
-    queued = replace(
-        pipeline_run(phase=PipelinePhase.QUEUED),
-        owner_id=owner,
-        lease_expires_at=NOW + timedelta(minutes=5),
-    )
+def test_constructor_does_not_recover_an_active_writer_but_explicit_stale_recovery_does(tmp_path):
+    active = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
     active.write_run(queued)
 
-    other = NewsPipelineStorage(tmp_path, owner_id="owner-b", now=lambda: NOW)
+    other = NewsPipelineStorage(tmp_path, now=lambda: NOW)
     with pytest.raises(ValueError, match="authority is active"):
-        other.recover_incomplete_runs(recovery_owner_id="owner-b")
+        other.recover_incomplete_runs()
     assert other.load_run("run-1").phase is PipelinePhase.QUEUED
 
-    stale = NewsPipelineStorage(tmp_path, owner_id="owner-b", now=lambda: NOW + timedelta(minutes=6))
-    stale.recover_incomplete_runs(recovery_owner_id="owner-b")
+    stale = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=31))
+    stale.recover_incomplete_runs()
     assert stale.load_run("run-1").phase is PipelinePhase.INTERRUPTED
 
 
-def test_run_owner_cannot_overwrite_another_active_owner(tmp_path):
-    owner_a = NewsPipelineStorage(tmp_path, owner_id="owner-a", now=lambda: NOW)
-    queued = replace(
-        pipeline_run(phase=PipelinePhase.QUEUED),
-        owner_id="owner-a",
-        lease_expires_at=NOW + timedelta(minutes=5),
-    )
-    owner_a.write_run(queued)
+def test_second_storage_instance_cannot_overwrite_an_active_private_writer(tmp_path):
+    writer = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
+    writer.write_run(queued)
 
-    owner_b = NewsPipelineStorage(tmp_path, owner_id="owner-b", now=lambda: NOW)
+    other = NewsPipelineStorage(tmp_path, now=lambda: NOW)
     with pytest.raises(ValueError, match="authority is active"):
-        owner_b.write_run(
+        other.write_run(
             replace(queued, phase=PipelinePhase.FETCHING),
             expected_phase=PipelinePhase.QUEUED,
         )
@@ -249,7 +245,7 @@ def test_explicit_recovery_interrupts_every_nonterminal_phase(tmp_path, phase):
                 break
 
     restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=31))
-    restarted.recover_incomplete_runs(recovery_owner_id="restart-owner")
+    restarted.recover_incomplete_runs()
 
     assert restarted.load_run(run.run_id).phase is PipelinePhase.INTERRUPTED
 
@@ -286,14 +282,6 @@ def test_run_storage_redacts_sensitive_error_before_persisting(tmp_path):
     assert "C:\\" not in error
 
 
-def test_run_rejects_non_datetime_lease_before_serialization(tmp_path):
-    storage = NewsPipelineStorage(tmp_path, owner_id="owner-a")
-    run = replace(pipeline_run(phase=PipelinePhase.QUEUED), owner_id="owner-a", lease_expires_at="tomorrow")
-
-    with pytest.raises(ValueError, match="lease_expires_at"):
-        storage.write_run(run)
-
-
 def test_pointer_write_oserror_preserves_previous_pointer_without_temp_cleanup(tmp_path):
     storage = NewsPipelineStorage(tmp_path)
     for raw_snapshot_id in ("old", "new"):
@@ -328,7 +316,7 @@ def test_atomic_write_never_unlinks_a_temp_path_replaced_by_another_file(tmp_pat
         swapped_paths.append(source_path)
         raise OSError("replace failed after temp path changed")
 
-    monkeypatch.setattr("news_pipeline.storage.os.replace", swap_temp_then_fail)
+    monkeypatch.setattr(storage, "_replace_durable", swap_temp_then_fail)
 
     with pytest.raises(OSError, match="replace failed"):
         storage.write_raw(raw_snapshot("raw-1"))
@@ -412,25 +400,165 @@ def test_redacted_error_removes_unix_unc_state_and_arbitrary_headers(tmp_path):
     assert all(value not in error for value in ("abc", "secret", "/srv/private", "\\server\\share", "host.test"))
 
 
-def test_fenced_authority_rejects_spoof_and_stale_writer_after_recovery(tmp_path):
-    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
-    first = storage.claim_authority("worker", lease_seconds=1)
+def test_recovery_fences_the_stale_private_writer_without_exposing_a_token(tmp_path):
+    current_time = [NOW]
+    storage = NewsPipelineStorage(tmp_path, now=lambda: current_time[0])
     queued = pipeline_run(phase=PipelinePhase.QUEUED)
-    storage.write_run(queued, authority=first)
+    storage.write_run(queued)
+    current_time[0] = NOW + timedelta(seconds=31)
+    restarted = NewsPipelineStorage(tmp_path, now=lambda: current_time[0])
+    restarted.recover_incomplete_runs()
 
     with pytest.raises(ValueError, match="authority"):
-        NewsPipelineStorage(tmp_path, now=lambda: NOW).write_run(
+        storage.write_run(
             replace(queued, phase=PipelinePhase.FETCHING),
             expected_phase=PipelinePhase.QUEUED,
-            authority=replace(first, token="spoof"),
         )
 
-    restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=2))
-    second = restarted.claim_authority("worker", lease_seconds=1)
-    assert second.generation > first.generation
-    with pytest.raises(ValueError, match="authority"):
-        restarted.write_run(
-            replace(queued, phase=PipelinePhase.FETCHING),
-            expected_phase=PipelinePhase.QUEUED,
-            authority=first,
-        )
+
+def test_public_pipeline_run_and_storage_mutators_expose_no_authority_inputs():
+    assert "owner_id" not in PipelineRun.__dataclass_fields__
+    assert "lease_expires_at" not in PipelineRun.__dataclass_fields__
+    assert "authority" not in inspect.signature(NewsPipelineStorage.write_run).parameters
+    assert "authority" not in inspect.signature(NewsPipelineStorage.write_raw).parameters
+    assert "authority" not in inspect.signature(NewsPipelineStorage.write_evidence).parameters
+    assert "authority" not in inspect.signature(NewsPipelineStorage.publish_trusted).parameters
+    assert "owner_id" not in inspect.signature(NewsPipelineStorage).parameters
+    assert "recovery_owner_id" not in inspect.signature(NewsPipelineStorage.recover_incomplete_runs).parameters
+    assert not hasattr(NewsPipelineStorage, "claim_authority")
+
+
+def test_evidence_and_trusted_artifacts_are_immutable_and_pointer_cannot_rewind(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    for raw_snapshot_id in ("old", "new"):
+        storage.write_raw(raw_snapshot(raw_snapshot_id))
+        storage.write_evidence(evidence_snapshot(raw_snapshot_id))
+        storage.publish_trusted(trusted_snapshot(raw_snapshot_id))
+
+    with pytest.raises(ValueError, match="evidence snapshot identity is immutable"):
+        storage.write_evidence(replace(evidence_snapshot("old"), generated_at=NOW + timedelta(seconds=1)))
+    with pytest.raises(ValueError, match="trusted pointer cannot move backwards"):
+        storage.publish_trusted(trusted_snapshot("old"))
+
+    assert storage.load_current_trusted().raw_snapshot_id == "new"
+
+
+@pytest.mark.parametrize("artifact", ["raw", "evidence", "trusted", "pointer"])
+def test_corrupt_artifacts_fail_closed_and_are_never_overwritten(tmp_path, artifact):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    storage.write_evidence(evidence_snapshot("raw-1"))
+    if artifact in {"trusted", "pointer"}:
+        storage.publish_trusted(trusted_snapshot("raw-1"))
+    if artifact == "pointer":
+        storage.write_raw(raw_snapshot("raw-2"))
+        storage.write_evidence(evidence_snapshot("raw-2"))
+    paths = {
+        "raw": storage.raw_root / "raw-1.json",
+        "evidence": storage.evidence_root / "raw-1.json",
+        "trusted": storage.trusted_root / "raw-1.json",
+        "pointer": storage.current_pointer_path,
+    }
+    path = paths[artifact]
+    path.write_text('{"schema_version":999}', encoding="utf-8")
+    before = path.read_bytes()
+
+    with pytest.raises(OSError, match="corrupt"):
+        if artifact == "raw":
+            storage.write_raw(raw_snapshot("raw-1"))
+        elif artifact == "evidence":
+            storage.write_evidence(evidence_snapshot("raw-1"))
+        else:
+            storage.publish_trusted(trusted_snapshot("raw-1" if artifact == "trusted" else "raw-2"))
+
+    assert path.read_bytes() == before
+
+
+def test_persisted_diagnostics_are_known_codes_only(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_run(replace(pipeline_run(phase=PipelinePhase.QUEUED), redacted_error="hunter2"))
+
+    assert storage.load_run("run-1").redacted_error == "pipeline_error"
+
+
+def test_failed_atomic_write_cleans_only_the_temp_file_it_created(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    real_replace = os.replace
+    created = []
+
+    def fail_replace(source, destination):
+        created.append(Path(source))
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(storage, "_replace_durable", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        storage.write_raw(raw_snapshot("raw-1"))
+
+    assert created and not created[0].exists()
+
+
+def test_real_subprocess_writers_use_cross_process_cas(tmp_path):
+    repo_backend = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from datetime import datetime, timezone
+from news_pipeline import NewsPipelineStorage, PipelineCounts, PipelinePhase, PipelineRun
+root, run_id = sys.argv[1:]
+now = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+run = PipelineRun(run_id, 'raw-1', None, None, PipelinePhase.QUEUED, PipelineCounts(), now, now, None, None)
+try:
+    NewsPipelineStorage(root).write_run(run)
+except Exception as error:
+    print(type(error).__name__)
+    raise
+"""
+    environment = {**os.environ, "PYTHONPATH": str(repo_backend)}
+    first = subprocess.run([sys.executable, "-c", script, str(tmp_path), "run-1"], env=environment, capture_output=True, text=True)
+    second = subprocess.run([sys.executable, "-c", script, str(tmp_path), "run-2"], env=environment, capture_output=True, text=True)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode != 0
+    assert "authority is active" in second.stderr
+
+
+def test_real_subprocess_recovery_interrupts_stale_run(tmp_path):
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    authority = json.loads(storage._authority_path.read_text(encoding="utf-8"))
+    authority["expires_at"] = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+    storage._authority_path.write_text(json.dumps(authority), encoding="utf-8")
+    repo_backend = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from news_pipeline import NewsPipelineStorage
+print(NewsPipelineStorage(sys.argv[1]).recover_incomplete_runs())
+"""
+    environment = {**os.environ, "PYTHONPATH": str(repo_backend)}
+    recovered = subprocess.run([sys.executable, "-c", script, str(tmp_path)], env=environment, capture_output=True, text=True)
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert recovered.stdout.strip() == "1"
+    assert NewsPipelineStorage(tmp_path).load_run("run-1").phase is PipelinePhase.INTERRUPTED
+
+
+def test_real_subprocess_phase_cas_cannot_overwrite_changed_state(tmp_path):
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    authority = json.loads(storage._authority_path.read_text(encoding="utf-8"))
+    authority["expires_at"] = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+    storage._authority_path.write_text(json.dumps(authority), encoding="utf-8")
+    repo_backend = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from datetime import datetime, timezone
+from news_pipeline import NewsPipelineStorage, PipelineCounts, PipelinePhase, PipelineRun
+now = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+run = PipelineRun('run-1', 'raw-1', None, None, PipelinePhase.FETCHING, PipelineCounts(), now, now, None, 'old')
+NewsPipelineStorage(sys.argv[1]).write_run(run, expected_phase=PipelinePhase.FETCHING)
+"""
+    environment = {**os.environ, "PYTHONPATH": str(repo_backend)}
+    attempted = subprocess.run([sys.executable, "-c", script, str(tmp_path)], env=environment, capture_output=True, text=True)
+
+    assert attempted.returncode != 0
+    assert "expected current phase does not match" in attempted.stderr
+    assert NewsPipelineStorage(tmp_path).load_run("run-1").phase is PipelinePhase.QUEUED
