@@ -10,6 +10,7 @@ from source_health.registry import (
     build_registry,
     news_source_id,
 )
+from data_sources.health_bridge import news_adapter_id
 from source_health.samples import select_public_samples
 
 
@@ -50,11 +51,13 @@ def test_models_expose_the_required_contract_fields():
     assert descriptor_fields == {
         "source_id", "source_name", "group", "capability", "source_reference",
         "priority", "critical", "requires_api_key", "probe_kind", "probe_args",
-        "freshness_max_age_seconds",
+        "freshness_max_age_seconds", "source_family_id", "adapter_id", "capability_id",
+        "configured_reference",
     }
     assert {
         "probe_status", "error_type", "rating", "rating_confidence",
-        "repair_value", "consecutive_failures", "last_success_at",
+        "repair_value", "consecutive_failures", "last_success_at", "configured_reference",
+        "observed_final_reference", "final_reference",
     } <= observation_fields
 
 
@@ -62,16 +65,16 @@ def test_registry_expands_provider_by_capability_and_reads_provider_priority():
     rows = build_provider_descriptors(fake_providers())
     by_id = {row.source_id: row for row in rows}
 
-    assert "fund:eastmoney-direct:search" in by_id
-    assert "fund:eastmoney-direct:nav_history" in by_id
-    assert "quote:eastmoney-direct:stock_snapshot" in by_id
-    assert "industry:cninfo-industry:stock_industry_classification" in by_id
-    assert by_id["fund:eastmoney-direct:search"].priority == FakeProvider.priority
+    assert "eastmoney-direct:search" in by_id
+    assert "eastmoney-direct:nav_history" in by_id
+    assert "eastmoney-direct:stock_snapshot" in by_id
+    assert "cninfo-industry:stock_industry_classification" in by_id
+    assert by_id["eastmoney-direct:search"].priority == FakeProvider.priority
     assert [row.source_id for row in rows] == [
-        "fund:eastmoney-direct:nav_history",
-        "fund:eastmoney-direct:search",
-        "quote:eastmoney-direct:stock_snapshot",
-        "industry:cninfo-industry:stock_industry_classification",
+        "eastmoney-direct:nav_history",
+        "eastmoney-direct:search",
+        "eastmoney-direct:stock_snapshot",
+        "cninfo-industry:stock_industry_classification",
     ]
 
 
@@ -92,10 +95,11 @@ def test_default_registry_preserves_actual_runtime_provider_order():
 def test_registry_assigns_semantic_freshness_windows_without_staling_profile_or_search():
     class ProviderWithAllCapabilities:
         name = "semantic-provider"
+        adapter_id = "eastmoney-direct"
         priority = 10
         capabilities = {
             "search", "profile", "nav_history", "holdings",
-            "industry_allocation", "stock_snapshot", "stock_industry_classification",
+            "industry_allocation", "stock_snapshot",
         }
 
     by_capability = {
@@ -106,7 +110,7 @@ def test_registry_assigns_semantic_freshness_windows_without_staling_profile_or_
     assert by_capability["profile"].freshness_max_age_seconds is None
     for capability in (
         "nav_history", "holdings", "industry_allocation",
-        "stock_snapshot", "stock_industry_classification",
+        "stock_snapshot",
     ):
         assert by_capability[capability].freshness_max_age_seconds == registry_module.CAPABILITY_FRESHNESS_MAX_AGE_SECONDS[capability]
         assert by_capability[capability].freshness_max_age_seconds > 0
@@ -157,7 +161,7 @@ def test_news_identity_and_reference_remove_non_public_query_parameters():
     serialized = str(row.to_dict()).lower()
 
     assert row.source_reference == public_url
-    assert row.source_id == news_source_id("ai", "Public feed", public_url)
+    assert row.source_id == news_adapter_id({"hint": "ai", "name": "Public feed", "url": configured_url}) + ":feed"
     for forbidden in (
         "client_secret", "client-value", "password", "password-value",
         "refresh_token", "refresh-value", "session", "session-value",

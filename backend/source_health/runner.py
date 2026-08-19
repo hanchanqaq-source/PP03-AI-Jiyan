@@ -14,6 +14,7 @@ from .models import ProbeObservation, SourceDescriptor
 from .probe_errors import classify_probe_error
 from .probes import probe_news_source, probe_provider_capability
 from .repair_advisor import apply_repair_advice
+from .registry import public_source_reference
 from .scoring import score_observation
 
 
@@ -93,7 +94,7 @@ class SourceHealthRunner:
             source_id for source_id, identity in identities if counts[identity] > 1
         }
         self._providers = {
-            str(getattr(provider, "name", type(provider).__name__)): provider
+            str(getattr(provider, "adapter_id", getattr(provider, "name", type(provider).__name__))): provider
             for provider in providers
         }
         self._news_sources = {key: dict(value) for key, value in news_sources.items()}
@@ -103,7 +104,7 @@ class SourceHealthRunner:
         self._news_timeout = float(news_timeout)
         self._fund_pool = ThreadPoolExecutor(max_workers=fund_workers, thread_name_prefix="source-health-fund")
         self._news_pool = ThreadPoolExecutor(max_workers=news_workers, thread_name_prefix="source-health-news")
-        self._provider_locks = {name: threading.Lock() for name in self._providers}
+        self._provider_locks = {adapter_id: threading.Lock() for adapter_id in self._providers}
         self._shutdown = False
         self._sample_path = Path(sample_path) if sample_path else Path(__file__).with_name("source-health-samples.json")
         self._sample_code: str | None = None
@@ -176,6 +177,11 @@ class SourceHealthRunner:
             fallback_available=self._fallback_available(descriptor),
             redirected=False,
             final_reference=None,
+            source_family_id=descriptor.source_family_id,
+            adapter_id=descriptor.adapter_id,
+            capability_id=descriptor.capability_id,
+            configured_reference=descriptor.configured_reference,
+            observed_final_reference=None,
         )
 
     def _observation(
@@ -199,6 +205,13 @@ class SourceHealthRunner:
                 freshness_seconds = max(0, round((current - observed).total_seconds()))
             except ValueError:
                 freshness_seconds = None
+        raw_final_reference = raw.get("final_reference") or raw.get("final_url")
+        observed_final_reference = None
+        if (status == "success" or (status == "partial" and raw.get("redirected"))) and raw_final_reference:
+            try:
+                observed_final_reference = public_source_reference(str(raw_final_reference))
+            except ValueError:
+                observed_final_reference = None
         observation = ProbeObservation(
             source_id=descriptor.source_id,
             source_name=str(raw.get("source_name") or descriptor.source_name),
@@ -223,7 +236,12 @@ class SourceHealthRunner:
             cache_status=str(raw.get("cache_status") or "not_used"),
             fallback_available=self._fallback_available(descriptor),
             redirected=bool(raw.get("redirected", False)),
-            final_reference=raw.get("final_reference") or raw.get("final_url"),
+            final_reference=observed_final_reference,
+            source_family_id=descriptor.source_family_id,
+            adapter_id=descriptor.adapter_id,
+            capability_id=descriptor.capability_id,
+            configured_reference=descriptor.configured_reference,
+            observed_final_reference=observed_final_reference,
         )
         return observation
 
@@ -289,7 +307,7 @@ class SourceHealthRunner:
             permanent_redirect_same_public_source=(
                 redirect_status in {301, 308}
                 and observation.redirected
-                and _same_public_source(descriptor.source_reference, observation.final_reference)
+                and _same_public_source(descriptor.configured_reference, observation.observed_final_reference)
             ),
             missing_standard_request_headers=bool(raw.get("missing_standard_request_headers")),
             confirmed_compatibility_issue=bool(raw.get("confirmed_compatibility_issue")),
@@ -319,7 +337,8 @@ class SourceHealthRunner:
                 source = self._news_sources[descriptor.source_id]
                 raw = self._news_probe(source, timeout=self._news_timeout)
             else:
-                provider = self._providers[descriptor.source_name]
+                adapter_id = descriptor.adapter_id or descriptor.source_name
+                provider = self._providers[adapter_id]
                 call = lambda: self._provider_probe(
                     provider,
                     descriptor.capability,
@@ -330,7 +349,7 @@ class SourceHealthRunner:
                 if getattr(provider, "thread_safe", False):
                     raw = call()
                 else:
-                    with self._provider_locks[descriptor.source_name]:
+                    with self._provider_locks[adapter_id]:
                         raw = call()
             observation = self._observation(descriptor, raw, started_at)
             self._finalize_observation(descriptor, observation, raw, history_rows)

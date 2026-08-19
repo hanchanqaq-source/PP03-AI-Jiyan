@@ -114,6 +114,7 @@ def test_stock_snapshot_missing_optional_quotes_is_partial_without_fabricating_v
 def test_registry_nav_freshness_window_drives_fresh_boundary_and_stale(age_seconds, expected_status):
     class NavProvider(FakeProvider):
         name = "nav-provider"
+        adapter_id = "eastmoney-direct"
         priority = 10
         capabilities = {"nav_history"}
 
@@ -137,6 +138,7 @@ def test_registry_nav_freshness_window_drives_fresh_boundary_and_stale(age_secon
 def test_profile_has_no_freshness_window_and_is_not_misclassified_as_stale():
     class ProfileProvider(FakeProvider):
         name = "profile-provider"
+        adapter_id = "eastmoney-direct"
         priority = 10
         capabilities = {"profile"}
 

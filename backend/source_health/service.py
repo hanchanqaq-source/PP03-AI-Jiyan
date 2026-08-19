@@ -120,12 +120,13 @@ class SourceHealthService:
 
     def _default_runner(self) -> SourceHealthRunner:
         import newsradar
+        from data_sources.health_bridge import news_adapter_id
 
         providers = default_fund_providers()
         news_config = load_news_config()
         descriptors = build_registry(providers, news_config)
         news_sources = {
-            news_source_id(str(row.get("hint") or ""), str(row.get("name") or ""), str(row.get("url") or "")): row
+            f"{news_adapter_id(row)}:feed": row
             for row in news_config.get("sources") or []
             if row.get("hint") and row.get("name") and row.get("url")
         }
@@ -137,7 +138,7 @@ class SourceHealthService:
             hint = str(source.get("hint") or "")
             name = str(source.get("name") or "")
             url = str(source.get("url") or "")
-            health_source_id = news_source_id(hint, name, url)
+            health_source_id = f"{news_adapter_id(source)}:feed"
             descriptor = descriptors_by_id.get(health_source_id)
             if descriptor is not None:
                 radar_source_identities[newsradar.source_id(source)] = (

@@ -47,6 +47,16 @@ class SourceDescriptor:
     probe_kind: str
     probe_args: dict[str, Any] = field(default_factory=dict)
     freshness_max_age_seconds: int | None = None
+    source_family_id: str = ""
+    adapter_id: str = ""
+    capability_id: str = ""
+    configured_reference: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.configured_reference:
+            object.__setattr__(self, "configured_reference", self.source_reference)
+        if not self.capability_id:
+            object.__setattr__(self, "capability_id", self.capability)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -74,6 +84,11 @@ class ProbeObservation:
     fallback_available: bool
     redirected: bool
     final_reference: str | None
+    source_family_id: str = ""
+    adapter_id: str = ""
+    capability_id: str = ""
+    configured_reference: str = ""
+    observed_final_reference: str | None = None
     rating_score: float = 0.0
     rating: HealthLabel = "failed"
     rating_confidence: RatingConfidence = "initial"
@@ -81,6 +96,12 @@ class ProbeObservation:
     repair_reason: str = ""
     consecutive_failures: int = 0
     last_success_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.observed_final_reference is None and self.final_reference is not None:
+            self.observed_final_reference = self.final_reference
+        if self.final_reference != self.observed_final_reference:
+            self.final_reference = self.observed_final_reference
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

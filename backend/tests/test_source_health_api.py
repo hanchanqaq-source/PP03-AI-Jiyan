@@ -19,6 +19,7 @@ from source_health.registry import news_source_id
 from source_health.runner import SourceHealthRunner
 from source_health.service import FullRunConflict, SourceHealthService
 from source_health.storage import SourceHealthStorage
+from data_sources.health_bridge import news_adapter_id
 
 
 UTC = timezone.utc
@@ -189,7 +190,7 @@ def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_eviden
         "url": "https://public.example.test/rss?mid=21&code=opaque-code-value",
         "language": "zh-CN", "region": "CN",
     }
-    health_source_id = news_source_id(source["hint"], source["name"], source["url"])
+    health_source_id = news_adapter_id(source) + ":feed"
     radar_source_id = newsradar.source_id(source)
     other_source = {**source, "url": "https://other.example.test/rss"}
     cache_source_id = newsradar.source_id(other_source) if cache_case == "mismatch" else radar_source_id
@@ -273,6 +274,34 @@ def test_default_service_uses_only_matching_fresh_radar_cache_as_reliable_eviden
     assert health_row["repair_value"] == expected
     assert "opaque-code-value" not in str(health_row)
     assert cache_path.read_bytes() == original_cache
+    service.shutdown()
+
+
+def test_default_service_routes_catalog_news_identity_to_the_news_probe(tmp_path, monkeypatch):
+    source = {
+        "hint": "ai", "name": "Public feed", "url": "https://public.example.test/rss",
+        "language": "zh-CN", "region": "CN",
+    }
+    calls = []
+    monkeypatch.setattr(service_module, "default_fund_providers", lambda: [])
+    monkeypatch.setattr(service_module, "load_news_config", lambda: {"fetch": {"timeout": 1}, "sources": [source]})
+    monkeypatch.setattr(newsradar, "probe_source_config", lambda row, **_kwargs: calls.append(row) or {
+        "status": "success", "source_name": source["name"], "error_type": "none",
+        "error_message_redacted": "", "http_status": 200, "latency_ms": 1,
+        "returned_items": 1, "data_as_of_date": NOW.isoformat(),
+        "field_completeness_pct": 100.0, "used_cache": False, "cache_status": "not_used",
+        "redirected": False, "final_url": source["url"],
+    })
+    service = SourceHealthService(
+        storage=SourceHealthStorage(root=tmp_path / "source-health", now=lambda: NOW),
+        now=lambda: NOW,
+    )
+
+    run = service.start_run("full")
+    wait_for(service, run["run_id"])
+
+    assert calls == [source]
+    assert service.list_sources()[0]["probe_status"] == "success"
     service.shutdown()
 
 

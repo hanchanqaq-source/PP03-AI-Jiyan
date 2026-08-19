@@ -5,7 +5,9 @@ import hashlib
 import json
 from typing import Any, Iterable, Mapping, Sequence, TypeVar
 
-from source_health.registry import load_news_config, public_source_reference
+from source_health.registry import load_news_config
+
+from .references import public_source_reference
 
 from .models import (
     AdapterDescriptor,
@@ -106,6 +108,9 @@ class DataSourceCatalog:
     def adapter(self, adapter_id: str) -> AdapterDescriptor:
         return self._adapters_by_id[adapter_id]
 
+    def capability(self, capability_id: str) -> CapabilityDescriptor:
+        return self._capabilities_by_id[capability_id]
+
     def adapters_for_family(self, family_id: str) -> tuple[AdapterDescriptor, ...]:
         self.family(family_id)
         return tuple(row for row in self._adapters if row.source_family_id == family_id)
@@ -179,6 +184,7 @@ def _news_identity(source: Mapping[str, Any]) -> str:
 def _news_records(news_config: Mapping[str, Any]) -> tuple[tuple[SourceFamily, ...], tuple[AdapterDescriptor, ...]]:
     families: list[SourceFamily] = []
     adapters: list[AdapterDescriptor] = []
+    registered_identities: set[str] = set()
     for source in news_config.get("sources") or []:
         if not isinstance(source, Mapping):
             continue
@@ -186,6 +192,9 @@ def _news_records(news_config: Mapping[str, Any]) -> tuple[tuple[SourceFamily, .
         if not hint or not name or not url:
             continue
         identity = _news_identity(source)
+        if identity in registered_identities:
+            continue
+        registered_identities.add(identity)
         family_id, adapter_id = f"news-publisher:{identity[:16]}", f"news-feed:{identity[:16]}"
         region = str(source.get("region") or "global").strip() or "global"
         families.append(SourceFamily(family_id, name, region, "news", (SourceRole.NEWS_PUBLISHER,), True, "publisher_terms_apply", CatalogStatus.CATALOG_ONLY))
