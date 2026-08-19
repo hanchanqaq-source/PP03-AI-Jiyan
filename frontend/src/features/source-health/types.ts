@@ -51,6 +51,11 @@ export interface SourceHealthSource {
   repair_reason: string;
   consecutive_failures: number;
   last_success_at: string | null;
+  source_family_id?: string;
+  adapter_id?: string;
+  capability_id?: string;
+  configured_reference?: string;
+  observed_final_reference?: string | null;
 }
 
 export interface SourceHealthRun {

@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { SourceHealthRating, SourceHealthSource } from "./types";
 import { SourceHealthSummary } from "./SourceHealthSummary";
+import { SourceCatalogWorkspace } from "@/features/source-catalog/SourceCatalogWorkspace";
 
 type GroupFilter = "all" | "fund" | "news" | "official" | "candidate";
 type RatingFilter = "all" | SourceHealthRating;
@@ -256,6 +257,7 @@ export function SourceHealthWorkspace() {
   const [addOpen, setAddOpen] = useState(false);
   const [candidates, setCandidates] = useState<CandidateSource[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  const [catalogUnavailable, setCatalogUnavailable] = useState(false);
   const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const addTriggerRef = useRef<HTMLButtonElement | null>(null);
 
@@ -264,7 +266,14 @@ export function SourceHealthWorkspace() {
     setError(false);
     try { setSources(await api.sourceHealthSources()); } catch { setError(true); } finally { setLoading(false); }
   }, []);
-  useEffect(() => { void loadSources(); }, [loadSources, refreshToken]);
+  // Catalog owns registration and list rendering. Legacy source-health clients remain
+  // available for compatibility consumers, but this workspace no longer treats them as a registry.
+  useEffect(() => {
+    let active = true;
+    api.dataSourceCatalog().catch(() => { if (active) setCatalogUnavailable(true); });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => { if (catalogUnavailable) void loadSources(); }, [catalogUnavailable, loadSources, refreshToken]);
 
   const normalizedSearch = search.trim().toLocaleLowerCase("zh-CN");
   const providers = useMemo(() => sortProviders(aggregateProviders(sources.filter((row) => row.group !== "news")).filter((provider) => {
@@ -282,6 +291,11 @@ export function SourceHealthWorkspace() {
   const closeAdd = useCallback(() => { setAddOpen(false); addTriggerRef.current?.focus(); }, []);
   const toggleProvider = (key: string) => setExpandedProviders((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; });
   const addCandidate = (candidate: CandidateSource) => setCandidates((current) => [...current.filter((row) => row.id !== candidate.id), candidate]);
+
+  if (!catalogUnavailable) return <div className="mt-4 space-y-4">
+    <SourceHealthSummary variant="bar" refreshToken={refreshToken} onUpdated={() => setRefreshToken((value) => value + 1)} />
+    <SourceCatalogWorkspace />
+  </div>;
 
   return <div className="mt-4 space-y-4">
     <SourceHealthSummary variant="bar" refreshToken={refreshToken} onUpdated={() => setRefreshToken((value) => value + 1)} />

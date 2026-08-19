@@ -28,6 +28,8 @@ const sources = [
     cache_status: "not_used", fallback_available: false, redirected: true, final_reference: "https://news.example.test/public",
     rating_score: 10, rating: "failed", rating_confidence: "initial", repair_value: "replace_candidate", repair_reason: "评估替换公开来源", consecutive_failures: 3,
     last_success_at: "2026-08-17T10:00:00+00:00",
+    source_family_id: "news-publisher:finance", adapter_id: "news-feed:finance", capability_id: "feed",
+    configured_reference: "https://news.example.test/configured", observed_final_reference: "https://news.example.test/public",
     headers: { Authorization: "Bearer secret-token" }, Cookie: "private-cookie", Token: "secret-token",
     stack: "C:\\Users\\private\\project\\backend.py line 9", local_path: "D:\\private\\debug.txt",
   },
@@ -75,7 +77,9 @@ describe("source health drawer through MarketNews", () => {
     await user.click(screen.getByRole("button", { name: "查看失败详情 财经资讯源" }));
     expect(screen.getByText("错误类型：超时")).toBeInTheDocument();
     expect(screen.getByText("脱敏原因：公开请求超时，未包含凭证")).toBeInTheDocument();
-    expect(screen.getByText("最终公开地址：https://news.example.test/public")).toBeInTheDocument();
+    expect(screen.getByText("稳定身份：news-publisher:finance / news-feed:finance / feed")).toBeInTheDocument();
+    expect(screen.getByText("配置公开地址：https://news.example.test/configured")).toBeInTheDocument();
+    expect(screen.getByText("观测公开地址：https://news.example.test/public")).toBeInTheDocument();
     expect(screen.getByText("是否重定向：是")).toBeInTheDocument();
     expect(screen.getByText("是否有备用来源：否")).toBeInTheDocument();
     expect(screen.getByText("建议处理：评估替换公开来源")).toBeInTheDocument();

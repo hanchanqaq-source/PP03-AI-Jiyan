@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
 import type { SourceHealthSource, SourceHealthSummaryData } from "@/features/source-health/types";
+import type { DataSourceCatalogResponse } from "@/features/source-catalog/types";
 import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWorkspace";
 
 const summary: SourceHealthSummaryData = {
@@ -208,7 +209,7 @@ describe("SourceHealthWorkspace", () => {
   it("opens the add-source prototype, shows the lifecycle, and keeps detected candidates out of the formal feed", async () => {
     const user = userEvent.setup();
     render(<SourceHealthWorkspace />);
-    await user.click(screen.getByRole("button", { name: "+ 添加数据源" }));
+    await user.click(await screen.findByRole("button", { name: "+ 添加数据源" }));
     const drawer = screen.getByRole("dialog", { name: "添加数据源原型" });
     for (const state of ["候选", "检测中", "待验证", "可启用", "已启用", "降级", "已停用"]) expect(within(drawer).getByText(state)).toBeInTheDocument();
     await user.type(within(drawer).getByLabelText("来源名称"), "北斗资讯候选");
@@ -227,7 +228,7 @@ describe("SourceHealthWorkspace", () => {
   it("keeps keyboard focus inside the add-source modal and restores its trigger", async () => {
     const user = userEvent.setup();
     render(<SourceHealthWorkspace />);
-    const trigger = screen.getByRole("button", { name: "+ 添加数据源" });
+    const trigger = await screen.findByRole("button", { name: "+ 添加数据源" });
     await user.click(trigger);
     const drawer = screen.getByRole("dialog", { name: "添加数据源原型" });
     const close = within(drawer).getByRole("button", { name: "关闭添加数据源" });
@@ -248,5 +249,19 @@ describe("SourceHealthWorkspace", () => {
     await screen.findByText("财经资讯源");
     await user.click(screen.getByRole("button", { name: "官方证据" }));
     expect(screen.getByText("A1 健康 API 未提供来源身份验证字段，当前不把普通来源标记为官方证据。")).toBeInTheDocument();
+  });
+
+  it("keeps runtime controls compact while the visible library comes from the catalog", async () => {
+    const catalog: DataSourceCatalogResponse = {
+      registration: { families: 1, adapters: 0, capabilities: 0, news_sources: 108, fingerprint: "catalog" },
+      observed: { sources: 0, families: 0, adapters: 0, capabilities: 0 },
+      portfolio_relation: { status: "unavailable_no_holdings" }, capabilities: [],
+      families: [{ source_family_id: "news", source_family_name: "公开资讯家族", region: "CN", market: "news", source_roles: ["news_publisher"], independent_evidence_eligible: true, commercial_use_status: "publisher_terms_apply", catalog_status: "catalog_only", health_status: "unexamined", adapters: [] }],
+    };
+    vi.spyOn(api, "dataSourceCatalog").mockResolvedValue(catalog);
+    render(<SourceHealthWorkspace />);
+    expect(await screen.findByText("公开资讯家族")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "数据源健康状态栏" })).toBeInTheDocument();
+    expect(screen.getByText("108 个资讯来源")).toBeInTheDocument();
   });
 });

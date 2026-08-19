@@ -42,6 +42,7 @@ function SourceRow({ source }: { source: SourceHealthSource }) {
         <span className="rounded-full border border-border px-2 py-1 text-xs">状态：{ratingLabels[source.rating]}</span>
       </div>
       <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-3">
+        {(source.source_family_id || source.adapter_id || source.capability_id) && <p className="break-all sm:col-span-2 lg:col-span-3">稳定身份：{source.source_family_id || "未提供"} / {source.adapter_id || "未提供"} / {source.capability_id || source.capability}</p>}
         <p>响应时间：{source.latency_ms} ms</p><p>返回条数：{source.returned_items}</p>
         <p>数据日期：{source.data_as_of_date || "暂无记录"}</p>
         <p>字段完整率：{source.field_completeness_pct == null ? "暂无记录" : `${source.field_completeness_pct}%`}</p>
@@ -57,7 +58,9 @@ function SourceRow({ source }: { source: SourceHealthSource }) {
             <div className="mt-3 grid gap-2 rounded-lg border border-warning/25 bg-warning/5 p-3 text-xs text-muted-foreground sm:grid-cols-2">
               <p>错误类型：{errorLabels[source.error_type] || "未知错误"}</p>
               <p>脱敏原因：{source.error_message_redacted || "暂无公开错误说明"}</p>
-              <p className="break-all sm:col-span-2">最终公开地址：{source.final_reference || "暂无公开地址"}</p>
+              <p className="break-all sm:col-span-2">配置公开地址：{source.configured_reference || "暂无公开地址"}</p>
+              {source.observed_final_reference && <p className="break-all sm:col-span-2">观测公开地址：{source.observed_final_reference}</p>}
+              {!source.observed_final_reference && <p className="sm:col-span-2">观测公开地址：尚未体检</p>}
               <p>是否重定向：{source.redirected ? "是" : "否"}</p>
               <p>是否有备用来源：{source.fallback_available ? "是" : "否"}</p>
               <p className="sm:col-span-2">建议处理：{source.repair_reason || "继续观察公开来源"}</p>

@@ -25,6 +25,7 @@ import type {
   SourceHealthSource,
   SourceHealthSummaryData,
 } from "@/features/source-health/types";
+import type { DataSourceCatalogResponse, SourceFamilyView } from "@/features/source-catalog/types";
 import type {
   EvidenceEventDetail,
   EvidenceEventList,
@@ -341,6 +342,10 @@ export const api = {
   sourceHealthSources: () => get<SourceHealthSource[]>("/source-health/sources"),
   sourceHealthStartFullRun: () => request<SourceHealthRunStarted>("/source-health/runs", "POST", { scope: "full" }),
   sourceHealthRun: (runId: string) => get<SourceHealthRun>(`/source-health/runs/${encodeURIComponent(runId)}`),
+  dataSourceCatalog: () => get<DataSourceCatalogResponse>("/data-sources/catalog"),
+  dataSourceFamilies: () => get<SourceFamilyView[]>("/data-sources/families"),
+  dataSourceFamily: (familyId: string) => get<SourceFamilyView>(`/data-sources/families/${encodeURIComponent(familyId)}`),
+  dataSourceRefresh: () => request<SourceHealthRunStarted>("/data-sources/refresh", "POST"),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),
