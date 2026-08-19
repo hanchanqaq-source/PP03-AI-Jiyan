@@ -6,6 +6,18 @@ import { SourceFamilyCard } from "./SourceFamilyCard";
 import type { DataSourceCatalogResponse, SourceFamilyView } from "./types";
 
 const initialFilters: CatalogFiltersValue = { search: "", billing: "all", catalogStatus: "all", healthStatus: "all" };
+let inFlightCatalogRequest: Promise<DataSourceCatalogResponse> | null = null;
+
+function requestCatalog(): Promise<DataSourceCatalogResponse> {
+  if (inFlightCatalogRequest) return inFlightCatalogRequest;
+  const request = api.dataSourceCatalog();
+  inFlightCatalogRequest = request;
+  request.then(
+    () => { if (inFlightCatalogRequest === request) inFlightCatalogRequest = null; },
+    () => { if (inFlightCatalogRequest === request) inFlightCatalogRequest = null; },
+  );
+  return request;
+}
 
 function matches(family: SourceFamilyView, filters: CatalogFiltersValue): boolean {
   const phrase = filters.search.trim().toLocaleLowerCase("zh-CN");
@@ -23,7 +35,7 @@ export function SourceCatalogWorkspace({ onCatalogUnavailable }: { onCatalogUnav
   const [filters, setFilters] = useState(initialFilters);
   const unavailableRef = useRef(onCatalogUnavailable);
   useEffect(() => { unavailableRef.current = onCatalogUnavailable; }, [onCatalogUnavailable]);
-  useEffect(() => { let active = true; api.dataSourceCatalog().then((value) => { if (active) { setCatalog(value); setError(false); } }).catch(() => { if (active) { setError(true); unavailableRef.current?.(); } }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, []);
+  useEffect(() => { let active = true; requestCatalog().then((value) => { if (active) { setCatalog(value); setError(false); } }).catch(() => { if (active) { setError(true); unavailableRef.current?.(); } }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, []);
   const families = useMemo(() => catalog?.families.filter((family) => matches(family, filters)) || [], [catalog, filters]);
   return <section className="rounded-xl border border-border/60 bg-background/45" aria-label="来源目录">
     <header className="flex flex-wrap items-start justify-between gap-3 border-b border-border/55 p-4"><div><h2 className="font-semibold">来源目录</h2><p className="mt-1 text-xs text-muted-foreground">目录身份独立于体检观测；展开家族后查看接入方式与能力。</p></div>{catalog && <div className="flex flex-wrap gap-2 text-xs"><span className="rounded border border-border px-2 py-1">{catalog.registration.news_sources} 个资讯来源</span><span className="rounded border border-border px-2 py-1">已观测 {catalog.observed.sources} 项</span></div>}</header>

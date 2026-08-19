@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -274,5 +275,20 @@ describe("SourceHealthWorkspace", () => {
     expect(load).toHaveBeenCalledTimes(1);
     expect(screen.getByText("公开资讯家族")).toBeInTheDocument();
     await waitFor(() => expect(legacy).not.toHaveBeenCalled());
+  });
+
+  it("shares one Catalog request across StrictMode mount replay without falling back after a second-request failure", async () => {
+    const catalog: DataSourceCatalogResponse = {
+      registration: { families: 1, adapters: 0, capabilities: 0, news_sources: 108, fingerprint: "catalog" },
+      observed: { sources: 0, families: 0, adapters: 0, capabilities: 0 },
+      portfolio_relation: { status: "unavailable_no_holdings" }, capabilities: [],
+      families: [{ source_family_id: "news", source_family_name: "StrictMode 公开资讯家族", region: "CN", market: "news", source_roles: ["news_publisher"], independent_evidence_eligible: true, commercial_use_status: "publisher_terms_apply", catalog_status: "catalog_only", health_status: "unexamined", adapters: [] }],
+    };
+    const load = vi.spyOn(api, "dataSourceCatalog").mockResolvedValueOnce(catalog).mockRejectedValueOnce(new Error("second StrictMode request failed"));
+    const legacy = vi.spyOn(api, "sourceHealthSources");
+    render(<StrictMode><SourceHealthWorkspace /></StrictMode>);
+    expect(await screen.findByText("StrictMode 公开资讯家族")).toBeInTheDocument();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(legacy).not.toHaveBeenCalled();
   });
 });
