@@ -149,8 +149,12 @@ def snapshot_document(snapshot: EvidenceSnapshot) -> dict[str, Any]:
 
 
 def _parse_datetime(value: Any) -> datetime:
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    if type(value) is not str or len(value) > 64:
+        raise ValueError("invalid timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp timezone is required")
+    return parsed
 
 
 def _evidence_from_document(row: dict[str, Any]) -> EvidenceItem:
@@ -209,12 +213,58 @@ def _event_from_document(row: dict[str, Any]) -> EvidenceEvent:
     )
 
 
+def _exact_builtin(value: object, depth: int = 0) -> None:
+    if depth > 16:
+        raise ValueError("document is too deep")
+    if value is None or type(value) is bool:
+        return
+    if type(value) is int:
+        if value < -1_000_000_000 or value > 1_000_000_000:
+            raise ValueError("integer is too large")
+        return
+    if type(value) is str:
+        if len(value) > 8_192:
+            raise ValueError("text is too large")
+        return
+    if type(value) is list:
+        if len(value) > 5_000:
+            raise ValueError("list is too large")
+        for item in value:
+            _exact_builtin(item, depth + 1)
+        return
+    if type(value) is dict:
+        if len(value) > 5_000 or any(type(key) is not str or len(key) > 128 for key in value):
+            raise ValueError("object is invalid")
+        for item in value.values():
+            _exact_builtin(item, depth + 1)
+        return
+    raise ValueError("document requires exact built-in values")
+
+
 def evidence_snapshot_from_document(document: dict[str, Any]) -> EvidenceSnapshot:
-    snapshot_id = str(document["snapshot_id"])
+    _exact_builtin(document)
+    required = {"schema_version", "snapshot_id", "generated_at", "events"}
+    allowed = required | {"raw_snapshot_id", "recovery_metadata"}
+    if (
+        type(document) is not dict
+        or set(document) - allowed
+        or not required.issubset(document)
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or type(document["snapshot_id"]) is not str
+        or type(document["generated_at"]) is not str
+        or type(document["events"]) is not list
+    ):
+        raise ValueError("invalid evidence snapshot schema")
+    snapshot_id = document["snapshot_id"]
     raw_snapshot_id = document.get("raw_snapshot_id")
     recovery_metadata = document.get("recovery_metadata")
-    metadata = dict(recovery_metadata) if isinstance(recovery_metadata, dict) else {}
-    if not isinstance(raw_snapshot_id, str) or not raw_snapshot_id:
+    if recovery_metadata is not None and type(recovery_metadata) is not dict:
+        raise ValueError("invalid recovery metadata")
+    metadata = dict(recovery_metadata) if recovery_metadata is not None else {}
+    if raw_snapshot_id is not None and type(raw_snapshot_id) is not str:
+        raise ValueError("invalid raw snapshot identity")
+    if not raw_snapshot_id:
         raw_snapshot_id = snapshot_id
         metadata["legacy_identity"] = True
     return EvidenceSnapshot(

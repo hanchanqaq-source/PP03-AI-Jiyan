@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 
+import pytest
+
 from evidence_verification.models import EvidenceEvent, EvidenceSnapshot, StatusTransition, VerificationStatus
-from evidence_verification.storage import EvidenceStorage, snapshot_document
+from evidence_verification.storage import EvidenceStorage, evidence_snapshot_from_document, snapshot_document
 
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
@@ -133,3 +135,25 @@ def test_evidence_document_preserves_allocated_raw_snapshot_identity():
     )
 
     assert snapshot_document(snapshot)["raw_snapshot_id"] == "raw-1"
+
+
+def test_evidence_parser_rejects_future_schema_and_non_builtin_identity_values():
+    snapshot = EvidenceSnapshot(
+        snapshot_id="evidence-raw-1",
+        raw_snapshot_id="raw-1",
+        generated_at=NOW,
+        events=(),
+    )
+    document = snapshot_document(snapshot)
+
+    with pytest.raises(ValueError):
+        evidence_snapshot_from_document({**document, "schema_version": 2})
+
+    class HostileString(str):
+        def __str__(self):
+            raise AssertionError("must not coerce custom values")
+
+    hostile = dict(document)
+    hostile["snapshot_id"] = HostileString("evidence-raw-1")
+    with pytest.raises(ValueError):
+        evidence_snapshot_from_document(hostile)

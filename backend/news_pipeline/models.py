@@ -41,6 +41,8 @@ class PipelineRun:
     updated_at: datetime
     redacted_error: str | None
     displayed_trusted_snapshot_id: str | None
+    owner_id: str | None = None
+    lease_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
