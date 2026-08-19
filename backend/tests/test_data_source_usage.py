@@ -146,6 +146,58 @@ def test_duplicate_reservation_retry_is_idempotent_but_conflicting_retry_fails(s
         _reserve(store, estimated_cost=Decimal("0.11"))
 
 
+def test_reservation_retry_later_in_period_preserves_original_timestamp_and_single_charge(store: UsageStore):
+    first = _reserve(store, reservation_id="retry-one")
+    retried = _reserve(
+        store,
+        reservation_id="retry-one",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert retried == first
+    assert retried.authorized_at == NOW
+    assert len(store.records(now=NOW + timedelta(seconds=1))) == 1
+
+
+def test_reservation_retry_across_utc_day_and_month_returns_original_without_moving_period(store: UsageStore):
+    original_time = datetime(2026, 8, 31, 23, 59, tzinfo=timezone.utc)
+    first = _reserve(store, reservation_id="month-boundary", now=original_time)
+    retried = _reserve(
+        store,
+        reservation_id="month-boundary",
+        now=datetime(2026, 9, 1, 0, 1, tzinfo=timezone.utc),
+    )
+
+    assert retried == first
+    assert retried.authorized_at == original_time
+    september = store.summary(
+        "paid-test", now=datetime(2026, 9, 1, 0, 1, tzinfo=timezone.utc)
+    )
+    assert september.monthly_cost == Decimal("0")
+    assert len(store.records(now=datetime(2026, 9, 1, 0, 1, tzinfo=timezone.utc))) == 1
+
+
+def test_reservation_retry_with_wrong_adapter_or_estimate_remains_a_conflict(store: UsageStore):
+    _reserve(store, reservation_id="immutable-reservation")
+
+    with pytest.raises(UsageConflictError):
+        store.reserve(
+            "other-adapter",
+            estimated_cost=Decimal("0.10"),
+            daily_budget=Decimal("1.00"),
+            monthly_budget=Decimal("5.00"),
+            now=NOW + timedelta(seconds=1),
+            reservation_id="immutable-reservation",
+        )
+    with pytest.raises(UsageConflictError):
+        _reserve(
+            store,
+            reservation_id="immutable-reservation",
+            estimated_cost=Decimal("0.11"),
+            now=NOW + timedelta(seconds=1),
+        )
+
+
 def test_duplicate_reconciliation_is_idempotent_but_conflicting_retry_fails(store: UsageStore):
     _reserve(store)
     arguments = {
@@ -294,6 +346,65 @@ def test_oversized_ledger_fails_closed_before_json_parse(tmp_path):
         store.records(now=NOW)
 
 
+@pytest.mark.parametrize("max_ledger_bytes", [64 * 1024 * 1024 + 1, 10**1000])
+def test_configurable_ledger_size_has_a_hard_upper_bound(tmp_path, max_ledger_bytes: int):
+    with pytest.raises(UsageValidationError):
+        UsageStore(tmp_path / "data", max_ledger_bytes=max_ledger_bytes)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("1E+1000000"), Decimal("1000000000000.01"), Decimal("9" * 29)],
+)
+def test_usage_decimal_rejects_pathological_or_above_ceiling_magnitude(store: UsageStore, value: Decimal):
+    with pytest.raises(UsageValidationError):
+        store.reserve(
+            "paid-test",
+            estimated_cost=value,
+            daily_budget=Decimal("1000000000000"),
+            monthly_budget=Decimal("1000000000000"),
+            now=NOW,
+        )
+
+
+def test_request_count_has_a_hard_ceiling_before_serialization(store: UsageStore):
+    _reserve(store)
+
+    with pytest.raises(UsageValidationError):
+        store.reconcile(
+            "paid-test",
+            reservation_id="reservation-1",
+            actual_cost=Decimal("0.10"),
+            request_count=10**1000,
+            status="succeeded",
+            units=Decimal("1"),
+            now=NOW + timedelta(seconds=1),
+        )
+
+
+def test_ledger_record_count_has_a_hard_ceiling_before_record_parsing(tmp_path):
+    store = UsageStore(tmp_path / "data", max_ledger_bytes=64 * 1024 * 1024)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(
+        json.dumps({"version": 1, "records": [{}] * 100_001}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UsageStoreError, match="too many records"):
+        store.records(now=NOW)
+
+
+def test_pathological_json_integer_is_wrapped_as_closed_ledger_failure(store: UsageStore):
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(
+        '{"version":1,"records":[{"request_count":' + "9" * 5000 + "}]}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UsageStoreError, match="corrupt"):
+        store.records(now=NOW)
+
+
 def test_unknown_or_secret_bearing_fields_in_ledger_fail_closed(store: UsageStore):
     store.path.parent.mkdir(parents=True)
     store.path.write_text(
@@ -362,6 +473,69 @@ def test_lock_timeout_fails_closed_before_writing(store: UsageStore, monkeypatch
     assert not store.path.exists()
 
 
+def test_process_lock_cleans_only_stale_matching_regular_temp_files(tmp_path):
+    store = UsageStore(tmp_path / "data")
+    store.root.mkdir(parents=True)
+    stale = store.root / ".usage.abcdef12.tmp"
+    recent = store.root / ".usage.recent12.tmp"
+    foreign = store.root / ".config.abcdef12.tmp"
+    for candidate in (stale, recent, foreign):
+        candidate.write_text("temporary", encoding="utf-8")
+    old = datetime.now(tz=timezone.utc).timestamp() - (25 * 60 * 60)
+    os.utime(stale, (old, old))
+
+    store.records(now=NOW)
+
+    assert not stale.exists()
+    assert recent.exists()
+    assert foreign.exists()
+
+
+def test_stale_temp_cleanup_does_not_unlink_reparse_candidate(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    store = UsageStore(tmp_path / "data")
+    store.root.mkdir(parents=True)
+    candidate = store.root / ".usage.attacker.tmp"
+    candidate.write_text("not trusted", encoding="utf-8")
+    old = datetime.now(tz=timezone.utc).timestamp() - (25 * 60 * 60)
+    os.utime(candidate, (old, old))
+    original_lstat = os.lstat
+
+    def fake_lstat(path):
+        metadata = original_lstat(path)
+        if Path(path) == candidate:
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG,
+                st_file_attributes=0x400,
+                st_mtime=metadata.st_mtime,
+            )
+        return metadata
+
+    monkeypatch.setattr("data_sources.usage_store.os.lstat", fake_lstat)
+
+    store.records(now=NOW)
+
+    assert candidate.exists()
+
+
+def test_stale_temp_cleanup_bounds_directory_scan(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    store = UsageStore(tmp_path / "data")
+    yielded = 0
+
+    def many_foreign_entries(_path):
+        nonlocal yielded
+        for index in range(2_000):
+            yielded += 1
+            yield store.root / f"foreign-{index}"
+
+    monkeypatch.setattr("data_sources.usage_store.Path.iterdir", many_foreign_entries)
+
+    store.records(now=NOW)
+
+    assert yielded == 1_024
+
+
 @pytest.mark.parametrize("timeout", [True, False, "1", None, 0, -1, 0.0, math.nan, math.inf, -math.inf, 10**1000])
 def test_invalid_lock_timeout_is_rejected(tmp_path, timeout: object):
     with pytest.raises(UsageValidationError):
@@ -374,17 +548,27 @@ def test_two_process_authorizations_cannot_overspend(tmp_path):
     worker = r'''
 from datetime import datetime, timezone
 from decimal import Decimal
-from types import SimpleNamespace
 from data_sources.budgets import BudgetGuard, BudgetPolicy
-from data_sources.models import BillingModel
+from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, SourceRole
 from data_sources.usage_store import UsageStore
 import sys
 policy = BudgetPolicy(
     adapter_id="paid-test", enabled=True, configured=True, free_only=False,
     daily_budget=Decimal("1.00"), monthly_budget=Decimal("1.00"), per_request_budget=Decimal("1.00"),
 )
-guard = BudgetGuard(UsageStore(sys.argv[1], lock_timeout_seconds=5), {"paid-test": policy})
-adapter = SimpleNamespace(adapter_id="paid-test", billing_model=BillingModel.PAID_API)
+adapter = AdapterDescriptor(
+    adapter_id="paid-test", adapter_name="test", source_family_id="test-family",
+    provider_type="http_client", source_roles=(SourceRole.MARKET_DATA,),
+    capability_ids=("test",), billing_model=BillingModel.PAID_API,
+    auth_type="api_key", credential_env_names=("TEST_API_KEY",), default_enabled=False,
+    license_note="fixture", usage_note="fixture", data_delay="fixture",
+    quota_policy="fixture", cost_policy="fixture", configured_reference="https://example.test/",
+    current_provider_priority=10, catalog_status=CatalogStatus.UNCONFIGURED,
+)
+guard = BudgetGuard(
+    UsageStore(sys.argv[1], lock_timeout_seconds=5),
+    {"paid-test": policy}, trusted_adapters={"paid-test": adapter},
+)
 decision = guard.authorize(
     adapter, estimated_cost=Decimal("0.60"),
     now=datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc), reservation_id=sys.argv[2],

@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import re
 from typing import Mapping
 
-from .models import BillingModel
+from .models import AdapterDescriptor, BillingModel
 from .usage_store import (
     UsageBudgetExceeded,
     UsageRecord,
@@ -20,10 +21,15 @@ class BudgetValidationError(ValueError):
     """Raised for an invalid policy or authorization request."""
 
 
+_MAX_DECIMAL_ABSOLUTE = Decimal("1000000000000")
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
 def _decimal(value: object, field: str) -> Decimal:
     if not isinstance(value, Decimal):
         raise BudgetValidationError(f"{field} must be a Decimal")
-    if not value.is_finite() or value < 0:
+    if not value.is_finite() or value < 0 or value > _MAX_DECIMAL_ABSOLUTE:
         raise BudgetValidationError(f"{field} must be a finite non-negative Decimal")
     _sign, digits, exponent = value.as_tuple()
     if exponent < -8 or len(digits) > 28:
@@ -32,13 +38,7 @@ def _decimal(value: object, field: str) -> Decimal:
 
 
 def _identifier(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > 128
-        or not value[0].isalnum()
-        or any(not (character.isalnum() or character in "._:-") for character in value)
-    ):
+    if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
         raise BudgetValidationError("adapter_id is invalid")
     return value
 
@@ -70,6 +70,15 @@ class BudgetDecision:
     estimated_cost: Decimal
     health_failure: bool = False
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed, bool) or not isinstance(self.health_failure, bool):
+            raise BudgetValidationError("decision flags must be boolean")
+        if not isinstance(self.reason, str) or not _SAFE_REASON.fullmatch(self.reason):
+            raise BudgetValidationError("decision reason is invalid")
+        if self.reservation_id is not None:
+            _identifier(self.reservation_id)
+        object.__setattr__(self, "estimated_cost", _decimal(self.estimated_cost, "estimated_cost"))
+
     def to_dict(self) -> dict[str, object]:
         return {
             "allowed": self.allowed,
@@ -83,7 +92,13 @@ class BudgetDecision:
 class BudgetGuard:
     """Apply configuration gates and reserve exact cost before any request."""
 
-    def __init__(self, usage_store: UsageStore, policies: Mapping[str, BudgetPolicy]) -> None:
+    def __init__(
+        self,
+        usage_store: UsageStore,
+        policies: Mapping[str, BudgetPolicy],
+        *,
+        trusted_adapters: Mapping[str, AdapterDescriptor],
+    ) -> None:
         if not isinstance(usage_store, UsageStore):
             raise BudgetValidationError("usage_store is invalid")
         if not isinstance(policies, Mapping):
@@ -93,8 +108,18 @@ class BudgetGuard:
             if not isinstance(policy, BudgetPolicy) or adapter_id != policy.adapter_id:
                 raise BudgetValidationError("policy mapping is invalid")
             normalized[adapter_id] = policy
+        if not isinstance(trusted_adapters, Mapping):
+            raise BudgetValidationError("trusted adapters must be a mapping")
+        trusted: dict[str, AdapterDescriptor] = {}
+        for adapter_id, descriptor in trusted_adapters.items():
+            if type(descriptor) is not AdapterDescriptor or adapter_id != descriptor.adapter_id:
+                raise BudgetValidationError("trusted adapter mapping is invalid")
+            trusted[adapter_id] = descriptor
+        if set(normalized) - set(trusted):
+            raise BudgetValidationError("policy is missing a trusted adapter")
         self.usage_store = usage_store
         self._policies = normalized
+        self._trusted_adapters = trusted
 
     @staticmethod
     def _blocked(reason: str, estimate: Decimal) -> BudgetDecision:
@@ -102,17 +127,22 @@ class BudgetGuard:
 
     def authorize(
         self,
-        adapter: object,
+        adapter: AdapterDescriptor,
         *,
         estimated_cost: Decimal,
         now: datetime,
         reservation_id: str | None = None,
     ) -> BudgetDecision:
         estimate = _decimal(estimated_cost, "estimated_cost")
-        adapter_id = _identifier(getattr(adapter, "adapter_id", None))
-        billing_model = getattr(adapter, "billing_model", None)
-        if not isinstance(billing_model, BillingModel):
-            raise BudgetValidationError("adapter billing_model is invalid")
+        if type(adapter) is not AdapterDescriptor:
+            raise BudgetValidationError("adapter is not a trusted descriptor")
+        adapter_id = _identifier(adapter.adapter_id)
+        trusted = self._trusted_adapters.get(adapter_id)
+        if trusted is None:
+            raise BudgetValidationError("adapter is not in the trusted catalog")
+        if adapter != trusted:
+            raise BudgetValidationError("adapter does not match the trusted catalog")
+        billing_model = trusted.billing_model
         policy = self._policies.get(adapter_id)
         if policy is None:
             return self._blocked("unconfigured", estimate)

@@ -42,10 +42,19 @@ class UsageBudgetExceeded(UsageStoreError):
 
 _LEDGER_VERSION = 1
 _DEFAULT_MAX_LEDGER_BYTES = 4 * 1024 * 1024
+_MAX_LEDGER_BYTES = 64 * 1024 * 1024
 _MAX_DECIMAL_PLACES = 8
 _MAX_DECIMAL_DIGITS = 28
+_MAX_DECIMAL_ABSOLUTE = Decimal("1000000000000")
+_MAX_DECIMAL_TEXT_LENGTH = 64
+_MAX_REQUEST_COUNT = 1_000_000_000
+_MAX_RECORDS = 100_000
+_MAX_TEMP_SCAN_ENTRIES = 1_024
+_MAX_TIMESTAMP_LENGTH = 32
+_STALE_TEMP_SECONDS = 24 * 60 * 60
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_STATUS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_TEMP_NAME = re.compile(r"^\.usage\.[A-Za-z0-9_-]{6,64}\.tmp$")
 _CREDENTIAL_TERMS = (
     "credential", "secret", "token", "password", "api_key", "apikey",
     "access_key", "private_key", "authorization", "bearer", "cookie",
@@ -60,7 +69,7 @@ _RECORD_FIELDS = {
 def _validate_decimal(value: object, field: str) -> Decimal:
     if not isinstance(value, Decimal):
         raise UsageValidationError(f"{field} must be a Decimal")
-    if not value.is_finite() or value < 0:
+    if not value.is_finite() or value < 0 or value > _MAX_DECIMAL_ABSOLUTE:
         raise UsageValidationError(f"{field} must be a finite non-negative Decimal")
     sign, digits, exponent = value.as_tuple()
     del sign
@@ -103,7 +112,11 @@ def _timestamp_text(value: datetime) -> str:
 
 
 def _parse_timestamp(value: object, field: str) -> datetime:
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_TIMESTAMP_LENGTH
+        or not value.endswith("Z")
+    ):
         raise UsageValidationError(f"{field} is invalid")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
@@ -115,7 +128,7 @@ def _parse_timestamp(value: object, field: str) -> datetime:
 
 
 def _parse_decimal_text(value: object, field: str) -> Decimal:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value or len(value) > _MAX_DECIMAL_TEXT_LENGTH:
         raise UsageValidationError(f"{field} must be a decimal string")
     try:
         parsed = Decimal(value)
@@ -149,7 +162,12 @@ class UsageRecord:
         _validate_decimal(self.estimated_cost, "estimated_cost")
         if self.actual_cost is not None:
             _validate_decimal(self.actual_cost, "actual_cost")
-        if isinstance(self.request_count, bool) or not isinstance(self.request_count, int) or self.request_count < 0:
+        if (
+            isinstance(self.request_count, bool)
+            or not isinstance(self.request_count, int)
+            or self.request_count < 0
+            or self.request_count > _MAX_REQUEST_COUNT
+        ):
             raise UsageValidationError("request_count is invalid")
         _validate_decimal(self.units, "units")
         if self.actual_cost is None:
@@ -188,7 +206,12 @@ class UsageRecord:
         actual_raw = value["actual_cost"]
         actual_cost = None if actual_raw is None else _parse_decimal_text(actual_raw, "actual_cost")
         request_count = value["request_count"]
-        if isinstance(request_count, bool) or not isinstance(request_count, int) or request_count < 0:
+        if (
+            isinstance(request_count, bool)
+            or not isinstance(request_count, int)
+            or request_count < 0
+            or request_count > _MAX_REQUEST_COUNT
+        ):
             raise UsageValidationError("request_count is invalid")
         status = value["status"]
         units = _parse_decimal_text(value["units"], "units")
@@ -256,7 +279,12 @@ class UsageStore:
             raise UsageValidationError("lock timeout is invalid") from None
         if not math.isfinite(timeout) or timeout <= 0:
             raise UsageValidationError("lock timeout is invalid")
-        if isinstance(max_ledger_bytes, bool) or not isinstance(max_ledger_bytes, int) or max_ledger_bytes <= 0:
+        if (
+            isinstance(max_ledger_bytes, bool)
+            or not isinstance(max_ledger_bytes, int)
+            or max_ledger_bytes <= 0
+            or max_ledger_bytes > _MAX_LEDGER_BYTES
+        ):
             raise UsageValidationError("max ledger bytes is invalid")
         self._data_root = Path(root)
         self.root = self._data_root / "data-sources" / "v1"
@@ -358,14 +386,47 @@ class UsageStore:
                 if time.monotonic() >= deadline:
                     raise UsageStoreError("usage lock is unavailable")
                 time.sleep(0.01)
+            self._cleanup_stale_temp_files()
             yield
         finally:
             if acquired:
                 self._unlock_file(handle)
             handle.close()
 
+    def _cleanup_stale_temp_files(self) -> None:
+        """Remove only old regular temp files created by this ledger writer."""
+        cutoff = time.time() - _STALE_TEMP_SECONDS
+        try:
+            candidates = self.root.iterdir()
+        except OSError:
+            return
+        for _index in range(_MAX_TEMP_SCAN_ENTRIES):
+            try:
+                candidate = next(candidates)
+            except StopIteration:
+                break
+            except OSError:
+                return
+            if candidate.parent != self.root or not _SAFE_TEMP_NAME.fullmatch(candidate.name):
+                continue
+            try:
+                metadata = os.lstat(candidate)
+            except OSError:
+                continue
+            if self._is_reparse_or_link(metadata) or not stat.S_ISREG(metadata.st_mode):
+                continue
+            if metadata.st_mtime > cutoff:
+                continue
+            try:
+                candidate.unlink()
+            except OSError:
+                continue
+
     def _atomic_write(self, records: Iterable[UsageRecord]) -> None:
-        document = {"version": _LEDGER_VERSION, "records": [record.to_dict() for record in records]}
+        record_list = list(records)
+        if len(record_list) > _MAX_RECORDS:
+            raise UsageStoreError("usage ledger contains too many records")
+        document = {"version": _LEDGER_VERSION, "records": [record.to_dict() for record in record_list]}
         descriptor, raw_path = tempfile.mkstemp(prefix=".usage.", suffix=".tmp", dir=self.root)
         temporary = Path(raw_path)
         try:
@@ -399,7 +460,7 @@ class UsageStore:
             document = json.loads(self.path.read_text(encoding="utf-8"))
         except UsageStoreError:
             raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise UsageStoreError("usage ledger is corrupt") from None
         if (
             not isinstance(document, Mapping)
@@ -408,6 +469,8 @@ class UsageStore:
             or not isinstance(document.get("records"), list)
         ):
             raise UsageStoreError("usage ledger schema is invalid")
+        if len(document["records"]) > _MAX_RECORDS:
+            raise UsageStoreError("usage ledger contains too many records")
         try:
             records = [UsageRecord.from_dict(row) for row in document["records"]]
         except UsageValidationError as exc:
@@ -493,7 +556,6 @@ class UsageStore:
                     if (
                         record.adapter_id == normalized_id
                         and record.estimated_cost == estimate
-                        and record.authorized_at == normalized_now
                     ):
                         return record
                     raise UsageConflictError("reservation identifier is already in use")
@@ -524,7 +586,12 @@ class UsageStore:
         normalized_id = _validate_identifier(adapter_id, "adapter_id")
         normalized_reservation = _validate_identifier(reservation_id, "reservation_id")
         actual = _validate_decimal(actual_cost, "actual_cost")
-        if isinstance(request_count, bool) or not isinstance(request_count, int) or request_count < 0:
+        if (
+            isinstance(request_count, bool)
+            or not isinstance(request_count, int)
+            or request_count < 0
+            or request_count > _MAX_REQUEST_COUNT
+        ):
             raise UsageValidationError("request_count must be a non-negative integer")
         normalized_status = _validate_status(status)
         normalized_units = _validate_decimal(units, "units")

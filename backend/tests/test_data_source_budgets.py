@@ -7,11 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from data_sources.budgets import (
+    BudgetDecision,
     BudgetGuard,
     BudgetPolicy,
     BudgetValidationError,
 )
-from data_sources.models import BillingModel
+from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, SourceRole
 from data_sources.usage_store import UsageStore
 
 
@@ -19,7 +20,32 @@ NOW = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
 
 
 def _adapter(adapter_id: str = "paid-test", billing_model: BillingModel = BillingModel.PAID_API):
-    return SimpleNamespace(adapter_id=adapter_id, billing_model=billing_model)
+    return _trusted_adapter(adapter_id, billing_model)
+
+
+def _trusted_adapter(
+    adapter_id: str = "paid-test", billing_model: BillingModel = BillingModel.PAID_API
+) -> AdapterDescriptor:
+    return AdapterDescriptor(
+        adapter_id=adapter_id,
+        adapter_name="Test paid provider",
+        source_family_id="test-family",
+        provider_type="http_client",
+        source_roles=(SourceRole.MARKET_DATA,),
+        capability_ids=("test-capability",),
+        billing_model=billing_model,
+        auth_type="api_key",
+        credential_env_names=("TEST_API_KEY",),
+        default_enabled=False,
+        license_note="fixture",
+        usage_note="fixture",
+        data_delay="fixture",
+        quota_policy="fixture",
+        cost_policy="fixture",
+        configured_reference="https://example.test/",
+        current_provider_priority=10,
+        catalog_status=CatalogStatus.UNCONFIGURED,
+    )
 
 
 def _policy(**overrides: object) -> BudgetPolicy:
@@ -36,8 +62,17 @@ def _policy(**overrides: object) -> BudgetPolicy:
     return BudgetPolicy(**values)
 
 
-def _guard(tmp_path, policy: BudgetPolicy | None = None) -> BudgetGuard:
-    return BudgetGuard(UsageStore(tmp_path / "data"), {"paid-test": policy or _policy()})
+def _guard(
+    tmp_path,
+    policy: BudgetPolicy | None = None,
+    adapter: AdapterDescriptor | None = None,
+) -> BudgetGuard:
+    trusted = adapter or _trusted_adapter()
+    return BudgetGuard(
+        UsageStore(tmp_path / "data"),
+        {"paid-test": policy or _policy()},
+        trusted_adapters={trusted.adapter_id: trusted},
+    )
 
 
 @pytest.mark.parametrize(
@@ -60,9 +95,12 @@ def test_preflight_gate_blocks_before_reserving(tmp_path, overrides: dict[str, o
 
 
 def test_missing_policy_is_unconfigured_and_not_a_health_failure(tmp_path):
-    guard = BudgetGuard(UsageStore(tmp_path / "data"), {})
+    trusted = _trusted_adapter("not-configured")
+    guard = BudgetGuard(
+        UsageStore(tmp_path / "data"), {}, trusted_adapters={"not-configured": trusted}
+    )
 
-    decision = guard.authorize(_adapter("not-configured"), estimated_cost=Decimal("0.01"), now=NOW)
+    decision = guard.authorize(trusted, estimated_cost=Decimal("0.01"), now=NOW)
 
     assert decision.to_dict() == {
         "allowed": False,
@@ -195,10 +233,11 @@ def test_zero_cost_free_key_request_is_allowed_in_free_only_mode_without_paid_bu
         monthly_budget=Decimal("0"),
         per_request_budget=Decimal("0"),
     )
-    guard = _guard(tmp_path, policy)
+    adapter = _trusted_adapter(billing_model=BillingModel.FREE_KEY)
+    guard = _guard(tmp_path, policy, adapter)
 
     decision = guard.authorize(
-        _adapter(billing_model=BillingModel.FREE_KEY),
+        adapter,
         estimated_cost=Decimal("0"),
         now=NOW,
         reservation_id="free-request",
@@ -245,3 +284,66 @@ def test_guard_rejects_adapter_descriptor_that_does_not_match_policy(tmp_path):
 
     with pytest.raises(BudgetValidationError):
         guard.authorize(malformed, estimated_cost=Decimal("0.01"), now=NOW)
+
+
+def test_guard_binds_authorization_to_trusted_descriptor_and_rejects_billing_spoof(tmp_path):
+    trusted = _trusted_adapter()
+    guard = BudgetGuard(
+        UsageStore(tmp_path / "data"),
+        {"paid-test": _policy(free_only=True)},
+        trusted_adapters={"paid-test": trusted},
+    )
+    spoof = _trusted_adapter(billing_model=BillingModel.FREE_NO_KEY)
+
+    with pytest.raises(BudgetValidationError, match="trusted"):
+        guard.authorize(spoof, estimated_cost=Decimal("0"), now=NOW)
+
+    assert guard.usage_store.records(now=NOW) == ()
+
+
+def test_guard_rejects_unknown_descriptor_before_policy_or_reservation(tmp_path):
+    trusted = _trusted_adapter()
+    guard = BudgetGuard(
+        UsageStore(tmp_path / "data"),
+        {"paid-test": _policy()},
+        trusted_adapters={"paid-test": trusted},
+    )
+
+    with pytest.raises(BudgetValidationError, match="trusted"):
+        guard.authorize(_trusted_adapter("unknown"), estimated_cost=Decimal("0.01"), now=NOW)
+
+    assert guard.usage_store.records(now=NOW) == ()
+
+
+def test_guard_authorizes_only_matching_trusted_descriptor(tmp_path):
+    trusted = _trusted_adapter()
+    guard = BudgetGuard(
+        UsageStore(tmp_path / "data"),
+        {"paid-test": _policy()},
+        trusted_adapters={"paid-test": trusted},
+    )
+
+    decision = guard.authorize(
+        trusted,
+        estimated_cost=Decimal("0.01"),
+        now=NOW,
+        reservation_id="trusted-request",
+    )
+
+    assert decision.allowed is True
+    assert decision.reservation_id == "trusted-request"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("1E+1000000"), Decimal("1000000000000.01"), Decimal("9" * 29)],
+)
+def test_policy_rejects_pathological_or_above_ceiling_decimal_magnitude(value: Decimal):
+    with pytest.raises(BudgetValidationError):
+        _policy(daily_budget=value)
+
+
+@pytest.mark.parametrize("value", [1.0, Decimal("1E+1000000"), Decimal("1000000000000.01")])
+def test_public_budget_decision_rejects_unsafe_decimal_before_serialization(value: object):
+    with pytest.raises(BudgetValidationError):
+        BudgetDecision(True, "authorized", "decision-id", value)
