@@ -8,3 +8,5 @@ requests
 akshare>=1.10
 mootdx>=0.10
 pandas
+baostock>=0.8
+yfinance>=0.2

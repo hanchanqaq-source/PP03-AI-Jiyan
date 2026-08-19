@@ -5,6 +5,7 @@ import pytest
 
 import app as app_module
 import source_health
+from data_sources.catalog import build_catalog
 
 
 class EmptyHealthService:
@@ -89,13 +90,14 @@ def test_local_toggle_excludes_disabled_adapter_from_refresh_and_validation():
     assert service.adapter_action("tencent-quote", "disable")["enabled"] is False
 
     assert service.refresh() == {"run_id": "b" * 20}
-    assert health.calls == [("full", {"tencent-quote", "efinance-eastmoney"})]
+    default_disabled = {adapter.adapter_id for adapter in build_catalog(news_config={"sources": []}).adapters if not adapter.default_enabled}
+    assert health.calls == [("full", {"tencent-quote", *default_disabled})]
     assert service.adapter_action("tencent-quote", "validate")["status"] == "configuration_barrier"
     assert len(health.calls) == 1
 
     assert service.adapter_action("tencent-quote", "enable")["enabled"] is True
     assert service.refresh() == {"run_id": "b" * 20}
-    assert health.calls[-1] == ("full", {"efinance-eastmoney"})
+    assert health.calls[-1] == ("full", default_disabled)
 
 
 def test_disabled_or_license_review_adapter_keeps_an_honest_barrier():

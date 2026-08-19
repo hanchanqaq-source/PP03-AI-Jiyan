@@ -1,4 +1,5 @@
 from data_sources.catalog import build_catalog
+from data_sources.models import SourceRole
 from source_health.registry import load_news_config
 
 
@@ -36,4 +37,35 @@ def test_catalog_registration_has_unique_identity_and_is_holding_independent():
     assert len(catalog.adapters_for_family("eastmoney")) == 3
     assert catalog.registration_fingerprint(holding_ids=[]) == catalog.registration_fingerprint(
         holding_ids=["017811"]
+    )
+
+
+def test_catalog_registers_baostock_as_independent_but_not_cninfo_or_nav_replacement():
+    catalog = build_catalog(news_config={"sources": []})
+    baostock = catalog.family("baostock")
+    adapter = catalog.adapter("baostock")
+
+    assert baostock.independent_evidence_eligible is True
+    assert "stock_industry_classification" not in adapter.capability_ids
+    assert "nav_history" not in adapter.capability_ids
+    assert adapter.billing_model.value == "free_no_key"
+    assert adapter.auth_type == "none"
+    assert adapter.catalog_status.value == "configured"
+
+
+def test_catalog_keeps_yahoo_finance_disabled_and_non_official_for_personal_research():
+    catalog = build_catalog(news_config={"sources": []})
+    yahoo = catalog.family("yahoo_finance")
+    adapter = catalog.adapter("yahoo-finance")
+
+    assert yahoo.independent_evidence_eligible is False
+    assert adapter.default_enabled is False
+    assert adapter.catalog_status.value == "disabled"
+    assert adapter.source_roles == (SourceRole.FALLBACK_DATA,)
+    assert SourceRole.OFFICIAL_EVIDENCE not in adapter.source_roles
+    assert adapter.capability_ids == (
+        "overseas_stock_history",
+        "overseas_etf_history",
+        "overseas_index_history",
+        "overseas_profile_reference",
     )

@@ -130,6 +130,16 @@ def _capabilities() -> tuple[CapabilityDescriptor, ...]:
         CapabilityDescriptor("industry_allocation", "官方行业配置", "industry", 200 * _DAY_SECONDS, True, "weight_pct", "quarterly", ("eastmoney",), (), ()),
         CapabilityDescriptor("stock_snapshot", "股票行情", "quote", 3 * _DAY_SECONDS, True, "market_quote", "intraday", ("tencent",), ("eastmoney",), ()),
         CapabilityDescriptor("stock_industry_classification", "股票行业分类", "industry", 400 * _DAY_SECONDS, True, "classification", "event_driven", ("cninfo",), (), ()),
+        CapabilityDescriptor("stock_history", "股票历史行情", "quote", 3 * _DAY_SECONDS, True, "CNY", "daily", ("baostock",), (), ()),
+        CapabilityDescriptor("stock_history_adjusted", "股票复权因子", "quote", 400 * _DAY_SECONDS, True, "factor", "event_driven", ("baostock",), (), ()),
+        CapabilityDescriptor("stock_financials", "股票财务指标", "financial", 200 * _DAY_SECONDS, True, "ratio", "quarterly", ("baostock",), (), ()),
+        CapabilityDescriptor("stock_industry_reference", "BaoStock 行业参考", "industry", 400 * _DAY_SECONDS, True, "classification", "event_driven", ("baostock",), (), ()),
+        CapabilityDescriptor("index_calendar", "交易日历", "market", 7 * _DAY_SECONDS, True, "boolean", "daily", ("baostock",), (), ()),
+        CapabilityDescriptor("stock_valuation", "股票估值指标", "quote", 3 * _DAY_SECONDS, True, "ratio", "daily", ("baostock",), (), ()),
+        CapabilityDescriptor("overseas_stock_history", "海外股票历史行情参考", "quote", 3 * _DAY_SECONDS, False, "upstream_currency", "daily", (), ("yahoo_finance",), ()),
+        CapabilityDescriptor("overseas_etf_history", "海外 ETF 历史行情参考", "quote", 3 * _DAY_SECONDS, False, "upstream_currency", "daily", (), ("yahoo_finance",), ()),
+        CapabilityDescriptor("overseas_index_history", "海外指数历史行情参考", "quote", 3 * _DAY_SECONDS, False, "upstream_currency", "daily", (), ("yahoo_finance",), ()),
+        CapabilityDescriptor("overseas_profile_reference", "海外证券档案参考", "reference", _DAY_SECONDS, False, "upstream_currency", "event_driven", (), ("yahoo_finance",), ()),
     )
 
 
@@ -139,6 +149,8 @@ def _families() -> tuple[SourceFamily, ...]:
         SourceFamily("tencent", "腾讯行情", "CN", "CN", (SourceRole.PRIMARY_DATA, SourceRole.MARKET_DATA), True, "public_upstream_terms_apply", CatalogStatus.CONFIGURED),
         SourceFamily("cninfo", "巨潮资讯", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE, SourceRole.PRIMARY_DATA), True, "public_upstream_terms_apply", CatalogStatus.CONFIGURED),
         SourceFamily("danjuan", "蛋卷基金", "CN", "CN", (SourceRole.FALLBACK_DATA,), True, "public_upstream_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("baostock", "BaoStock", "CN", "CN", (SourceRole.PRIMARY_DATA, SourceRole.MARKET_DATA, SourceRole.CROSS_CHECK), True, "public_upstream_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("yahoo_finance", "Yahoo Finance／yfinance", "global", "overseas", (SourceRole.FALLBACK_DATA,), False, "non_official_reference_terms_apply", CatalogStatus.DISABLED),
     )
 
 
@@ -173,6 +185,8 @@ def _static_adapters() -> tuple[AdapterDescriptor, ...]:
         _adapter("tencent-quote", "腾讯行情", "tencent", "http_client", (SourceRole.PRIMARY_DATA, SourceRole.MARKET_DATA), ("stock_snapshot",), "https://qt.gtimg.cn/", 10),
         _adapter("cninfo-industry", "巨潮资讯行业分类", "cninfo", "http_client", (SourceRole.OFFICIAL_EVIDENCE, SourceRole.PRIMARY_DATA), ("stock_industry_classification",), "https://webapi.cninfo.com.cn/", 10),
         _adapter("akshare-danjuan", "AKShare／蛋卷基金", "danjuan", "akshare", (SourceRole.FALLBACK_DATA,), ("search", "profile", "nav_history", "holdings"), "https://danjuanfunds.com/", 50, usage_note="AKShare 是访问路径；仅访问公开蛋卷基金数据。"),
+        _adapter("baostock", "BaoStock", "baostock", "baostock", (SourceRole.PRIMARY_DATA, SourceRole.MARKET_DATA, SourceRole.CROSS_CHECK), ("stock_history", "stock_history_adjusted", "stock_financials", "stock_industry_reference", "index_calendar", "stock_valuation"), "https://www.baostock.com/", 30, usage_note="独立于东方财富和腾讯；仅限公开数据，不能替代巨潮资讯行业证据或基金正式净值。"),
+        _adapter("yahoo-finance", "Yahoo Finance／yfinance", "yahoo_finance", "yfinance", (SourceRole.FALLBACK_DATA,), ("overseas_stock_history", "overseas_etf_history", "overseas_index_history", "overseas_profile_reference"), "https://ranaroussi.github.io/yfinance/", 200, default_enabled=False, catalog_status=CatalogStatus.DISABLED, license_note="非官方参考路径；使用须遵守 yfinance 与 Yahoo Finance 条款。", usage_note="默认关闭；只限 personal_research，不得提升为官方证据或独立证据。"),
     )
 
 
