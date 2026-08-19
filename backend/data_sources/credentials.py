@@ -25,6 +25,10 @@ class CredentialStoreUnavailable(RuntimeError):
     """Raised without backend details when the system keyring is unavailable."""
 
 
+class CredentialNotAllowed(ValueError):
+    """Raised before any credential backend access outside the declared scope."""
+
+
 @dataclass(frozen=True, slots=True)
 class CredentialState:
     configured: bool
@@ -42,25 +46,43 @@ class CredentialState:
 
 
 class CredentialStore(Protocol):
-    def get(self, adapter_id: str, env_name: str | None = None) -> str | None: ...
+    def get(self, adapter_id: str, env_name: str) -> str | None: ...
 
-    def set(self, adapter_id: str, env_name: str | None = None, value: str | None = None) -> None: ...
+    def set(self, adapter_id: str, env_name: str, value: str) -> None: ...
 
-    def delete(self, adapter_id: str, env_name: str | None = None) -> None: ...
+    def delete(self, adapter_id: str, env_name: str) -> None: ...
 
     def state(self, adapter_id: str) -> CredentialState: ...
 
 
-def _name_pair(adapter_id: str, env_name: str | None) -> tuple[str, str]:
-    """Allow one-argument environment access without weakening scoped stores."""
-    if env_name is None:
-        env_name = adapter_id
-        adapter_id = ""
-    if not isinstance(adapter_id, str) or (adapter_id and not _IDENTIFIER.fullmatch(adapter_id)):
-        raise ValueError("invalid credential adapter identifier")
-    if not isinstance(env_name, str) or not _IDENTIFIER.fullmatch(env_name):
-        raise ValueError("invalid credential environment identifier")
-    return adapter_id, env_name
+class _CredentialScope:
+    """A non-empty adapter/environment allowlist derived from Catalog metadata."""
+
+    def __init__(self, adapter_env_names: Mapping[str, tuple[str, ...]]) -> None:
+        if not isinstance(adapter_env_names, Mapping):
+            raise CredentialNotAllowed("credential scope is required")
+        normalized: dict[str, frozenset[str]] = {}
+        for adapter_id, names in adapter_env_names.items():
+            if not isinstance(adapter_id, str) or not _IDENTIFIER.fullmatch(adapter_id):
+                raise CredentialNotAllowed("invalid credential adapter identifier")
+            if not isinstance(names, tuple) or not names:
+                raise CredentialNotAllowed("adapter credentials must be declared")
+            allowed = frozenset(names)
+            if any(not isinstance(name, str) or not _IDENTIFIER.fullmatch(name) for name in allowed):
+                raise CredentialNotAllowed("invalid credential environment identifier")
+            normalized[adapter_id] = allowed
+        self._names = normalized
+
+    def names(self, adapter_id: str) -> frozenset[str]:
+        if not isinstance(adapter_id, str) or not _IDENTIFIER.fullmatch(adapter_id) or adapter_id not in self._names:
+            raise CredentialNotAllowed("credential adapter is not declared")
+        return self._names[adapter_id]
+
+    def pair(self, adapter_id: str, env_name: str) -> tuple[str, str]:
+        names = self.names(adapter_id)
+        if not isinstance(env_name, str) or env_name not in names:
+            raise CredentialNotAllowed("credential environment name is not declared")
+        return adapter_id, env_name
 
 
 def _nonblank(value: object) -> str | None:
@@ -70,27 +92,27 @@ def _nonblank(value: object) -> str | None:
 class MemoryCredentialStore:
     """Test-only in-memory credential store; never select this in production."""
 
-    def __init__(self) -> None:
+    def __init__(self, adapter_env_names: Mapping[str, tuple[str, ...]]) -> None:
+        self._scope = _CredentialScope(adapter_env_names)
         self._values: dict[tuple[str, str], str] = {}
 
-    def get(self, adapter_id: str, env_name: str | None = None) -> str | None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
+    def get(self, adapter_id: str, env_name: str) -> str | None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         return self._values.get((adapter_id, env_name))
 
-    def set(self, adapter_id: str, env_name: str | None = None, value: str | None = None) -> None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
+    def set(self, adapter_id: str, env_name: str, value: str) -> None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         normalized = _nonblank(value)
         if normalized is None:
             raise ValueError("credential value must not be blank")
         self._values[(adapter_id, env_name)] = normalized
 
-    def delete(self, adapter_id: str, env_name: str | None = None) -> None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
+    def delete(self, adapter_id: str, env_name: str) -> None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         self._values.pop((adapter_id, env_name), None)
 
     def state(self, adapter_id: str) -> CredentialState:
-        if not isinstance(adapter_id, str) or not _IDENTIFIER.fullmatch(adapter_id):
-            raise ValueError("invalid credential adapter identifier")
+        self._scope.names(adapter_id)
         configured = any(key_adapter == adapter_id for key_adapter, _ in self._values)
         return CredentialState(configured, "stored" if configured else "unconfigured", None, "memory")
 
@@ -98,31 +120,24 @@ class MemoryCredentialStore:
 class EnvironmentCredentialStore:
     """Read-only access to explicitly requested environment variable names."""
 
-    def __init__(self, adapter_env_names: Mapping[str, tuple[str, ...]] | None = None) -> None:
-        self._adapter_env_names = {
-            adapter_id: tuple(names)
-            for adapter_id, names in (adapter_env_names or {}).items()
-        }
-        self._requested_names: dict[str, set[str]] = {}
+    def __init__(self, adapter_env_names: Mapping[str, tuple[str, ...]]) -> None:
+        self._scope = _CredentialScope(adapter_env_names)
 
-    def get(self, adapter_id: str, env_name: str | None = None) -> str | None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
-        self._requested_names.setdefault(adapter_id, set()).add(env_name)
+    def get(self, adapter_id: str, env_name: str) -> str | None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         # Do not enumerate os.environ: callers may request only their declared key.
         return _nonblank(os.environ.get(env_name))
 
-    def set(self, adapter_id: str, env_name: str | None = None, value: str | None = None) -> None:
+    def set(self, adapter_id: str, env_name: str, value: str) -> None:
         del adapter_id, env_name, value
         raise CredentialWriteNotSupported("environment credentials are read-only")
 
-    def delete(self, adapter_id: str, env_name: str | None = None) -> None:
+    def delete(self, adapter_id: str, env_name: str) -> None:
         del adapter_id, env_name
         raise CredentialWriteNotSupported("environment credentials are read-only")
 
     def state(self, adapter_id: str) -> CredentialState:
-        if not isinstance(adapter_id, str) or (adapter_id and not _IDENTIFIER.fullmatch(adapter_id)):
-            raise ValueError("invalid credential adapter identifier")
-        names = self._adapter_env_names.get(adapter_id, ()) or tuple(self._requested_names.get(adapter_id, ()))
+        names = self._scope.names(adapter_id)
         configured = any(_nonblank(os.environ.get(env_name)) is not None for env_name in names)
         return CredentialState(configured, "stored" if configured else "unconfigured", None, "environment")
 
@@ -130,9 +145,8 @@ class EnvironmentCredentialStore:
 class KeyringCredentialStore:
     """System keyring store with a PP03/adapter namespace and no plaintext fallback."""
 
-    def __init__(self, adapter_env_names: Mapping[str, tuple[str, ...]] | None = None, *, keyring_module: object | None = None) -> None:
-        self._adapter_env_names = {adapter_id: tuple(names) for adapter_id, names in (adapter_env_names or {}).items()}
-        self._requested_names: dict[str, set[str]] = {}
+    def __init__(self, adapter_env_names: Mapping[str, tuple[str, ...]], *, keyring_module: object | None = None) -> None:
+        self._scope = _CredentialScope(adapter_env_names)
         self._unavailable_adapters: set[str] = set()
         if keyring_module is not None:
             self._keyring = keyring_module
@@ -144,8 +158,6 @@ class KeyringCredentialStore:
 
     @staticmethod
     def _service_name(adapter_id: str) -> str:
-        if not _IDENTIFIER.fullmatch(adapter_id):
-            raise ValueError("invalid credential adapter identifier")
         return f"PP03:{adapter_id}"
 
     def _backend(self, adapter_id: str) -> object:
@@ -154,11 +166,8 @@ class KeyringCredentialStore:
             raise CredentialStoreUnavailable("credential store unavailable")
         return self._keyring
 
-    def get(self, adapter_id: str, env_name: str | None = None) -> str | None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
-        if not adapter_id:
-            raise ValueError("keyring credentials require an adapter identifier")
-        self._requested_names.setdefault(adapter_id, set()).add(env_name)
+    def get(self, adapter_id: str, env_name: str) -> str | None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         try:
             return _nonblank(self._backend(adapter_id).get_password(self._service_name(adapter_id), env_name))
         except CredentialStoreUnavailable:
@@ -167,14 +176,11 @@ class KeyringCredentialStore:
             self._unavailable_adapters.add(adapter_id)
             return None
 
-    def set(self, adapter_id: str, env_name: str | None = None, value: str | None = None) -> None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
-        if not adapter_id:
-            raise ValueError("keyring credentials require an adapter identifier")
+    def set(self, adapter_id: str, env_name: str, value: str) -> None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         normalized = _nonblank(value)
         if normalized is None:
             raise ValueError("credential value must not be blank")
-        self._requested_names.setdefault(adapter_id, set()).add(env_name)
         try:
             self._backend(adapter_id).set_password(self._service_name(adapter_id), env_name, normalized)
         except CredentialStoreUnavailable:
@@ -184,26 +190,23 @@ class KeyringCredentialStore:
             self._unavailable_adapters.add(adapter_id)
             raise CredentialStoreUnavailable("credential store unavailable") from None
 
-    def delete(self, adapter_id: str, env_name: str | None = None) -> None:
-        adapter_id, env_name = _name_pair(adapter_id, env_name)
-        if not adapter_id:
-            raise ValueError("keyring credentials require an adapter identifier")
-        self._requested_names.setdefault(adapter_id, set()).add(env_name)
+    def delete(self, adapter_id: str, env_name: str) -> None:
+        adapter_id, env_name = self._scope.pair(adapter_id, env_name)
         try:
             self._backend(adapter_id).delete_password(self._service_name(adapter_id), env_name)
         except CredentialStoreUnavailable:
             raise
         except Exception as error:
+            if type(error).__name__ == "PasswordDeleteError":
+                return
             del error
             self._unavailable_adapters.add(adapter_id)
             raise CredentialStoreUnavailable("credential store unavailable") from None
 
     def state(self, adapter_id: str) -> CredentialState:
-        if not isinstance(adapter_id, str) or not _IDENTIFIER.fullmatch(adapter_id):
-            raise ValueError("invalid credential adapter identifier")
+        names = self._scope.names(adapter_id)
         if adapter_id in self._unavailable_adapters or self._keyring is None:
             return CredentialState(False, "credential_store_unavailable", None, "keyring")
-        names = self._adapter_env_names.get(adapter_id, ()) or tuple(self._requested_names.get(adapter_id, ()))
         configured = any(self.get(adapter_id, env_name) is not None for env_name in names)
         if adapter_id in self._unavailable_adapters:
             return CredentialState(False, "credential_store_unavailable", None, "keyring")

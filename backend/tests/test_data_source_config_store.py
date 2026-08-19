@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
+import stat
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +17,7 @@ from data_sources.catalog import build_catalog
 @pytest.fixture
 def store(tmp_path, monkeypatch: pytest.MonkeyPatch) -> DataSourceConfigStore:
     monkeypatch.setenv("VR_DATA_DIR", str(tmp_path / "data"))
-    return DataSourceConfigStore(catalog=build_catalog({"sources": []}))
+    return DataSourceConfigStore(catalog=build_catalog({"sources": []}), lock_timeout_seconds=0.01)
 
 
 def test_config_round_trips_only_non_secret_state_and_uses_atomic_replace(store: DataSourceConfigStore, monkeypatch: pytest.MonkeyPatch):
@@ -91,3 +96,78 @@ def test_config_corruption_and_symlink_escape_fail_closed(store: DataSourceConfi
         pytest.skip("symlinks are unavailable for this test user")
     with pytest.raises(ConfigValidationError):
         store.load()
+
+
+@pytest.mark.parametrize("mode, attributes", [
+    (stat.S_IFLNK, 0),
+    (stat.S_IFDIR, 0x400),  # FILE_ATTRIBUTE_REPARSE_POINT: Windows junction/reparse point.
+])
+def test_config_rejects_dangling_link_or_windows_reparse_ancestor_before_mkdir(
+    store: DataSourceConfigStore, monkeypatch: pytest.MonkeyPatch, mode: int, attributes: int,
+):
+    unsafe_ancestor = store.root.parent
+    store._data_root.mkdir(parents=True)
+    original_lstat = __import__("os").lstat
+    original_mkdir = Path.mkdir
+    calls: list[Path] = []
+    mkdir_calls: list[Path] = []
+
+    def fake_lstat(path):
+        candidate = Path(path)
+        calls.append(candidate)
+        if candidate == unsafe_ancestor:
+            return SimpleNamespace(st_mode=mode, st_file_attributes=attributes)
+        return original_lstat(path)
+
+    def record_mkdir(path, *args, **kwargs):
+        mkdir_calls.append(Path(path))
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr("data_sources.config_store.os.lstat", fake_lstat)
+    monkeypatch.setattr("data_sources.config_store.Path.mkdir", record_mkdir)
+
+    with pytest.raises(ConfigValidationError):
+        store.save({"free_only": True, "adapters": {}})
+
+    assert unsafe_ancestor in calls
+    assert mkdir_calls == []
+
+
+def test_update_adapter_merges_independent_process_writes(tmp_path):
+    root = tmp_path / "data"
+    backend_root = Path(__file__).parents[1]
+    worker = """
+from data_sources.catalog import build_catalog
+from data_sources.config_store import DataSourceConfigStore
+import sys
+store = DataSourceConfigStore(sys.argv[1], catalog=build_catalog({'sources': []}), lock_timeout_seconds=5)
+for _ in range(25):
+    store.update_adapter(sys.argv[2], {'enabled': True, 'daily_request_limit': 1})
+"""
+    processes = [
+        subprocess.Popen([sys.executable, "-c", worker, str(root), adapter], cwd=backend_root)
+        for adapter in ("sec-edgar", "baostock")
+    ]
+    assert [process.wait(timeout=20) for process in processes] == [0, 0]
+
+    document = DataSourceConfigStore(root, catalog=build_catalog({"sources": []})).load()
+    assert set(document["adapters"]) == {"sec-edgar", "baostock"}
+
+
+def test_config_lock_failures_are_closed_before_writing(store: DataSourceConfigStore, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(store, "_try_lock_file", lambda _handle: False)
+
+    with pytest.raises(ConfigValidationError):
+        store.update_adapter("sec-edgar", {"enabled": True})
+
+    assert not store.path.exists()
+
+
+def test_corrupt_lock_path_fails_closed_before_writing(store: DataSourceConfigStore):
+    store.root.mkdir(parents=True)
+    store._lock_path.mkdir()
+
+    with pytest.raises(ConfigValidationError):
+        store.update_adapter("sec-edgar", {"enabled": True})
+
+    assert not store.path.exists()
