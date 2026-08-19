@@ -41,8 +41,22 @@ class UsageBudgetExceeded(UsageStoreError):
 
 
 _LEDGER_VERSION = 1
+_RECONCILIATION_VERSION = 1
+_RECONCILIATION_SERVICE = "pp03-data-sources"
+_RECONCILIATION_OPERATION = "provider_validation"
+_RECONCILIATION_GUARD_SCOPE = "server_authorization_v1"
+_VALIDATION_SETTLEMENT_STATUSES = {
+    "validation_not_attempted",
+    "validation_success",
+    "validation_partial",
+    "validation_failure",
+}
 _DEFAULT_MAX_LEDGER_BYTES = 4 * 1024 * 1024
 _MAX_LEDGER_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_RECONCILIATION_BYTES = 1024 * 1024
+_MAX_RECONCILIATION_BYTES = 4 * 1024 * 1024
+_MAX_RECONCILIATION_INTENTS = 4_096
+_MAX_RECOVERY_ATTEMPTS = 128
 _MAX_DECIMAL_PLACES = 8
 _MAX_DECIMAL_DIGITS = 28
 _MAX_DECIMAL_ABSOLUTE = Decimal("1000000000000")
@@ -63,6 +77,11 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _RECORD_FIELDS = {
     "reservation_id", "adapter_id", "authorized_at", "recorded_at",
     "estimated_cost", "actual_cost", "request_count", "status", "units",
+}
+_RECONCILIATION_FIELDS = {
+    "operation", "guard_scope", "adapter_id", "reservation_id",
+    "authorized_at", "recorded_at", "estimated_cost", "actual_cost",
+    "request_count", "status", "units",
 }
 
 
@@ -154,6 +173,130 @@ def _parse_decimal_text(value: object, field: str) -> Decimal:
     if _decimal_text(parsed) != value:
         raise UsageValidationError(f"{field} is not canonical")
     return parsed
+
+
+def _json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if type(key) is not str or key in document:
+            raise ValueError("invalid JSON object")
+        document[key] = value
+    return document
+
+
+def _json_integer(raw: str) -> int:
+    if len(raw) > 11:
+        raise ValueError("JSON integer is too large")
+    value = int(raw)
+    if value < -_MAX_REQUEST_COUNT or value > _MAX_REQUEST_COUNT:
+        raise ValueError("JSON integer is too large")
+    return value
+
+
+def _invalid_json_number(_raw: str) -> float:
+    raise ValueError("non-integer JSON numbers are not allowed")
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationIntent:
+    operation: str
+    guard_scope: str
+    adapter_id: str
+    reservation_id: str
+    authorized_at: datetime
+    recorded_at: datetime
+    estimated_cost: Decimal
+    actual_cost: Decimal
+    request_count: int
+    status: str
+    units: Decimal
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not str or self.operation != _RECONCILIATION_OPERATION:
+            raise UsageValidationError("reconciliation operation is invalid")
+        if type(self.guard_scope) is not str or self.guard_scope != _RECONCILIATION_GUARD_SCOPE:
+            raise UsageValidationError("reconciliation guard scope is invalid")
+        object.__setattr__(self, "adapter_id", _validate_identifier(self.adapter_id, "adapter_id"))
+        object.__setattr__(
+            self,
+            "reservation_id",
+            _validate_identifier(self.reservation_id, "reservation_id"),
+        )
+        authorized_at = _utc_datetime(self.authorized_at, "authorized_at")
+        recorded_at = _utc_datetime(self.recorded_at, "recorded_at")
+        if recorded_at < authorized_at:
+            raise UsageValidationError("reconciliation timestamp is invalid")
+        object.__setattr__(self, "authorized_at", authorized_at)
+        object.__setattr__(self, "recorded_at", recorded_at)
+        object.__setattr__(
+            self, "estimated_cost", _validate_decimal(self.estimated_cost, "estimated_cost")
+        )
+        object.__setattr__(self, "actual_cost", _validate_decimal(self.actual_cost, "actual_cost"))
+        if (
+            type(self.request_count) is not int
+            or self.request_count < 0
+            or self.request_count > _MAX_REQUEST_COUNT
+        ):
+            raise UsageValidationError("request_count must be a non-negative integer")
+        object.__setattr__(self, "status", _validate_status(self.status))
+        object.__setattr__(self, "units", _validate_decimal(self.units, "units"))
+        if (
+            self.estimated_cost != 0
+            or self.actual_cost != 0
+            or self.request_count not in {0, 1}
+            or self.status not in _VALIDATION_SETTLEMENT_STATUSES
+            or self.units != self.units.to_integral_value()
+            or self.units > _MAX_REQUEST_COUNT
+            or (
+                self.request_count == 0
+                and (
+                    self.status != "validation_not_attempted"
+                    or self.units != 0
+                )
+            )
+            or (
+                self.request_count == 1
+                and self.status == "validation_not_attempted"
+            )
+        ):
+            raise UsageValidationError("validation reconciliation facts are invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            "operation": self.operation,
+            "guard_scope": self.guard_scope,
+            "adapter_id": self.adapter_id,
+            "reservation_id": self.reservation_id,
+            "authorized_at": _timestamp_text(self.authorized_at),
+            "recorded_at": _timestamp_text(self.recorded_at),
+            "estimated_cost": _decimal_text(self.estimated_cost),
+            "actual_cost": _decimal_text(self.actual_cost),
+            "request_count": self.request_count,
+            "status": self.status,
+            "units": _decimal_text(self.units),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "_ReconciliationIntent":
+        if type(value) is not dict:
+            raise UsageValidationError("reconciliation intent schema is invalid")
+        keys = tuple(value.keys())
+        if any(type(key) is not str for key in keys) or set(keys) != _RECONCILIATION_FIELDS:
+            raise UsageValidationError("reconciliation intent schema is invalid")
+        return cls(
+            value["operation"],
+            value["guard_scope"],
+            _validate_identifier(value["adapter_id"], "adapter_id"),
+            _validate_identifier(value["reservation_id"], "reservation_id"),
+            _parse_timestamp(value["authorized_at"], "authorized_at"),
+            _parse_timestamp(value["recorded_at"], "recorded_at"),
+            _parse_decimal_text(value["estimated_cost"], "estimated_cost"),
+            _parse_decimal_text(value["actual_cost"], "actual_cost"),
+            value["request_count"],
+            _validate_status(value["status"]),
+            _parse_decimal_text(value["units"], "units"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +451,7 @@ class UsageStore:
         *,
         lock_timeout_seconds: float = 2.0,
         max_ledger_bytes: int = _DEFAULT_MAX_LEDGER_BYTES,
+        max_reconciliation_bytes: int = _DEFAULT_MAX_RECONCILIATION_BYTES,
     ) -> None:
         if root is None:
             configured = os.environ.get("VR_DATA_DIR")
@@ -339,12 +483,20 @@ class UsageStore:
             or max_ledger_bytes > _MAX_LEDGER_BYTES
         ):
             raise UsageValidationError("max ledger bytes is invalid")
+        if (
+            type(max_reconciliation_bytes) is not int
+            or max_reconciliation_bytes <= 0
+            or max_reconciliation_bytes > _MAX_RECONCILIATION_BYTES
+        ):
+            raise UsageValidationError("max reconciliation bytes is invalid")
         self._data_root = Path(root)
         self.root = self._data_root / "data-sources" / "v1"
         self.path = self.root / "usage.json"
+        self.reconciliation_path = self.root / "usage-reconciliation.json"
         self._lock_path = self.root / ".usage.lock"
         self._lock_timeout_seconds = timeout
         self._max_ledger_bytes = max_ledger_bytes
+        self._max_reconciliation_bytes = max_reconciliation_bytes
 
     @staticmethod
     def _is_reparse_or_link(metadata: os.stat_result) -> bool:
@@ -383,6 +535,7 @@ class UsageStore:
         self._assert_no_reparse_components(self._data_root)
         self._assert_no_reparse_components(self.root)
         self._assert_no_reparse_components(self.path)
+        self._assert_no_reparse_components(self.reconciliation_path)
         self._assert_no_reparse_components(self._lock_path)
         try:
             resolved_data_root = self._data_root.resolve(strict=True)
@@ -469,6 +622,123 @@ class UsageStore:
             if isinstance(exc, UsageStoreError):
                 raise
             raise UsageStoreError("usage ledger could not be written") from None
+
+    def _atomic_write_reconciliations(
+        self, intents: Iterable[_ReconciliationIntent],
+    ) -> None:
+        intent_list = list(intents)
+        if len(intent_list) > _MAX_RECONCILIATION_INTENTS:
+            raise UsageStoreError("too many usage reconciliation intents")
+        document = {
+            "version": _RECONCILIATION_VERSION,
+            "service": _RECONCILIATION_SERVICE,
+            "intents": [intent.to_dict() for intent in intent_list],
+        }
+        try:
+            raw = (
+                json.dumps(
+                    document,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise UsageStoreError("usage reconciliation intents could not be written") from None
+        if len(raw) > self._max_reconciliation_bytes:
+            raise UsageStoreError("usage reconciliation intents are too large")
+        try:
+            descriptor, raw_path = tempfile.mkstemp(
+                prefix=".usage-reconciliation.", suffix=".tmp", dir=self.root,
+            )
+        except OSError:
+            raise UsageStoreError(
+                "usage reconciliation intents could not be written"
+            ) from None
+        temporary = Path(raw_path)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.reconciliation_path)
+        except BaseException as exc:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            # Failed replacements are retained for explicit operator handling.
+            # Never unlink a pathname that may have been replaced concurrently.
+            if isinstance(exc, UsageStoreError):
+                raise
+            raise UsageStoreError("usage reconciliation intents could not be written") from None
+
+    def _load_reconciliations_unlocked(
+        self,
+        reference_now: datetime,
+        *,
+        trusted_adapter_ids: frozenset[str] | None = None,
+    ) -> list[_ReconciliationIntent]:
+        try:
+            with self.reconciliation_path.open("rb") as handle:
+                raw = handle.read(self._max_reconciliation_bytes + 1)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            raise UsageStoreError("usage reconciliation intents are unavailable") from None
+        if len(raw) > self._max_reconciliation_bytes:
+            raise UsageStoreError("usage reconciliation intents are too large")
+        try:
+            document = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_json_object,
+                parse_int=_json_integer,
+                parse_float=_invalid_json_number,
+                parse_constant=_invalid_json_number,
+            )
+            if (
+                type(document) is not dict
+                or set(document) != {"version", "service", "intents"}
+                or type(document.get("version")) is not int
+                or document.get("version") != _RECONCILIATION_VERSION
+                or type(document.get("service")) is not str
+                or document.get("service") != _RECONCILIATION_SERVICE
+                or type(document.get("intents")) is not list
+                or len(document["intents"]) > _MAX_RECONCILIATION_INTENTS
+            ):
+                raise UsageValidationError("usage reconciliation schema is invalid")
+            intents = [
+                _ReconciliationIntent.from_dict(row) for row in document["intents"]
+            ]
+            seen: set[str] = set()
+            for intent in intents:
+                if intent.reservation_id in seen:
+                    raise UsageValidationError(
+                        "usage reconciliation contains duplicate reservations"
+                    )
+                seen.add(intent.reservation_id)
+                if (
+                    intent.authorized_at > reference_now
+                    or intent.recorded_at > reference_now
+                ):
+                    raise UsageValidationError("usage reconciliation timestamp is in the future")
+                if (
+                    trusted_adapter_ids is not None
+                    and intent.adapter_id not in trusted_adapter_ids
+                ):
+                    raise UsageValidationError("usage reconciliation adapter is not trusted")
+            return intents
+        except UsageValidationError:
+            raise UsageStoreError("usage reconciliation intents are corrupt") from None
+        except (
+            OverflowError,
+            RecursionError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            raise UsageStoreError("usage reconciliation intents are corrupt") from None
 
     def _load_unlocked(self, reference_now: datetime) -> list[UsageRecord]:
         if not self.path.exists():
@@ -678,6 +948,262 @@ class UsageStore:
                 self._atomic_write(records)
                 return record
 
+    @staticmethod
+    def _reconcile_records(
+        records: list[UsageRecord],
+        *,
+        adapter_id: str,
+        reservation_id: str,
+        actual_cost: Decimal,
+        request_count: int,
+        status: str,
+        units: Decimal,
+        recorded_at: datetime,
+    ) -> tuple[UsageRecord, bool]:
+        for index, existing in enumerate(records):
+            if existing.reservation_id != reservation_id:
+                continue
+            if existing.adapter_id != adapter_id:
+                raise UsageConflictError("reservation belongs to another adapter")
+            if existing.actual_cost is not None:
+                if (
+                    existing.actual_cost == actual_cost
+                    and existing.request_count == request_count
+                    and existing.status == status
+                    and existing.units == units
+                ):
+                    return existing, False
+                raise UsageConflictError("reservation was reconciled with different usage")
+            if recorded_at < existing.authorized_at:
+                raise UsageValidationError("reconciliation predates authorization")
+            reconciled = UsageRecord(
+                existing.reservation_id,
+                existing.adapter_id,
+                existing.authorized_at,
+                recorded_at,
+                existing.estimated_cost,
+                actual_cost,
+                request_count,
+                status,
+                units,
+            )
+            records[index] = reconciled
+            return reconciled, True
+        raise UsageConflictError("reservation does not exist")
+
+    @staticmethod
+    def _intent_matches_record(
+        intent: _ReconciliationIntent, record: UsageRecord,
+    ) -> bool:
+        if (
+            record.adapter_id != intent.adapter_id
+            or record.authorized_at != intent.authorized_at
+            or record.estimated_cost != intent.estimated_cost
+        ):
+            return False
+        if record.actual_cost is None:
+            return True
+        return (
+            record.recorded_at == intent.recorded_at
+            and record.actual_cost == intent.actual_cost
+            and record.request_count == intent.request_count
+            and record.status == intent.status
+            and record.units == intent.units
+        )
+
+    def stage_reconciliation(
+        self,
+        adapter_id: str,
+        *,
+        reservation_id: str,
+        actual_cost: Decimal,
+        request_count: int,
+        status: str,
+        units: Decimal,
+        recorded_at: datetime,
+    ) -> _ReconciliationIntent:
+        """Durably bind server-owned settlement facts to an existing reservation."""
+        normalized_id = _validate_identifier(adapter_id, "adapter_id")
+        normalized_reservation = _validate_identifier(reservation_id, "reservation_id")
+        actual = _validate_decimal(actual_cost, "actual_cost")
+        if (
+            type(request_count) is not int
+            or request_count < 0
+            or request_count > _MAX_REQUEST_COUNT
+        ):
+            raise UsageValidationError("request_count must be a non-negative integer")
+        normalized_status = _validate_status(status)
+        normalized_units = _validate_decimal(units, "units")
+        normalized_recorded_at = _utc_datetime(recorded_at, "recorded_at")
+        with CACHE_IO_LOCK:
+            with self._process_lock():
+                records = self._load_unlocked(normalized_recorded_at)
+                reservation = next(
+                    (
+                        record for record in records
+                        if record.reservation_id == normalized_reservation
+                    ),
+                    None,
+                )
+                if reservation is None:
+                    raise UsageConflictError("reservation does not exist")
+                if reservation.adapter_id != normalized_id:
+                    raise UsageConflictError("reservation belongs to another adapter")
+                intent = _ReconciliationIntent(
+                    _RECONCILIATION_OPERATION,
+                    _RECONCILIATION_GUARD_SCOPE,
+                    normalized_id,
+                    normalized_reservation,
+                    reservation.authorized_at,
+                    normalized_recorded_at,
+                    reservation.estimated_cost,
+                    actual,
+                    request_count,
+                    normalized_status,
+                    normalized_units,
+                )
+                if not self._intent_matches_record(intent, reservation):
+                    raise UsageConflictError(
+                        "reservation was reconciled with different usage"
+                    )
+                intents = self._load_reconciliations_unlocked(normalized_recorded_at)
+                for existing in intents:
+                    if existing.reservation_id != normalized_reservation:
+                        continue
+                    if existing == intent:
+                        return existing
+                    raise UsageConflictError(
+                        "reservation has a different reconciliation intent"
+                    )
+                if len(intents) >= _MAX_RECONCILIATION_INTENTS:
+                    raise UsageStoreError("usage reconciliation capacity is exhausted")
+                intents.append(intent)
+                self._atomic_write_reconciliations(intents)
+                return intent
+
+    def complete_reconciliation(
+        self,
+        intent: _ReconciliationIntent,
+        *,
+        now: datetime,
+    ) -> None:
+        """Clear only the exact staged intent after its exact ledger settlement exists."""
+        if type(intent) is not _ReconciliationIntent:
+            raise UsageValidationError("reconciliation intent authority is invalid")
+        intent.__post_init__()
+        normalized_now = _utc_datetime(now)
+        with CACHE_IO_LOCK:
+            with self._process_lock():
+                records = self._load_unlocked(normalized_now)
+                record = next(
+                    (
+                        row for row in records
+                        if row.reservation_id == intent.reservation_id
+                    ),
+                    None,
+                )
+                if (
+                    record is None
+                    or record.actual_cost is None
+                    or not self._intent_matches_record(intent, record)
+                ):
+                    raise UsageConflictError("reconciliation is not complete")
+                intents = self._load_reconciliations_unlocked(normalized_now)
+                matching = [
+                    row for row in intents if row.reservation_id == intent.reservation_id
+                ]
+                if not matching:
+                    return
+                if len(matching) != 1 or matching[0] != intent:
+                    raise UsageConflictError("reconciliation intent changed")
+                self._atomic_write_reconciliations([
+                    row for row in intents
+                    if row.reservation_id != intent.reservation_id
+                ])
+
+    def recover_reconciliations(
+        self,
+        *,
+        trusted_adapter_ids: frozenset[str],
+        now: datetime,
+    ) -> dict[str, object]:
+        """Boundedly settle trusted staged intents without provider/config access."""
+        if (
+            type(trusted_adapter_ids) is not frozenset
+            or len(trusted_adapter_ids) > _MAX_RECORDS
+        ):
+            raise UsageValidationError("trusted reconciliation adapters are invalid")
+        normalized_trusted = frozenset(
+            _validate_identifier(adapter_id, "adapter_id")
+            for adapter_id in trusted_adapter_ids
+        )
+        normalized_now = _utc_datetime(now)
+        with CACHE_IO_LOCK:
+            with self._process_lock():
+                intents = self._load_reconciliations_unlocked(
+                    normalized_now,
+                    trusted_adapter_ids=normalized_trusted,
+                )
+                records = self._load_unlocked(normalized_now)
+                by_reservation = {
+                    record.reservation_id: record for record in records
+                }
+                for intent in intents:
+                    record = by_reservation.get(intent.reservation_id)
+                    if record is None or not self._intent_matches_record(intent, record):
+                        raise UsageStoreError(
+                            "usage reconciliation reservation binding is invalid"
+                        )
+                intent_ids = {intent.reservation_id for intent in intents}
+                orphan_count = sum(
+                    1
+                    for record in records
+                    if record.actual_cost is None
+                    and record.reservation_id not in intent_ids
+                )
+                if orphan_count:
+                    return {
+                        "blocked": True,
+                        "attempted": 0,
+                        "recovered": 0,
+                        "retained": len(intents) + orphan_count,
+                    }
+                batch = intents[:_MAX_RECOVERY_ATTEMPTS]
+                changed = False
+                try:
+                    for intent in batch:
+                        _record, record_changed = self._reconcile_records(
+                            records,
+                            adapter_id=intent.adapter_id,
+                            reservation_id=intent.reservation_id,
+                            actual_cost=intent.actual_cost,
+                            request_count=intent.request_count,
+                            status=intent.status,
+                            units=intent.units,
+                            recorded_at=intent.recorded_at,
+                        )
+                        changed = changed or record_changed
+                    if changed:
+                        self._atomic_write(records)
+                    if batch:
+                        self._atomic_write_reconciliations(
+                            intents[len(batch):]
+                        )
+                except UsageStoreError:
+                    return {
+                        "blocked": True,
+                        "attempted": len(batch),
+                        "recovered": 0,
+                        "retained": len(intents) + orphan_count,
+                    }
+                retained = len(intents) - len(batch) + orphan_count
+                return {
+                    "blocked": orphan_count > 0,
+                    "attempted": len(batch),
+                    "recovered": len(batch),
+                    "retained": retained,
+                }
+
     def reconcile(
         self,
         adapter_id: str,
@@ -688,6 +1214,7 @@ class UsageStore:
         status: str,
         units: Decimal,
         now: datetime,
+        recorded_at: datetime | None = None,
     ) -> UsageRecord:
         normalized_id = _validate_identifier(adapter_id, "adapter_id")
         normalized_reservation = _validate_identifier(reservation_id, "reservation_id")
@@ -701,40 +1228,29 @@ class UsageStore:
         normalized_status = _validate_status(status)
         normalized_units = _validate_decimal(units, "units")
         normalized_now = _utc_datetime(now)
+        normalized_recorded_at = (
+            normalized_now
+            if recorded_at is None
+            else _utc_datetime(recorded_at, "recorded_at")
+        )
+        if normalized_recorded_at > normalized_now:
+            raise UsageValidationError("reconciliation timestamp is in the future")
         with CACHE_IO_LOCK:
             with self._process_lock():
                 records = self._load_unlocked(normalized_now)
-                for index, existing in enumerate(records):
-                    if existing.reservation_id != normalized_reservation:
-                        continue
-                    if existing.adapter_id != normalized_id:
-                        raise UsageConflictError("reservation belongs to another adapter")
-                    if existing.actual_cost is not None:
-                        if (
-                            existing.actual_cost == actual
-                            and existing.request_count == request_count
-                            and existing.status == normalized_status
-                            and existing.units == normalized_units
-                        ):
-                            return existing
-                        raise UsageConflictError("reservation was reconciled with different usage")
-                    if normalized_now < existing.authorized_at:
-                        raise UsageValidationError("reconciliation predates authorization")
-                    reconciled = UsageRecord(
-                        existing.reservation_id,
-                        existing.adapter_id,
-                        existing.authorized_at,
-                        normalized_now,
-                        existing.estimated_cost,
-                        actual,
-                        request_count,
-                        normalized_status,
-                        normalized_units,
-                    )
-                    records[index] = reconciled
+                reconciled, changed = self._reconcile_records(
+                    records,
+                    adapter_id=normalized_id,
+                    reservation_id=normalized_reservation,
+                    actual_cost=actual,
+                    request_count=request_count,
+                    status=normalized_status,
+                    units=normalized_units,
+                    recorded_at=normalized_recorded_at,
+                )
+                if changed:
                     self._atomic_write(records)
-                    return reconciled
-                raise UsageConflictError("reservation does not exist")
+                return reconciled
 
 
 __all__ = [

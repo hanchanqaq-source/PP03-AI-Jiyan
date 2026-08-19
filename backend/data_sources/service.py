@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -109,6 +109,42 @@ class _AuthorizationContext:
     decision: BudgetDecision
     guard: BudgetGuard
     usage_store: UsageStore
+    settlement: "_AuthorizationSettlement | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizationSettlement:
+    adapter_id: str
+    reservation_id: str
+    actual_cost: Decimal
+    request_count: int
+    status: str
+    units: Decimal
+    recorded_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.adapter_id) is not str
+            or type(self.reservation_id) is not str
+            or type(self.actual_cost) is not Decimal
+            or type(self.request_count) is not int
+            or type(self.status) is not str
+            or type(self.units) is not Decimal
+            or type(self.recorded_at) is not datetime
+            or self.recorded_at.tzinfo is None
+            or self.recorded_at.utcoffset() is None
+        ):
+            raise BudgetValidationError("authorization settlement is invalid")
+        if (
+            not self.actual_cost.is_finite()
+            or self.actual_cost < 0
+            or not self.units.is_finite()
+            or self.units < 0
+            or self.request_count < 0
+            or self.request_count > 1_000_000_000
+            or not _USAGE_MODE.fullmatch(self.status)
+        ):
+            raise BudgetValidationError("authorization settlement is invalid")
 
 
 class _ServerAuthorizationGuard:
@@ -183,6 +219,7 @@ class _ServerAuthorizationGuard:
         if "reservation_id" in kwargs:
             raise BudgetValidationError("caller reservation authority is not accepted")
         with self._context_lock:
+            self._service._assert_usage_reconciliation_ready()
             self._prune_completed_context()
             if len(self._contexts) >= _MAX_AUTHORIZATION_CONTEXTS:
                 raise BudgetValidationError("authorization context capacity is exhausted")
@@ -202,9 +239,23 @@ class _ServerAuthorizationGuard:
             return decision
 
     def record(self, adapter_id: str, **kwargs: Any):
+        expected_fields = {
+            "reservation_id", "actual_cost", "request_count", "status", "units", "now",
+        }
+        if type(kwargs) is not dict or set(kwargs) != expected_fields:
+            raise BudgetValidationError("authorization settlement is invalid")
         reservation_id = kwargs.get("reservation_id")
         if type(adapter_id) is not str or type(reservation_id) is not str:
             raise BudgetValidationError("authorization context is unavailable")
+        settlement = _AuthorizationSettlement(
+            adapter_id,
+            reservation_id,
+            kwargs["actual_cost"],
+            kwargs["request_count"],
+            kwargs["status"],
+            kwargs["units"],
+            kwargs["now"],
+        )
         with self._context_lock:
             context = self._contexts.get(reservation_id)
             if (
@@ -217,15 +268,52 @@ class _ServerAuthorizationGuard:
                 or context.guard.usage_store is not context.usage_store
             ):
                 raise BudgetValidationError("authorization context is unavailable")
+            if context.settlement is not None and context.settlement != settlement:
+                raise BudgetValidationError("authorization settlement is unavailable")
+            if context.settlement is None:
+                context = replace(context, settlement=settlement)
+                self._contexts[reservation_id] = context
+            try:
+                intent = context.usage_store.stage_reconciliation(
+                    settlement.adapter_id,
+                    reservation_id=settlement.reservation_id,
+                    actual_cost=settlement.actual_cost,
+                    request_count=settlement.request_count,
+                    status=settlement.status,
+                    units=settlement.units,
+                    recorded_at=settlement.recorded_at,
+                )
+            except UsageStoreError:
+                self._service._mark_usage_reconciliation_pending()
+                raise
             try:
                 record = context.guard.record(adapter_id, **kwargs)
+            except BudgetValidationError:
+                self._service._mark_usage_reconciliation_pending()
+                raise
             except UsageConflictError:
+                self._service._mark_usage_reconciliation_pending()
                 raise
             except UsageStoreError:
                 # One bounded retry closes both pre-write transient failures and
                 # post-write ambiguous failures via UsageStore idempotency. A
                 # persistent failure keeps the reservation open and fail-closed.
-                record = context.guard.record(adapter_id, **kwargs)
+                try:
+                    record = context.guard.record(adapter_id, **kwargs)
+                except (BudgetValidationError, UsageConflictError, UsageStoreError):
+                    self._service._mark_usage_reconciliation_pending()
+                    raise
+            try:
+                completion_now = self._service._now()
+                if completion_now < settlement.recorded_at:
+                    completion_now = settlement.recorded_at
+                context.usage_store.complete_reconciliation(
+                    intent,
+                    now=completion_now,
+                )
+            except (DataSourceUnavailable, UsageStoreError):
+                self._service._mark_usage_reconciliation_pending()
+                raise
             self._completed_contexts.add(reservation_id)
             return record
 
@@ -294,19 +382,79 @@ class DataSourceService:
         self._now_factory = now_factory or (lambda: datetime.now(timezone.utc))
         self._mutation_lock = threading.RLock()
         self._adapter_locks: dict[str, threading.RLock] = {}
+        self._usage_recovery_lock = threading.RLock()
+        self._usage_recovery_attempted = False
+        self._usage_recovery_ready = False
 
     def _catalog(self) -> DataSourceCatalog:
         return self._catalog_builder()
 
+    def _trusted_reconciliation_adapter_ids(self) -> frozenset[str]:
+        return frozenset(
+            adapter.adapter_id
+            for adapter in self._catalog().adapters
+            if (
+                adapter.billing_model is BillingModel.FREE_NO_KEY
+                and adapter.auth_type == "none"
+                and tuple(adapter.credential_env_names) == ()
+            )
+        )
+
+    def _mark_usage_reconciliation_pending(self) -> None:
+        with self._usage_recovery_lock:
+            self._usage_recovery_attempted = True
+            self._usage_recovery_ready = False
+
+    def _assert_usage_reconciliation_ready(self) -> None:
+        with self._usage_recovery_lock:
+            if not self._usage_recovery_attempted or not self._usage_recovery_ready:
+                raise UsageStoreError("usage reconciliation is pending")
+
+    def recover_usage_reconciliation(self) -> dict[str, object]:
+        """Run one bounded, payload-free recovery pass over server-owned intents."""
+        with self._usage_recovery_lock:
+            if self._usage_store is None:
+                self._usage_store = UsageStore()
+            try:
+                result = self._usage_store.recover_reconciliations(
+                    trusted_adapter_ids=self._trusted_reconciliation_adapter_ids(),
+                    now=self._now(),
+                )
+            except (UsageStoreError, BudgetValidationError, TypeError, ValueError):
+                self._usage_recovery_attempted = True
+                self._usage_recovery_ready = False
+                return {
+                    "status": "blocked",
+                    "attempted": 0,
+                    "recovered": 0,
+                    "retained": 0,
+                }
+            attempted = result["attempted"]
+            recovered = result["recovered"]
+            retained = result["retained"]
+            blocked = result["blocked"] is True
+            self._usage_recovery_attempted = True
+            self._usage_recovery_ready = not blocked and retained == 0
+            return {
+                "status": (
+                    "blocked" if blocked else "closed" if retained == 0 else "pending"
+                ),
+                "attempted": attempted,
+                "recovered": recovered,
+                "retained": retained,
+            }
+
     def _ensure_configuration_dependencies(self) -> None:
         catalog = self._catalog()
         scope = {row.adapter_id: tuple(row.credential_env_names) for row in catalog.adapters if row.credential_env_names}
+        if self._usage_store is None:
+            self._usage_store = UsageStore()
+        if not self._usage_recovery_attempted:
+            self.recover_usage_reconciliation()
         if self._config_store is None:
             self._config_store = DataSourceConfigStore(catalog=catalog)
         if self._credential_store is None:
             self._credential_store = _DefaultCredentialStore(scope)
-        if self._usage_store is None:
-            self._usage_store = UsageStore()
         if self._budget_guard is None:
             self._budget_guard = _ServerAuthorizationGuard(self)
         if self._provider_registry is None:
