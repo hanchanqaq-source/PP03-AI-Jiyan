@@ -101,6 +101,19 @@ def test_imf_rejects_non_finite_or_boolean_sdmx_observations(raw_value):
         ImfAdapter(http=FakeHttp([payload])).fetch(request())
 
 
+@pytest.mark.parametrize("raw_value", [10**400, -(10**400)])
+def test_imf_preserves_arbitrarily_large_integer_sdmx_observations(raw_value):
+    """Catches finite-number validation raising OverflowError on exact SDMX integers."""
+    from data_sources.providers.imf import ImfAdapter
+
+    payload = imf_fixture()
+    payload["dataSets"][0]["series"]["0:0"]["observations"]["0"][0] = raw_value
+    row = ImfAdapter(http=FakeHttp([payload])).fetch(request())[0]
+
+    assert row.value == raw_value
+    assert type(row.value) is int
+
+
 def test_imf_returns_an_explicit_empty_result_for_a_valid_zero_series_sdmx_response():
     from data_sources.providers.imf import ImfAdapter
 

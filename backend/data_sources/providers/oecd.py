@@ -4,7 +4,6 @@ import csv
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
 from io import StringIO
-import math
 import re
 import time
 from typing import Any
@@ -15,6 +14,7 @@ from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
 
 from .base import BaseProvider
+from .numeric import is_finite_public_number
 
 
 _REFERENCE = "https://sdmx.oecd.org/public/"
@@ -77,9 +77,9 @@ class OecdAdapter(BaseProvider):
             if any(not isinstance(row.get(field), str) for field in required) or row["DATAFLOW"] != dataset or f"{row['FREQ']}.{row['REF_AREA']}.{row['SUBJECT']}" != series or row["FREQ"] not in _FREQUENCY or not row["UNIT_MEASURE"] or not row["LAST_UPDATE"]:
                 raise ProviderSchemaChanged("schema_changed", reference=url)
             raw = row["OBS_VALUE"].strip()
-            try: value = None if not raw else float(raw)
+            try: value = None if not raw else int(raw) if re.fullmatch(r"[+-]?\d+", raw) else float(raw)
             except ValueError as error: raise ProviderSchemaChanged("schema_changed", reference=url) from error
-            if value is not None and not math.isfinite(value): raise ProviderSchemaChanged("schema_changed", reference=url)
+            if value is not None and not is_finite_public_number(value): raise ProviderSchemaChanged("schema_changed", reference=url)
             values.append(ProviderValue(value, "oecd", "oecd", request.capability_id, _as_date(row["TIME_PERIOD"], url), self._fetched_at(), "missing" if value is None else "upstream_reported", "OECD SDMX public data", 30, None, row["UNIT_MEASURE"], _FREQUENCY[row["FREQ"]], {"dataset": dataset, "series_key": series, "source_revision": row["LAST_UPDATE"]}))
         return tuple(values)
 

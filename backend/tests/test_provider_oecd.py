@@ -85,6 +85,17 @@ def test_oecd_rejects_non_finite_or_boolean_observation_text(raw_value):
         OecdAdapter(http=FakeHttp([oecd_csv().replace(b"3.50", raw_value.encode())])).fetch(request())
 
 
+@pytest.mark.parametrize("raw_value", [str(10**400), str(-(10**400))])
+def test_oecd_preserves_arbitrarily_large_integer_observation_text(raw_value):
+    """Catches CSV coercion turning exact public integer text into infinity."""
+    from data_sources.providers.oecd import OecdAdapter
+
+    row = OecdAdapter(http=FakeHttp([oecd_csv().replace(b"3.50", raw_value.encode())])).fetch(request())[0]
+
+    assert row.value == int(raw_value)
+    assert type(row.value) is int
+
+
 def test_oecd_returns_an_explicit_empty_result_for_a_valid_header_only_csv():
     from data_sources.providers.oecd import OecdAdapter
 

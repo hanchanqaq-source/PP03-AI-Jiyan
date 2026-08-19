@@ -98,6 +98,19 @@ def test_world_bank_rejects_non_finite_or_boolean_observations(raw_value):
         WorldBankAdapter(http=FakeHttp([payload])).fetch(request())
 
 
+@pytest.mark.parametrize("raw_value", [10**400, -(10**400)])
+def test_world_bank_preserves_arbitrarily_large_integer_observations(raw_value):
+    """Catches math.isfinite coercing valid upstream integers through C float."""
+    from data_sources.providers.world_bank import WorldBankAdapter
+
+    payload = world_bank_fixture()
+    payload[1][0]["value"] = raw_value
+    row = WorldBankAdapter(http=FakeHttp([payload])).fetch(request())[0]
+
+    assert row.value == raw_value
+    assert type(row.value) is int
+
+
 @pytest.mark.parametrize(("period", "expected_frequency"), [("2025", "annual"), ("2025M03", "monthly"), ("2025Q2", "quarterly")])
 def test_world_bank_derives_frequency_from_the_official_observation_period(period, expected_frequency):
     """Catches a caller-supplied frequency relabelling an official observation."""

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
-import math
 import re
 import time
 from typing import Any
@@ -12,6 +11,7 @@ from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
 
 from .base import BaseProvider
+from .numeric import is_finite_public_number
 
 
 _REFERENCE = "https://api.worldbank.org/"
@@ -97,7 +97,7 @@ class WorldBankAdapter(BaseProvider):
             if not isinstance(item, Mapping) or not isinstance(indicator_data, Mapping) or item.get("countryiso3code") != country or indicator_data.get("id") != indicator:
                 raise ProviderSchemaChanged("schema_changed", reference=url)
             unit, value = item.get("unit"), item.get("value")
-            if not isinstance(unit, str) or not unit or isinstance(value, bool) or (value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value))):
+            if not isinstance(unit, str) or not unit or (value is not None and not is_finite_public_number(value)):
                 raise ProviderSchemaChanged("schema_changed", reference=url)
             as_of_date, observed_frequency = _period(item.get("date"), url)
             if frequency is not None and frequency != observed_frequency:
