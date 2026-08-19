@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -171,3 +172,83 @@ def test_corrupt_lock_path_fails_closed_before_writing(store: DataSourceConfigSt
         store.update_adapter("sec-edgar", {"enabled": True})
 
     assert not store.path.exists()
+
+
+def test_relative_data_root_first_component_reparse_is_rejected_before_config_or_lock_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VR_DATA_DIR", "relative-data")
+    store = DataSourceConfigStore(catalog=build_catalog({"sources": []}))
+    original_lstat = os.lstat
+    opened: list[Path] = []
+
+    def fake_lstat(path):
+        if Path(path) == Path("relative-data"):
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original_lstat(path)
+
+    def record_open(path, *args, **kwargs):
+        opened.append(Path(path))
+        return original_open(path, *args, **kwargs)
+
+    original_open = Path.open
+    monkeypatch.setattr("data_sources.config_store.os.lstat", fake_lstat)
+    monkeypatch.setattr("data_sources.config_store.Path.open", record_open)
+
+    with pytest.raises(ConfigValidationError):
+        store.save({"free_only": True, "adapters": {}})
+
+    assert opened == []
+    assert not (tmp_path / "relative-data").exists()
+
+
+def test_relative_data_root_reparse_lock_path_is_rejected_before_open(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+    store = DataSourceConfigStore("relative-data", catalog=build_catalog({"sources": []}))
+    store.root.mkdir(parents=True)
+    original_lstat = os.lstat
+    opened: list[Path] = []
+
+    def fake_lstat(path):
+        if Path(path) == store._lock_path:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original_lstat(path)
+
+    original_open = Path.open
+
+    def record_open(path, *args, **kwargs):
+        opened.append(Path(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("data_sources.config_store.os.lstat", fake_lstat)
+    monkeypatch.setattr("data_sources.config_store.Path.open", record_open)
+
+    with pytest.raises(ConfigValidationError):
+        store.load()
+
+    assert opened == []
+
+
+def test_relative_data_root_real_symlink_is_rejected_when_windows_allows_it(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    relative_root = tmp_path / "relative-data"
+    try:
+        relative_root.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("relative directory symlinks are unavailable for this Windows user")
+    monkeypatch.setenv("VR_DATA_DIR", "relative-data")
+    store = DataSourceConfigStore(catalog=build_catalog({"sources": []}))
+
+    with pytest.raises(ConfigValidationError):
+        store.save({"free_only": True, "adapters": {}})
+
+    assert not (outside / "data-sources" / "v1" / "config.json").exists()
+
+
+@pytest.mark.parametrize("timeout", [True, False, "1", None, 0, -1, 0.0, -0.1, math.nan, math.inf, -math.inf, 10**1000])
+def test_config_rejects_nonfinite_or_nonpositive_lock_timeout(tmp_path, timeout: object):
+    with pytest.raises(ConfigValidationError):
+        DataSourceConfigStore(tmp_path / "data", catalog=build_catalog({"sources": []}), lock_timeout_seconds=timeout)

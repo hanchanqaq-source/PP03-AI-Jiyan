@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 
 import pytest
 
 from data_sources.credentials import (
     CredentialNotAllowed,
+    CredentialStoreUnavailable,
     CredentialWriteNotSupported,
     EnvironmentCredentialStore,
     KeyringCredentialStore,
@@ -144,7 +146,7 @@ def test_credential_stores_require_declared_adapter_and_environment_names(monkey
     assert keyring_calls == []
 
 
-def test_keyring_delete_of_missing_item_is_idempotent_not_unavailable():
+def test_keyring_delete_same_named_non_backend_error_is_unavailable():
     class PasswordDeleteError(Exception):
         pass
 
@@ -157,6 +159,62 @@ def test_keyring_delete_of_missing_item_is_idempotent_not_unavailable():
 
     store = KeyringCredentialStore(_FRED_CREDENTIAL, keyring_module=MissingItemKeyring())
 
-    store.delete("fred", "FRED_API_KEY")
+    with pytest.raises(CredentialStoreUnavailable):
+        store.delete("fred", "FRED_API_KEY")
 
-    assert store.state("fred").to_dict()["status"] == "unconfigured"
+    assert store.state("fred").to_dict()["status"] == "credential_store_unavailable"
+
+
+def test_environment_write_methods_validate_scope_before_read_only_error():
+    store = EnvironmentCredentialStore(_FRED_CREDENTIAL)
+
+    for operation in (
+        lambda: store.set("unknown", "FRED_API_KEY", "replacement"),
+        lambda: store.set("fred", "UNDECLARED_KEY", "replacement"),
+        lambda: store.delete("unknown", "FRED_API_KEY"),
+        lambda: store.delete("fred", "UNDECLARED_KEY"),
+    ):
+        with pytest.raises(CredentialNotAllowed):
+            operation()
+
+
+def test_keyring_missing_delete_requires_exact_backend_exception_class(monkeypatch: pytest.MonkeyPatch):
+    class BackendPasswordDeleteError(Exception):
+        pass
+
+    class SameNamedButUnrelatedPasswordDeleteError(Exception):
+        pass
+
+    monkeypatch.setattr("data_sources.credentials._PASSWORD_DELETE_ERROR", BackendPasswordDeleteError)
+
+    class MissingItemKeyring:
+        def delete_password(self, service_name: str, username: str) -> None:
+            raise BackendPasswordDeleteError()
+
+        def get_password(self, service_name: str, username: str):
+            return None
+
+    KeyringCredentialStore(_FRED_CREDENTIAL, keyring_module=MissingItemKeyring()).delete("fred", "FRED_API_KEY")
+
+    class BrokenKeyring:
+        def delete_password(self, service_name: str, username: str) -> None:
+            raise SameNamedButUnrelatedPasswordDeleteError()
+
+    store = KeyringCredentialStore(_FRED_CREDENTIAL, keyring_module=BrokenKeyring())
+    with pytest.raises(Exception) as raised:
+        store.delete("fred", "FRED_API_KEY")
+    assert type(raised.value).__name__ == "CredentialStoreUnavailable"
+
+
+@pytest.mark.skipif(importlib.util.find_spec("keyring") is None, reason="keyring dependency is not installed in this test environment")
+def test_keyring_real_password_delete_error_is_idempotent():
+    from keyring.errors import PasswordDeleteError
+
+    class MissingItemKeyring:
+        def delete_password(self, service_name: str, username: str) -> None:
+            raise PasswordDeleteError()
+
+        def get_password(self, service_name: str, username: str):
+            return None
+
+    KeyringCredentialStore(_FRED_CREDENTIAL, keyring_module=MissingItemKeyring()).delete("fred", "FRED_API_KEY")

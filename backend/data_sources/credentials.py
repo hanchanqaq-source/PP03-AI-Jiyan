@@ -13,6 +13,11 @@ import os
 import re
 from typing import Mapping, Protocol
 
+try:
+    from keyring.errors import PasswordDeleteError as _PASSWORD_DELETE_ERROR
+except ImportError:
+    _PASSWORD_DELETE_ERROR: type[Exception] | None = None
+
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
 
@@ -129,10 +134,12 @@ class EnvironmentCredentialStore:
         return _nonblank(os.environ.get(env_name))
 
     def set(self, adapter_id: str, env_name: str, value: str) -> None:
+        self._scope.pair(adapter_id, env_name)
         del adapter_id, env_name, value
         raise CredentialWriteNotSupported("environment credentials are read-only")
 
     def delete(self, adapter_id: str, env_name: str) -> None:
+        self._scope.pair(adapter_id, env_name)
         del adapter_id, env_name
         raise CredentialWriteNotSupported("environment credentials are read-only")
 
@@ -197,7 +204,7 @@ class KeyringCredentialStore:
         except CredentialStoreUnavailable:
             raise
         except Exception as error:
-            if type(error).__name__ == "PasswordDeleteError":
+            if _PASSWORD_DELETE_ERROR is not None and isinstance(error, _PASSWORD_DELETE_ERROR):
                 return
             del error
             self._unavailable_adapters.add(adapter_id)

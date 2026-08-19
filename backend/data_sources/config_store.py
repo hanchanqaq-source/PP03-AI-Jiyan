@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -74,13 +75,19 @@ class DataSourceConfigStore:
         if root is None:
             configured = os.environ.get("VR_DATA_DIR")
             root = Path(configured) if configured and configured.strip() else Path(os.environ.get("USERPROFILE") or Path.home()) / ".vibe-research"
-        if isinstance(lock_timeout_seconds, bool) or not isinstance(lock_timeout_seconds, (int, float)) or lock_timeout_seconds < 0:
+        if isinstance(lock_timeout_seconds, bool) or not isinstance(lock_timeout_seconds, (int, float)):
+            raise ConfigValidationError("lock timeout is invalid")
+        try:
+            normalized_lock_timeout = float(lock_timeout_seconds)
+        except (OverflowError, TypeError, ValueError):
+            raise ConfigValidationError("lock timeout is invalid") from None
+        if not math.isfinite(normalized_lock_timeout) or normalized_lock_timeout <= 0:
             raise ConfigValidationError("lock timeout is invalid")
         self._data_root = Path(root)
         self.root = self._data_root / "data-sources" / "v1"
         self.path = self.root / "config.json"
         self._lock_path = self.root / ".config.lock"
-        self._lock_timeout_seconds = float(lock_timeout_seconds)
+        self._lock_timeout_seconds = normalized_lock_timeout
         self._catalog = catalog or build_catalog({"sources": []})
         self._adapter_ids = frozenset(adapter.adapter_id for adapter in self._catalog.adapters)
 
@@ -93,9 +100,13 @@ class DataSourceConfigStore:
         parts = path.parts
         if not parts:
             raise ConfigValidationError("configuration path is unsafe")
-        current = Path(path.anchor) if path.anchor else Path(parts[0])
-        start = 1 if not path.anchor else len(Path(path.anchor).parts)
-        for part in parts[start:]:
+        if path.anchor:
+            current = Path(path.anchor)
+            path_parts = parts[len(Path(path.anchor).parts):]
+        else:
+            current = Path()
+            path_parts = parts
+        for part in path_parts:
             current = current / part
             try:
                 metadata = os.lstat(current)
