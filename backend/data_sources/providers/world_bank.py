@@ -97,12 +97,12 @@ class WorldBankAdapter(BaseProvider):
             if not isinstance(item, Mapping) or not isinstance(indicator_data, Mapping) or item.get("countryiso3code") != country or indicator_data.get("id") != indicator:
                 raise ProviderSchemaChanged("schema_changed", reference=url)
             unit, value = item.get("unit"), item.get("value")
-            if not isinstance(unit, str) or not unit or (value is not None and not is_finite_public_number(value)):
+            if not isinstance(unit, str) or (value is not None and not is_finite_public_number(value)):
                 raise ProviderSchemaChanged("schema_changed", reference=url)
             as_of_date, observed_frequency = _period(item.get("date"), url)
             if frequency is not None and frequency != observed_frequency:
                 raise ProviderSchemaChanged("schema_changed", reference=url)
-            rows.append(ProviderValue(value, "world_bank", "world-bank", request.capability_id, as_of_date, self._fetched_at(), "missing" if value is None else "upstream_reported", "World Bank Indicators API public data", 30, None, unit, observed_frequency, {"country": country, "indicator": indicator, "source_revision": revision}))
+            rows.append(ProviderValue(value, "world_bank", "world-bank", request.capability_id, as_of_date, self._fetched_at(), "missing" if value is None else "upstream_reported", "World Bank Indicators API public data", 30, None, unit or "unknown", observed_frequency, {"country": country, "indicator": indicator, "source_revision": revision}))
         return tuple(rows)
 
     def probe(self, capability_id: str) -> Mapping[str, object]:

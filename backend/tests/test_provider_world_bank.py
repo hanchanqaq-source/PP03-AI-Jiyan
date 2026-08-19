@@ -4,6 +4,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -55,6 +56,23 @@ def test_world_bank_preserves_official_keys_dates_units_and_missing_values():
     assert {row.source_metadata["indicator"] for row in rows} == {"NY.GDP.MKTP.CD"}
     assert {row.source_metadata["source_revision"] for row in rows} == {"2026-08-18"}
     assert http.calls == [("https://api.worldbank.org/v2/country/CHN/indicator/NY.GDP.MKTP.CD", {"Accept": "application/json"}, {"format": "json", "per_page": 1000, "date": "2024:2025"})]
+
+
+def test_world_bank_preserves_an_empty_official_unit_and_missing_value():
+    """An empty upstream unit is unknown metadata, not a malformed value."""
+    from data_sources.providers.world_bank import WorldBankAdapter
+
+    fixture = Path(__file__).parent / "fixtures" / "providers" / "world_bank_empty_unit.json"
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+    payload[1].append({"indicator": {"id": "SP.POP.TOTL"}, "country": {"id": "US"}, "countryiso3code": "USA", "date": "2023", "value": None, "unit": "", "obs_status": ""})
+
+    rows = WorldBankAdapter(http=FakeHttp([payload])).fetch(
+        ProviderRequest("macro_indicator", {"country": "USA", "indicator": "SP.POP.TOTL"})
+    )
+
+    assert [row.value for row in rows] == [340003797, None]
+    assert [row.unit for row in rows] == ["unknown", "unknown"]
+    assert rows[-1].data_status == "missing"
 
 
 @pytest.mark.parametrize("payload", [[], [{"page": 1}, []], [{"page": 1}, [{"date": "2025"}]]])

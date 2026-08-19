@@ -5,8 +5,9 @@
 This is a decision ledger, not a claim that a public publisher is currently
 healthy. The isolated Before audit ran on 2026-08-19 with the unchanged
 108-source configuration (`fbb2239676aa22d16a755780a80621a433b9ceb60f19499967440eac20c1f33e`),
-8-second per-request timeout, 500,000-byte cap, TLS verification enabled and
-12 workers. It wrote only redacted public metadata to
+8-second per-request timeout, 500,000-byte cap and 12 workers. HTTPS requests
+used TLS verification; configured HTTP references were not requested and are
+classified as insecure transport. It wrote only redacted public metadata to
 `.tmp/acceptance/a2-w1-phase2-before/public-audit.json` while every data,
 news-cache, report, log and acceptance path was explicitly scoped below that
 directory. No portfolio, holdings, notes, credentials, formal cache or prior
@@ -35,6 +36,9 @@ identity are independently proved.
 | `news:e9780af8b41b4a97` | 钛媒体 | success / HTTP 200 / 1 item | not applicable; healthy in this isolated observation | observed in this run | Chinese technology business coverage | configured publisher feed is already the observed public endpoint | no repair needed | 观察 |
 | `news:6b195fa321259338` | 虎嗅 | failure / TLS / 0 items | unknown; one isolated TLS observation | unknown | Chinese technology business coverage | configured publisher feed only; no verified migration | low investigation, never disable TLS | 观察 |
 | `news:3fb71517e26dc86e` | 动点科技 | failure / HTTP 403 / 0 items | unknown; one isolated public-access observation | unknown | Chinese technology/startup coverage | configured `cn.technode.com` feed only; no credentialless verified alternative | medium; credentials/cookies are prohibited | 需要凭据 |
+| `news:4ec6e685d9c8fe08` | 东方财富股票 | partial / insecure_transport / 0 items | unknown; HTTP was not requested | unknown | China market-news feed | no verified same-publisher HTTPS migration | medium; HTTPS identity proof required | 观察 |
+| `news:ea5cf31f8cf75d8a` | 东方财富资讯 | partial / insecure_transport / 0 items | unknown; HTTP was not requested | unknown | China market-news feed | no verified same-publisher HTTPS migration | medium; HTTPS identity proof required | 观察 |
+| `news:6a2e186b891ab2cb` | 经济观察网 | partial / insecure_transport / 0 items | unknown; HTTP was not requested | unknown | China macro/business reporting | no verified same-publisher HTTPS migration | medium; HTTPS identity proof required | 观察 |
 | `news:8a479d79f4e2ffb4` | 白鲸出海 | partial / redirect / 1 item | unknown; not a failure | observed in this run | Chinese outbound-tech coverage | final `baijing.cn` needs identity validation before migration | low | 观察 |
 | `news:39177cbe7653d141` | DPReview | partial / redirect / 1 item | unknown; not a failure | observed in this run | imaging/consumer technology coverage | final `dpreview.com/feed` needs identity validation before migration | low | 观察 |
 | `news:4cd1631448626c47` | Financial Times | partial / redirect / 1 item | unknown; not a failure | observed in this run | global macro/business reporting | final FT public RSS route needs identity validation before migration | low | 观察 |

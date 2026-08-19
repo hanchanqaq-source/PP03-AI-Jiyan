@@ -3,6 +3,9 @@
 - RSS/Atom observations are limited to each configured publisher's public
   endpoint. They do not grant republication rights; published content and
   feeds remain subject to publisher terms.
+- The configured HTTP feeds 东方财富股票、东方财富资讯 and 经济观察网 are classified as
+  `insecure_transport` without an HTTP request until a same-publisher HTTPS
+  migration is independently proved.
 - `WSJ Markets` is kept behind a `需要许可证` decision because a stale public
   feed does not establish rights to obtain fresh content through a paid,
   licensed or bypassed route.

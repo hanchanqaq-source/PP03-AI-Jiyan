@@ -2,7 +2,7 @@
 
 The states below are intentionally separate: registered/configured describes
 the Catalog, while connected is only a successful bounded public request. The
-Before audit used a no-key, no-login, TLS-verified 8-second/500,000-byte
+Before audit used a no-key, no-login, TLS-verified HTTPS 8-second/500,000-byte
 transport. Adapter outcomes are current observations, not finance truth or
 evidence admission.
 
@@ -12,10 +12,10 @@ evidence admission.
 | `gdelt` | `gdelt` | configured | minimal public fetch | timeout | no | collector/candidate only; cannot become independent evidence |
 | `imf` | `imf` | catalog_only | adapter probe only | catalog_only | no | no live request by contract pending separately documented interface validation |
 | `oecd` | `oecd` | configured | minimal public fetch | HTTP client error | no | public endpoint request was bounded; no fallback scraping |
-| `sec-edgar` | `sec_edgar` | configured | minimal public fetch | authentication | no | public contact was not fabricated; no email, login, cookie or retry beyond contract |
-| `world-bank` | `world_bank` | configured | minimal public fetch | schema_changed | no | endpoint response did not meet adapter's documented schema; no empty-success conversion |
+| `sec-edgar` | `sec_edgar` | configured | public capability probe | unconfigured_contact | no | explicit barrier, not Adapter failure; public contact was not fabricated |
+| `world-bank` | `world_bank` | configured | minimal public fetch | success | yes | empty official `unit` is normalized to unknown; missing numeric values remain missing |
 | `yahoo-finance` | `yahoo_finance` | disabled | adapter probe only | optional dependency unavailable | no | non-official and personal-research-only; no installation or enabled use |
 
-No Adapter is reported as connected in this task. The three ordinary public
-fetch failures and the catalog/dependency states remain visible rather than
-being converted into successful registration claims.
+Only World Bank is reported connected in the corrected audit. Other public
+fetch failures and catalog/dependency states remain visible rather than being
+converted into successful registration claims.
