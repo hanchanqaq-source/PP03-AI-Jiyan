@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 import json
 import threading
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 import pytest
 
@@ -70,6 +72,85 @@ class _UnavailableCredentialStore(_ReadOnlyCredentialStore):
 
     def state(self, adapter_id: str) -> CredentialState:
         return CredentialState(False, "credential_store_unavailable", None, "keyring")
+
+
+class _MemoryConfigStore:
+    def __init__(self, document: dict[str, object], *, fail_save: bool = False) -> None:
+        self.document = json.loads(json.dumps(document))
+        self.fail_save = fail_save
+
+    def load(self):
+        return json.loads(json.dumps(self.document))
+
+    def update_adapter(self, adapter_id: str, updates: dict[str, object]):
+        entry = self.document["adapters"].setdefault(adapter_id, {})
+        entry.update(updates)
+        return self.load()
+
+    def save(self, document: dict[str, object]):
+        if self.fail_save:
+            raise OSError("rollback storage detail")
+        self.document = json.loads(json.dumps(document))
+        return self.load()
+
+
+class _PartiallyFailingConfigStore(_MemoryConfigStore):
+    def update_adapter(self, adapter_id: str, updates: dict[str, object]):
+        super().update_adapter(adapter_id, updates)
+        raise OSError("write completion detail")
+
+
+class _PartiallyFailingUnreadableConfigStore(_PartiallyFailingConfigStore):
+    def __init__(self, document: dict[str, object]) -> None:
+        super().__init__(document)
+        self.unreadable = False
+
+    def load(self):
+        if self.unreadable:
+            raise OSError("recovery read detail")
+        return super().load()
+
+    def update_adapter(self, adapter_id: str, updates: dict[str, object]):
+        try:
+            return super().update_adapter(adapter_id, updates)
+        finally:
+            self.unreadable = True
+
+
+class _CallbackFailingCredentialStore:
+    def __init__(self, *, configured: bool = False, on_set=None, on_delete=None) -> None:
+        self.configured = configured
+        self.on_set = on_set
+        self.on_delete = on_delete
+        self.calls: list[str] = []
+
+    def get(self, adapter_id: str, env_name: str):
+        raise AssertionError("rollback must not read an old credential")
+
+    def set(self, adapter_id: str, env_name: str, value: str) -> None:
+        self.calls.append("set")
+        if self.on_set is not None:
+            self.on_set()
+        raise CredentialStoreUnavailable("secret backend detail")
+
+    def delete(self, adapter_id: str, env_name: str) -> None:
+        self.calls.append("delete")
+        if self.on_delete is not None:
+            self.on_delete()
+        raise CredentialStoreUnavailable("secret backend detail")
+
+    def state(self, adapter_id: str) -> CredentialState:
+        return CredentialState(
+            self.configured,
+            "stored" if self.configured else "unconfigured",
+            None,
+            "test",
+        )
+
+
+class _RecordingCredentialStore(_CallbackFailingCredentialStore):
+    def set(self, adapter_id: str, env_name: str, value: str) -> None:
+        self.calls.append("set")
 
 
 @pytest.fixture
@@ -200,6 +281,48 @@ def test_configured_keyed_adapter_without_trusted_validation_transport_fails_clo
     response = client.post("/api/data-sources/fred/validate", json={})
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "unsupported_credential_transport"
+    assert registry.calls == []
+    assert SECRET not in response.text
+
+
+def test_legacy_validate_unsupported_transport_is_non_health_failure_and_zero_run(
+    tmp_path, monkeypatch,
+):
+    class RecordingHealth(_EmptyHealthService):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def start_run(self, scope: str, *, excluded_adapter_ids=()):
+            self.calls.append(scope)
+            return super().start_run(scope, excluded_adapter_ids=excluded_adapter_ids)
+
+    catalog = build_catalog({"sources": []})
+    scope = {
+        adapter.adapter_id: tuple(adapter.credential_env_names)
+        for adapter in catalog.adapters if adapter.credential_env_names
+    }
+    config = DataSourceConfigStore(tmp_path / "legacy-config", catalog=catalog)
+    credentials = MemoryCredentialStore(scope)
+    credentials.set("fred", "FRED_API_KEY", SECRET)
+    health = RecordingHealth()
+    registry = _NoCallRegistry()
+    monkeypatch.setattr(api_module, "_service", DataSourceService(
+        catalog_builder=lambda: catalog,
+        health_service_factory=lambda: health,
+        config_store=config,
+        credential_store=credentials,
+        usage_store=UsageStore(tmp_path / "legacy-usage"),
+        provider_registry=registry,
+        now_factory=lambda: NOW,
+    ))
+
+    response = TestClient(app_module.app).post(
+        "/api/data-sources/fred/validate", json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "unsupported_credential_transport"
+    assert health.calls == []
     assert registry.calls == []
     assert SECRET not in response.text
 
@@ -417,3 +540,226 @@ def test_global_config_update_does_not_overwrite_concurrent_adapter_update(tmp_p
         "free_only": False,
         "adapters": {"fmp": {"daily_budget": "1.00"}},
     }
+
+
+def _transaction_client(monkeypatch, tmp_path, config, credentials):
+    catalog = build_catalog({"sources": []})
+    service = DataSourceService(
+        catalog_builder=lambda: catalog,
+        health_service_factory=_EmptyHealthService,
+        config_store=config,
+        credential_store=credentials,
+        usage_store=UsageStore(tmp_path / "transaction-usage"),
+        provider_registry=_NoCallRegistry(),
+        now_factory=lambda: NOW,
+    )
+    monkeypatch.setattr(api_module, "_service", service)
+    return TestClient(app_module.app, raise_server_exceptions=False)
+
+
+def test_failed_credential_put_restores_exact_prior_adapter_config(tmp_path, monkeypatch):
+    catalog = build_catalog({"sources": []})
+    config = DataSourceConfigStore(tmp_path / "config", catalog=catalog)
+    before = {
+        "free_only": True,
+        "adapters": {"fred": {
+            "enabled": True,
+            "last_validated_at": "2026-08-19T00:00:00Z",
+            "daily_budget": "2.00",
+        }},
+    }
+    config.save(before)
+    client = _transaction_client(
+        monkeypatch, tmp_path, config, _CallbackFailingCredentialStore()
+    )
+
+    response = client.put("/api/data-sources/fred/credentials", json={"credential": SECRET})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "credential_store_unavailable"
+    assert config.load() == before
+    assert SECRET not in response.text
+
+
+def test_failed_credential_delete_restores_exact_prior_adapter_config(tmp_path, monkeypatch):
+    catalog = build_catalog({"sources": []})
+    config = DataSourceConfigStore(tmp_path / "config", catalog=catalog)
+    before = {
+        "free_only": False,
+        "adapters": {"fred": {
+            "enabled": True,
+            "last_validated_at": "2026-08-19T00:00:00Z",
+            "monthly_request_limit": 25,
+        }},
+    }
+    config.save(before)
+    client = _transaction_client(
+        monkeypatch, tmp_path, config,
+        _CallbackFailingCredentialStore(configured=True),
+    )
+
+    response = client.delete("/api/data-sources/fred/credentials")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "credential_store_unavailable"
+    assert config.load() == before
+
+
+def test_credential_rollback_preserves_concurrent_unrelated_adapter_fields(tmp_path, monkeypatch):
+    config = _MemoryConfigStore({
+        "free_only": True,
+        "adapters": {"fred": {
+            "enabled": True,
+            "last_validated_at": "2026-08-19T00:00:00Z",
+            "daily_budget": "1.00",
+        }},
+    })
+    credentials = _CallbackFailingCredentialStore(
+        on_set=lambda: config.update_adapter("fred", {"daily_budget": "2.00"}),
+    )
+    client = _transaction_client(monkeypatch, tmp_path, config, credentials)
+
+    response = client.put("/api/data-sources/fred/credentials", json={"credential": SECRET})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "credential_store_unavailable"
+    assert config.load()["adapters"]["fred"] == {
+        "enabled": True,
+        "last_validated_at": "2026-08-19T00:00:00Z",
+        "daily_budget": "2.00",
+    }
+
+
+def test_credential_rollback_does_not_clobber_concurrent_operation_field(tmp_path, monkeypatch):
+    config = _MemoryConfigStore({
+        "free_only": True,
+        "adapters": {"fred": {"enabled": True}},
+    })
+    credentials = _CallbackFailingCredentialStore(
+        on_set=lambda: config.update_adapter("fred", {"enabled": True}),
+    )
+    client = _transaction_client(monkeypatch, tmp_path, config, credentials)
+
+    response = client.put("/api/data-sources/fred/credentials", json={"credential": SECRET})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "configuration_recovery_required"
+    assert config.load()["adapters"]["fred"]["enabled"] is True
+    assert SECRET not in response.text
+
+
+def test_credential_rollback_failure_is_bounded_and_never_false_success(tmp_path, monkeypatch):
+    config = _MemoryConfigStore({
+        "free_only": True,
+        "adapters": {"fred": {
+            "enabled": True,
+            "last_validated_at": "2026-08-19T00:00:00Z",
+        }},
+    }, fail_save=True)
+    client = _transaction_client(
+        monkeypatch, tmp_path, config, _CallbackFailingCredentialStore()
+    )
+
+    response = client.put("/api/data-sources/fred/credentials", json={"credential": SECRET})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "configuration_recovery_required"
+    assert config.load()["adapters"]["fred"] == {
+        "enabled": False,
+        "last_validated_at": None,
+    }
+    assert "rollback storage detail" not in response.text
+
+
+def test_config_failure_happens_before_credential_mutation(tmp_path, monkeypatch):
+    credentials = _RecordingCredentialStore()
+    client = _transaction_client(
+        monkeypatch, tmp_path, _WriteFailingConfigStore(), credentials,
+    )
+
+    response = client.put("/api/data-sources/fred/credentials", json={"credential": SECRET})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "configuration_store_unavailable"
+    assert credentials.calls == []
+    assert SECRET not in response.text
+
+
+def test_partial_config_failure_is_compensated_before_any_credential_mutation(
+    tmp_path, monkeypatch,
+):
+    before = {
+        "free_only": True,
+        "adapters": {"fred": {
+            "enabled": True,
+            "last_validated_at": "2026-08-19T00:00:00Z",
+            "daily_budget": "3.00",
+        }},
+    }
+    config = _PartiallyFailingConfigStore(before)
+    credentials = _RecordingCredentialStore()
+    client = _transaction_client(monkeypatch, tmp_path, config, credentials)
+
+    response = client.put(
+        "/api/data-sources/fred/credentials", json={"credential": SECRET},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "configuration_store_unavailable"
+    assert config.load() == before
+    assert credentials.calls == []
+    assert "write completion detail" not in response.text
+
+
+def test_partial_config_failure_with_unreadable_recovery_state_requires_recovery(
+    tmp_path, monkeypatch,
+):
+    config = _PartiallyFailingUnreadableConfigStore({
+        "free_only": True, "adapters": {"fred": {"enabled": True}},
+    })
+    credentials = _RecordingCredentialStore()
+    client = _transaction_client(monkeypatch, tmp_path, config, credentials)
+
+    response = client.put(
+        "/api/data-sources/fred/credentials", json={"credential": SECRET},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "configuration_recovery_required"
+    assert credentials.calls == []
+    assert "recovery read detail" not in response.text
+
+
+def test_put_cors_preflight_is_allowed_without_broadening_method_or_origin_policy():
+    production = next(
+        middleware for middleware in app_module.app.user_middleware
+        if middleware.cls is CORSMiddleware
+    )
+    options = dict(production.kwargs)
+    options["allow_origins"] = ["http://127.0.0.1:5899"]
+    strict_app = FastAPI()
+    strict_app.add_middleware(CORSMiddleware, **options)
+    client = TestClient(strict_app)
+    headers = {
+        "Origin": "http://127.0.0.1:5899",
+        "Access-Control-Request-Method": "PUT",
+    }
+    for path in (
+        "/api/data-sources/config",
+        "/api/data-sources/fred/credentials",
+    ):
+        allowed = client.options(path, headers=headers)
+        assert allowed.status_code == 200
+        assert "PUT" in allowed.headers["access-control-allow-methods"]
+
+    disallowed_method = client.options(
+        "/api/data-sources/config",
+        headers={**headers, "Access-Control-Request-Method": "PATCH"},
+    )
+    disallowed_origin = client.options(
+        "/api/data-sources/config",
+        headers={**headers, "Origin": "https://unapproved.example"},
+    )
+    assert disallowed_method.status_code == 400
+    assert disallowed_origin.status_code == 400
+    assert "access-control-allow-origin" not in disallowed_origin.headers

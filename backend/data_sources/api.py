@@ -61,6 +61,7 @@ _PUBLIC_MESSAGES = {
     "credential_source_read_only": "当前凭据来源为只读配置",
     "credential_store_unavailable": "凭据存储当前不可用",
     "configuration_store_unavailable": "数据源配置当前不可用",
+    "configuration_recovery_required": "数据源配置需要恢复后才能继续",
     "usage_store_unavailable": "数据源用量记录当前不可用",
     "clock_unavailable": "服务时间当前不可用",
 }
