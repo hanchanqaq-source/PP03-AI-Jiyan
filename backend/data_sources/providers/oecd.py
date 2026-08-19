@@ -4,6 +4,7 @@ import csv
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
 from io import StringIO
+import math
 import re
 import time
 from typing import Any
@@ -66,9 +67,11 @@ class OecdAdapter(BaseProvider):
         if end: params["endPeriod"] = end
         try: decoded = self._get_bytes(url, params).decode("utf-8")
         except UnicodeDecodeError as error: raise ProviderSchemaChanged("schema_changed", reference=url) from error
-        rows = list(csv.DictReader(StringIO(decoded)))
+        reader = csv.DictReader(StringIO(decoded))
         required = {"DATAFLOW", "REF_AREA", "SUBJECT", "FREQ", "TIME_PERIOD", "OBS_VALUE", "UNIT_MEASURE", "LAST_UPDATE", "OBS_STATUS"}
-        if not rows or not required.issubset(set(rows[0] or ())): raise ProviderSchemaChanged("schema_changed", reference=url)
+        if not required.issubset(set(reader.fieldnames or ())): raise ProviderSchemaChanged("schema_changed", reference=url)
+        rows = list(reader)
+        if not rows: raise ProviderUnavailable("empty_result", reference=url)
         values: list[ProviderValue] = []
         for row in rows:
             if any(not isinstance(row.get(field), str) for field in required) or row["DATAFLOW"] != dataset or f"{row['FREQ']}.{row['REF_AREA']}.{row['SUBJECT']}" != series or row["FREQ"] not in _FREQUENCY or not row["UNIT_MEASURE"] or not row["LAST_UPDATE"]:
@@ -76,6 +79,7 @@ class OecdAdapter(BaseProvider):
             raw = row["OBS_VALUE"].strip()
             try: value = None if not raw else float(raw)
             except ValueError as error: raise ProviderSchemaChanged("schema_changed", reference=url) from error
+            if value is not None and not math.isfinite(value): raise ProviderSchemaChanged("schema_changed", reference=url)
             values.append(ProviderValue(value, "oecd", "oecd", request.capability_id, _as_date(row["TIME_PERIOD"], url), self._fetched_at(), "missing" if value is None else "upstream_reported", "OECD SDMX public data", 30, None, row["UNIT_MEASURE"], _FREQUENCY[row["FREQ"]], {"dataset": dataset, "series_key": series, "source_revision": row["LAST_UPDATE"]}))
         return tuple(values)
 

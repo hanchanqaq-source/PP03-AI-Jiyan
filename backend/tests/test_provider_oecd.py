@@ -74,3 +74,20 @@ def test_oecd_rejects_path_injection_before_http():
     with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
         OecdAdapter(http=http).fetch(ProviderRequest("macro_series", {"dataset": "OECD/../", "series_key": "M.USA"}))
     assert http.calls == []
+
+
+@pytest.mark.parametrize("raw_value", ["NaN", "Infinity", "-Infinity", "True"])
+def test_oecd_rejects_non_finite_or_boolean_observation_text(raw_value):
+    """Catches CSV numeric coercion accepting non-finite values as reported data."""
+    from data_sources.providers.oecd import OecdAdapter
+
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        OecdAdapter(http=FakeHttp([oecd_csv().replace(b"3.50", raw_value.encode())])).fetch(request())
+
+
+def test_oecd_returns_an_explicit_empty_result_for_a_valid_header_only_csv():
+    from data_sources.providers.oecd import OecdAdapter
+
+    header = oecd_csv().splitlines()[0] + b"\n"
+    with pytest.raises(ProviderUnavailable, match="empty_result"):
+        OecdAdapter(http=FakeHttp([header])).fetch(request())

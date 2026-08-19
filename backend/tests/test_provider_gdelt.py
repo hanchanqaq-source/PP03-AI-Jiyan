@@ -37,14 +37,14 @@ def test_gdelt_returns_only_collector_candidates_with_original_publisher_identit
     http = FakeHttp([gdelt_fixture()])
     rows = GdeltAdapter(http=http, fetched_at=lambda: datetime(2026, 8, 19, tzinfo=timezone.utc)).fetch(request())
 
-    assert rows[0].value == {"publisher_url": "https://publisher.example/news/123", "origin_domain": "publisher.example", "title": "Public report", "language": "English", "source_country": "United States", "collector": "gdelt", "candidate": True, "independent_evidence_eligible": False}
+    assert rows[0].value == {"publisher_url": "https://publisher.example/news/123", "origin_domain": "publisher.example", "title": "Public report", "language": "English", "source_country": "United States", "seen_at": "20260818T120000Z", "collector": "gdelt", "candidate": True, "independent_evidence_eligible": False}
     assert rows[0].source_family_id == "gdelt"
     assert rows[0].data_status == "candidate"
     assert rows[0].frequency == "event_driven"
     assert http.calls == [("https://api.gdeltproject.org/api/v2/doc/doc", {"Accept": "application/json"}, {"query": "inflation report", "mode": "artlist", "format": "json", "maxrecords": 25, "timespan": "1week"})]
 
 
-@pytest.mark.parametrize("payload", [{}, {"articles": []}, {"articles": [{"url": "https://publisher.example/only-url"}]}])
+@pytest.mark.parametrize("payload", [{}, {"articles": [{"url": "https://publisher.example/only-url"}]}])
 def test_gdelt_rejects_empty_or_incomplete_candidate_payload(payload):
     from data_sources.providers.gdelt import GdeltAdapter
 
@@ -71,6 +71,38 @@ def test_gdelt_rejects_unsafe_query_and_non_https_publisher_url():
     assert http.calls == []
     with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
         GdeltAdapter(http=FakeHttp([{ "articles": [{"url": "http://publisher.example/no-tls", "title": "Unsafe", "seendate": "20260818T120000Z", "domain": "publisher.example", "language": "English", "sourcecountry": "US"}]}])).fetch(request())
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        GdeltAdapter(http=FakeHttp([{ "articles": [{"url": "https://publisher.example:bad-port/news", "title": "Unsafe", "seendate": "20260818T120000Z", "domain": "publisher.example", "language": "English", "sourcecountry": "US"}]}])).fetch(request())
+
+
+def test_gdelt_redacts_publisher_url_secrets_and_preserves_a_valid_seen_time():
+    """Catches credential-bearing publisher URLs or loss of auditable candidate timing."""
+    from data_sources.providers.gdelt import GdeltAdapter
+
+    payload = gdelt_fixture()
+    payload["articles"][0]["url"] = "https://publisher.example/news/123?token=secret&public=ok"
+    row = GdeltAdapter(http=FakeHttp([payload])).fetch(request())[0]
+
+    assert row.value["publisher_url"] == "https://publisher.example/news/123"
+    assert "secret" not in str(row.value)
+    assert row.value["seen_at"] == "20260818T120000Z"
+
+
+@pytest.mark.parametrize("seen_date", ["", "2026-08-18", "20260818T120000", "not-a-date"])
+def test_gdelt_rejects_invalid_candidate_seen_time(seen_date):
+    from data_sources.providers.gdelt import GdeltAdapter
+
+    payload = gdelt_fixture()
+    payload["articles"][0]["seendate"] = seen_date
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        GdeltAdapter(http=FakeHttp([payload])).fetch(request())
+
+
+def test_gdelt_returns_an_explicit_empty_result_for_a_valid_empty_article_list():
+    from data_sources.providers.gdelt import GdeltAdapter
+
+    with pytest.raises(ProviderUnavailable, match="empty_result"):
+        GdeltAdapter(http=FakeHttp([{"articles": []}])).fetch(request())
 
 
 def test_catalog_registers_macro_sources_and_candidate_only_gdelt_without_connected_claims():

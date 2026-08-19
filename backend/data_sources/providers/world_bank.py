@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
+import math
 import re
 import time
 from typing import Any
@@ -23,16 +24,16 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _period(value: object, reference: str) -> date:
+def _period(value: object, reference: str) -> tuple[date, str]:
     if not isinstance(value, str) or not value:
         raise ProviderSchemaChanged("schema_changed", reference=reference)
     try:
         if re.fullmatch(r"\d{4}", value):
-            return date(int(value), 1, 1)
+            return date(int(value), 1, 1), "annual"
         if re.fullmatch(r"\d{4}M\d{2}", value):
-            return date(int(value[:4]), int(value[5:]), 1)
+            return date(int(value[:4]), int(value[5:]), 1), "monthly"
         if re.fullmatch(r"\d{4}Q[1-4]", value):
-            return date(int(value[:4]), (int(value[-1]) - 1) * 3 + 1, 1)
+            return date(int(value[:4]), (int(value[-1]) - 1) * 3 + 1, 1), "quarterly"
     except ValueError as error:
         raise ProviderSchemaChanged("schema_changed", reference=reference) from error
     raise ProviderSchemaChanged("schema_changed", reference=reference)
@@ -54,18 +55,18 @@ class WorldBankAdapter(BaseProvider):
         self._http, self._sleeper, self._fetched_at = http, sleeper, fetched_at
 
     @staticmethod
-    def _request(request: ProviderRequest) -> tuple[str, str, str | None, str]:
+    def _request(request: ProviderRequest) -> tuple[str, str, str | None, str | None]:
         if request.capability_id != "macro_indicator":
             raise ProviderUnavailable("unsupported_capability", reference=_REFERENCE)
         country, indicator = request.parameters.get("country"), request.parameters.get("indicator")
-        raw_date, frequency = request.parameters.get("date"), request.parameters.get("frequency", "annual")
+        raw_date, frequency = request.parameters.get("date"), request.parameters.get("frequency")
         if not isinstance(country, str) or not _PATH_VALUE.fullmatch(country) or not isinstance(indicator, str) or not _PATH_VALUE.fullmatch(indicator):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if raw_date is not None and (not isinstance(raw_date, str) or not _DATE_VALUE.fullmatch(raw_date)):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        if frequency not in {"annual", "quarterly", "monthly"}:
+        if frequency is not None and frequency not in {"annual", "quarterly", "monthly"}:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return country, indicator, raw_date, str(frequency)
+        return country, indicator, raw_date, str(frequency) if frequency is not None else None
 
     def _get_json(self, url: str, params: Mapping[str, object]) -> object:
         try:
@@ -81,7 +82,11 @@ class WorldBankAdapter(BaseProvider):
         if requested_date is not None:
             params["date"] = requested_date
         payload = self._get_json(url, params)
-        if not isinstance(payload, list) or len(payload) != 2 or not isinstance(payload[0], Mapping) or not isinstance(payload[1], list) or not payload[1]:
+        if not isinstance(payload, list) or len(payload) != 2 or not isinstance(payload[0], Mapping) or not isinstance(payload[1], list):
+            raise ProviderSchemaChanged("schema_changed", reference=url)
+        if not payload[1]:
+            if payload[0].get("total") in {0, "0"}:
+                raise ProviderUnavailable("empty_result", reference=url)
             raise ProviderSchemaChanged("schema_changed", reference=url)
         revision = payload[0].get("lastupdated")
         if not isinstance(revision, str) or not revision:
@@ -92,9 +97,12 @@ class WorldBankAdapter(BaseProvider):
             if not isinstance(item, Mapping) or not isinstance(indicator_data, Mapping) or item.get("countryiso3code") != country or indicator_data.get("id") != indicator:
                 raise ProviderSchemaChanged("schema_changed", reference=url)
             unit, value = item.get("unit"), item.get("value")
-            if not isinstance(unit, str) or not unit or isinstance(value, bool) or (value is not None and not isinstance(value, (int, float))):
+            if not isinstance(unit, str) or not unit or isinstance(value, bool) or (value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value))):
                 raise ProviderSchemaChanged("schema_changed", reference=url)
-            rows.append(ProviderValue(value, "world_bank", "world-bank", request.capability_id, _period(item.get("date"), url), self._fetched_at(), "missing" if value is None else "upstream_reported", "World Bank Indicators API public data", 30, None, unit, frequency, {"country": country, "indicator": indicator, "source_revision": revision}))
+            as_of_date, observed_frequency = _period(item.get("date"), url)
+            if frequency is not None and frequency != observed_frequency:
+                raise ProviderSchemaChanged("schema_changed", reference=url)
+            rows.append(ProviderValue(value, "world_bank", "world-bank", request.capability_id, as_of_date, self._fetched_at(), "missing" if value is None else "upstream_reported", "World Bank Indicators API public data", 30, None, unit, observed_frequency, {"country": country, "indicator": indicator, "source_revision": revision}))
         return tuple(rows)
 
     def probe(self, capability_id: str) -> Mapping[str, object]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
+import math
 import re
 import time
 from typing import Any
@@ -63,7 +64,9 @@ class ImfAdapter(BaseProvider):
         series_dimensions = dimensions.get("series") if isinstance(dimensions, Mapping) else None
         observation_dimensions = dimensions.get("observation") if isinstance(dimensions, Mapping) else None
         data_series = data_sets[0].get("series") if isinstance(data_sets[0], Mapping) else None
-        if not isinstance(series_dimensions, list) or len(series_dimensions) < 2 or not isinstance(observation_dimensions, list) or len(observation_dimensions) != 1 or not isinstance(data_series, Mapping) or len(data_series) != 1: raise ProviderSchemaChanged("schema_changed", reference=url)
+        if not isinstance(series_dimensions, list) or len(series_dimensions) < 2 or not isinstance(observation_dimensions, list) or len(observation_dimensions) != 1 or not isinstance(data_series, Mapping): raise ProviderSchemaChanged("schema_changed", reference=url)
+        if not data_series: raise ProviderUnavailable("empty_result", reference=url)
+        if len(data_series) != 1: raise ProviderSchemaChanged("schema_changed", reference=url)
         try:
             area = series_dimensions[0]["values"][0]["id"]
             indicator = series_dimensions[1]["values"][0]["id"]
@@ -78,7 +81,7 @@ class ImfAdapter(BaseProvider):
         for index, point in observations.items():
             try: raw_value = point[0]; period = periods[int(index)]["id"]
             except (IndexError, KeyError, TypeError, ValueError) as error: raise ProviderSchemaChanged("schema_changed", reference=url) from error
-            if isinstance(raw_value, bool) or raw_value is not None and not isinstance(raw_value, (int, float)): raise ProviderSchemaChanged("schema_changed", reference=url)
+            if isinstance(raw_value, bool) or raw_value is not None and (not isinstance(raw_value, (int, float)) or not math.isfinite(raw_value)): raise ProviderSchemaChanged("schema_changed", reference=url)
             output.append(ProviderValue(raw_value, "imf", "imf", request.capability_id, _date(period, url), self._fetched_at(), "missing" if raw_value is None else "upstream_reported", "IMF public SDMX data", 40, None, unit, _FREQUENCY[frequency_code], {"dataset": dataset, "series_key": series, "source_revision": header["prepared"]}))
         return tuple(output)
 

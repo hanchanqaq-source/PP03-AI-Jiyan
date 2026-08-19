@@ -38,6 +38,23 @@ class SourceRole(str, Enum):
     CANDIDATE = "candidate"
 
 
+class FrozenMetadata(dict[str, str]):
+    """A copied provenance mapping that remains JSON and dataclass serializable."""
+
+    @staticmethod
+    def _immutable(*_args: object, **_kwargs: object) -> None:
+        raise TypeError("source_metadata is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
 @dataclass(frozen=True, slots=True)
 class SourceFamily:
     source_family_id: str
@@ -102,3 +119,6 @@ class ProviderValue:
     unit: str
     frequency: str
     source_metadata: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_metadata", FrozenMetadata(self.source_metadata))

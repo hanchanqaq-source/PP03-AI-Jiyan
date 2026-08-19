@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 
 import pytest
 
@@ -87,3 +88,23 @@ def test_imf_retries_one_bounded_rate_limit_and_rejects_path_injection():
     with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
         ImfAdapter(http=http).fetch(ProviderRequest("macro_series", {"dataset": "IFS/../", "series_key": "USA.NGDP_RPCH"}))
     assert http.calls == []
+
+
+@pytest.mark.parametrize("raw_value", [math.nan, math.inf, -math.inf, True])
+def test_imf_rejects_non_finite_or_boolean_sdmx_observations(raw_value):
+    """Catches SDMX numeric values that are not finite measurements."""
+    from data_sources.providers.imf import ImfAdapter
+
+    payload = imf_fixture()
+    payload["dataSets"][0]["series"]["0:0"]["observations"]["0"][0] = raw_value
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        ImfAdapter(http=FakeHttp([payload])).fetch(request())
+
+
+def test_imf_returns_an_explicit_empty_result_for_a_valid_zero_series_sdmx_response():
+    from data_sources.providers.imf import ImfAdapter
+
+    payload = imf_fixture()
+    payload["dataSets"][0]["series"] = {}
+    with pytest.raises(ProviderUnavailable, match="empty_result"):
+        ImfAdapter(http=FakeHttp([payload])).fetch(request())

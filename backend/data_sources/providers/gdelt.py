@@ -10,15 +10,27 @@ from urllib.parse import urlsplit
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.references import public_source_reference
 
 from .base import BaseProvider
 
 
 _REFERENCE = "https://api.gdeltproject.org/api/v2/doc/doc"
 _TIMESPAN = re.compile(r"^[1-9][0-9]{0,2}(?:h|d|week|weeks|month|months)$")
+_SEEN_DATE = re.compile(r"^\d{8}T\d{6}Z$")
 
 
 def _now() -> datetime: return datetime.now(timezone.utc)
+
+
+def _seen_at(value: object) -> str:
+    if not isinstance(value, str) or not _SEEN_DATE.fullmatch(value):
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    try:
+        datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+    except ValueError as error:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from error
+    return value
 
 
 class GdeltAdapter(BaseProvider):
@@ -45,16 +57,21 @@ class GdeltAdapter(BaseProvider):
         query, timespan, maximum = self._request(request)
         payload = self._get_json({"query": query, "mode": "artlist", "format": "json", "maxrecords": maximum, "timespan": timespan})
         articles = payload.get("articles") if isinstance(payload, Mapping) else None
-        if not isinstance(articles, list) or not articles: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+        if not isinstance(articles, list): raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+        if not articles: raise ProviderUnavailable("empty_result", reference=_REFERENCE)
         values: list[ProviderValue] = []
         for article in articles:
             if not isinstance(article, Mapping): raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             url, title, seen, domain, language, country = (article.get(field) for field in ("url", "title", "seendate", "domain", "language", "sourcecountry"))
             try: parts = urlsplit(url) if isinstance(url, str) else None
             except ValueError as error: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from error
-            if not parts or parts.scheme != "https" or parts.username or parts.password or not parts.hostname or not isinstance(domain, str) or parts.hostname.lower() != domain.lower() or any(not isinstance(value, str) or not value for value in (title, seen, language, country)):
+            if not parts or parts.scheme != "https" or parts.username or parts.password or not parts.hostname or not isinstance(domain, str) or parts.hostname.lower() != domain.lower() or any(not isinstance(value, str) or not value for value in (title, language, country)):
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
-            values.append(ProviderValue({"publisher_url": url, "origin_domain": domain.lower(), "title": title, "language": language, "source_country": country, "collector": "gdelt", "candidate": True, "independent_evidence_eligible": False}, "gdelt", "gdelt", request.capability_id, None, self._fetched_at(), "candidate", "GDELT public discovery index; original publisher must be independently verified", 100, None, "candidate", "event_driven", {"collector": "gdelt", "origin_domain": domain.lower()}))
+            try:
+                publisher_url = public_source_reference(url)
+            except ValueError as error:
+                raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from error
+            values.append(ProviderValue({"publisher_url": publisher_url, "origin_domain": domain.lower(), "title": title, "language": language, "source_country": country, "seen_at": _seen_at(seen), "collector": "gdelt", "candidate": True, "independent_evidence_eligible": False}, "gdelt", "gdelt", request.capability_id, None, self._fetched_at(), "candidate", "GDELT public discovery index; original publisher must be independently verified", 100, None, "candidate", "event_driven", {"collector": "gdelt", "origin_domain": domain.lower()}))
         return tuple(values)
 
     def probe(self, capability_id: str) -> Mapping[str, object]: return {"status": "not_probed" if capability_id == "news_discovery" else "unsupported_capability", "connected": False}

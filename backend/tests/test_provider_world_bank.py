@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timezone
+import json
+import math
 
 import pytest
 
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.models import ProviderValue
 
 
 class FakeHttp:
@@ -81,3 +85,59 @@ def test_world_bank_rejects_untrusted_path_values_before_http():
     with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
         WorldBankAdapter(http=http).fetch(ProviderRequest("macro_indicator", {"country": "CHN/../", "indicator": "NY.GDP.MKTP.CD"}))
     assert http.calls == []
+
+
+@pytest.mark.parametrize("raw_value", [math.nan, math.inf, -math.inf, True])
+def test_world_bank_rejects_non_finite_or_boolean_observations(raw_value):
+    """Catches NaN/Infinity or bool values being labelled upstream_reported."""
+    from data_sources.providers.world_bank import WorldBankAdapter
+
+    payload = world_bank_fixture()
+    payload[1][0]["value"] = raw_value
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        WorldBankAdapter(http=FakeHttp([payload])).fetch(request())
+
+
+@pytest.mark.parametrize(("period", "expected_frequency"), [("2025", "annual"), ("2025M03", "monthly"), ("2025Q2", "quarterly")])
+def test_world_bank_derives_frequency_from_the_official_observation_period(period, expected_frequency):
+    """Catches a caller-supplied frequency relabelling an official observation."""
+    from data_sources.providers.world_bank import WorldBankAdapter
+
+    payload = world_bank_fixture()
+    payload[1][0]["date"] = period
+    payload[1][1]["date"] = period
+    rows = WorldBankAdapter(http=FakeHttp([payload])).fetch(
+        ProviderRequest("macro_indicator", {"country": "CHN", "indicator": "NY.GDP.MKTP.CD"})
+    )
+    assert {row.frequency for row in rows} == {expected_frequency}
+
+
+def test_world_bank_rejects_frequency_that_conflicts_with_the_official_period():
+    from data_sources.providers.world_bank import WorldBankAdapter
+
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        WorldBankAdapter(http=FakeHttp([world_bank_fixture()])).fetch(
+            ProviderRequest("macro_indicator", {"country": "CHN", "indicator": "NY.GDP.MKTP.CD", "frequency": "monthly"})
+        )
+
+
+def test_world_bank_returns_an_explicit_empty_result_for_a_valid_zero_row_response():
+    from data_sources.providers.world_bank import WorldBankAdapter
+
+    payload = world_bank_fixture()
+    payload[0].update({"total": 0, "pages": 0})
+    payload[1] = []
+    with pytest.raises(ProviderUnavailable, match="empty_result"):
+        WorldBankAdapter(http=FakeHttp([payload])).fetch(request())
+
+
+def test_provider_value_copies_and_freezes_source_metadata():
+    """Catches caller mutation changing an immutable ProviderValue's provenance."""
+    supplied = {"country": "CHN"}
+    value = ProviderValue(1, "world_bank", "world-bank", "macro_indicator", None, datetime(2026, 8, 19, tzinfo=timezone.utc), "upstream_reported", "public", 1, None, "USD", "annual", supplied)
+    supplied["country"] = "USA"
+
+    assert value.source_metadata == {"country": "CHN"}
+    with pytest.raises(TypeError):
+        value.source_metadata["country"] = "USA"
+    assert json.loads(json.dumps(asdict(value)["source_metadata"])) == {"country": "CHN"}
