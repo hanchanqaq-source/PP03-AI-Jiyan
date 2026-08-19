@@ -34,11 +34,16 @@ _FACTORIES: Mapping[str, _ProviderFactory] = {
     "twelve-data": _ProviderFactory("data_sources.providers.twelve_data", "TwelveDataAdapter", True, True),
     "nasdaq-data-link": _ProviderFactory("data_sources.providers.nasdaq_data_link", "NasdaqDataLinkAdapter", True, True),
     "news-api": _ProviderFactory("data_sources.providers.news_api", "NewsApiAdapter", True, True),
+    "fmp": _ProviderFactory("data_sources.providers.fmp", "FmpAdapter", True, True),
+    "massive": _ProviderFactory("data_sources.providers.massive", "MassiveAdapter", True, True),
+    "tiingo": _ProviderFactory("data_sources.providers.tiingo", "TiingoAdapter", True, True),
+    "eodhd": _ProviderFactory("data_sources.providers.eodhd", "EodhdAdapter", True, True),
+    "databento": _ProviderFactory("data_sources.providers.databento", "DatabentoAdapter", True, True),
 }
 
 
 class ProviderRegistry:
-    """Resolve free-provider implementations only when an adapter is requested.
+    """Resolve provider implementations only when an adapter is requested.
 
     Importing this registry (or building the Catalog) does not import optional
     BaoStock/yfinance dependencies and does not create a transport client.

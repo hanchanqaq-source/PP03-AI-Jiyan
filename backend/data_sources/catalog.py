@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping, Sequence, TypeVar
 from source_health.registry import load_news_config
 
 from .references import public_source_reference
+from .enterprise_catalog import enterprise_adapters, enterprise_families
 
 from .models import (
     AdapterDescriptor,
@@ -182,6 +183,11 @@ def _families() -> tuple[SourceFamily, ...]:
         SourceFamily("twelve_data", "Twelve Data", "global", "overseas", (SourceRole.FALLBACK_DATA, SourceRole.MARKET_DATA, SourceRole.CROSS_CHECK), True, "twelve_data_account_terms_apply", CatalogStatus.UNCONFIGURED),
         SourceFamily("nasdaq_data_link", "Nasdaq Data Link", "global", "global", (SourceRole.MACRO_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "nasdaq_data_link_dataset_terms_apply", CatalogStatus.UNCONFIGURED),
         SourceFamily("news_api", "NewsAPI", "global", "news", (SourceRole.COLLECTOR, SourceRole.CANDIDATE), False, "news_api_account_and_publisher_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("fmp", "Financial Modeling Prep", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "financial_modeling_prep_paid_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("massive", "Polygon/Massive", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "massive_paid_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("tiingo", "Tiingo", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "tiingo_paid_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("eodhd", "EODHD", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "eodhd_paid_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("databento", "Databento", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "databento_paid_terms_apply", CatalogStatus.UNCONFIGURED),
     )
 
 
@@ -244,6 +250,11 @@ def _static_adapters() -> tuple[AdapterDescriptor, ...]:
         _adapter("twelve-data", "Twelve Data", "twelve_data", "http_client", (SourceRole.FALLBACK_DATA, SourceRole.MARKET_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://api.twelvedata.com/", 125, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Twelve Data account terms apply; interval and credits depend on the actual plan.", usage_note="Fallback market history with explicit plan and credit metadata.", billing_model=BillingModel.FREEMIUM, auth_type="api_key", credential_env_names=("TWELVE_DATA_API_KEY",), data_delay="以 Twelve Data 实际返回为准", quota_policy="以账户实际套餐、能力和 credits 为准", cost_policy="套餐成本未知；无可信能力级权益时禁止请求"),
         _adapter("nasdaq-data-link", "Nasdaq Data Link", "nasdaq_data_link", "http_client", (SourceRole.MACRO_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("macro_series",), "https://data.nasdaq.com/", 140, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Nasdaq Data Link account and dataset license terms apply.", usage_note="Known public datasets are distinguished from Premium datasets; Premium requires explicit account entitlement.", billing_model=BillingModel.FREEMIUM, auth_type="api_key", credential_env_names=("NASDAQ_DATA_LINK_API_KEY",), data_delay="以 dataset 实际刷新时间为准", quota_policy="以账户实际套餐、dataset 权限和配额为准", cost_policy="套餐和 Premium 成本未知；无可信能力级权益时禁止请求"),
         _adapter("news-api", "NewsAPI", "news_api", "http_client", (SourceRole.COLLECTOR, SourceRole.CANDIDATE), ("news_discovery",), "https://newsapi.org/", 160, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="NewsAPI account and publisher terms apply.", usage_note="仅用于候选发现；保留原发布者身份，不是内容来源或独立证据，不进入可信准入计数。", billing_model=BillingModel.FREEMIUM, auth_type="api_key", credential_env_names=("NEWS_API_KEY",), data_delay="以原发布者时间为准；聚合发现可能延迟", quota_policy="以账户实际套餐、延迟和配额为准", cost_policy="套餐成本未知；无可信能力级权益时禁止请求"),
+        _adapter("fmp", "Financial Modeling Prep", "fmp", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_snapshot",), "https://site.financialmodelingprep.com/", 70, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Financial Modeling Prep paid account and dataset terms apply.", usage_note="默认关闭；本轮只登记已覆盖 Mock 的行情快照能力；只有凭据、套餐、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("FMP_API_KEY",), data_delay="以实际付费套餐与上游返回为准", quota_policy="以用户自有付费账户实际套餐为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
+        _adapter("massive", "Polygon/Massive", "massive", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://massive.com/", 70, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Polygon/Massive paid account and market-data terms apply.", usage_note="默认关闭；本轮只登记已覆盖 Mock 的历史行情能力；只有凭据、套餐、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("MASSIVE_API_KEY",), data_delay="以实际付费套餐与上游返回为准", quota_policy="以用户自有付费账户实际套餐为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
+        _adapter("tiingo", "Tiingo", "tiingo", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://www.tiingo.com/", 75, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Tiingo paid account and data terms apply.", usage_note="默认关闭；只有凭据、套餐、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("TIINGO_API_KEY",), data_delay="以实际付费套餐与上游返回为准", quota_policy="以用户自有付费账户实际套餐为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
+        _adapter("eodhd", "EODHD", "eodhd", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://eodhd.com/", 75, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="EODHD paid account and data terms apply.", usage_note="默认关闭；本轮只登记已覆盖 Mock 的历史行情能力；只有凭据、套餐、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("EODHD_API_KEY",), data_delay="以实际付费套餐与上游返回为准", quota_policy="以用户自有付费账户实际套餐为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
+        _adapter("databento", "Databento", "databento", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://databento.com/", 65, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Databento paid account, dataset and market-data terms apply.", usage_note="默认关闭；本轮只登记已覆盖 Mock 的历史行情能力；只有凭据、数据集许可、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("DATABENTO_API_KEY",), data_delay="以实际付费套餐、数据集与上游返回为准", quota_policy="以用户自有付费账户和数据集授权为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
     )
 
 
@@ -277,7 +288,7 @@ def build_catalog(news_config: Mapping[str, Any] | None = None) -> DataSourceCat
     configured_news = news_config if news_config is not None else load_news_config()
     news_families, news_adapters = _news_records(configured_news)
     return DataSourceCatalog(
-        families=(*_families(), *news_families),
-        adapters=(*_static_adapters(), *news_adapters),
+        families=(*_families(), *enterprise_families(), *news_families),
+        adapters=(*_static_adapters(), *enterprise_adapters(), *news_adapters),
         capabilities=_capabilities(),
     )
