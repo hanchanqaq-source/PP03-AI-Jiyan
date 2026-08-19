@@ -30,11 +30,16 @@ _ADAPTER_FIELDS = {
 }
 _CREDENTIAL_TERMS = ("credential", "secret", "token", "password", "api_key", "apikey", "access_key", "private_key", "authorization", "bearer")
 _SAFE_USAGE_MODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,8})?$")
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_MAX_CONFIG_BYTES = 1024 * 1024
+_MAX_BUDGET = Decimal("1000000000000")
+_MAX_REQUEST_LIMIT = 1_000_000_000
+_MAX_TIMESTAMP_TEXT = 64
 
 
 def _contains_credential_marker(value: object) -> bool:
-    if not isinstance(value, str):
+    if type(value) is not str:
         return False
     lowered = value.lower()
     return any(marker in lowered for marker in _CREDENTIAL_TERMS)
@@ -43,13 +48,23 @@ def _contains_credential_marker(value: object) -> bool:
 def _decimal_string(value: object, field: str) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or len(value) > 64 or not _SAFE_DECIMAL.fullmatch(value):
         raise ConfigValidationError(f"{field} must be a non-negative decimal string")
     try:
         decimal = Decimal(value)
     except (InvalidOperation, ValueError):
         raise ConfigValidationError(f"{field} must be a non-negative decimal string") from None
-    if not decimal.is_finite() or decimal < 0:
+    sign, digits, exponent = decimal.as_tuple()
+    if (
+        not decimal.is_finite()
+        or decimal < 0
+        or decimal > _MAX_BUDGET
+        or type(exponent) is not int
+        or exponent < -8
+        or exponent > 12
+        or len(digits) > 21
+        or sign not in {0, 1}
+    ):
         raise ConfigValidationError(f"{field} must be a non-negative decimal string")
     return format(decimal, "f")
 
@@ -57,9 +72,31 @@ def _decimal_string(value: object, field: str) -> str | None:
 def _integer(value: object, field: str) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0 or value > _MAX_REQUEST_LIMIT:
         raise ConfigValidationError(f"{field} must be a non-negative integer")
     return value
+
+
+def _json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if type(key) is not str or key in document:
+            raise ValueError("invalid JSON object")
+        document[key] = value
+    return document
+
+
+def _json_integer(raw: str) -> int:
+    if len(raw) > 11:
+        raise ValueError("JSON integer is too large")
+    value = int(raw)
+    if value < -_MAX_REQUEST_LIMIT or value > _MAX_REQUEST_LIMIT:
+        raise ValueError("JSON integer is too large")
+    return value
+
+
+def _invalid_json_number(_raw: str) -> float:
+    raise ValueError("non-integer JSON numbers are not allowed")
 
 
 class DataSourceConfigStore:
@@ -193,37 +230,56 @@ class DataSourceConfigStore:
             handle.close()
 
     def _validate(self, document: Mapping[str, Any]) -> dict[str, Any]:
-        if not isinstance(document, Mapping):
+        if type(document) is not dict or len(document) > 2:
             raise ConfigValidationError("configuration must be an object")
-        if any(not isinstance(key, str) or _contains_credential_marker(key) for key in document):
+        if any(
+            type(key) is not str
+            or len(key) > 32
+            or _contains_credential_marker(key)
+            for key in document
+        ):
             raise ConfigValidationError("configuration must not contain credential material")
         unknown_top_level = set(document) - {"free_only", "adapters"}
         if unknown_top_level:
             raise ConfigValidationError("unknown configuration field")
         free_only = document.get("free_only", True)
-        if not isinstance(free_only, bool):
+        if type(free_only) is not bool:
             raise ConfigValidationError("free_only must be boolean")
         adapters = document.get("adapters", {})
-        if not isinstance(adapters, Mapping):
+        if type(adapters) is not dict or len(adapters) > len(self._adapter_ids):
             raise ConfigValidationError("adapters must be an object")
         result_adapters: dict[str, dict[str, Any]] = {}
         for adapter_id, raw_adapter in adapters.items():
-            if not isinstance(adapter_id, str) or adapter_id not in self._adapter_ids:
+            if (
+                type(adapter_id) is not str
+                or len(adapter_id) > 160
+                or adapter_id not in self._adapter_ids
+            ):
                 raise ConfigValidationError("unknown adapter identifier")
-            if not isinstance(raw_adapter, Mapping):
+            if type(raw_adapter) is not dict or len(raw_adapter) > len(_ADAPTER_FIELDS):
                 raise ConfigValidationError("adapter configuration must be an object")
-            if any(not isinstance(key, str) or _contains_credential_marker(key) for key in raw_adapter):
+            if any(
+                type(key) is not str
+                or len(key) > 64
+                or _contains_credential_marker(key)
+                for key in raw_adapter
+            ):
                 raise ConfigValidationError("configuration must not contain credential material")
             if set(raw_adapter) - _ADAPTER_FIELDS:
                 raise ConfigValidationError("unknown adapter configuration field")
             entry: dict[str, Any] = {}
             if "enabled" in raw_adapter:
-                if not isinstance(raw_adapter["enabled"], bool):
+                if type(raw_adapter["enabled"]) is not bool:
                     raise ConfigValidationError("enabled must be boolean")
                 entry["enabled"] = raw_adapter["enabled"]
             if "usage_mode" in raw_adapter:
                 usage_mode = raw_adapter["usage_mode"]
-                if not isinstance(usage_mode, str) or not _SAFE_USAGE_MODE.fullmatch(usage_mode) or _contains_credential_marker(usage_mode):
+                if (
+                    type(usage_mode) is not str
+                    or len(usage_mode) > 64
+                    or not _SAFE_USAGE_MODE.fullmatch(usage_mode)
+                    or _contains_credential_marker(usage_mode)
+                ):
                     raise ConfigValidationError("usage_mode is invalid")
                 entry["usage_mode"] = usage_mode
             for field in ("daily_budget", "monthly_budget", "per_request_budget"):
@@ -235,11 +291,13 @@ class DataSourceConfigStore:
             if "last_validated_at" in raw_adapter:
                 timestamp = raw_adapter["last_validated_at"]
                 if timestamp is not None:
-                    if not isinstance(timestamp, str):
+                    if type(timestamp) is not str or len(timestamp) > _MAX_TIMESTAMP_TEXT:
                         raise ConfigValidationError("last_validated_at must be an ISO timestamp or null")
                     try:
-                        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                    except ValueError:
+                        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None or parsed.utcoffset() is None:
+                            raise ValueError("timezone is required")
+                    except (OverflowError, ValueError):
                         raise ConfigValidationError("last_validated_at must be an ISO timestamp or null") from None
                 entry["last_validated_at"] = timestamp
             if _contains_credential_marker(json.dumps(entry, ensure_ascii=False)):
@@ -272,10 +330,27 @@ class DataSourceConfigStore:
         if not self.path.exists():
             return {"free_only": True, "adapters": {}}
         try:
-            document = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            with self.path.open("rb") as handle:
+                raw = handle.read(_MAX_CONFIG_BYTES + 1)
+            if len(raw) > _MAX_CONFIG_BYTES:
+                raise ValueError("configuration is too large")
+            document = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_json_object,
+                parse_int=_json_integer,
+                parse_float=_invalid_json_number,
+                parse_constant=_invalid_json_number,
+            )
+            return self._validate(document)
+        except (
+            ConfigValidationError,
+            OSError,
+            OverflowError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             raise ConfigValidationError("configuration is corrupt") from None
-        return self._validate(document)
 
     def load(self) -> dict[str, Any]:
         with CACHE_IO_LOCK:

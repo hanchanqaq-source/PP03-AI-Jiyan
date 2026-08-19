@@ -106,6 +106,14 @@ def _validate_status(value: object, *, allow_reserved: bool = False) -> str:
     return value.encode("utf-8").decode("utf-8")
 
 
+def _validate_request_limit(value: object, field: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0 or value > _MAX_REQUEST_COUNT:
+        raise UsageValidationError(f"{field} must be a bounded non-negative integer or null")
+    return value
+
+
 def _utc_datetime(value: object, field: str = "now") -> datetime:
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise UsageValidationError(f"{field} must be a timezone-aware datetime")
@@ -541,6 +549,82 @@ class UsageStore:
                 records = self._load_unlocked(normalized_now)
                 return self._summary_from(records, normalized_id, normalized_now)
 
+    @staticmethod
+    def _request_counts_from(
+        records: Iterable[UsageRecord], adapter_id: str, now: datetime,
+    ) -> tuple[int, int]:
+        day = now.date().isoformat()
+        month = now.strftime("%Y-%m")
+        daily_requests = 0
+        monthly_requests = 0
+        for record in records:
+            if record.adapter_id != adapter_id:
+                continue
+            # An open reservation represents one in-flight request. Reconciled
+            # zero-request barriers (for example cost_unknown) remain true zero.
+            reserved_requests = 1 if record.actual_cost is None else record.request_count
+            if record.authorized_at.strftime("%Y-%m") == month:
+                monthly_requests += reserved_requests
+            if record.authorized_at.date().isoformat() == day:
+                daily_requests += reserved_requests
+        return daily_requests, monthly_requests
+
+    @classmethod
+    def _check_authorization_limits(
+        cls,
+        records: Iterable[UsageRecord],
+        adapter_id: str,
+        *,
+        estimated_cost: Decimal,
+        daily_budget: Decimal,
+        monthly_budget: Decimal,
+        daily_request_limit: int | None,
+        monthly_request_limit: int | None,
+        now: datetime,
+    ) -> None:
+        summary = cls._summary_from(records, adapter_id, now)
+        if estimated_cost > 0 and summary.daily_cost + estimated_cost > daily_budget:
+            raise UsageBudgetExceeded("daily_budget_exhausted")
+        if estimated_cost > 0 and summary.monthly_cost + estimated_cost > monthly_budget:
+            raise UsageBudgetExceeded("monthly_budget_exhausted")
+        daily_requests, monthly_requests = cls._request_counts_from(records, adapter_id, now)
+        if daily_request_limit is not None and daily_requests + 1 > daily_request_limit:
+            raise UsageBudgetExceeded("daily_request_limit_exhausted")
+        if monthly_request_limit is not None and monthly_requests + 1 > monthly_request_limit:
+            raise UsageBudgetExceeded("monthly_request_limit_exhausted")
+
+    def preflight(
+        self,
+        adapter_id: str,
+        *,
+        estimated_cost: Decimal,
+        daily_budget: Decimal,
+        monthly_budget: Decimal,
+        daily_request_limit: int | None,
+        monthly_request_limit: int | None,
+        now: datetime,
+    ) -> None:
+        normalized_id = _validate_identifier(adapter_id, "adapter_id")
+        estimate = _validate_decimal(estimated_cost, "estimated_cost")
+        daily_budget_value = _validate_decimal(daily_budget, "daily_budget")
+        monthly_budget_value = _validate_decimal(monthly_budget, "monthly_budget")
+        daily_requests = _validate_request_limit(daily_request_limit, "daily_request_limit")
+        monthly_requests = _validate_request_limit(monthly_request_limit, "monthly_request_limit")
+        normalized_now = _utc_datetime(now)
+        with CACHE_IO_LOCK:
+            with self._process_lock():
+                records = self._load_unlocked(normalized_now)
+                self._check_authorization_limits(
+                    records,
+                    normalized_id,
+                    estimated_cost=estimate,
+                    daily_budget=daily_budget_value,
+                    monthly_budget=monthly_budget_value,
+                    daily_request_limit=daily_requests,
+                    monthly_request_limit=monthly_requests,
+                    now=normalized_now,
+                )
+
     def reserve(
         self,
         adapter_id: str,
@@ -550,11 +634,15 @@ class UsageStore:
         monthly_budget: Decimal,
         now: datetime,
         reservation_id: str | None = None,
+        daily_request_limit: int | None = None,
+        monthly_request_limit: int | None = None,
     ) -> UsageRecord:
         normalized_id = _validate_identifier(adapter_id, "adapter_id")
         estimate = _validate_decimal(estimated_cost, "estimated_cost")
         daily_limit = _validate_decimal(daily_budget, "daily_budget")
         monthly_limit = _validate_decimal(monthly_budget, "monthly_budget")
+        daily_requests = _validate_request_limit(daily_request_limit, "daily_request_limit")
+        monthly_requests = _validate_request_limit(monthly_request_limit, "monthly_request_limit")
         normalized_now = _utc_datetime(now)
         normalized_reservation = _validate_identifier(
             uuid.uuid4().hex if reservation_id is None else reservation_id,
@@ -572,11 +660,16 @@ class UsageStore:
                     ):
                         return record
                     raise UsageConflictError("reservation identifier is already in use")
-                summary = self._summary_from(records, normalized_id, normalized_now)
-                if estimate > 0 and summary.daily_cost + estimate > daily_limit:
-                    raise UsageBudgetExceeded("daily_budget_exhausted")
-                if estimate > 0 and summary.monthly_cost + estimate > monthly_limit:
-                    raise UsageBudgetExceeded("monthly_budget_exhausted")
+                self._check_authorization_limits(
+                    records,
+                    normalized_id,
+                    estimated_cost=estimate,
+                    daily_budget=daily_limit,
+                    monthly_budget=monthly_limit,
+                    daily_request_limit=daily_requests,
+                    monthly_request_limit=monthly_requests,
+                    now=normalized_now,
+                )
                 record = UsageRecord(
                     normalized_reservation, normalized_id, normalized_now, None,
                     estimate, None, 0, "reserved", Decimal("0"),

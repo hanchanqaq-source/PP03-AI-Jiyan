@@ -121,7 +121,14 @@ def permission_fixture():
 
 def real_guard(tmp_path, *, free_only):
     descriptor = build_catalog({"sources": []}).adapter("tushare")
-    policy = BudgetPolicy("tushare", True, True, free_only, Decimal("1.00"), Decimal("5.00"), Decimal("1.00"))
+    policy = BudgetPolicy(
+        "tushare", True, True, free_only,
+        Decimal("1.00"), Decimal("5.00"), Decimal("1.00"),
+        credential_validated=True,
+        trusted_entitlement=True,
+        transport_supported=True,
+        live_authorized=True,
+    )
     return BudgetGuard(UsageStore(tmp_path / ("tushare-free" if free_only else "tushare-budgeted")), {"tushare": policy}, trusted_adapters={"tushare": descriptor})
 
 

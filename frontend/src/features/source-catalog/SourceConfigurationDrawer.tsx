@@ -51,6 +51,7 @@ const statusLabels: Record<string, string> = {
   connected: "已连接",
   configured: "已配置",
   stored: "凭据已保存",
+  environment_fallback_active: "环境变量凭据仍有效",
   validated: "已验证",
   unconfigured: "未配置",
   plan_unavailable: "当前套餐不可用",
@@ -99,10 +100,12 @@ export function SourceConfigurationDrawer({
   open,
   adapter,
   onClose,
+  onChanged,
 }: {
   open: boolean;
   adapter: AdapterView | null;
   onClose: () => void;
+  onChanged?: () => void | Promise<void>;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -292,6 +295,7 @@ export function SourceConfigurationDrawer({
       if (isCurrentOperation("credential", token, true)) {
         setConfiguration((current) => current ? { ...current, credential: state, enabled: false } : current);
         setFeedback("凭据已保存");
+        void Promise.resolve(onChanged?.()).catch(() => undefined);
       }
     } catch {
       if (isCurrentOperation("credential", token, true)) setError(boundedActionError("credential"));
@@ -316,7 +320,12 @@ export function SourceConfigurationDrawer({
       if (isCurrentOperation("delete", token, true)) {
         setConfiguration((current) => current ? { ...current, credential: state, enabled: false } : current);
         setConfirmDelete(false);
-        setFeedback("凭据已删除");
+        setFeedback(
+          state.configured && state.credential_source === "environment"
+            ? "本地凭据已删除，但环境变量凭据仍有效，需在外部移除"
+            : "凭据已删除",
+        );
+        void Promise.resolve(onChanged?.()).catch(() => undefined);
       }
     } catch {
       if (isCurrentOperation("delete", token, true)) setError(boundedActionError("delete"));
@@ -383,6 +392,7 @@ export function SourceConfigurationDrawer({
       if (isCurrentOperation("action", token, true)) {
         if (action !== "validate" && typeof result.enabled === "boolean") setConfiguration((current) => current ? { ...current, enabled: result.enabled! } : current);
         setFeedback(action === "validate" ? (result.status === "unconfigured" ? "未配置" : "配置验证完成") : action === "enable" ? "数据源已启用；连接状态仍以实际观测为准" : "数据源已停用");
+        if (action !== "validate") void Promise.resolve(onChanged?.()).catch(() => undefined);
       }
     } catch (reason) {
       if (isCurrentOperation("action", token, true)) {

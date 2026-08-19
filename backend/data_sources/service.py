@@ -13,6 +13,7 @@ import source_health
 
 from cache_io_lock import CACHE_IO_LOCK
 from .catalog import DataSourceCatalog, build_catalog
+from .budgets import BudgetGuard, BudgetPolicy
 from .config_store import ConfigValidationError, DataSourceConfigStore
 from .credentials import (
     CredentialState,
@@ -23,6 +24,8 @@ from .credentials import (
 )
 from .models import BillingModel, CatalogStatus
 from .provider_registry import ProviderRegistry
+from .routing import effective_adapter_enabled
+from source_health.probes.data_source_adapter import probe_data_source_adapter
 from .references import public_source_reference
 from .usage_store import UsageStore, UsageStoreError
 
@@ -87,8 +90,76 @@ class _DefaultCredentialStore:
             return keyring_state
         environment_state = self._environment.state(adapter_id)
         if environment_state.configured:
-            return environment_state
+            return CredentialState(
+                True,
+                "environment_fallback_active",
+                None,
+                "environment",
+            )
         return keyring_state if keyring_state.status == "credential_store_unavailable" else environment_state
+
+
+class _ServerAuthorizationGuard:
+    """Build an authorization snapshot only from the owning Service's stores."""
+
+    def __init__(self, service: "DataSourceService") -> None:
+        self._service = service
+
+    @property
+    def usage_store(self) -> UsageStore:
+        self._service._ensure_configuration_dependencies()
+        return self._service._usage_store
+
+    @staticmethod
+    def _budget(entry: Mapping[str, Any], field: str) -> Decimal:
+        value = entry.get(field)
+        return Decimal("0") if value is None else Decimal(value)
+
+    def _snapshot(self, adapter_id: str) -> BudgetGuard:
+        catalog = self._service._catalog()
+        adapter = catalog.adapter(adapter_id)
+        config = self._service._load_config()
+        entry = config["adapters"].get(adapter_id, {})
+        credential = self._service._credential_state(adapter, config)
+        credential_required = bool(adapter.credential_env_names)
+        free_entitlement = adapter.billing_model in {
+            BillingModel.FREE_NO_KEY,
+            BillingModel.FREE_KEY,
+        }
+        policy = BudgetPolicy(
+            adapter_id=adapter_id,
+            enabled=self._service._effective_enabled(adapter, config),
+            configured=(not credential_required) or credential["configured"] is True,
+            credential_validated=(
+                not credential_required
+                or (
+                    credential["configured"] is True
+                    and bool(entry.get("last_validated_at"))
+                )
+            ),
+            trusted_entitlement=free_entitlement,
+            free_only=config["free_only"],
+            daily_budget=self._budget(entry, "daily_budget"),
+            monthly_budget=self._budget(entry, "monthly_budget"),
+            per_request_budget=self._budget(entry, "per_request_budget"),
+            daily_request_limit=entry.get("daily_request_limit"),
+            monthly_request_limit=entry.get("monthly_request_limit"),
+            # No keyed provider currently has a reviewed secret-safe transport.
+            transport_supported=not credential_required and adapter.auth_type == "none",
+            # Paid live access additionally needs an explicit future runtime gate.
+            live_authorized=free_entitlement,
+        )
+        return BudgetGuard(
+            self.usage_store,
+            {adapter_id: policy},
+            trusted_adapters={adapter_id: adapter},
+        )
+
+    def authorize(self, adapter: Any, **kwargs: Any):
+        return self._snapshot(adapter.adapter_id).authorize(adapter, **kwargs)
+
+    def record(self, adapter_id: str, **kwargs: Any):
+        return self._snapshot(adapter_id).record(adapter_id, **kwargs)
 
 
 def _document(value: Any) -> Any:
@@ -147,7 +218,6 @@ class DataSourceService:
     ) -> None:
         self._catalog_builder = catalog_builder
         self._health_service_factory = health_service_factory or (lambda: source_health.get_service())
-        self._adapter_enabled: dict[str, bool] = {}
         self._config_store = config_store
         self._credential_store = credential_store
         self._budget_guard = budget_guard
@@ -169,8 +239,22 @@ class DataSourceService:
             self._credential_store = _DefaultCredentialStore(scope)
         if self._usage_store is None:
             self._usage_store = UsageStore()
+        if self._budget_guard is None:
+            self._budget_guard = _ServerAuthorizationGuard(self)
         if self._provider_registry is None:
-            self._provider_registry = ProviderRegistry(catalog=catalog)
+            self._provider_registry = ProviderRegistry(
+                catalog=catalog,
+                credential_store=self._credential_store,
+                budget_guard=self._budget_guard,
+            )
+
+    @staticmethod
+    def _effective_enabled(adapter: Any, config: Mapping[str, Any]) -> bool:
+        enabled = effective_adapter_enabled(adapter, config)
+        entry = config.get("adapters", {}).get(adapter.adapter_id, {})
+        if "enabled" in entry and type(entry["enabled"]) is not bool:
+            raise DataSourceUnavailable("configuration_store_unavailable")
+        return enabled
 
     def _observations(self, catalog: DataSourceCatalog) -> dict[tuple[str, str, str], dict[str, Any]]:
         known = {
@@ -250,9 +334,10 @@ class DataSourceService:
         catalog: DataSourceCatalog,
         adapter: Any,
         observations: Mapping[tuple[str, str, str], dict[str, Any]],
+        config: Mapping[str, Any],
     ) -> dict[str, object]:
         document = _document(asdict(adapter))
-        enabled = self._adapter_enabled.get(adapter.adapter_id, adapter.default_enabled)
+        enabled = self._effective_enabled(adapter, config)
         capabilities = [
             self._capability_document(catalog, capability_id, observations, adapter=adapter)
             for capability_id in adapter.capability_ids
@@ -274,10 +359,11 @@ class DataSourceService:
         catalog: DataSourceCatalog,
         family_id: str,
         observations: Mapping[tuple[str, str, str], dict[str, Any]],
+        config: Mapping[str, Any],
     ) -> dict[str, object]:
         family = catalog.family(family_id)
         adapters = [
-            self._adapter_document(catalog, adapter, observations)
+            self._adapter_document(catalog, adapter, observations, config)
             for adapter in catalog.adapters_for_family(family_id)
         ]
         rows = [
@@ -298,8 +384,14 @@ class DataSourceService:
 
     def catalog_document(self) -> dict[str, object]:
         catalog = self._catalog()
+        config = self._load_config()
         observations = self._observations(catalog)
-        families = [self._family_document(catalog, family.source_family_id, observations) for family in catalog.families]
+        families = [
+            self._family_document(
+                catalog, family.source_family_id, observations, config,
+            )
+            for family in catalog.families
+        ]
         news_adapters = [adapter for adapter in catalog.adapters if "feed" in adapter.capability_ids]
         return {
             "registration": {
@@ -325,13 +417,20 @@ class DataSourceService:
 
     def families_document(self) -> list[dict[str, object]]:
         catalog = self._catalog()
+        config = self._load_config()
         observations = self._observations(catalog)
-        return [self._family_document(catalog, family.source_family_id, observations) for family in catalog.families]
+        return [
+            self._family_document(
+                catalog, family.source_family_id, observations, config,
+            )
+            for family in catalog.families
+        ]
 
     def family_document(self, family_id: str) -> dict[str, object]:
         catalog = self._catalog()
+        config = self._load_config()
         observations = self._observations(catalog)
-        return self._family_document(catalog, family_id, observations)
+        return self._family_document(catalog, family_id, observations, config)
 
     def capabilities_document(self) -> list[dict[str, object]]:
         catalog = self._catalog()
@@ -341,18 +440,21 @@ class DataSourceService:
             for capability in catalog.capabilities
         ]
 
-    def _disabled_adapter_ids(self, catalog: DataSourceCatalog) -> tuple[str, ...]:
+    def _disabled_adapter_ids(
+        self, catalog: DataSourceCatalog, config: Mapping[str, Any],
+    ) -> tuple[str, ...]:
         return tuple(
             adapter.adapter_id
             for adapter in catalog.adapters
-            if not self._adapter_enabled.get(adapter.adapter_id, adapter.default_enabled)
+            if not self._effective_enabled(adapter, config)
         )
 
     def refresh(self) -> dict[str, object]:
         catalog = self._catalog()
+        config = self._load_config()
         run = self._health_service_factory().start_run(
             "full",
-            excluded_adapter_ids=self._disabled_adapter_ids(catalog),
+            excluded_adapter_ids=self._disabled_adapter_ids(catalog, config),
         )
         return {"run_id": str(run["run_id"])}
 
@@ -374,15 +476,19 @@ class DataSourceService:
                     "catalog_status": catalog_status,
                     "connected": False,
                 }
-            self._adapter_enabled[adapter_id] = action == "enable"
+            if action == "enable":
+                self.enable_adapter(adapter_id)
+            else:
+                self.disable_adapter(adapter_id)
             return {
                 "adapter_id": adapter_id,
                 "action": action,
                 "status": "local_toggle_updated",
-                "enabled": self._adapter_enabled[adapter_id],
+                "enabled": action == "enable",
                 "connected": False,
             }
-        if not local_toggle_allowed or not self._adapter_enabled.get(adapter_id, adapter.default_enabled):
+        config = self._load_config()
+        if not local_toggle_allowed or not self._effective_enabled(adapter, config):
             return {
                 "adapter_id": adapter_id,
                 "action": "validate",
@@ -390,13 +496,7 @@ class DataSourceService:
                 "catalog_status": catalog_status,
                 "connected": False,
             }
-        return {
-            "adapter_id": adapter_id,
-            "action": "validate",
-            "status": "full_health_run_started",
-            "connected": False,
-            **self.refresh(),
-        }
+        return self.validate_adapter(adapter_id)
 
     def _adapter(self, adapter_id: str):
         if type(adapter_id) is not str:
@@ -577,7 +677,6 @@ class DataSourceService:
                 self._config_store.update_adapter(adapter_id, {"enabled": True})
             except (ConfigValidationError, OSError):
                 raise DataSourceUnavailable("configuration_store_unavailable") from None
-            self._adapter_enabled[adapter_id] = True
         return {"adapter_id": adapter_id, "action": "enable", "status": "enabled", "enabled": True, "connected": False}
 
     def disable_adapter(self, adapter_id: str) -> dict[str, object]:
@@ -589,7 +688,6 @@ class DataSourceService:
                 self._config_store.update_adapter(adapter_id, {"enabled": False})
             except (ConfigValidationError, OSError):
                 raise DataSourceUnavailable("configuration_store_unavailable") from None
-            self._adapter_enabled[adapter_id] = False
         return {"adapter_id": adapter_id, "action": "disable", "status": "disabled", "enabled": False, "connected": False}
 
     def validate_adapter(self, adapter_id: str) -> dict[str, object]:
@@ -599,9 +697,43 @@ class DataSourceService:
         credential = self._credential_state(adapter, config)
         if adapter.credential_env_names and not credential["configured"]:
             return {"adapter_id": adapter_id, "status": "unconfigured", "connected": False, "health_failure": False, "last_validated_at": None}
-        # An explicit trusted validation_transport_supported flag does not yet
-        # exist in Catalog/runtime metadata. Do not resolve or call a Provider.
-        raise DataSourceConflict("unsupported_credential_transport")
+        if adapter.credential_env_names:
+            # An explicit trusted validation_transport_supported flag does not
+            # yet exist in Catalog/runtime metadata. Do not resolve a Provider.
+            raise DataSourceConflict("unsupported_credential_transport")
+        if (
+            adapter.billing_model is not BillingModel.FREE_NO_KEY
+            or adapter.auth_type != "none"
+            or not self._effective_enabled(adapter, config)
+        ):
+            raise DataSourceConflict("disabled")
+        self._ensure_configuration_dependencies()
+        available = set(self._provider_registry.available_adapter_ids())
+        if adapter_id not in available:
+            raise DataSourceConflict("configuration_barrier")
+        capability_id = next(
+            (
+                capability_id
+                for capability_id in adapter.capability_ids
+                if self._catalog().capability(capability_id).probe_enabled
+            ),
+            None,
+        )
+        if capability_id is None:
+            raise DataSourceConflict("configuration_barrier")
+        result = probe_data_source_adapter(
+            self._provider_registry.adapter(adapter_id), capability_id,
+        )
+        status = str(result.get("connection_status") or result.get("status") or "failure")
+        connected = result.get("status") == "success" and status == "success"
+        return {
+            "adapter_id": adapter_id,
+            "capability_id": capability_id,
+            "status": status,
+            "connected": connected,
+            "health_failure": result.get("status") == "failure",
+            "last_validated_at": self._timestamp(self._now()) if connected else None,
+        }
 
     @staticmethod
     def _updated_config_document(

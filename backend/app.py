@@ -14,6 +14,7 @@ import math
 import os
 from contextlib import asynccontextmanager
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -77,12 +78,20 @@ app.include_router(data_sources_router)
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)
 
-# CORS：默认放开（本地自托管友好）；公网部署时用 VR_ALLOW_ORIGINS 收紧成白名单。
-#   例：VR_ALLOW_ORIGINS="https://myhost"  （逗号分隔多个）
-_ORIGINS = [o.strip() for o in os.environ.get("VR_ALLOW_ORIGINS", "*").split(",") if o.strip()] or ["*"]
+# CORS defaults to loopback browser origins. Operators may supply an explicit
+# read-origin list, but the separate write middleware below remains mandatory.
+_CONFIGURED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("VR_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+]
+_LOOPBACK_ORIGIN_REGEX = (
+    r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?$"
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ORIGINS,
+    allow_origins=_CONFIGURED_ORIGINS,
+    allow_origin_regex=None if _CONFIGURED_ORIGINS else _LOOPBACK_ORIGIN_REGEX,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -90,6 +99,76 @@ app.add_middleware(
 # 可选鉴权：设了 VR_API_KEY 就要求所有 /api/* 带 `Authorization: Bearer <key>`
 #   （本地自托管不设=开放；公网部署务必设，否则别人能读你的持仓/调你的后端）。
 _API_KEY = os.environ.get("VR_API_KEY", "").strip()
+_DATA_SOURCE_WRITE_HEADER = "x-pp03-write-intent"
+_DATA_SOURCE_WRITE_METHODS = {"POST", "PUT", "DELETE"}
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _single_request_header(request: Request, name: str) -> str | None:
+    encoded_name = name.lower().encode("ascii")
+    values = [
+        value.decode("latin-1")
+        for key, value in request.scope.get("headers", ())
+        if key.lower() == encoded_name
+    ]
+    return values[0] if len(values) == 1 else None
+
+
+def _loopback_authority(value: str | None) -> bool:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > 255
+        or value != value.strip()
+        or "," in value
+        or any(ord(char) < 33 or ord(char) == 127 for char in value)
+    ):
+        return False
+    try:
+        parsed = urlsplit(f"//{value}")
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.username is None
+        and parsed.password is None
+        and parsed.path == ""
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and parsed.hostname in _LOOPBACK_HOSTS
+        and (port is None or 1 <= port <= 65535)
+    )
+
+
+def _local_browser_origin(value: str | None) -> bool:
+    if type(value) is not str or not value or len(value) > 512 or value != value.strip():
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.hostname in _LOOPBACK_HOSTS
+        and parsed.path == ""
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and (port is None or 1 <= port <= 65535)
+    )
+
+
+def _data_source_write_request(request: Request) -> bool:
+    if not request.url.path.startswith("/api/data-sources/"):
+        return False
+    if request.method in _DATA_SOURCE_WRITE_METHODS:
+        return True
+    if request.method != "OPTIONS":
+        return False
+    requested_method = _single_request_header(request, "access-control-request-method")
+    return requested_method is not None and requested_method.upper() in _DATA_SOURCE_WRITE_METHODS
 
 
 @app.middleware("http")
@@ -102,6 +181,33 @@ async def _require_api_key(request: Request, call_next):
     ):
         if request.headers.get("authorization", "") != f"Bearer {_API_KEY}":
             return JSONResponse({"detail": "未授权：缺少或错误的 API Key（VR_API_KEY）"}, status_code=401)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _protect_data_source_writes(request: Request, call_next):
+    if not _data_source_write_request(request):
+        return await call_next(request)
+    host = _single_request_header(request, "host")
+    origin = _single_request_header(request, "origin")
+    if not _loopback_authority(host):
+        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+    if request.method == "OPTIONS":
+        requested_headers = _single_request_header(request, "access-control-request-headers")
+        header_names = {
+            item.strip().lower()
+            for item in (requested_headers or "").split(",")
+            if item.strip()
+        }
+        if not _local_browser_origin(origin) or _DATA_SOURCE_WRITE_HEADER not in header_names:
+            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+        return await call_next(request)
+    if _single_request_header(request, _DATA_SOURCE_WRITE_HEADER) != "1":
+        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+    # Browsers send Origin; an originless caller is accepted only under the
+    # already-verified loopback Host plus the non-simple custom-header gate.
+    if origin is not None and not _local_browser_origin(origin):
+        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
     return await call_next(request)
 
 _CODE_RE = r"^\d{6}$"

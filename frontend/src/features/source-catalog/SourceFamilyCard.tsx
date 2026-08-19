@@ -22,13 +22,27 @@ function AdapterRow({ adapter, onConfigure }: { adapter: AdapterView; onConfigur
   </section>;
 }
 
-export function SourceFamilyCard({ family }: { family: SourceFamilyView }) {
+export function SourceFamilyCard({
+  family,
+  onCatalogChanged,
+}: {
+  family: SourceFamilyView;
+  onCatalogChanged?: () => void | Promise<void>;
+}) {
   const [expanded, setExpanded] = useState(false);
-  const [selectedAdapter, setSelectedAdapter] = useState<AdapterView | null>(null);
+  const [selectedAdapterId, setSelectedAdapterId] = useState<string | null>(null);
+  const selectedAdapter = family.adapters.find(
+    (adapter) => adapter.adapter_id === selectedAdapterId,
+  ) || null;
+  const evidenceLabel = family.independent_evidence_eligible
+    ? family.catalog_status === "license_required"
+      ? "取得许可证并完成独立验证后，才可能作为独立证据来源"
+      : "可作为独立证据来源"
+    : "访问路径不构成独立证据来源";
   return <><article aria-label={`来源家族 ${family.source_family_name}`} className="rounded-xl border border-border/60 bg-muted/10 p-4">
     <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold text-foreground">{family.source_family_name}</h3><p className="mt-1 text-xs text-muted-foreground">家族 ID：{family.source_family_id} · {family.region} / {family.market}</p></div><div className="flex flex-wrap gap-1 text-xs"><span className="rounded border border-border px-2 py-1">目录：{catalogLabels[family.catalog_status]}</span><span className="rounded border border-border px-2 py-1">体检：{healthLabels[family.health_status]}</span></div></div>
-    <p className="mt-3 text-xs text-muted-foreground">{family.independent_evidence_eligible ? "可作为独立证据来源" : "访问路径不构成独立证据来源"} · {family.adapters.length} 个接入方式</p>
+    <p className="mt-3 text-xs text-muted-foreground">{evidenceLabel} · {family.adapters.length} 个接入方式</p>
     <button onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} aria-label={`${expanded ? "收起" : "展开"}接入方式 ${family.source_family_name}`} className="mt-3 inline-flex items-center gap-1 rounded-lg border border-primary/40 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}{expanded ? "收起接入方式" : "展开接入方式"}</button>
-    {expanded && <div className="mt-3 space-y-2 border-t border-border/50 pt-3">{family.adapters.map((adapter) => <AdapterRow key={adapter.adapter_id} adapter={adapter} onConfigure={() => setSelectedAdapter(adapter)} />)}</div>}
-  </article><SourceConfigurationDrawer open={selectedAdapter !== null} adapter={selectedAdapter} onClose={() => setSelectedAdapter(null)} /></>;
+    {expanded && <div className="mt-3 space-y-2 border-t border-border/50 pt-3">{family.adapters.map((adapter) => <AdapterRow key={adapter.adapter_id} adapter={adapter} onConfigure={() => setSelectedAdapterId(adapter.adapter_id)} />)}</div>}
+  </article><SourceConfigurationDrawer open={selectedAdapter !== null} adapter={selectedAdapter} onClose={() => setSelectedAdapterId(null)} onChanged={onCatalogChanged} /></>;
 }

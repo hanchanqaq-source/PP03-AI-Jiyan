@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .models import CatalogStatus, SourceRole
 
@@ -17,11 +17,33 @@ class CapabilityRoute:
     independent_family_ids: tuple[str, ...]
 
 
+def effective_adapter_enabled(
+    adapter: Any,
+    configuration: Mapping[str, Any] | None = None,
+) -> bool:
+    """Resolve enablement from validated persisted config, failing closed."""
+    if configuration is None:
+        return adapter.default_enabled is True
+    try:
+        adapters = configuration.get("adapters", {})
+        entry = adapters.get(adapter.adapter_id, {})
+        enabled = entry.get("enabled", adapter.default_enabled)
+    except (AttributeError, TypeError):
+        return False
+    return enabled if type(enabled) is bool else False
+
+
 class CapabilityRouter:
     """Build deterministic Catalog routes without changing evidence eligibility."""
 
-    def __init__(self, catalog: Any) -> None:
+    def __init__(
+        self,
+        catalog: Any,
+        *,
+        configuration: Mapping[str, Any] | None = None,
+    ) -> None:
         self._catalog = catalog
+        self._configuration = configuration
 
     def route(self, capability_id: str, *, personal_research: bool = False) -> CapabilityRoute:
         try:
@@ -79,11 +101,13 @@ class CapabilityRouter:
                 rows.append(adapter)
         return tuple(rows)
 
-    @staticmethod
-    def _eligible(adapter: Any, personal_research: bool) -> bool:
+    def _eligible(self, adapter: Any, personal_research: bool) -> bool:
         status = getattr(adapter.catalog_status, "value", adapter.catalog_status)
         if status in {CatalogStatus.UNCONFIGURED.value, CatalogStatus.CATALOG_ONLY.value, CatalogStatus.LICENSE_REQUIRED.value}:
             return False
         if adapter.adapter_id == "yahoo-finance":
             return personal_research
-        return bool(adapter.default_enabled) and status != CatalogStatus.DISABLED.value
+        return (
+            effective_adapter_enabled(adapter, self._configuration)
+            and status != CatalogStatus.DISABLED.value
+        )

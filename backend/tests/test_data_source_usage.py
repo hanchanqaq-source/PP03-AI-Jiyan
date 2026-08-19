@@ -933,6 +933,8 @@ import sys
 policy = BudgetPolicy(
     adapter_id="paid-test", enabled=True, configured=True, free_only=False,
     daily_budget=Decimal("1.00"), monthly_budget=Decimal("1.00"), per_request_budget=Decimal("1.00"),
+    credential_validated=True, trusted_entitlement=True,
+    transport_supported=True, live_authorized=True,
 )
 adapter = AdapterDescriptor(
     adapter_id="paid-test", adapter_name="test", source_family_id="test-family",

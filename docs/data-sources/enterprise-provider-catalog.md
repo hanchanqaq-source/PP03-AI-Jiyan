@@ -26,6 +26,9 @@ license includes those products. Enabling requires an explicit enterprise
 license decision, approved SDK/transport work, and a new security and cost
 review. This phase did not install an SDK, read a license, call an enterprise
 service, or represent any shell as healthy.
+Only after the applicable license is obtained and the resulting source is
+independently validated could one of these entries possibly count as
+independent evidence; the Catalog shell itself is not usable evidence.
 
 See [licensing and usage boundaries](licensing-and-usage-boundaries.md) for the
 common license and purchase rules.

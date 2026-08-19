@@ -28,6 +28,15 @@ NOW = datetime(2026, 8, 20, 4, 5, 6, tzinfo=timezone.utc)
 SECRET = "task6-test-secret-value"
 
 
+def _test_client(**kwargs):
+    return TestClient(
+        app_module.app,
+        base_url="http://127.0.0.1:8900",
+        headers={"X-PP03-Write-Intent": "1"},
+        **kwargs,
+    )
+
+
 class _EmptyHealthService:
     def list_sources(self):
         return []
@@ -175,7 +184,7 @@ def harness(tmp_path, monkeypatch):
         now_factory=lambda: NOW,
     )
     monkeypatch.setattr(api_module, "_service", service)
-    return TestClient(app_module.app), config, credentials, usage, registry
+    return _test_client(), config, credentials, usage, registry
 
 
 def _row(document: dict[str, object], adapter_id: str) -> dict[str, object]:
@@ -316,7 +325,7 @@ def test_legacy_validate_unsupported_transport_is_non_health_failure_and_zero_ru
         now_factory=lambda: NOW,
     ))
 
-    response = TestClient(app_module.app).post(
+    response = _test_client().post(
         "/api/data-sources/fred/validate", json={},
     )
 
@@ -368,7 +377,7 @@ def test_duplicate_secret_json_fields_are_rejected_without_storing_either_value(
 
 def test_oversized_json_integer_is_a_redacted_422_not_an_unhandled_error(harness):
     _client, _config, _credentials, _usage, _registry = harness
-    client = TestClient(app_module.app, raise_server_exceptions=False)
+    client = _test_client(raise_server_exceptions=False)
     response = client.put(
         "/api/data-sources/fmp/config",
         content=b'{"daily_request_limit":' + b"9" * 5000 + b'}',
@@ -399,7 +408,7 @@ def test_config_write_failure_is_bounded_503_without_backend_detail(harness, mon
         now_factory=lambda: NOW,
     )
     monkeypatch.setattr(api_module, "_service", service)
-    client = TestClient(app_module.app, raise_server_exceptions=False)
+    client = _test_client(raise_server_exceptions=False)
 
     response = client.post("/api/data-sources/tencent-quote/enable", json={})
 
@@ -554,7 +563,7 @@ def _transaction_client(monkeypatch, tmp_path, config, credentials):
         now_factory=lambda: NOW,
     )
     monkeypatch.setattr(api_module, "_service", service)
-    return TestClient(app_module.app, raise_server_exceptions=False)
+    return _test_client(raise_server_exceptions=False)
 
 
 def test_failed_credential_put_restores_exact_prior_adapter_config(tmp_path, monkeypatch):

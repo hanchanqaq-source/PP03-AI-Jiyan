@@ -68,6 +68,8 @@ def _text_tuple(value: object, field: str) -> tuple[str, ...]:
 class _TrustedAdapterIdentity:
     adapter_id: str
     billing_model: BillingModel
+    catalog_status: CatalogStatus
+    credential_required: bool
     canonical: tuple[object, ...]
 
 
@@ -111,7 +113,13 @@ def _descriptor_identity(descriptor: object) -> _TrustedAdapterIdentity:
         descriptor.current_provider_priority,
         descriptor.catalog_status.value,
     )
-    return _TrustedAdapterIdentity(adapter_id, billing_model, canonical)
+    return _TrustedAdapterIdentity(
+        adapter_id,
+        billing_model,
+        CatalogStatus(descriptor.catalog_status.value),
+        bool(descriptor.credential_env_names),
+        canonical,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,14 +131,29 @@ class BudgetPolicy:
     daily_budget: Decimal
     monthly_budget: Decimal
     per_request_budget: Decimal
+    credential_validated: bool = False
+    trusted_entitlement: bool = False
+    transport_supported: bool = False
+    live_authorized: bool = False
+    daily_request_limit: int | None = None
+    monthly_request_limit: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "adapter_id", _identifier(self.adapter_id))
-        for field in ("enabled", "configured", "free_only"):
+        for field in (
+            "enabled", "configured", "free_only", "credential_validated",
+            "trusted_entitlement", "transport_supported", "live_authorized",
+        ):
             if type(getattr(self, field)) is not bool:
                 raise BudgetValidationError(f"{field} must be boolean")
         for field in ("daily_budget", "monthly_budget", "per_request_budget"):
             object.__setattr__(self, field, _decimal(getattr(self, field), field))
+        for field in ("daily_request_limit", "monthly_request_limit"):
+            value = getattr(self, field)
+            if value is not None and (
+                type(value) is not int or value < 0 or value > 1_000_000_000
+            ):
+                raise BudgetValidationError(f"{field} must be a bounded non-negative integer or null")
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +212,12 @@ class BudgetGuard:
                 daily_budget=policy.daily_budget,
                 monthly_budget=policy.monthly_budget,
                 per_request_budget=policy.per_request_budget,
+                credential_validated=policy.credential_validated,
+                trusted_entitlement=policy.trusted_entitlement,
+                transport_supported=policy.transport_supported,
+                live_authorized=policy.live_authorized,
+                daily_request_limit=policy.daily_request_limit,
+                monthly_request_limit=policy.monthly_request_limit,
             )
         if type(trusted_adapters) is not dict:
             raise BudgetValidationError("trusted adapters must be a mapping")
@@ -226,6 +255,12 @@ class BudgetGuard:
         if candidate.canonical != trusted.canonical:
             raise BudgetValidationError("adapter does not match the trusted catalog")
         billing_model = trusted.billing_model
+        if trusted.catalog_status is CatalogStatus.LICENSE_REQUIRED or billing_model is BillingModel.ENTERPRISE_LICENSE:
+            return self._blocked("license_required", estimate)
+        if trusted.catalog_status is CatalogStatus.CATALOG_ONLY:
+            return self._blocked("catalog_only", estimate)
+        if trusted.catalog_status is CatalogStatus.DISABLED:
+            return self._blocked("disabled", estimate)
         policy = self._policies.get(adapter_id)
         if policy is None:
             return self._blocked("unconfigured", estimate)
@@ -233,6 +268,10 @@ class BudgetGuard:
             return self._blocked("disabled", estimate)
         if not policy.configured:
             return self._blocked("unconfigured", estimate)
+        if trusted.credential_required and not policy.credential_validated:
+            return self._blocked("credential_not_validated", estimate)
+        if billing_model in {BillingModel.FREEMIUM, BillingModel.PAID_API} and not policy.trusted_entitlement:
+            return self._blocked("plan_unavailable", estimate)
 
         always_paid = billing_model in {BillingModel.PAID_API, BillingModel.ENTERPRISE_LICENSE}
         cost_bearing = always_paid or estimate > 0
@@ -248,6 +287,25 @@ class BudgetGuard:
             if estimate > policy.per_request_budget:
                 return self._blocked("per_request_budget_exhausted", estimate)
         try:
+            self.usage_store.preflight(
+                adapter_id,
+                estimated_cost=estimate,
+                daily_budget=policy.daily_budget,
+                monthly_budget=policy.monthly_budget,
+                daily_request_limit=policy.daily_request_limit,
+                monthly_request_limit=policy.monthly_request_limit,
+                now=now,
+            )
+        except UsageBudgetExceeded as exc:
+            return self._blocked(exc.reason, estimate)
+        except UsageValidationError as exc:
+            raise BudgetValidationError(str(exc)) from None
+        if not policy.transport_supported:
+            reason = "unsupported_credential_transport" if trusted.credential_required else "unsupported_transport"
+            return self._blocked(reason, estimate)
+        if cost_bearing and billing_model in {BillingModel.FREEMIUM, BillingModel.PAID_API} and not policy.live_authorized:
+            return self._blocked("paid_live_not_authorized", estimate)
+        try:
             reservation = self.usage_store.reserve(
                 adapter_id,
                 estimated_cost=estimate,
@@ -255,6 +313,8 @@ class BudgetGuard:
                 monthly_budget=policy.monthly_budget,
                 now=now,
                 reservation_id=reservation_id,
+                daily_request_limit=policy.daily_request_limit,
+                monthly_request_limit=policy.monthly_request_limit,
             )
         except UsageBudgetExceeded as exc:
             return self._blocked(exc.reason, estimate)

@@ -276,6 +276,7 @@ describe("SourceConfigurationDrawer", () => {
     expect(path).toBe("/api/data-sources/fmp/credentials");
     expect(String(path)).not.toContain("body-only-secret");
     expect(JSON.stringify(init?.headers || {})).not.toContain("body-only-secret");
+    expect(init?.headers).toMatchObject({ "X-PP03-Write-Intent": "1" });
     expect(JSON.parse(String(init?.body))).toEqual({ credential: "body-only-secret" });
   });
 
@@ -512,6 +513,89 @@ describe("SourceConfigurationDrawer", () => {
     await user.click(screen.getByRole("button", { name: "配置数据源 Financial Modeling Prep" }));
     expect(await screen.findByRole("dialog", { name: "配置 Financial Modeling Prep" })).toBeInTheDocument();
     expect(api.dataSourceConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an environment fallback after keyring deletion without claiming revocation", async () => {
+    mockReads(paidAdapter, configFor(paidAdapter, {
+      credential: { configured: true, status: "stored", last_validated_at: null, credential_source: "keyring" },
+    }));
+    vi.spyOn(api, "dataSourceDeleteCredential").mockResolvedValue({
+      configured: true,
+      status: "environment_fallback_active",
+      last_validated_at: null,
+      credential_source: "environment",
+    });
+    const user = userEvent.setup();
+    render(<SourceConfigurationDrawer open adapter={paidAdapter} onClose={vi.fn()} />);
+
+    await user.click(await screen.findByRole("button", { name: "删除凭据" }));
+    await user.click(screen.getByRole("button", { name: "确认删除凭据" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("本地凭据已删除，但环境变量凭据仍有效，需在外部移除");
+    expect(screen.queryByText(/^凭据已删除$/)).not.toBeInTheDocument();
+  });
+
+  it("qualifies enterprise catalog evidence as license-and-validation dependent", () => {
+    const enterpriseFamily: SourceFamilyView = {
+      ...paidFamily,
+      source_family_id: "bloomberg",
+      source_family_name: "Bloomberg",
+      independent_evidence_eligible: true,
+      catalog_status: "license_required",
+      adapters: [enterpriseAdapter],
+    };
+
+    render(<SourceFamilyCard family={enterpriseFamily} />);
+
+    expect(screen.getByText(/取得许可证并完成独立验证后，才可能作为独立证据来源/)).toBeInTheDocument();
+    expect(screen.queryByText(/^可作为独立证据来源/)).not.toBeInTheDocument();
+  });
+
+  it("refreshes the parent Catalog after mutation and reopens with effective state", async () => {
+    const enabledAdapter = { ...freeAdapter, enabled: true };
+    const disabledAdapter = { ...freeAdapter, enabled: false };
+    const enabledFamily: SourceFamilyView = {
+      ...paidFamily,
+      source_family_id: freeAdapter.source_family_id,
+      source_family_name: freeAdapter.adapter_name,
+      catalog_status: "configured",
+      adapters: [enabledAdapter],
+    };
+    const disabledFamily = { ...enabledFamily, adapters: [disabledAdapter] };
+    const catalog = (family: SourceFamilyView): DataSourceCatalogResponse => ({
+      registration: { families: 1, adapters: 1, capabilities: 1, news_sources: 0, fingerprint: "test" },
+      observed: { sources: 0, families: 0, adapters: 0, capabilities: 0 },
+      portfolio_relation: { status: "unavailable_no_holdings" },
+      families: [family],
+      capabilities: [],
+    });
+    vi.spyOn(api, "dataSourceCatalog")
+      .mockResolvedValueOnce(catalog(enabledFamily))
+      .mockResolvedValue(catalog(disabledFamily));
+    vi.spyOn(api, "dataSourceConfig")
+      .mockResolvedValueOnce(configFor(enabledAdapter, { enabled: true }))
+      .mockResolvedValue(configFor(disabledAdapter, { enabled: false }));
+    vi.spyOn(api, "dataSourceUsage").mockImplementation(async () => usageFor(disabledAdapter));
+    vi.spyOn(api, "dataSourceCost").mockImplementation(async () => costFor(disabledAdapter));
+    vi.spyOn(api, "dataSourceDisable").mockResolvedValue({
+      adapter_id: freeAdapter.adapter_id,
+      action: "disable",
+      status: "disabled",
+      enabled: false,
+      connected: false,
+    });
+    const user = userEvent.setup();
+    render(<SourceCatalogWorkspace />);
+
+    await user.click(await screen.findByRole("button", { name: `展开接入方式 ${freeAdapter.adapter_name}` }));
+    await user.click(screen.getByRole("button", { name: `配置数据源 ${freeAdapter.adapter_name}` }));
+    await user.click(await screen.findByRole("button", { name: "停用数据源" }));
+
+    await waitFor(() => expect(api.dataSourceCatalog).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/免费免密钥 · 未启用/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "关闭数据源配置" }));
+    await user.click(screen.getByRole("button", { name: `配置数据源 ${freeAdapter.adapter_name}` }));
+    expect(await screen.findByRole("button", { name: "启用数据源" })).toBeEnabled();
   });
 
   it("deduplicates Catalog and configuration reads under StrictMode", async () => {

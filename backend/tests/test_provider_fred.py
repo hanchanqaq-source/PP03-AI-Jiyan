@@ -193,7 +193,7 @@ def test_fred_configured_key_is_blocked_before_it_can_enter_a_prepared_url():
     assert "api_key" not in captured.value.public_reference
 
 
-def test_fred_unavailable_credential_store_and_free_only_block_are_zero_call_states():
+def test_fred_unavailable_credentials_and_transport_barrier_are_zero_call_states():
     from data_sources.providers.fred import FredAdapter
 
     http = FakeHttp([])
@@ -275,7 +275,7 @@ def test_fred_preserves_series_dates_unit_frequency_reference_and_missing_value(
     assert SECRET not in repr(rows)
 
 
-def test_fred_trusted_free_key_catalog_is_zero_cost_under_real_free_only_guard(tmp_path):
+def test_fred_transport_barrier_precedes_real_guard_and_creates_no_reservation(tmp_path):
     from data_sources.providers.fred import FredAdapter
 
     http = FakeHttp([])

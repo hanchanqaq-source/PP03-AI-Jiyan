@@ -20,7 +20,11 @@ class EmptyHealthService:
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(app_module.source_health, "get_service", lambda: EmptyHealthService())
-    return TestClient(app_module.app)
+    return TestClient(
+        app_module.app,
+        base_url="http://127.0.0.1:8900",
+        headers={"X-PP03-Write-Intent": "1"},
+    )
 
 
 def test_catalog_api_is_complete_without_portfolio(client):

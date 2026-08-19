@@ -75,6 +75,92 @@ def test_config_rejects_invalid_budgets(store: DataSourceConfigStore, invalid: o
         store.save({"free_only": True, "adapters": {"sec-edgar": {"daily_budget": invalid}}})
 
 
+def test_config_rejects_oversized_valid_disk_document_before_json_materialization(store: DataSourceConfigStore):
+    store.save({"free_only": True, "adapters": {}})
+    store.path.write_bytes(b" " * (1024 * 1024 + 1) + b"{}")
+
+    with pytest.raises(ConfigValidationError, match="configuration is corrupt"):
+        store.load()
+
+
+@pytest.mark.parametrize("value", ["1e10000", "-0e-10000", "0." + "0" * 10_000])
+def test_config_rejects_extreme_or_overlong_decimal_scalars_before_decimal_format(
+    store: DataSourceConfigStore, value: str
+):
+    with pytest.raises(ConfigValidationError):
+        store._validate({
+            "free_only": True,
+            "adapters": {"sec-edgar": {"daily_budget": value}},
+        })
+
+
+def test_config_rejects_huge_exact_integer_before_serialization(store: DataSourceConfigStore):
+    with pytest.raises(ConfigValidationError):
+        store._validate({
+            "free_only": True,
+            "adapters": {"sec-edgar": {"daily_request_limit": 1 << 20_000}},
+        })
+
+
+def test_config_normalizes_huge_json_integer_to_bounded_corrupt_state(store: DataSourceConfigStore):
+    store.save({"free_only": True, "adapters": {}})
+    store.path.write_text(
+        '{"free_only":true,"adapters":{"sec-edgar":{"daily_request_limit":'
+        + "9" * 5_000
+        + "}}}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigValidationError, match="configuration is corrupt"):
+        store.load()
+
+
+def test_config_rejects_custom_scalar_without_executing_string_methods(store: DataSourceConfigStore):
+    class ExplodingString(str):
+        called = False
+
+        def explode(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("custom string method executed")
+
+        strip = lower = __str__ = explode
+
+    value = ExplodingString("1.00")
+
+    with pytest.raises(ConfigValidationError):
+        store._validate({
+            "free_only": True,
+            "adapters": {"sec-edgar": {"daily_budget": value}},
+        })
+    assert value.called is False
+
+
+def test_config_rejects_custom_mapping_without_iterating_it(store: DataSourceConfigStore):
+    class ExplodingMapping(dict):
+        called = False
+
+        def explode(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("custom mapping method executed")
+
+        __iter__ = keys = items = values = get = explode
+
+    document = ExplodingMapping({"free_only": True, "adapters": {}})
+
+    with pytest.raises(ConfigValidationError):
+        store._validate(document)
+    assert document.called is False
+
+
+def test_config_rejects_naive_or_overlong_validation_timestamp(store: DataSourceConfigStore):
+    for value in ("2026-08-20T00:00:00", "2026-08-20T00:00:00Z" + "0" * 1_000):
+        with pytest.raises(ConfigValidationError):
+            store._validate({
+                "free_only": True,
+                "adapters": {"sec-edgar": {"last_validated_at": value}},
+            })
+
+
 def test_config_rejects_credential_keys_and_values(store: DataSourceConfigStore):
     with pytest.raises(ConfigValidationError):
         store.save({"free_only": True, "api_key": "secret-value", "adapters": {}})

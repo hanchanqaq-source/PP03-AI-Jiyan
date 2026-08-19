@@ -112,6 +112,9 @@ async function request<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
+  if (method !== "GET" && path.startsWith("/data-sources/")) {
+    headers["X-PP03-Write-Intent"] = "1";
+  }
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);

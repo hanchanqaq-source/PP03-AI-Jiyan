@@ -41,6 +41,9 @@
   localStorage or sessionStorage. Mutation responses are redacted state, not
   credential echoes. Credential-store failures are compensated under the
   adapter/process lock or become an explicit recovery-required state.
+- Data-source mutations are loopback-only by default: the server validates the
+  Host and any browser Origin and requires a non-simple write-intent header.
+  Originless local automation must still provide the loopback Host and header.
 - `free_only` defaults to true. Billing model, credential presence, account
   plan/license, per-request budget, daily budget, monthly budget, enablement,
   and supported authentication transport are independent gates. Missing or
@@ -61,7 +64,9 @@
   purchase, charge, automatic upgrade, or current price/quota claim occurred.
 - The nine enterprise entries are license-required static Catalog shells. No
   enterprise SDK, credential, health probe, direct request, account-plan
-  inference, or connected state exists in this phase.
+  inference, or connected state exists in this phase. A shell may only become
+  a possible independent-evidence source after the applicable license is
+  obtained and the integrated source is independently validated.
 
 Provider-level truth is listed in the
 [credentialed/freemium matrix](freemium-provider-matrix.md),

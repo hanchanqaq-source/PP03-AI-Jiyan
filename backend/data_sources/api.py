@@ -143,25 +143,22 @@ def _refresh_or_conflict(callback):
 
 @router.get("/catalog")
 def catalog():
-    return _service.catalog_document()
+    return _call(_service.catalog_document)
 
 
 @router.get("/families")
 def families():
-    return _service.families_document()
+    return _call(_service.families_document)
 
 
 @router.get("/families/{family_id}")
 def family(family_id: str = Path(min_length=1, max_length=160)):
-    try:
-        return _service.family_document(family_id)
-    except KeyError as error:
-        raise _not_found() from error
+    return _call(lambda: _service.family_document(family_id))
 
 
 @router.get("/capabilities")
 def capabilities():
-    return _service.capabilities_document()
+    return _call(_service.capabilities_document)
 
 
 @router.get("/config")
@@ -209,7 +206,7 @@ def cost(adapter_id: str | None = Query(default=None, min_length=1, max_length=1
 
 @router.post("/refresh", status_code=202)
 def refresh():
-    return _refresh_or_conflict(_service.refresh)
+    return _call(lambda: _refresh_or_conflict(_service.refresh))
 
 
 @router.post("/{adapter_id}/{action}")
