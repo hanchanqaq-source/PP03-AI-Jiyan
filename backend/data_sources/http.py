@@ -17,7 +17,7 @@ from .provider_errors import ProviderRateLimited, ProviderSchemaChanged, Provide
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _TEST_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
-_SENSITIVE_HEADER_MARKERS = (
+_SENSITIVE_HEADER_TERMS = (
     "authorization",
     "cookie",
     "token",
@@ -191,8 +191,10 @@ class SafeHttpClient:
 
     @staticmethod
     def _is_sensitive_header(header_name: str) -> bool:
-        lowered = header_name.strip().lower()
-        return any(marker in lowered for marker in _SENSITIVE_HEADER_MARKERS)
+        normalized = "".join(
+            character.lower() for character in header_name if character.isascii() and character.isalnum()
+        )
+        return any(term in normalized for term in _SENSITIVE_HEADER_TERMS)
 
     def _validate_url(self, url: str) -> None:
         try:

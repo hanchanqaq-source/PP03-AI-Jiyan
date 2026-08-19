@@ -279,6 +279,11 @@ def test_http_client_rejects_non_finite_safety_bounds(options: dict[str, float])
         "Proxy-Authorization",
         "X-Api-Key",
         "X-Auth-Token",
+        "X-API_Key",
+        "X_API_KEY",
+        "Access_Token",
+        "Secret-Key",
+        "Credential",
     ],
 )
 def test_http_client_rejects_sensitive_caller_headers_before_the_session(
@@ -293,6 +298,18 @@ def test_http_client_rejects_sensitive_caller_headers_before_the_session(
 
     assert fake_session.calls == []
     assert "secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize("header_name", ["Accept-Language", "Last-Modified", "X-Request-Id"])
+def test_http_client_allows_benign_extension_headers(fake_session: FakeSession, header_name: str):
+    """Catches over-broad header canonicalization rejecting ordinary request metadata."""
+    fake_session.response(content=b"ok")
+
+    assert SafeHttpClient(session=fake_session).get_bytes(
+        "https://example.test/data", headers={header_name: "public-metadata"}
+    ) == b"ok"
+
+    assert dict(fake_session.last_request.headers)[header_name] == "public-metadata"
 
 
 def test_http_client_ignores_injected_session_identity_cookie_and_environment_on_redirects():
