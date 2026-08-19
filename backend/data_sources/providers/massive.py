@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -24,6 +26,12 @@ _MAX_ROWS = 1_000
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc_now(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    return value.astimezone(timezone.utc)
 
 
 def _text(value: object, length: int = 256) -> str:
@@ -61,6 +69,39 @@ def _iso_date(value: object) -> date:
         raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE) from None
 
 
+def _context_seal(*parts: object) -> str:
+    return hashlib.sha256("\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _MassiveRequestContext:
+    adapter_id: str
+    capability_id: str
+    symbol: str
+    start_date: date
+    end_date: date
+    max_age_days: int | None
+    adjusted: bool
+    seal: str
+
+
+def _validated_context(value: object) -> _MassiveRequestContext:
+    if type(value) is not _MassiveRequestContext:
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    if (
+        type(value.adapter_id) is not str or value.adapter_id != "massive"
+        or type(value.capability_id) is not str or value.capability_id != "stock_history"
+        or type(value.symbol) is not str or not _SYMBOL.fullmatch(value.symbol)
+        or type(value.start_date) is not date or type(value.end_date) is not date or value.start_date > value.end_date
+        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
+        or type(value.adjusted) is not bool or value.adjusted is not True
+        or type(value.seal) is not str
+        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.adjusted)
+    ):
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    return value
+
+
 class MassiveAdapter(BaseProvider):
     descriptor = AdapterDescriptor(
         "massive", "Polygon/Massive", "massive", "http_client",
@@ -84,7 +125,7 @@ class MassiveAdapter(BaseProvider):
         return value if type(value) is str and value.strip() else None
 
     @staticmethod
-    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+    def _context(request: ProviderRequest) -> _MassiveRequestContext:
         if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "max_age_days"}):
@@ -92,50 +133,78 @@ class MassiveAdapter(BaseProvider):
         symbol = request.parameters.get("symbol")
         if type(symbol) is not str or not _SYMBOL.fullmatch(symbol):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        start, end = request.parameters.get("start_date"), request.parameters.get("end_date")
-        if type(start) is not str or type(end) is not str or _iso_date(start) > _iso_date(end):
+        start, end = _iso_date(request.parameters.get("start_date")), _iso_date(request.parameters.get("end_date"))
+        if start > end:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         max_age = request.parameters.get("max_age_days")
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return _ENDPOINT, {"symbol": symbol, "from": start, "to": end, "adjusted": "true"}
+        return _MassiveRequestContext(
+            "massive", request.capability_id, symbol, start, end, max_age, True,
+            _context_seal("massive", request.capability_id, symbol, start.isoformat(), end.isoformat(), max_age, True),
+        )
 
     @staticmethod
-    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        MassiveAdapter._request(request)
+    def _request(context: _MassiveRequestContext) -> tuple[str, dict[str, str]]:
+        context = _validated_context(context)
+        return _ENDPOINT, {
+            "symbol": context.symbol,
+            "from": context.start_date.isoformat(),
+            "to": context.end_date.isoformat(),
+            "adjusted": "true",
+        }
+
+    @staticmethod
+    def _parse(payload: object, context: _MassiveRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = _validated_context(context)
+        now = _utc_now(now)
         if type(payload) is not dict or type(payload.get("status")) is not str or payload.get("status") != "OK" or type(payload.get("results")) is not list:
+            raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+        response_ticker = payload.get("ticker")
+        if response_ticker is not None and (
+            type(response_ticker) is not str or response_ticker != context.symbol
+        ):
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         items = payload["results"]
         if not items:
             raise ProviderUnavailable("empty_result", reference=_REFERENCE)
         if len(items) > _MAX_ROWS:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
-        max_age = request.parameters.get("max_age_days")
-        rows: list[ProviderValue] = []
+        rows: list[tuple[int, ProviderValue]] = []
+        seen_timestamps: set[int] = set()
         for item in items:
             if type(item) is not dict:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             symbol = _text(item.get("T"), 32)
-            if not _SYMBOL.fullmatch(symbol):
+            if not _SYMBOL.fullmatch(symbol) or symbol != context.symbol:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             timestamp = item.get("t")
             if type(timestamp) is not int or not 0 <= timestamp <= 4_102_444_800_000:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             as_of = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).date()
-            if as_of > now.date():
+            if as_of > now.date() or not context.start_date <= as_of <= context.end_date or timestamp in seen_timestamps:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+            seen_timestamps.add(timestamp)
             close, volume = _number(item.get("c")), _number(item.get("v"))
-            stale = type(max_age) is int and (now.date() - as_of).days > max_age
+            stale = context.max_age_days is not None and (now.date() - as_of).days > context.max_age_days
             status = "cached" if cached else ("stale" if stale else "upstream_reported")
-            metadata = {"source_reference": _REFERENCE, "coverage": "aggregate_bars", "plan_observation": "fixture_only_not_live_entitlement"}
+            metadata = {
+                "source_reference": _REFERENCE,
+                "coverage": "aggregate_bars",
+                "plan_observation": "fixture_only_not_live_entitlement",
+                "requested_symbol": context.symbol,
+                "requested_start_date": context.start_date.isoformat(),
+                "requested_end_date": context.end_date.isoformat(),
+                "adjusted": "true",
+            }
             if cached:
                 metadata["cache_status"] = "fixture_fallback"
-            rows.append(ProviderValue(
+            rows.append((timestamp, ProviderValue(
                 {"symbol": symbol, "close": close, "volume": volume}, "massive", "massive",
-                request.capability_id, as_of, now, status, "Polygon/Massive paid account terms apply",
+                context.capability_id, as_of, now, status, "Polygon/Massive paid account terms apply",
                 70, None, "unknown", "daily", metadata,
-            ))
-        return tuple(rows)
+            )))
+        return tuple(row for _key, row in sorted(rows, key=lambda item: item[0]))
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         del request

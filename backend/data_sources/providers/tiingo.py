@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -24,6 +26,12 @@ _MAX_ROWS = 1_000
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc_now(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    return value.astimezone(timezone.utc)
 
 
 def _schema() -> ProviderSchemaChanged:
@@ -59,6 +67,39 @@ def _request_date(value: object) -> str:
     return value
 
 
+def _context_seal(*parts: object) -> str:
+    return hashlib.sha256("\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _TiingoRequestContext:
+    adapter_id: str
+    capability_id: str
+    symbol: str
+    start_date: date
+    end_date: date
+    max_age_days: int | None
+    resample_frequency: str
+    seal: str
+
+
+def _validated_context(value: object) -> _TiingoRequestContext:
+    if type(value) is not _TiingoRequestContext:
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    if (
+        type(value.adapter_id) is not str or value.adapter_id != "tiingo"
+        or type(value.capability_id) is not str or value.capability_id != "stock_history"
+        or type(value.symbol) is not str or not _SYMBOL.fullmatch(value.symbol)
+        or type(value.start_date) is not date or type(value.end_date) is not date or value.start_date > value.end_date
+        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
+        or type(value.resample_frequency) is not str or value.resample_frequency != "daily"
+        or type(value.seal) is not str
+        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.resample_frequency)
+    ):
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    return value
+
+
 class TiingoAdapter(BaseProvider):
     descriptor = AdapterDescriptor(
         "tiingo", "Tiingo", "tiingo", "http_client",
@@ -82,7 +123,7 @@ class TiingoAdapter(BaseProvider):
         return value if type(value) is str and value.strip() else None
 
     @staticmethod
-    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+    def _context(request: ProviderRequest) -> _TiingoRequestContext:
         if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "max_age_days"}):
@@ -90,30 +131,46 @@ class TiingoAdapter(BaseProvider):
         symbol = request.parameters.get("symbol")
         if type(symbol) is not str or not _SYMBOL.fullmatch(symbol):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        start, end = _request_date(request.parameters.get("start_date")), _request_date(request.parameters.get("end_date"))
+        start_text, end_text = _request_date(request.parameters.get("start_date")), _request_date(request.parameters.get("end_date"))
+        start, end = date.fromisoformat(start_text), date.fromisoformat(end_text)
         if start > end:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         max_age = request.parameters.get("max_age_days")
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return _ENDPOINT, {"ticker": symbol, "startDate": start, "endDate": end, "resampleFreq": "daily"}
+        frequency = "daily"
+        return _TiingoRequestContext(
+            "tiingo", request.capability_id, symbol, start, end, max_age, frequency,
+            _context_seal("tiingo", request.capability_id, symbol, start.isoformat(), end.isoformat(), max_age, frequency),
+        )
 
     @staticmethod
-    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        TiingoAdapter._request(request)
+    def _request(context: _TiingoRequestContext) -> tuple[str, dict[str, str]]:
+        context = _validated_context(context)
+        return _ENDPOINT, {
+            "ticker": context.symbol,
+            "startDate": context.start_date.isoformat(),
+            "endDate": context.end_date.isoformat(),
+            "resampleFreq": context.resample_frequency,
+        }
+
+    @staticmethod
+    def _parse(payload: object, context: _TiingoRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = _validated_context(context)
+        now = _utc_now(now)
         if type(payload) is not list:
             raise _schema()
         if not payload:
             raise ProviderUnavailable("empty_result", reference=_REFERENCE)
         if len(payload) > _MAX_ROWS:
             raise _schema()
-        max_age = request.parameters.get("max_age_days")
-        rows: list[ProviderValue] = []
+        rows: list[tuple[datetime, ProviderValue]] = []
+        seen_timestamps: set[datetime] = set()
         for item in payload:
             if type(item) is not dict:
                 raise _schema()
             symbol, raw_date = item.get("ticker"), item.get("date")
-            if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or type(raw_date) is not str or len(raw_date) > 64:
+            if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or symbol != context.symbol or type(raw_date) is not str or len(raw_date) > 64:
                 raise _schema()
             try:
                 parsed_at = datetime.fromisoformat(raw_date[:-1] + "+00:00" if raw_date.endswith("Z") else raw_date)
@@ -121,20 +178,30 @@ class TiingoAdapter(BaseProvider):
                 raise _schema() from None
             if parsed_at.tzinfo is None:
                 raise _schema()
-            as_of = parsed_at.astimezone(timezone.utc).date()
-            if as_of > now.astimezone(timezone.utc).date():
+            canonical_timestamp = parsed_at.astimezone(timezone.utc)
+            as_of = canonical_timestamp.date()
+            if as_of > now.astimezone(timezone.utc).date() or not context.start_date <= as_of <= context.end_date or canonical_timestamp in seen_timestamps:
                 raise _schema()
+            seen_timestamps.add(canonical_timestamp)
             close, volume = _number(item.get("close")), _number(item.get("volume"))
-            stale = type(max_age) is int and (now.date() - as_of).days > max_age
+            stale = context.max_age_days is not None and (now.date() - as_of).days > context.max_age_days
             status = "cached" if cached else ("stale" if stale else "upstream_reported")
-            metadata = {"source_reference": _REFERENCE, "coverage": "daily_prices", "plan_observation": "fixture_only_not_live_entitlement"}
+            metadata = {
+                "source_reference": _REFERENCE,
+                "coverage": "daily_prices",
+                "plan_observation": "fixture_only_not_live_entitlement",
+                "requested_symbol": context.symbol,
+                "requested_start_date": context.start_date.isoformat(),
+                "requested_end_date": context.end_date.isoformat(),
+                "resample_frequency": context.resample_frequency,
+            }
             if cached:
                 metadata["cache_status"] = "fixture_fallback"
-            rows.append(ProviderValue(
+            rows.append((canonical_timestamp, ProviderValue(
                 {"symbol": symbol, "close": close, "volume": volume}, "tiingo", "tiingo", "stock_history",
                 as_of, now, status, "Tiingo paid account terms apply", 75, None, "unknown", "daily", metadata,
-            ))
-        return tuple(rows)
+            )))
+        return tuple(row for _key, row in sorted(rows, key=lambda item: item[0]))
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         del request

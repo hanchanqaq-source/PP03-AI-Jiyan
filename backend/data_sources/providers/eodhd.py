@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -24,6 +26,12 @@ _MAX_ROWS = 1_000
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc_now(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    return value.astimezone(timezone.utc)
 
 
 def _schema() -> ProviderSchemaChanged:
@@ -59,6 +67,39 @@ def _request_date(value: object) -> str:
     return value
 
 
+def _context_seal(*parts: object) -> str:
+    return hashlib.sha256("\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _EodhdRequestContext:
+    adapter_id: str
+    capability_id: str
+    symbol: str
+    start_date: date
+    end_date: date
+    max_age_days: int | None
+    period: str
+    seal: str
+
+
+def _validated_context(value: object) -> _EodhdRequestContext:
+    if type(value) is not _EodhdRequestContext:
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    if (
+        type(value.adapter_id) is not str or value.adapter_id != "eodhd"
+        or type(value.capability_id) is not str or value.capability_id != "stock_history"
+        or type(value.symbol) is not str or not _SYMBOL.fullmatch(value.symbol)
+        or type(value.start_date) is not date or type(value.end_date) is not date or value.start_date > value.end_date
+        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
+        or type(value.period) is not str or value.period != "d"
+        or type(value.seal) is not str
+        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.period)
+    ):
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    return value
+
+
 class EodhdAdapter(BaseProvider):
     descriptor = AdapterDescriptor(
         "eodhd", "EODHD", "eodhd", "http_client",
@@ -82,7 +123,7 @@ class EodhdAdapter(BaseProvider):
         return value if type(value) is str and value.strip() else None
 
     @staticmethod
-    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+    def _context(request: ProviderRequest) -> _EodhdRequestContext:
         if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict or request.capability_id != "stock_history":
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "max_age_days"}):
@@ -90,37 +131,55 @@ class EodhdAdapter(BaseProvider):
         symbol = request.parameters.get("symbol")
         if type(symbol) is not str or not _SYMBOL.fullmatch(symbol):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        start, end = _request_date(request.parameters.get("start_date")), _request_date(request.parameters.get("end_date"))
+        start_text, end_text = _request_date(request.parameters.get("start_date")), _request_date(request.parameters.get("end_date"))
+        start, end = date.fromisoformat(start_text), date.fromisoformat(end_text)
         if start > end:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         max_age = request.parameters.get("max_age_days")
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return _ENDPOINT, {"symbol": symbol, "from": start, "to": end, "fmt": "json", "period": "d"}
+        period = "d"
+        return _EodhdRequestContext(
+            "eodhd", request.capability_id, symbol, start, end, max_age, period,
+            _context_seal("eodhd", request.capability_id, symbol, start.isoformat(), end.isoformat(), max_age, period),
+        )
 
     @staticmethod
-    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        EodhdAdapter._request(request)
+    def _request(context: _EodhdRequestContext) -> tuple[str, dict[str, str]]:
+        context = _validated_context(context)
+        return _ENDPOINT, {
+            "symbol": context.symbol,
+            "from": context.start_date.isoformat(),
+            "to": context.end_date.isoformat(),
+            "fmt": "json",
+            "period": context.period,
+        }
+
+    @staticmethod
+    def _parse(payload: object, context: _EodhdRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = _validated_context(context)
+        now = _utc_now(now)
         if type(payload) is not list:
             raise _schema()
         if not payload:
             raise ProviderUnavailable("empty_result", reference=_REFERENCE)
         if len(payload) > _MAX_ROWS:
             raise _schema()
-        max_age = request.parameters.get("max_age_days")
-        rows: list[ProviderValue] = []
+        rows: list[tuple[date, ProviderValue]] = []
+        seen_dates: set[date] = set()
         for item in payload:
             if type(item) is not dict:
                 raise _schema()
             symbol, raw_date = item.get("code"), item.get("date")
-            if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or type(raw_date) is not str:
+            if type(symbol) is not str or not _SYMBOL.fullmatch(symbol) or symbol != context.symbol or type(raw_date) is not str:
                 raise _schema()
             try:
                 as_of = date.fromisoformat(raw_date)
             except ValueError:
                 raise _schema() from None
-            if as_of > now.date():
+            if as_of > now.date() or not context.start_date <= as_of <= context.end_date or as_of in seen_dates:
                 raise _schema()
+            seen_dates.add(as_of)
             currency_value = item.get("currency")
             if currency_value is None:
                 currency = "unknown"
@@ -129,16 +188,25 @@ class EodhdAdapter(BaseProvider):
             else:
                 raise _schema()
             close, volume = _number(item.get("close")), _number(item.get("volume"))
-            stale = type(max_age) is int and (now.date() - as_of).days > max_age
+            stale = context.max_age_days is not None and (now.date() - as_of).days > context.max_age_days
             status = "cached" if cached else ("stale" if stale else "upstream_reported")
-            metadata = {"source_reference": _REFERENCE, "coverage": "end_of_day", "currency": currency, "plan_observation": "fixture_only_not_live_entitlement"}
+            metadata = {
+                "source_reference": _REFERENCE,
+                "coverage": "end_of_day",
+                "currency": currency,
+                "plan_observation": "fixture_only_not_live_entitlement",
+                "requested_symbol": context.symbol,
+                "requested_start_date": context.start_date.isoformat(),
+                "requested_end_date": context.end_date.isoformat(),
+                "period": context.period,
+            }
             if cached:
                 metadata["cache_status"] = "fixture_fallback"
-            rows.append(ProviderValue(
-                {"symbol": symbol, "close": close, "volume": volume}, "eodhd", "eodhd", request.capability_id,
+            rows.append((as_of, ProviderValue(
+                {"symbol": symbol, "close": close, "volume": volume}, "eodhd", "eodhd", context.capability_id,
                 as_of, now, status, "EODHD paid account terms apply", 75, None, currency, "daily", metadata,
-            ))
-        return tuple(rows)
+            )))
+        return tuple(row for _key, row in sorted(rows, key=lambda item: item[0]))
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         del request

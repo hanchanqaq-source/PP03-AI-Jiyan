@@ -8,8 +8,10 @@ authorization or transport.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import math
 import re
 from typing import Any, Mapping
@@ -32,6 +34,12 @@ _MAX_ROWS = 1_000
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc_now(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    return value.astimezone(timezone.utc)
 
 
 def _text(value: object, *, length: int = 256) -> str:
@@ -72,6 +80,55 @@ def _date(value: object, now: datetime) -> date:
     return parsed
 
 
+def _parameter_date(value: object) -> date:
+    if type(value) is not str or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE) from None
+
+
+def _context_seal(*parts: object) -> str:
+    encoded = "\x1f".join("" if part is None else str(part) for part in parts).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _FmpRequestContext:
+    adapter_id: str
+    capability_id: str
+    symbol: str
+    start_date: date
+    end_date: date
+    max_age_days: int | None
+    mode: str
+    seal: str
+
+
+def _validated_context(value: object) -> _FmpRequestContext:
+    if type(value) is not _FmpRequestContext:
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    if (
+        type(value.adapter_id) is not str
+        or value.adapter_id != "fmp"
+        or type(value.capability_id) is not str
+        or value.capability_id != "stock_snapshot"
+        or type(value.symbol) is not str
+        or not _SYMBOL.fullmatch(value.symbol)
+        or type(value.start_date) is not date
+        or type(value.end_date) is not date
+        or value.start_date > value.end_date
+        or (value.max_age_days is not None and (type(value.max_age_days) is not int or not 0 <= value.max_age_days <= 36_500))
+        or type(value.mode) is not str
+        or value.mode != "snapshot_fixture"
+        or type(value.seal) is not str
+        or value.seal != _context_seal(value.adapter_id, value.capability_id, value.symbol, value.start_date.isoformat(), value.end_date.isoformat(), value.max_age_days, value.mode)
+    ):
+        raise ProviderUnavailable("invalid_request_context", reference=_REFERENCE)
+    return value
+
+
 class FmpAdapter(BaseProvider):
     descriptor = AdapterDescriptor(
         "fmp", "Financial Modeling Prep", "fmp", "http_client",
@@ -97,58 +154,79 @@ class FmpAdapter(BaseProvider):
         return value if type(value) is str and value.strip() else None
 
     @staticmethod
-    def _request(request: ProviderRequest) -> tuple[str, dict[str, str]]:
+    def _context(request: ProviderRequest) -> _FmpRequestContext:
         if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict:
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         endpoint = _ENDPOINTS.get(request.capability_id)
-        if endpoint is None or any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "max_age_days"}):
+        if endpoint is None or any(type(key) is not str for key in request.parameters) or not set(request.parameters).issubset({"symbol", "start_date", "end_date", "max_age_days"}):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         symbol = request.parameters.get("symbol")
         if type(symbol) is not str or not _SYMBOL.fullmatch(symbol):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        start_date = _parameter_date(request.parameters.get("start_date"))
+        end_date = _parameter_date(request.parameters.get("end_date"))
+        if start_date > end_date:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         max_age = request.parameters.get("max_age_days")
         if max_age is not None and (type(max_age) is not int or not 0 <= max_age <= 36_500):
             raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
-        return endpoint, {"symbol": symbol}
+        mode = "snapshot_fixture"
+        return _FmpRequestContext(
+            "fmp", request.capability_id, symbol, start_date, end_date, max_age, mode,
+            _context_seal("fmp", request.capability_id, symbol, start_date.isoformat(), end_date.isoformat(), max_age, mode),
+        )
 
     @staticmethod
-    def _parse(payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
-        FmpAdapter._request(request)
+    def _request(context: _FmpRequestContext) -> tuple[str, dict[str, str]]:
+        context = _validated_context(context)
+        return _ENDPOINTS[context.capability_id], {"symbol": context.symbol}
+
+    @staticmethod
+    def _parse(payload: object, context: _FmpRequestContext, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
+        context = _validated_context(context)
+        now = _utc_now(now)
         if type(payload) is not list:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         if not payload:
             raise ProviderUnavailable("empty_result", reference=_REFERENCE)
         if len(payload) > _MAX_ROWS:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
-        max_age = request.parameters.get("max_age_days")
-        rows: list[ProviderValue] = []
+        rows: list[tuple[date, ProviderValue]] = []
+        seen_dates: set[date] = set()
         for item in payload:
             if type(item) is not dict:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             symbol = _text(item.get("symbol"), length=32)
-            if not _SYMBOL.fullmatch(symbol):
+            if not _SYMBOL.fullmatch(symbol) or symbol != context.symbol:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             as_of = _date(item.get("date"), now)
+            if not context.start_date <= as_of <= context.end_date or as_of in seen_dates:
+                raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+            seen_dates.add(as_of)
             currency_value = item.get("currency")
             currency = "unknown" if currency_value is None else _text(currency_value, length=16)
             price = _decimal(item.get("price"))
             volume = _decimal(item.get("volume"))
-            stale = type(max_age) is int and (now.date() - as_of).days > max_age
+            stale = context.max_age_days is not None and (now.date() - as_of).days > context.max_age_days
             status = "cached" if cached else ("stale" if stale else "upstream_reported")
             metadata = {
                 "source_reference": _REFERENCE,
                 "coverage": "quote_snapshot",
                 "currency": currency,
                 "plan_observation": "fixture_only_not_live_entitlement",
+                "requested_symbol": context.symbol,
+                "requested_start_date": context.start_date.isoformat(),
+                "requested_end_date": context.end_date.isoformat(),
+                "request_mode": context.mode,
             }
             if cached:
                 metadata["cache_status"] = "fixture_fallback"
-            rows.append(ProviderValue(
+            rows.append((as_of, ProviderValue(
                 {"symbol": symbol, "price": price, "volume": volume}, "fmp", "fmp",
-                request.capability_id, as_of, now, status, "FMP paid account terms apply", 70,
+                context.capability_id, as_of, now, status, "FMP paid account terms apply", 70,
                 None, currency, "snapshot", metadata,
-            ))
-        return tuple(rows)
+            )))
+        return tuple(row for _key, row in sorted(rows, key=lambda item: item[0]))
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         del request
