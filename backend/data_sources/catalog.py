@@ -148,6 +148,9 @@ def _capabilities() -> tuple[CapabilityDescriptor, ...]:
         CapabilityDescriptor("sec_13f_metadata", "SEC 13F 索引元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "quarterly", ("sec_edgar",), (), ()),
         CapabilityDescriptor("sec_company_facts", "SEC Company Facts 元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "event_driven", ("sec_edgar",), (), ()),
         CapabilityDescriptor("official_evidence_link", "官方披露链接核验", "official_disclosure", None, True, "metadata", "event_driven", ("sse", "szse", "cninfo", "hkexnews", "csrc"), ("fund_company_official", "index_company_official"), ()),
+        CapabilityDescriptor("macro_indicator", "宏观指标", "macro", 31 * _DAY_SECONDS, True, "provider_native", "provider_native", ("world_bank",), (), ()),
+        CapabilityDescriptor("macro_series", "宏观时间序列", "macro", 31 * _DAY_SECONDS, True, "provider_native", "provider_native", ("oecd",), ("imf",), ()),
+        CapabilityDescriptor("news_discovery", "资讯候选发现", "news", None, False, "candidate", "event_driven", (), ("gdelt",), ()),
     )
 
 
@@ -166,6 +169,10 @@ def _families() -> tuple[SourceFamily, ...]:
         SourceFamily("csrc", "中国证监会", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "government_public_disclosure_terms_apply", CatalogStatus.CONFIGURED),
         SourceFamily("fund_company_official", "基金公司官方公告", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "official_company_host_review_required", CatalogStatus.UNCONFIGURED),
         SourceFamily("index_company_official", "指数公司官方公告", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "official_company_host_review_required", CatalogStatus.UNCONFIGURED),
+        SourceFamily("world_bank", "World Bank Indicators", "global", "global", (SourceRole.MACRO_DATA,), True, "world_bank_public_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("oecd", "OECD SDMX", "global", "global", (SourceRole.MACRO_DATA,), True, "oecd_public_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("imf", "IMF public SDMX", "global", "global", (SourceRole.MACRO_DATA,), True, "imf_public_sdmx_live_status_unverified", CatalogStatus.CATALOG_ONLY),
+        SourceFamily("gdelt", "GDELT DOC 2.0", "global", "news", (SourceRole.COLLECTOR, SourceRole.CANDIDATE), False, "gdelt_public_terms_apply", CatalogStatus.CONFIGURED),
     )
 
 
@@ -210,6 +217,10 @@ def _static_adapters() -> tuple[AdapterDescriptor, ...]:
         _adapter("csrc-official-evidence", "中国证监会官方链接", "csrc", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "https://www.csrc.gov.cn/", 10, license_note="中国证监会公开披露入口；使用须遵守发布者条款。", usage_note="仅核验允许的公开链接；拒绝跨发布者重定向和受保护页面。"),
         _adapter("fund-company-official-evidence", "基金公司官方公告链接", "fund_company_official", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "", 30, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="必须先逐项登记官方基金公司主机并核验公开条款。", usage_note="未登记官方主机时不得请求；不使用登录、Cookie 或 CAPTCHA 绕过。"),
         _adapter("index-company-official-evidence", "指数公司官方公告链接", "index_company_official", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "", 30, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="必须先逐项登记官方指数公司主机并核验公开条款。", usage_note="未登记官方主机时不得请求；不使用登录、Cookie 或 CAPTCHA 绕过。"),
+        _adapter("world-bank", "World Bank Indicators", "world_bank", "http_client", (SourceRole.MACRO_DATA,), ("macro_indicator",), "https://api.worldbank.org/", 30, license_note="World Bank Indicators API 公开数据；使用须遵守上游条款。", usage_note="仅请求明确国家和指标代码；不使用凭据。"),
+        _adapter("oecd", "OECD SDMX", "oecd", "http_client", (SourceRole.MACRO_DATA,), ("macro_series",), "https://sdmx.oecd.org/public/", 30, license_note="OECD SDMX 公开数据；使用须遵守上游条款。", usage_note="仅请求明确 dataset 与 series key；不使用凭据。"),
+        _adapter("imf", "IMF public SDMX", "imf", "http_client", (SourceRole.MACRO_DATA,), ("macro_series",), "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest/", 40, default_enabled=False, catalog_status=CatalogStatus.CATALOG_ONLY, license_note="IMF public SDMX contract is registered; current live accessibility is not asserted.", usage_note="Catalog-only pending a bounded official live validation; no credentials or fallback scraping."),
+        _adapter("gdelt", "GDELT DOC 2.0", "gdelt", "http_client", (SourceRole.COLLECTOR, SourceRole.CANDIDATE), ("news_discovery",), "https://api.gdeltproject.org/api/v2/doc/doc", 100, license_note="GDELT public discovery API；使用须遵守上游条款。", usage_note="仅返回候选及原发布者标识；不得作为可信或独立证据。"),
     )
 
 
