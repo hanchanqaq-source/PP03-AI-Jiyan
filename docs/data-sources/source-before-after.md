@@ -3,9 +3,12 @@
 ## Scope and evidence boundary
 
 Task 6's corrected audit-data point is
-`08b4b72ab41be9c513824e118010e9ddcf617fb3`. Task 7 qualification code/tests
-base is `547b2a72c1312f6f853edc81e9b091d67cf91df2`; the final qualification
-HEAD is this document's commit. Phase 1 started from
+`08b4b72ab41be9c513824e118010e9ddcf617fb3`. Task 7 pre-fix qualification
+code/tests base is `547b2a72c1312f6f853edc81e9b091d67cf91df2`. The Phase 2
+Task 7 qualified implementation and fresh backend-test HEAD is
+`957aa58aea051d8faf7a2cf4e2d2b477de369c31`. This documentation-only
+traceability overlay does not supersede or relabel that tested implementation
+SHA. Phase 1 started from
 `9dfd8246290a04555ed1886ded92c39de9a001f4` and its reviewed end / Phase 2
 start is `e4c0d930e80266dc8ebaacd2b26807690e830daa`.
 
@@ -15,7 +18,7 @@ and isolated live observations are separate facts. No fund, portfolio, user
 note, credential, key, cookie, paid endpoint, enterprise service, or Phase 3
 provider was read or used in this phase.
 
-| Measure | Phase 1 | Task 7 qualification base (`547b2a7`) | Meaning |
+| Measure | Phase 1 | Task 7 qualified implementation (`957aa58`) | Meaning |
 | --- | ---: | ---: | --- |
 | RSS/Atom configurations | 108 | 108 | Preserved exactly; Task 6 made no parser/config migration. |
 | Catalog families | 112 | 125 | 17 static families plus 108 publisher families; no holdings relation affects this count. |
