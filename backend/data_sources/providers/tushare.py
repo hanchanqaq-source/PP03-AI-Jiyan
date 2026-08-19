@@ -8,6 +8,7 @@ import math
 import re
 import threading
 
+from data_sources.budgets import BudgetDecision
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
@@ -24,6 +25,10 @@ _MAX_NUMBER_TEXT = 128
 _FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _PARAMETER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _CACHEABLE = {"timeout", "tls", "dns", "connection", "server_error", "rate_limited"}
+# This is an authorization sentinel, not a provider price. It classifies an
+# unqualified plan/points request as cost-bearing for Free-only enforcement and
+# is reconciled to zero without transport when no trusted entitlement exists.
+_PLAN_DEPENDENT_PREFLIGHT_COST = Decimal("0.01")
 _CAPABILITIES: Mapping[str, tuple[str, str, tuple[str, ...]]] = {
     "fund_holdings": ("fund_portfolio", "quarterly", ("ts_code", "period")),
     "stock_history": ("daily", "daily", ("ts_code", "trade_date", "start_date", "end_date")),
@@ -58,6 +63,8 @@ def _public_scalar(value: object) -> object:
     if type(value) is str:
         return _text(value, allow_blank=True)
     if type(value) is int:
+        if value.bit_length() > 333:
+            raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         if len(str(abs(value))) > 100:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         return Decimal(value)
@@ -92,7 +99,7 @@ class TushareAdapter(BaseProvider):
         BillingModel.FREEMIUM, "api_token", (_ENV_NAME,), False,
         "Tushare Pro token and capability-specific account permission required.",
         "Configured capability access depends on actual points/plan; denials are not provider-health failures.",
-        "以 Tushare Pro 发布和修订为准", "以账户实际积分和套餐权限为准", "免费/增值边界按实际账户；不自动购买或升级",
+        "以 Tushare Pro 发布和修订为准", "以账户实际积分和套餐权限为准", "套餐/积分成本未知；无可信能力级权益时禁止请求",
         _REFERENCE, 50, CatalogStatus.UNCONFIGURED,
     )
 
@@ -128,11 +135,39 @@ class TushareAdapter(BaseProvider):
     def _authorize(self, now: datetime) -> str | None:
         if self._budget_guard is None:
             return None
-        decision = self._budget_guard.authorize(self.descriptor, estimated_cost=Decimal("0"), now=now)
-        return None if decision.allowed else str(decision.reason)
+        decision = self._budget_guard.authorize(
+            self.descriptor,
+            estimated_cost=_PLAN_DEPENDENT_PREFLIGHT_COST,
+            now=now,
+        )
+        if (
+            type(decision) is not BudgetDecision
+            or type(decision.allowed) is not bool
+            or type(decision.reason) is not str
+            or type(decision.estimated_cost) is not Decimal
+            or (decision.reservation_id is not None and type(decision.reservation_id) is not str)
+            or decision.estimated_cost != _PLAN_DEPENDENT_PREFLIGHT_COST
+        ):
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+        if not decision.allowed:
+            return str(decision.reason)
+        if decision.reservation_id is None:
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
+        self._budget_guard.record(
+            self.descriptor.adapter_id,
+            reservation_id=decision.reservation_id,
+            actual_cost=Decimal("0"),
+            request_count=0,
+            status="cost_unknown",
+            units=Decimal("0"),
+            now=now,
+        )
+        return "cost_unknown"
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[str, dict[str, object], str, int | None]:
+        if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         contract = _CAPABILITIES.get(request.capability_id)
         if contract is None:
             raise ProviderUnavailable("unsupported_capability", reference=_REFERENCE)
@@ -143,7 +178,7 @@ class TushareAdapter(BaseProvider):
                 raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
             if key == "max_age_days":
                 continue
-            if type(value) not in {str, int} or isinstance(value, bool) or len(str(value)) > 256:
+            if type(value) not in {str, int} or (type(value) is int and value.bit_length() > 850) or len(str(value)) > 256:
                 raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
             cleaned[key] = value
         max_age = request.parameters.get("max_age_days")
@@ -169,11 +204,11 @@ class TushareAdapter(BaseProvider):
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
     def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, frequency: str, max_age_days: int | None, cached: bool) -> tuple[ProviderValue, ...]:
-        if not isinstance(payload, Mapping):
+        if type(payload) is not dict:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._payload_error(payload)
         data = payload.get("data")
-        if not isinstance(data, Mapping):
+        if type(data) is not dict:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         fields, items = data.get("fields"), data.get("items")
         if type(fields) is not list or not 0 < len(fields) <= _MAX_FIELDS or type(items) is not list:
@@ -250,7 +285,7 @@ class TushareAdapter(BaseProvider):
         if blocked is not None:
             self._set_capability_status(capability_id, blocked)
             return {"status": blocked, "connected": False, "health_failure": False, "capability_id": capability_id}
-        request = ProviderRequest(capability_id, parameters or {})
+        request = ProviderRequest(capability_id, {} if parameters is None else parameters)
         try:
             rows = self._execute(request, credential, now)
         except ProviderRateLimited as error:

@@ -5,9 +5,12 @@ from decimal import Decimal
 
 import pytest
 
+from data_sources.budgets import BudgetDecision, BudgetGuard, BudgetPolicy
+from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.usage_store import UsageStore
 
 
 NOW = datetime(2026, 8, 19, tzinfo=timezone.utc)
@@ -33,7 +36,42 @@ class FakeBudget:
 
     def authorize(self, descriptor, *, estimated_cost, now):
         self.calls.append((descriptor.adapter_id, estimated_cost, now))
-        return type("Decision", (), {"allowed": self.allowed, "reason": self.reason})()
+        return BudgetDecision(self.allowed, self.reason, None, estimated_cost)
+
+
+class TrapDict(dict):
+    def __init__(self, value):
+        super().__init__(value)
+        self.called = False
+
+    def explode(self, *_args, **_kwargs):
+        self.called = True
+        raise AssertionError("attacker-controlled dict method executed")
+
+    get = items = keys = values = __iter__ = __len__ = __bool__ = __eq__ = explode
+
+
+class TrapList(list):
+    def __init__(self, value):
+        super().__init__(value)
+        self.called = False
+
+    def explode(self, *_args, **_kwargs):
+        self.called = True
+        raise AssertionError("attacker-controlled list method executed")
+
+    __iter__ = __len__ = __bool__ = __getitem__ = __eq__ = explode
+
+
+class TrapValue:
+    def __init__(self):
+        self.called = False
+
+    def explode(self, *_args, **_kwargs):
+        self.called = True
+        raise AssertionError("attacker-controlled budget field executed")
+
+    __eq__ = __bool__ = __str__ = explode
 
 
 def credentials(configured=True):
@@ -61,6 +99,12 @@ def fixture():
     }
 
 
+def real_guard(tmp_path, *, free_only=True):
+    descriptor = build_catalog({"sources": []}).adapter("eia")
+    policy = BudgetPolicy("eia", True, True, free_only, Decimal("1.00"), Decimal("5.00"), Decimal("1.00"))
+    return BudgetGuard(UsageStore(tmp_path / "eia-usage"), {"eia": policy}, trusted_adapters={"eia": descriptor})
+
+
 def test_eia_no_key_and_blocked_status_guard_make_zero_transport_calls():
     from data_sources.providers.eia import EiaAdapter
 
@@ -75,6 +119,18 @@ def test_eia_no_key_and_blocked_status_guard_make_zero_transport_calls():
     free_only = FakeBudget(False, "free_only")
     assert EiaAdapter(http=http, credentials=credentials(), budget_guard=free_only, fetched_at=lambda: NOW).probe("macro_series") == {"status": "free_only", "connected": False, "health_failure": False}
     assert http.calls == []
+
+
+def test_eia_rejects_mutated_budget_decision_before_using_hostile_field():
+    from data_sources.providers.eia import EiaAdapter
+
+    trap = TrapValue()
+    decision = BudgetDecision(True, "authorized", None, Decimal("0"))
+    object.__setattr__(decision, "estimated_cost", trap)
+    budget = type("HostileBudget", (), {"authorize": lambda *_args, **_kwargs: decision})()
+    with pytest.raises(ProviderUnavailable, match="budget_status_invalid"):
+        EiaAdapter(http=FakeHttp([]), credentials=credentials(), budget_guard=budget, fetched_at=lambda: NOW).fetch(request())
+    assert trap.called is False
 
 
 def test_eia_preserves_series_name_unit_frequency_period_actual_forecast_and_reference():
@@ -94,6 +150,18 @@ def test_eia_preserves_series_name_unit_frequency_period_actual_forecast_and_ref
     assert {row.source_metadata["source_reference"] for row in rows} == {"https://api.eia.gov/v2/"}
     assert http.calls[0][0] == "https://api.eia.gov/v2/electricity/retail-sales/data/"
     assert SECRET not in repr(rows) and SECRET not in repr(http.calls)
+
+
+def test_eia_trusted_free_key_catalog_is_zero_cost_under_real_free_only_guard(tmp_path):
+    from data_sources.providers.eia import EiaAdapter
+
+    http = FakeHttp([fixture()])
+    guard = real_guard(tmp_path, free_only=True)
+    rows = EiaAdapter(http=http, credentials=credentials(), budget_guard=guard, fetched_at=lambda: NOW).fetch(request())
+
+    assert len(rows) == 2
+    assert len(http.calls) == 1
+    assert guard.usage_store.records(now=NOW)[0].estimated_cost == Decimal("0")
 
 
 @pytest.mark.parametrize(
@@ -134,6 +202,7 @@ def test_eia_timeout_uses_cache_without_hiding_actual_forecast_or_cache_state():
         {"response": {"frequency": "monthly", "data": [{"series": "RES-ALL-M", "series-name": "x", "period": "2099-01", "value": 1, "units": "kWh", "type": "actual"}]}},
         {"response": {"frequency": "monthly", "data": [{"series": "RES-ALL-M", "series-name": "x", "period": "2025-01", "value": float("nan"), "units": "kWh", "type": "actual"}]}},
         {"response": {"frequency": "monthly", "data": [{"series": "RES-ALL-M", "series-name": "x", "period": "2025-01", "value": "1e999999", "units": "kWh", "type": "actual"}]}},
+        {"response": {"frequency": "monthly", "data": [{"series": "RES-ALL-M", "series-name": "x", "period": "2025-01", "value": 1 << 20000, "units": "kWh", "type": "actual"}]}},
         {"response": {"frequency": "monthly", "data": [{"series": "RES-ALL-M", "series-name": "x" * 5000, "period": "2025-01", "value": 1, "units": "kWh", "type": "actual"}]}},
         {"response": {"frequency": "monthly", "data": [{"series": "RES-ALL-M", "series-name": "x", "period": "2025-01", "value": 1, "units": "kWh", "type": "actual"}] * 1001}},
     ],
@@ -154,6 +223,34 @@ def test_eia_marks_stale_actual_and_preserves_unknown_unit():
     assert row.data_status == "stale"
     assert row.source_metadata["observation_type"] == "actual"
     assert row.unit == "unknown"
+
+
+def test_eia_rejects_custom_response_containers_without_executing_methods():
+    from data_sources.providers.eia import EiaAdapter
+
+    root = TrapDict(fixture())
+    response = TrapDict(fixture()["response"])
+    items = TrapList(fixture()["response"]["data"])
+    row = TrapDict(fixture()["response"]["data"][0])
+    variants = [
+        (root, [root]),
+        ({"response": response}, [response]),
+        ({"response": {**fixture()["response"], "data": items}}, [items]),
+        ({"response": {**fixture()["response"], "data": [row]}}, [row]),
+    ]
+    for payload, traps in variants:
+        with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+            EiaAdapter(http=FakeHttp([payload]), credentials=credentials(), fetched_at=lambda: NOW).fetch(request())
+        assert all(trap.called is False for trap in traps)
+
+
+def test_eia_rejects_custom_request_mapping_without_executing_methods():
+    from data_sources.providers.eia import EiaAdapter
+
+    parameters = TrapDict({"route": "electricity/retail-sales", "series_id": "RES-ALL-M"})
+    with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
+        EiaAdapter(http=FakeHttp([]), credentials=credentials(), fetched_at=lambda: NOW).fetch(ProviderRequest("macro_series", parameters))
+    assert parameters.called is False
 
 
 def test_eia_catalog_and_registry_metadata_are_exact():

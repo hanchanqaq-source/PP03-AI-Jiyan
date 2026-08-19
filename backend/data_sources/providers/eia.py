@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 import re
 
+from data_sources.budgets import BudgetDecision
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
@@ -51,7 +52,9 @@ def _period(value: object) -> tuple[date, str]:
 def _number(value: object) -> Decimal | None:
     if value is None:
         return None
-    if type(value) not in {str, int, float, Decimal} or isinstance(value, bool):
+    if type(value) not in {str, int, float, Decimal}:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    if type(value) is int and value.bit_length() > 333:
         raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
     raw = str(value)
     if len(raw) > _MAX_NUMBER_TEXT:
@@ -109,10 +112,21 @@ class EiaAdapter(BaseProvider):
         if self._budget_guard is None:
             return None
         decision = self._budget_guard.authorize(self.descriptor, estimated_cost=Decimal("0"), now=now)
+        if (
+            type(decision) is not BudgetDecision
+            or type(decision.allowed) is not bool
+            or type(decision.reason) is not str
+            or type(decision.estimated_cost) is not Decimal
+            or (decision.reservation_id is not None and type(decision.reservation_id) is not str)
+            or decision.estimated_cost != Decimal("0")
+        ):
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
         return None if decision.allowed else str(decision.reason)
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[str, dict[str, object], int | None]:
+        if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if request.capability_id != "macro_series":
             raise ProviderUnavailable("unsupported_capability", reference=_REFERENCE)
         route, series_id = request.parameters.get("route"), request.parameters.get("series_id")
@@ -146,11 +160,11 @@ class EiaAdapter(BaseProvider):
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
     def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, max_age_days: int | None, cached: bool) -> tuple[ProviderValue, ...]:
-        if not isinstance(payload, Mapping):
+        if type(payload) is not dict:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._payload_error(payload)
         response = payload.get("response")
-        if not isinstance(response, Mapping):
+        if type(response) is not dict:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         raw_frequency = _text(response.get("frequency")).strip().lower()
         items = response.get("data")
@@ -163,7 +177,7 @@ class EiaAdapter(BaseProvider):
         expected_series = str(request.parameters["series_id"])
         rows: list[ProviderValue] = []
         for item in items:
-            if not isinstance(item, Mapping) or item.get("series") != expected_series:
+            if type(item) is not dict or item.get("series") != expected_series:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             series_name = _text(item.get("series-name"))
             as_of, period_frequency = _period(item.get("period"))
@@ -222,7 +236,7 @@ class EiaAdapter(BaseProvider):
         blocked = self._authorize(now)
         if blocked is not None:
             return {"status": blocked, "connected": False, "health_failure": False}
-        request = ProviderRequest(capability_id, parameters or {"route": "electricity/retail-sales", "series_id": "RES-ALL-M"})
+        request = ProviderRequest(capability_id, {"route": "electricity/retail-sales", "series_id": "RES-ALL-M"} if parameters is None else parameters)
         try:
             rows = self._execute(request, credential, now)
         except ProviderRateLimited as error:

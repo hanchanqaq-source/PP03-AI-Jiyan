@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 import re
 
+from data_sources.budgets import BudgetDecision
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
@@ -50,9 +51,11 @@ def _iso_date(value: object) -> date:
 
 
 def _number(value: object) -> Decimal | None:
-    if value == ".":
+    if type(value) not in {str, int, float, Decimal}:
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+    if type(value) is str and value == ".":
         return None
-    if type(value) not in {str, int, float, Decimal} or isinstance(value, bool):
+    if type(value) is int and value.bit_length() > 333:
         raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
     raw = str(value)
     if len(raw) > _MAX_NUMBER_TEXT:
@@ -113,10 +116,21 @@ class FredAdapter(BaseProvider):
         if self._budget_guard is None:
             return None
         decision = self._budget_guard.authorize(self.descriptor, estimated_cost=Decimal("0"), now=now)
+        if (
+            type(decision) is not BudgetDecision
+            or type(decision.allowed) is not bool
+            or type(decision.reason) is not str
+            or type(decision.estimated_cost) is not Decimal
+            or (decision.reservation_id is not None and type(decision.reservation_id) is not str)
+            or decision.estimated_cost != Decimal("0")
+        ):
+            raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
         return None if decision.allowed else str(decision.reason)
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[dict[str, object], int | None]:
+        if type(request) is not ProviderRequest or type(request.capability_id) is not str or type(request.parameters) is not dict:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
         if request.capability_id != "macro_series":
             raise ProviderUnavailable("unsupported_capability", reference=_REFERENCE)
         series_id = request.parameters.get("series_id")
@@ -159,7 +173,7 @@ class FredAdapter(BaseProvider):
         max_age_days: int | None,
         cached: bool,
     ) -> tuple[ProviderValue, ...]:
-        if not isinstance(payload, Mapping):
+        if type(payload) is not dict:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._payload_error(payload)
         observations = payload.get("observations")
@@ -176,7 +190,7 @@ class FredAdapter(BaseProvider):
         series_id = str(request.parameters["series_id"])
         rows: list[ProviderValue] = []
         for observation in observations:
-            if not isinstance(observation, Mapping):
+            if type(observation) is not dict:
                 raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             as_of = _iso_date(observation.get("date"))
             if as_of > now.date():
@@ -239,7 +253,7 @@ class FredAdapter(BaseProvider):
         blocked = self._authorize(now)
         if blocked is not None:
             return {"status": blocked, "connected": False, "health_failure": False}
-        request = ProviderRequest(capability_id, parameters or {"series_id": "GDP"})
+        request = ProviderRequest(capability_id, {"series_id": "GDP"} if parameters is None else parameters)
         try:
             rows = self._execute(request, credential, now)
         except ProviderRateLimited as error:
