@@ -156,6 +156,10 @@ function dataSourceNullableString(value: unknown): string | null {
   return dataSourceString(value);
 }
 
+function dataSourceTimezone(value: unknown): "UTC" | null {
+  return value === "UTC" ? "UTC" : null;
+}
+
 function dataSourceBoolean(value: unknown): boolean {
   if (typeof value !== "boolean") throw new ApiError("数据源配置响应无效", 502);
   return value;
@@ -256,7 +260,7 @@ function dataSourceUsage(value: unknown): DataSourceUsageResponse {
   if (!Array.isArray(row.adapters)) throw new ApiError("数据源用量响应无效", 502);
   return {
     as_of: dataSourceString(row.as_of),
-    timezone: dataSourceString(row.timezone),
+    timezone: dataSourceTimezone(row.timezone),
     usage_status: usageStatus(row.usage_status),
     adapters: row.adapters.map(adapterUsage),
   };
@@ -289,7 +293,7 @@ function dataSourceCost(value: unknown): DataSourceCostResponse {
   if (!Array.isArray(row.adapters)) throw new ApiError("数据源费用响应无效", 502);
   return {
     as_of: dataSourceString(row.as_of),
-    timezone: dataSourceString(row.timezone),
+    timezone: dataSourceTimezone(row.timezone),
     free_only: dataSourceBoolean(row.free_only),
     usage_status: usageStatus(row.usage_status),
     adapters: row.adapters.map(adapterCost),

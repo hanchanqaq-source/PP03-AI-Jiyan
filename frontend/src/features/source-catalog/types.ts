@@ -110,7 +110,7 @@ export interface AdapterUsageView {
 
 export interface DataSourceUsageResponse {
   as_of: string;
-  timezone: string;
+  timezone: "UTC" | null;
   usage_status: "observed" | "unobserved";
   adapters: AdapterUsageView[];
 }
@@ -136,7 +136,7 @@ export interface AdapterCostView {
 
 export interface DataSourceCostResponse {
   as_of: string;
-  timezone: string;
+  timezone: "UTC" | null;
   free_only: boolean;
   usage_status: "observed" | "unobserved";
   adapters: AdapterCostView[];

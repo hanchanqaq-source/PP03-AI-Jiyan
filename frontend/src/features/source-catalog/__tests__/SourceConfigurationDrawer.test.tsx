@@ -127,6 +127,61 @@ function mockReads(
   vi.spyOn(api, "dataSourceCost").mockResolvedValue(cost);
 }
 
+function jsonResponse(value: unknown): Response {
+  return new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+function responseWithTimezone<T extends object>(response: T, timezone: unknown): Record<string, unknown> {
+  const result = { ...response } as Record<string, unknown>;
+  if (timezone === undefined) delete result.timezone;
+  else result.timezone = timezone;
+  return result;
+}
+
+function observedUsageResponse(timezone: unknown): Record<string, unknown> {
+  const base = usageFor(paidAdapter);
+  return responseWithTimezone({
+    ...base,
+    usage_status: "observed",
+    adapters: [{
+      ...base.adapters[0],
+      usage_status: "observed",
+      daily_cost: "0",
+      monthly_cost: "0.00000000",
+      daily_request_count: 0,
+      monthly_request_count: 0,
+      daily_units: "0",
+      monthly_units: "0",
+      open_reservations: 0,
+    }],
+  }, timezone);
+}
+
+function observedCostResponse(timezone: unknown): Record<string, unknown> {
+  const base = costFor(paidAdapter);
+  return responseWithTimezone({
+    ...base,
+    usage_status: "observed",
+    adapters: [{
+      ...base.adapters[0],
+      usage_status: "observed",
+      daily_cost: "0",
+      monthly_cost: "0.00000000",
+      open_reservations: 0,
+    }],
+  }, timezone);
+}
+
+function mockRawConfigurationReads(usageTimezone: unknown, costTimezone: unknown) {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const path = String(input);
+    if (path.includes("/data-sources/config")) return jsonResponse(configFor(paidAdapter));
+    if (path.includes("/data-sources/usage")) return jsonResponse(observedUsageResponse(usageTimezone));
+    if (path.includes("/data-sources/cost")) return jsonResponse(observedCostResponse(costTimezone));
+    throw new Error(`unexpected request: ${path}`);
+  });
+}
+
 function ControlledDrawer({ adapter = paidAdapter }: { adapter?: AdapterView }) {
   const [open, setOpen] = useState(false);
   return <>
@@ -327,13 +382,69 @@ describe("SourceConfigurationDrawer", () => {
   });
 
   it("requires matching built-in UTC values from usage and cost", async () => {
-    const usage = { ...usageFor(paidAdapter), timezone: "UTC" };
-    const cost = { ...costFor(paidAdapter), timezone: "Asia/Shanghai" };
+    const usage: DataSourceUsageResponse = { ...usageFor(paidAdapter), timezone: "UTC" };
+    const cost: DataSourceCostResponse = { ...costFor(paidAdapter), timezone: null };
     mockReads(paidAdapter, configFor(paidAdapter), usage, cost);
     render(<SourceConfigurationDrawer open adapter={paidAdapter} onClose={vi.fn()} />);
     expect(await screen.findByText(/时区未知/)).toBeInTheDocument();
     expect(screen.queryByText(/Asia\/Shanghai/)).not.toBeInTheDocument();
     expect(screen.queryByText(/时区 UTC/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["null", null],
+    ["custom string", "PST"],
+    ["numeric", 8],
+    ["boolean", false],
+    ["object", { zone: "UTC" }],
+    ["array", ["UTC"]],
+    ["exact built-in UTC", "UTC"],
+  ])("defensively shapes a %s timezone without weakening other usage and cost fields", async (_label, rawTimezone) => {
+    const transport = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(observedUsageResponse(rawTimezone)))
+      .mockResolvedValueOnce(jsonResponse(observedCostResponse(rawTimezone)));
+
+    const usage = await api.dataSourceUsage("fmp");
+    const cost = await api.dataSourceCost("fmp");
+
+    expect(usage.timezone).toBe(rawTimezone === "UTC" ? "UTC" : null);
+    expect(cost.timezone).toBe(rawTimezone === "UTC" ? "UTC" : null);
+    expect(usage.adapters[0]).toMatchObject({ day: "2026-08-20", month: "2026-08", usage_status: "observed", daily_cost: "0" });
+    expect(cost.adapters[0]).toMatchObject({ day: "2026-08-20", month: "2026-08", usage_status: "observed", monthly_cost: "0.00000000" });
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps non-timezone response fields strict while timezone is defensive", async () => {
+    const invalidUsage = observedUsageResponse({ zone: "UTC" });
+    delete invalidUsage.as_of;
+    const invalidCost = { ...observedCostResponse(undefined), free_only: "false" };
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(invalidUsage))
+      .mockResolvedValueOnce(jsonResponse(invalidCost));
+
+    await expect(api.dataSourceUsage("fmp")).rejects.toMatchObject({ status: 502 });
+    await expect(api.dataSourceCost("fmp")).rejects.toMatchObject({ status: 502 });
+  });
+
+  it.each([
+    ["usage missing", undefined, "UTC", "时区未知"],
+    ["cost missing", "UTC", undefined, "时区未知"],
+    ["both missing", undefined, undefined, "时区未知"],
+    ["custom PST", "PST", "PST", "时区未知"],
+    ["numeric", 8, 8, "时区未知"],
+    ["object", { zone: "UTC" }, { zone: "UTC" }, "时区未知"],
+    ["mismatch", "UTC", "PST", "时区未知"],
+    ["valid UTC", "UTC", "UTC", "时区 UTC"],
+  ])("keeps the period panel available when timezone is %s", async (_label, usageTimezone, costTimezone, expectedLabel) => {
+    mockRawConfigurationReads(usageTimezone, costTimezone);
+    render(<SourceConfigurationDrawer open adapter={paidAdapter} onClose={vi.fn()} />);
+
+    expect(await screen.findByText(new RegExp(expectedLabel))).toBeInTheDocument();
+    expect(screen.queryByText(/配置读取失败/)).not.toBeInTheDocument();
+    expect(screen.getAllByText("¥0")).toHaveLength(2);
+    expect(screen.getByText(/日 2026-08-20 · 月 2026-08/)).toBeInTheDocument();
+    expect(screen.queryByText(/PST|\[object Object\]/)).not.toBeInTheDocument();
   });
 
   it("traps focus, closes with Escape, and restores the opener", async () => {
