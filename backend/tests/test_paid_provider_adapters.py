@@ -150,6 +150,16 @@ class ExplodingBudget:
         raise AssertionError("budget must not run before the credential transport is safe")
 
 
+class RecordingCredentials:
+    def __init__(self, value: object) -> None:
+        self.value = value
+        self.calls: list[tuple[object, ...]] = []
+
+    def get(self, adapter_id: str, env_name: str):
+        self.calls.append((adapter_id, env_name))
+        return self.value
+
+
 def adapter_type(case: PaidCase):
     return getattr(importlib.import_module(case.module_name), case.class_name)
 
@@ -161,10 +171,17 @@ def credentials(case: PaidCase, *, configured: bool) -> MemoryCredentialStore:
     return store
 
 
-def make_adapter(case: PaidCase, *, configured: bool = True, http=None, budget_guard=None):
+def make_adapter(
+    case: PaidCase,
+    *,
+    configured: bool = True,
+    http=None,
+    budget_guard=None,
+    credential_store=None,
+):
     return adapter_type(case)(
         http=http or FakeHttp(),
-        credentials=credentials(case, configured=configured),
+        credentials=credentials(case, configured=configured) if credential_store is None else credential_store,
         budget_guard=budget_guard,
         fetched_at=lambda: NOW,
     )
@@ -192,17 +209,69 @@ def test_paid_adapter_mapping_descriptor_and_catalog_are_exact(case: PaidCase):
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
 def test_paid_adapter_no_key_short_circuits_before_request_budget_and_transport(case: PaidCase):
-    http, guard = FakeHttp(), ExplodingBudget()
-    active = make_adapter(case, configured=False, http=http, budget_guard=guard)
-    hostile = ProviderRequest(case.capability_id, HostileDict({"symbol": object()}))
+    http, guard, credential_store = FakeHttp(), ExplodingBudget(), RecordingCredentials(None)
+    active = make_adapter(
+        case,
+        configured=False,
+        http=http,
+        budget_guard=guard,
+        credential_store=credential_store,
+    )
 
     assert active.probe(case.capability_id) == {
         "status": "unconfigured",
         "connected": False,
         "health_failure": False,
     }
+    credential_store.calls.clear()
     with pytest.raises(ProviderUnavailable, match="unconfigured"):
-        active.fetch(hostile)
+        active.fetch(provider_request(case))
+    assert credential_store.calls == [(case.adapter_id, case.env_name)]
+    assert guard.calls == []
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
+@pytest.mark.parametrize("invalid_kind", ["object", "lookalike", "subclass"])
+def test_paid_fetch_rejects_nonexact_request_before_credential_state_and_transport(
+    case: PaidCase,
+    invalid_kind: str,
+):
+    credential_store, http, guard = RecordingCredentials(SECRET), FakeHttp(case.payload), ExplodingBudget()
+    active = make_adapter(case, credential_store=credential_store, http=http, budget_guard=guard)
+    invalid = {
+        "object": object(),
+        "lookalike": LookalikeProviderRequest(case.capability_id, dict(case.parameters)),
+        "subclass": HostileProviderRequest(case.capability_id, dict(case.parameters)),
+    }[invalid_kind]
+
+    with pytest.raises(TypeError, match="exact ProviderRequest required"):
+        active.fetch(invalid)
+    assert credential_store.calls == []
+    assert guard.calls == []
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.adapter_id)
+@pytest.mark.parametrize("invalid_kind", ["parameters_subclass", "capability_subclass", "symbol_subclass"])
+def test_paid_fetch_rejects_hostile_exact_request_fields_before_credential_state(
+    case: PaidCase,
+    invalid_kind: str,
+):
+    credential_store, http, guard = RecordingCredentials(None), FakeHttp(case.payload), ExplodingBudget()
+    active = make_adapter(case, credential_store=credential_store, http=http, budget_guard=guard)
+    parameters = dict(case.parameters)
+    if invalid_kind == "parameters_subclass":
+        request = ProviderRequest(case.capability_id, HostileDict(parameters))
+    elif invalid_kind == "capability_subclass":
+        request = ProviderRequest(HostileString(case.capability_id), parameters)
+    else:
+        parameters["symbol"] = HostileString(str(parameters["symbol"]))
+        request = ProviderRequest(case.capability_id, parameters)
+
+    with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
+        active.fetch(request)
+    assert credential_store.calls == []
     assert guard.calls == []
     assert http.calls == []
 

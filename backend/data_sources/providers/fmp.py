@@ -201,7 +201,7 @@ class FmpAdapter(BaseProvider):
         return tuple(row for _key, row in sorted(rows, key=lambda item: item[0]))
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
-        del request
+        FmpAdapter._context(request)
         if self._credential() is None:
             raise ProviderUnavailable("unconfigured", reference=_REFERENCE)
         raise ProviderUnavailable("unsupported_credential_transport", reference=_REFERENCE)
