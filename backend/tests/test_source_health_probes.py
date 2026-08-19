@@ -10,6 +10,7 @@ import requests
 from fund_data.models import ProviderResult
 from source_health.probe_errors import classify_probe_error, redact_url
 from source_health.probes.fund_provider import probe_provider_capability
+from source_health.probes.data_source_adapter import probe_data_source_adapter
 from source_health.registry import build_provider_descriptors
 
 
@@ -325,3 +326,56 @@ def test_probe_redacts_windows_path_on_one_line_without_swallowing_the_next(path
     assert "trace.log" not in lowered
     assert "users" not in lowered
     assert "public follow-up detail" in lowered
+
+
+def test_data_source_adapter_probe_reports_sanitized_health_metadata_without_evidence_promotion():
+    class Descriptor:
+        adapter_id = "sec-edgar"
+        source_family_id = "sec_edgar"
+        configured_reference = "https://data.sec.gov/submissions?token=not-public"
+        catalog_status = "configured"
+
+    class Adapter:
+        descriptor = Descriptor()
+
+        def probe(self, capability_id):
+            assert capability_id == "sec_company_submissions"
+            return {
+                "status": "success",
+                "connected": True,
+                "final_reference": "https://data.sec.gov/submissions?token=not-public",
+                "returned_items": 2,
+                "schema_status": "verified",
+                "content_verification_status": "candidate_only",
+            }
+
+    result = probe_data_source_adapter(Adapter(), "sec_company_submissions")
+
+    assert result["status"] == "success"
+    assert result["source_reference"] == "https://data.sec.gov/submissions"
+    assert result["final_reference"] == "https://data.sec.gov/submissions"
+    assert result["returned_items"] == 2
+    assert result["field_completeness_pct"] == 100.0
+    assert "content_verification_status" not in result
+    assert "candidate_only" not in str(result)
+
+
+def test_data_source_adapter_probe_keeps_catalog_only_as_a_non_connection_barrier():
+    class Descriptor:
+        adapter_id = "imf"
+        source_family_id = "imf"
+        configured_reference = "https://portal.api.imf.org/"
+        catalog_status = "catalog_only"
+
+    class Adapter:
+        descriptor = Descriptor()
+
+        def probe(self, _capability_id):
+            return {"status": "catalog_only", "connected": False}
+
+    result = probe_data_source_adapter(Adapter(), "macro_series")
+
+    assert result["status"] == "partial"
+    assert result["error_type"] == "none"
+    assert result["connection_status"] == "catalog_only"
+    assert result["final_reference"] is None

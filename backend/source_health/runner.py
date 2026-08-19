@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from .models import ProbeObservation, SourceDescriptor
 from .probe_errors import classify_probe_error
-from .probes import probe_news_source, probe_provider_capability
+from .probes import probe_news_source, probe_registered_provider
 from .repair_advisor import apply_repair_advice
 from .registry import public_source_reference
 from .scoring import score_observation
@@ -65,6 +65,16 @@ def _same_public_source(left: str | None, right: str | None) -> bool:
     return bool(host(left)) and host(left) == host(right)
 
 
+def _provider_key(provider: Any) -> str:
+    adapter_id = str(getattr(provider, "adapter_id", "")).strip()
+    if adapter_id:
+        return adapter_id
+    descriptor_id = str(getattr(getattr(provider, "descriptor", None), "adapter_id", "")).strip()
+    if descriptor_id:
+        return descriptor_id
+    return str(getattr(provider, "name", type(provider).__name__))
+
+
 class SourceHealthRunner:
     """Run source probes within the documented concurrency boundaries."""
 
@@ -74,7 +84,7 @@ class SourceHealthRunner:
         *,
         providers: Iterable[Any],
         news_sources: dict[str, dict[str, Any]],
-        provider_probe: Callable[..., dict[str, Any]] = probe_provider_capability,
+        provider_probe: Callable[..., dict[str, Any]] = probe_registered_provider,
         news_probe: Callable[..., dict[str, Any]] = probe_news_source,
         now: Callable[[], datetime] | None = None,
         news_timeout: float = 15,
@@ -93,10 +103,7 @@ class SourceHealthRunner:
         self._duplicate_source_ids = {
             source_id for source_id, identity in identities if counts[identity] > 1
         }
-        self._providers = {
-            str(getattr(provider, "adapter_id", getattr(provider, "name", type(provider).__name__))): provider
-            for provider in providers
-        }
+        self._providers = {_provider_key(provider): provider for provider in providers}
         self._news_sources = {key: dict(value) for key, value in news_sources.items()}
         self._provider_probe = provider_probe
         self._news_probe = news_probe

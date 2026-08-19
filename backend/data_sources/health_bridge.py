@@ -49,6 +49,10 @@ def _provider_adapter_id(provider: Any) -> str:
     configured_adapter_id = str(getattr(provider, "adapter_id", "")).strip()
     if configured_adapter_id:
         return configured_adapter_id
+    descriptor = getattr(provider, "descriptor", None)
+    descriptor_adapter_id = str(getattr(descriptor, "adapter_id", "")).strip()
+    if descriptor_adapter_id:
+        return descriptor_adapter_id
     for provider_type, adapter_id in _PROVIDER_ADAPTER_IDS:
         if isinstance(provider, provider_type):
             return adapter_id
@@ -152,7 +156,8 @@ def catalog_probe_descriptors(
         adapter = adapters_by_id.get(provider_adapter_id)
         if adapter is None:
             raise ValueError(f"Provider {type(provider).__name__} maps to unknown adapter {provider_adapter_id}")
-        available_capabilities = set(getattr(provider, "capabilities", set()))
+        descriptor = getattr(provider, "descriptor", None)
+        available_capabilities = set(getattr(provider, "capabilities", getattr(descriptor, "capability_ids", ())))
         source_name = str(getattr(provider, "name", adapter.adapter_name))
         priority = int(getattr(provider, "priority", adapter.current_provider_priority))
         for capability_id in sorted(set(adapter.capability_ids) & available_capabilities):

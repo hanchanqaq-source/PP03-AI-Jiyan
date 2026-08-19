@@ -107,6 +107,26 @@ def test_catalog_descriptors_keep_configured_reference_as_source_reference_alias
     assert row.source_reference == row.configured_reference
 
 
+def test_catalog_descriptors_accept_contract_adapter_identity_and_capabilities_without_network():
+    class Descriptor:
+        adapter_id = "sec-edgar"
+        adapter_name = "SEC EDGAR"
+        capability_ids = ("sec_company_submissions",)
+
+    class ContractAdapter:
+        descriptor = Descriptor()
+
+    [row] = catalog_probe_descriptors(
+        build_catalog({"sources": []}),
+        [ContractAdapter()],
+        {"sources": []},
+    )
+
+    assert row.adapter_id == "sec-edgar"
+    assert row.capability_id == "sec_company_submissions"
+    assert row.configured_reference == "https://data.sec.gov/"
+
+
 def test_unexamined_and_mixed_family_health_do_not_treat_missing_observations_as_failures():
     catalog = build_catalog({"sources": []})
 

@@ -464,3 +464,29 @@ def test_runner_marks_exact_duplicate_registration_but_permission_rule_keeps_pri
     distinct_results = distinct_runner.run("full", history_documents=[])
     assert {row.repair_value for row in distinct_results} == {"none"}
     distinct_runner.shutdown()
+
+
+def test_runner_uses_contract_adapter_health_probe_without_fetching_content():
+    row = descriptor("sec-edgar:sec_company_submissions", source_name="SEC EDGAR", group="fund", capability="sec_company_submissions")
+    row = SourceDescriptor(**{**row.to_dict(), "adapter_id": "sec-edgar", "capability_id": "sec_company_submissions", "configured_reference": "https://data.sec.gov/"})
+
+    class AdapterDescriptor:
+        adapter_id = "sec-edgar"
+        adapter_name = "SEC EDGAR"
+        configured_reference = "https://data.sec.gov/"
+
+    class ContractAdapter:
+        descriptor = AdapterDescriptor()
+
+        def probe(self, capability_id):
+            assert capability_id == "sec_company_submissions"
+            return {"status": "catalog_only", "connected": False}
+
+    runner = SourceHealthRunner([row], providers=[ContractAdapter()], news_sources={}, now=lambda: NOW)
+
+    [observation] = runner.run("full")
+
+    assert observation.probe_status == "partial"
+    assert observation.error_type == "none"
+    assert observation.observed_final_reference is None
+    runner.shutdown()

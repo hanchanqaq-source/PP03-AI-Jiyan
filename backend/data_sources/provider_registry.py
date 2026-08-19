@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import importlib
+from typing import Any, Callable, Mapping
+
+from .catalog import build_catalog
+from .http import SafeHttpClient
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderFactory:
+    module_name: str
+    class_name: str
+    requires_http: bool = False
+
+
+_FACTORIES: Mapping[str, _ProviderFactory] = {
+    "baostock": _ProviderFactory("data_sources.providers.baostock", "BaoStockAdapter"),
+    "gdelt": _ProviderFactory("data_sources.providers.gdelt", "GdeltAdapter", True),
+    "imf": _ProviderFactory("data_sources.providers.imf", "ImfAdapter", True),
+    "oecd": _ProviderFactory("data_sources.providers.oecd", "OecdAdapter", True),
+    "sec-edgar": _ProviderFactory("data_sources.providers.sec_edgar", "SecEdgarAdapter", True),
+    "world-bank": _ProviderFactory("data_sources.providers.world_bank", "WorldBankAdapter", True),
+    "yahoo-finance": _ProviderFactory("data_sources.providers.yahoo_finance", "YahooFinanceAdapter"),
+}
+
+
+class ProviderRegistry:
+    """Resolve free-provider implementations only when an adapter is requested.
+
+    Importing this registry (or building the Catalog) does not import optional
+    BaoStock/yfinance dependencies and does not create a transport client.
+    """
+
+    def __init__(
+        self,
+        catalog: Any | None = None,
+        *,
+        http_factory: Callable[[], Any] = SafeHttpClient,
+    ) -> None:
+        self._catalog = catalog or build_catalog({"sources": []})
+        catalog_adapter_ids = {adapter.adapter_id for adapter in self._catalog.adapters}
+        unknown = set(_FACTORIES) - catalog_adapter_ids
+        if unknown:
+            raise ValueError(f"Provider registry IDs missing from Catalog: {', '.join(sorted(unknown))}")
+        self._http_factory = http_factory
+        self._instances: dict[str, Any] = {}
+
+    def available_adapter_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(_FACTORIES))
+
+    def adapter(self, adapter_id: str) -> Any:
+        normalized = str(adapter_id).strip()
+        factory = _FACTORIES.get(normalized)
+        if factory is None:
+            raise KeyError(f"unknown provider adapter: {normalized}")
+        if normalized not in self._instances:
+            module = importlib.import_module(factory.module_name)
+            adapter_type = getattr(module, factory.class_name)
+            kwargs = {"http": self._http_factory()} if factory.requires_http else {}
+            adapter = adapter_type(**kwargs)
+            descriptor = getattr(adapter, "descriptor", None)
+            if getattr(descriptor, "adapter_id", None) != normalized:
+                raise ValueError(f"Provider implementation does not match Catalog adapter: {normalized}")
+            self._instances[normalized] = adapter
+        return self._instances[normalized]
