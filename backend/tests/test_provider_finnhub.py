@@ -74,7 +74,9 @@ def test_finnhub_news_parser_preserves_publisher_and_remains_collector_candidate
     catalog = build_catalog({"sources": []})
     assert catalog.family("finnhub").independent_evidence_eligible is False
     assert catalog.adapter("finnhub").source_roles == (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.COLLECTOR, SourceRole.CANDIDATE)
-    assert "finnhub" not in CapabilityRouter(catalog).route("news_discovery").evidence_adapter_ids
+    assert "finnhub" not in CapabilityRouter(
+        catalog, configuration={"free_only": True, "adapters": {}},
+    ).route("news_discovery").evidence_adapter_ids
 
 
 def test_finnhub_quote_parser_preserves_symbol_timestamp_and_unknown_unit():

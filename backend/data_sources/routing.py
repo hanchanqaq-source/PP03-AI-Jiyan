@@ -19,11 +19,9 @@ class CapabilityRoute:
 
 def effective_adapter_enabled(
     adapter: Any,
-    configuration: Mapping[str, Any] | None = None,
+    configuration: Mapping[str, Any],
 ) -> bool:
     """Resolve enablement from validated persisted config, failing closed."""
-    if configuration is None:
-        return adapter.default_enabled is True
     try:
         adapters = configuration.get("adapters", {})
         entry = adapters.get(adapter.adapter_id, {})
@@ -40,8 +38,10 @@ class CapabilityRouter:
         self,
         catalog: Any,
         *,
-        configuration: Mapping[str, Any] | None = None,
+        configuration: Mapping[str, Any],
     ) -> None:
+        if not isinstance(configuration, Mapping):
+            raise TypeError("configuration is required")
         self._catalog = catalog
         self._configuration = configuration
 

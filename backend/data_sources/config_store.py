@@ -346,6 +346,7 @@ class DataSourceConfigStore:
             ConfigValidationError,
             OSError,
             OverflowError,
+            RecursionError,
             UnicodeDecodeError,
             ValueError,
             json.JSONDecodeError,
@@ -366,14 +367,27 @@ class DataSourceConfigStore:
 
     def update_adapter(self, adapter_id: str, updates: Mapping[str, Any]) -> dict[str, Any]:
         """Atomically merge one adapter's non-secret settings across processes."""
-        if not isinstance(updates, Mapping):
+        if (
+            type(adapter_id) is not str
+            or len(adapter_id) > 160
+            or adapter_id not in self._adapter_ids
+        ):
+            raise ConfigValidationError("unknown adapter identifier")
+        if type(updates) is not dict:
             raise ConfigValidationError("adapter updates must be an object")
+        # Validate and copy exact built-in primitives before acquiring a lock or
+        # merging with trusted persisted state.  This prevents Mapping/str
+        # subclasses from running keys/getitem/hash/equality hooks in mutation.
+        normalized_updates = self._validate({
+            "free_only": True,
+            "adapters": {adapter_id: updates},
+        })["adapters"][adapter_id]
         with CACHE_IO_LOCK:
             with self._process_lock():
                 document = self._load_unlocked()
                 adapters = {key: dict(value) for key, value in document["adapters"].items()}
                 entry = adapters.get(adapter_id, {})
-                entry.update(updates)
+                entry.update(normalized_updates)
                 adapters[adapter_id] = entry
                 validated = self._validate({"free_only": document["free_only"], "adapters": adapters})
                 self._atomic_write(validated)

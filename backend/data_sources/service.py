@@ -13,7 +13,7 @@ import source_health
 
 from cache_io_lock import CACHE_IO_LOCK
 from .catalog import DataSourceCatalog, build_catalog
-from .budgets import BudgetGuard, BudgetPolicy
+from .budgets import BudgetGuard, BudgetPolicy, BudgetValidationError
 from .config_store import ConfigValidationError, DataSourceConfigStore
 from .credentials import (
     CredentialState,
@@ -24,7 +24,7 @@ from .credentials import (
 )
 from .models import BillingModel, CatalogStatus
 from .provider_registry import ProviderRegistry
-from .routing import effective_adapter_enabled
+from .routing import CapabilityRoute, CapabilityRouter, effective_adapter_enabled
 from source_health.probes.data_source_adapter import probe_data_source_adapter
 from .references import public_source_reference
 from .usage_store import UsageStore, UsageStoreError
@@ -440,6 +440,16 @@ class DataSourceService:
             for capability in catalog.capabilities
         ]
 
+    def capability_route(
+        self, capability_id: str, *, personal_research: bool = False,
+    ) -> CapabilityRoute:
+        """Build a production route from the latest persisted configuration."""
+        catalog = self._catalog()
+        config = self._load_config()
+        return CapabilityRouter(catalog, configuration=config).route(
+            capability_id, personal_research=personal_research,
+        )
+
     def _disabled_adapter_ids(
         self, catalog: DataSourceCatalog, config: Mapping[str, Any],
     ) -> tuple[str, ...]:
@@ -704,26 +714,84 @@ class DataSourceService:
         if (
             adapter.billing_model is not BillingModel.FREE_NO_KEY
             or adapter.auth_type != "none"
-            or not self._effective_enabled(adapter, config)
         ):
             raise DataSourceConflict("disabled")
         self._ensure_configuration_dependencies()
-        available = set(self._provider_registry.available_adapter_ids())
-        if adapter_id not in available:
-            raise DataSourceConflict("configuration_barrier")
-        capability_id = next(
-            (
-                capability_id
-                for capability_id in adapter.capability_ids
-                if self._catalog().capability(capability_id).probe_enabled
-            ),
-            None,
-        )
-        if capability_id is None:
-            raise DataSourceConflict("configuration_barrier")
-        result = probe_data_source_adapter(
-            self._provider_registry.adapter(adapter_id), capability_id,
-        )
+        now = self._now()
+        try:
+            decision = self._budget_guard.authorize(
+                adapter,
+                estimated_cost=Decimal("0"),
+                now=now,
+            )
+        except (BudgetValidationError, UsageStoreError):
+            raise DataSourceUnavailable("usage_store_unavailable") from None
+        if not decision.allowed:
+            # Preserve the existing HTTP conflict contract for persisted local
+            # disablement while still deriving it from the server-owned guard.
+            if decision.reason == "disabled":
+                raise DataSourceConflict("disabled")
+            return {
+                "adapter_id": adapter_id,
+                "status": decision.reason,
+                "connected": False,
+                "health_failure": False,
+                "last_validated_at": None,
+            }
+        if type(decision.reservation_id) is not str:
+            raise DataSourceUnavailable("usage_store_unavailable")
+
+        request_count = 0
+        usage_status = "validation_not_attempted"
+        units = Decimal("0")
+        result: Mapping[str, Any] | None = None
+        try:
+            # Registry resolution and the bounded health probe are both after
+            # authorization. Missing implementations consume no request.
+            available = set(self._provider_registry.available_adapter_ids())
+            if adapter_id not in available:
+                raise DataSourceConflict("configuration_barrier")
+            capability_id = next(
+                (
+                    capability_id
+                    for capability_id in adapter.capability_ids
+                    if self._catalog().capability(capability_id).probe_enabled
+                ),
+                None,
+            )
+            if capability_id is None:
+                raise DataSourceConflict("configuration_barrier")
+            provider = self._provider_registry.adapter(adapter_id)
+            request_count = 1
+            usage_status = "validation_failure"
+            result = probe_data_source_adapter(provider, capability_id)
+            probe_status = result.get("status")
+            usage_status = {
+                "success": "validation_success",
+                "partial": "validation_partial",
+            }.get(probe_status, "validation_failure")
+            returned_items = result.get("returned_items")
+            if (
+                type(returned_items) is int
+                and 0 <= returned_items <= 1_000_000_000
+            ):
+                units = Decimal(returned_items)
+        finally:
+            try:
+                self._budget_guard.record(
+                    adapter_id,
+                    reservation_id=decision.reservation_id,
+                    actual_cost=Decimal("0"),
+                    request_count=request_count,
+                    status=usage_status,
+                    units=units,
+                    now=now,
+                )
+            except (BudgetValidationError, UsageStoreError):
+                raise DataSourceUnavailable("usage_store_unavailable") from None
+
+        if result is None:
+            raise DataSourceUnavailable("usage_store_unavailable")
         status = str(result.get("connection_status") or result.get("status") or "failure")
         connected = result.get("status") == "success" and status == "success"
         return {
@@ -732,7 +800,7 @@ class DataSourceService:
             "status": status,
             "connected": connected,
             "health_failure": result.get("status") == "failure",
-            "last_validated_at": self._timestamp(self._now()) if connected else None,
+            "last_validated_at": self._timestamp(now) if connected else None,
         }
 
     @staticmethod

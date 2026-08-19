@@ -15,8 +15,15 @@ from data_sources.routing import CapabilityRouter
 from data_sources.catalog import DataSourceCatalog
 
 
+def _router(catalog):
+    return CapabilityRouter(
+        catalog,
+        configuration={"free_only": True, "adapters": {}},
+    )
+
+
 def test_router_preserves_catalog_primary_fallback_and_no_same_origin_cross_check():
-    route = CapabilityRouter(build_catalog({"sources": []})).route("stock_snapshot")
+    route = _router(build_catalog({"sources": []})).route("stock_snapshot")
 
     assert route.primary_adapter_ids == ("tencent-quote",)
     assert route.fallback_adapter_ids == ("eastmoney-direct",)
@@ -25,7 +32,7 @@ def test_router_preserves_catalog_primary_fallback_and_no_same_origin_cross_chec
 
 
 def test_router_keeps_baostock_independent_of_eastmoney_and_tencent():
-    route = CapabilityRouter(build_catalog({"sources": []})).route("stock_history")
+    route = _router(build_catalog({"sources": []})).route("stock_history")
 
     assert route.primary_adapter_ids == ("baostock",)
     assert route.independent_family_ids == ("baostock",)
@@ -33,7 +40,7 @@ def test_router_keeps_baostock_independent_of_eastmoney_and_tencent():
 
 
 def test_router_prioritizes_sec_official_capabilities_and_keeps_gdelt_candidate_only():
-    router = CapabilityRouter(build_catalog({"sources": []}))
+    router = _router(build_catalog({"sources": []}))
 
     assert router.route("sec_company_submissions").primary_adapter_ids == ("sec-edgar",)
     discovery = router.route("news_discovery")
@@ -45,7 +52,7 @@ def test_router_prioritizes_sec_official_capabilities_and_keeps_gdelt_candidate_
 
 
 def test_router_allows_yahoo_only_for_personal_research_and_never_as_evidence():
-    router = CapabilityRouter(build_catalog({"sources": []}))
+    router = _router(build_catalog({"sources": []}))
 
     assert router.route("overseas_stock_history").fallback_adapter_ids == ()
     research = router.route("overseas_stock_history", personal_research=True)
@@ -55,7 +62,7 @@ def test_router_allows_yahoo_only_for_personal_research_and_never_as_evidence():
 
 def test_router_rejects_unknown_capability():
     with pytest.raises(KeyError, match="unknown capability"):
-        CapabilityRouter(build_catalog({"sources": []})).route("not-a-capability")
+        _router(build_catalog({"sources": []})).route("not-a-capability")
 
 
 def test_router_preserves_requested_family_order_and_catalog_order_within_each_family():
@@ -80,6 +87,6 @@ def test_router_preserves_requested_family_order_and_catalog_order_within_each_f
         ),),
     )
 
-    route = CapabilityRouter(catalog).route(capability_id)
+    route = _router(catalog).route(capability_id)
 
     assert route.primary_adapter_ids == ("second-a", "second-z", "first-a", "first-z")

@@ -82,7 +82,9 @@ def test_news_api_parser_retains_publisher_but_never_content_source_or_corrobora
     assert catalog.family("news_api").independent_evidence_eligible is False
     assert descriptor.source_roles == (SourceRole.COLLECTOR, SourceRole.CANDIDATE)
     assert SourceRole.NEWS_PUBLISHER not in descriptor.source_roles and SourceRole.OFFICIAL_EVIDENCE not in descriptor.source_roles
-    assert "news-api" not in CapabilityRouter(catalog).route("news_discovery").evidence_adapter_ids
+    assert "news-api" not in CapabilityRouter(
+        catalog, configuration={"free_only": True, "adapters": {}},
+    ).route("news_discovery").evidence_adapter_ids
 
 
 @pytest.mark.parametrize("payload,error_type,code", [
