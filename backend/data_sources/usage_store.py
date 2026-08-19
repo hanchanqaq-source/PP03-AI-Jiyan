@@ -46,15 +46,15 @@ _MAX_LEDGER_BYTES = 64 * 1024 * 1024
 _MAX_DECIMAL_PLACES = 8
 _MAX_DECIMAL_DIGITS = 28
 _MAX_DECIMAL_ABSOLUTE = Decimal("1000000000000")
+_MAX_DECIMAL_POSITIVE_EXPONENT = 12
 _MAX_DECIMAL_TEXT_LENGTH = 64
 _MAX_REQUEST_COUNT = 1_000_000_000
 _MAX_RECORDS = 100_000
-_MAX_TEMP_SCAN_ENTRIES = 1_024
 _MAX_TIMESTAMP_LENGTH = 32
-_STALE_TEMP_SECONDS = 24 * 60 * 60
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_STATUS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_SAFE_TEMP_NAME = re.compile(r"^\.usage\.[A-Za-z0-9_-]{6,64}\.tmp$")
+_SAFE_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_MONTH = re.compile(r"^\d{4}-\d{2}$")
 _CREDENTIAL_TERMS = (
     "credential", "secret", "token", "password", "api_key", "apikey",
     "access_key", "private_key", "authorization", "bearer", "cookie",
@@ -67,19 +67,25 @@ _RECORD_FIELDS = {
 
 
 def _validate_decimal(value: object, field: str) -> Decimal:
-    if not isinstance(value, Decimal):
+    if type(value) is not Decimal:
         raise UsageValidationError(f"{field} must be a Decimal")
-    if not value.is_finite() or value < 0 or value > _MAX_DECIMAL_ABSOLUTE:
+    if not value.is_finite():
         raise UsageValidationError(f"{field} must be a finite non-negative Decimal")
     sign, digits, exponent = value.as_tuple()
-    del sign
-    if exponent < -_MAX_DECIMAL_PLACES or len(digits) > _MAX_DECIMAL_DIGITS:
+    if (
+        not isinstance(exponent, int)
+        or exponent < -_MAX_DECIMAL_PLACES
+        or exponent > _MAX_DECIMAL_POSITIVE_EXPONENT
+        or len(digits) > _MAX_DECIMAL_DIGITS
+    ):
         raise UsageValidationError(f"{field} precision is invalid")
-    return value
+    if value < 0 or value > _MAX_DECIMAL_ABSOLUTE:
+        raise UsageValidationError(f"{field} must be a finite non-negative Decimal")
+    return Decimal((sign, digits, exponent))
 
 
 def _decimal_text(value: Decimal) -> str:
-    return format(value, "f")
+    return format(_validate_decimal(value, "decimal value"), "f")
 
 
 def _validate_identifier(value: object, field: str) -> str:
@@ -240,6 +246,24 @@ class UsageSummary:
     daily_units: Decimal
     monthly_units: Decimal
 
+    def __post_init__(self) -> None:
+        _validate_identifier(self.adapter_id, "adapter_id")
+        if not isinstance(self.day, str) or not _SAFE_DAY.fullmatch(self.day):
+            raise UsageValidationError("summary day is invalid")
+        if not isinstance(self.month, str) or not _SAFE_MONTH.fullmatch(self.month):
+            raise UsageValidationError("summary month is invalid")
+        for field in ("daily_cost", "monthly_cost", "daily_units", "monthly_units"):
+            object.__setattr__(self, field, _validate_decimal(getattr(self, field), field))
+        for field in ("daily_request_count", "monthly_request_count"):
+            value = getattr(self, field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > _MAX_REQUEST_COUNT * _MAX_RECORDS
+            ):
+                raise UsageValidationError(f"{field} is invalid")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "adapter_id": self.adapter_id,
@@ -386,41 +410,11 @@ class UsageStore:
                 if time.monotonic() >= deadline:
                     raise UsageStoreError("usage lock is unavailable")
                 time.sleep(0.01)
-            self._cleanup_stale_temp_files()
             yield
         finally:
             if acquired:
                 self._unlock_file(handle)
             handle.close()
-
-    def _cleanup_stale_temp_files(self) -> None:
-        """Remove only old regular temp files created by this ledger writer."""
-        cutoff = time.time() - _STALE_TEMP_SECONDS
-        try:
-            candidates = self.root.iterdir()
-        except OSError:
-            return
-        for _index in range(_MAX_TEMP_SCAN_ENTRIES):
-            try:
-                candidate = next(candidates)
-            except StopIteration:
-                break
-            except OSError:
-                return
-            if candidate.parent != self.root or not _SAFE_TEMP_NAME.fullmatch(candidate.name):
-                continue
-            try:
-                metadata = os.lstat(candidate)
-            except OSError:
-                continue
-            if self._is_reparse_or_link(metadata) or not stat.S_ISREG(metadata.st_mode):
-                continue
-            if metadata.st_mtime > cutoff:
-                continue
-            try:
-                candidate.unlink()
-            except OSError:
-                continue
 
     def _atomic_write(self, records: Iterable[UsageRecord]) -> None:
         record_list = list(records)

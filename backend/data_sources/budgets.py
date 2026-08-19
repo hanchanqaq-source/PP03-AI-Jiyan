@@ -8,7 +8,7 @@ from decimal import Decimal
 import re
 from typing import Mapping
 
-from .models import AdapterDescriptor, BillingModel
+from .models import AdapterDescriptor, BillingModel, CatalogStatus, SourceRole
 from .usage_store import (
     UsageBudgetExceeded,
     UsageRecord,
@@ -22,25 +22,97 @@ class BudgetValidationError(ValueError):
 
 
 _MAX_DECIMAL_ABSOLUTE = Decimal("1000000000000")
+_MAX_DECIMAL_POSITIVE_EXPONENT = 12
+_MAX_TEXT_LENGTH = 8_192
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 def _decimal(value: object, field: str) -> Decimal:
-    if not isinstance(value, Decimal):
+    if type(value) is not Decimal:
         raise BudgetValidationError(f"{field} must be a Decimal")
-    if not value.is_finite() or value < 0 or value > _MAX_DECIMAL_ABSOLUTE:
+    if not value.is_finite():
         raise BudgetValidationError(f"{field} must be a finite non-negative Decimal")
-    _sign, digits, exponent = value.as_tuple()
-    if exponent < -8 or len(digits) > 28:
+    sign, digits, exponent = value.as_tuple()
+    if (
+        not isinstance(exponent, int)
+        or exponent < -8
+        or exponent > _MAX_DECIMAL_POSITIVE_EXPONENT
+        or len(digits) > 28
+    ):
         raise BudgetValidationError(f"{field} precision is invalid")
-    return value
+    if value < 0 or value > _MAX_DECIMAL_ABSOLUTE:
+        raise BudgetValidationError(f"{field} must be a finite non-negative Decimal")
+    return Decimal((sign, digits, exponent))
 
 
 def _identifier(value: object) -> str:
     if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
         raise BudgetValidationError("adapter_id is invalid")
     return value
+
+
+def _text(value: object, field: str) -> str:
+    if type(value) is not str or len(value) > _MAX_TEXT_LENGTH:
+        raise BudgetValidationError(f"trusted descriptor {field} is invalid")
+    return value
+
+
+def _text_tuple(value: object, field: str) -> tuple[str, ...]:
+    if type(value) is not tuple or len(value) > 128:
+        raise BudgetValidationError(f"trusted descriptor {field} is invalid")
+    return tuple(_text(item, field) for item in value)
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedAdapterIdentity:
+    adapter_id: str
+    billing_model: BillingModel
+    canonical: tuple[object, ...]
+
+
+def _descriptor_identity(descriptor: object) -> _TrustedAdapterIdentity:
+    if type(descriptor) is not AdapterDescriptor:
+        raise BudgetValidationError("adapter is not a trusted descriptor")
+    adapter_id = _identifier(descriptor.adapter_id)
+    if type(descriptor.source_roles) is not tuple or len(descriptor.source_roles) > 32:
+        raise BudgetValidationError("trusted descriptor source_roles is invalid")
+    if any(type(role) is not SourceRole for role in descriptor.source_roles):
+        raise BudgetValidationError("trusted descriptor source_roles is invalid")
+    if type(descriptor.billing_model) is not BillingModel:
+        raise BudgetValidationError("trusted descriptor billing_model is invalid")
+    if type(descriptor.catalog_status) is not CatalogStatus:
+        raise BudgetValidationError("trusted descriptor catalog_status is invalid")
+    if type(descriptor.default_enabled) is not bool:
+        raise BudgetValidationError("trusted descriptor default_enabled is invalid")
+    if (
+        isinstance(descriptor.current_provider_priority, bool)
+        or not isinstance(descriptor.current_provider_priority, int)
+        or abs(descriptor.current_provider_priority) > 1_000_000
+    ):
+        raise BudgetValidationError("trusted descriptor priority is invalid")
+    billing_model = BillingModel(descriptor.billing_model.value)
+    canonical: tuple[object, ...] = (
+        adapter_id,
+        _text(descriptor.adapter_name, "adapter_name"),
+        _text(descriptor.source_family_id, "source_family_id"),
+        _text(descriptor.provider_type, "provider_type"),
+        tuple(role.value for role in descriptor.source_roles),
+        _text_tuple(descriptor.capability_ids, "capability_ids"),
+        billing_model.value,
+        _text(descriptor.auth_type, "auth_type"),
+        _text_tuple(descriptor.credential_env_names, "credential_env_names"),
+        descriptor.default_enabled,
+        _text(descriptor.license_note, "license_note"),
+        _text(descriptor.usage_note, "usage_note"),
+        _text(descriptor.data_delay, "data_delay"),
+        _text(descriptor.quota_policy, "quota_policy"),
+        _text(descriptor.cost_policy, "cost_policy"),
+        _text(descriptor.configured_reference, "configured_reference"),
+        descriptor.current_provider_priority,
+        descriptor.catalog_status.value,
+    )
+    return _TrustedAdapterIdentity(adapter_id, billing_model, canonical)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +156,7 @@ class BudgetDecision:
             "allowed": self.allowed,
             "reason": self.reason,
             "reservation_id": self.reservation_id,
-            "estimated_cost": format(self.estimated_cost, "f"),
+            "estimated_cost": format(_decimal(self.estimated_cost, "estimated_cost"), "f"),
             "health_failure": self.health_failure,
         }
 
@@ -105,16 +177,25 @@ class BudgetGuard:
             raise BudgetValidationError("policies must be a mapping")
         normalized: dict[str, BudgetPolicy] = {}
         for adapter_id, policy in policies.items():
-            if not isinstance(policy, BudgetPolicy) or adapter_id != policy.adapter_id:
+            if type(policy) is not BudgetPolicy or adapter_id != policy.adapter_id:
                 raise BudgetValidationError("policy mapping is invalid")
-            normalized[adapter_id] = policy
+            normalized[adapter_id] = BudgetPolicy(
+                adapter_id=policy.adapter_id,
+                enabled=policy.enabled,
+                configured=policy.configured,
+                free_only=policy.free_only,
+                daily_budget=policy.daily_budget,
+                monthly_budget=policy.monthly_budget,
+                per_request_budget=policy.per_request_budget,
+            )
         if not isinstance(trusted_adapters, Mapping):
             raise BudgetValidationError("trusted adapters must be a mapping")
-        trusted: dict[str, AdapterDescriptor] = {}
+        trusted: dict[str, _TrustedAdapterIdentity] = {}
         for adapter_id, descriptor in trusted_adapters.items():
-            if type(descriptor) is not AdapterDescriptor or adapter_id != descriptor.adapter_id:
+            identity = _descriptor_identity(descriptor)
+            if adapter_id != identity.adapter_id:
                 raise BudgetValidationError("trusted adapter mapping is invalid")
-            trusted[adapter_id] = descriptor
+            trusted[adapter_id] = identity
         if set(normalized) - set(trusted):
             raise BudgetValidationError("policy is missing a trusted adapter")
         self.usage_store = usage_store
@@ -134,13 +215,12 @@ class BudgetGuard:
         reservation_id: str | None = None,
     ) -> BudgetDecision:
         estimate = _decimal(estimated_cost, "estimated_cost")
-        if type(adapter) is not AdapterDescriptor:
-            raise BudgetValidationError("adapter is not a trusted descriptor")
-        adapter_id = _identifier(adapter.adapter_id)
+        candidate = _descriptor_identity(adapter)
+        adapter_id = candidate.adapter_id
         trusted = self._trusted_adapters.get(adapter_id)
         if trusted is None:
             raise BudgetValidationError("adapter is not in the trusted catalog")
-        if adapter != trusted:
+        if candidate.canonical != trusted.canonical:
             raise BudgetValidationError("adapter does not match the trusted catalog")
         billing_model = trusted.billing_model
         policy = self._policies.get(adapter_id)

@@ -336,14 +336,93 @@ def test_guard_authorizes_only_matching_trusted_descriptor(tmp_path):
 
 @pytest.mark.parametrize(
     "value",
-    [Decimal("1E+1000000"), Decimal("1000000000000.01"), Decimal("9" * 29)],
+    [
+        Decimal("1E+1000000"),
+        Decimal("0E+1000000"),
+        Decimal("-0E+1000000"),
+        Decimal("1000000000000.01"),
+        Decimal("9" * 29),
+    ],
 )
 def test_policy_rejects_pathological_or_above_ceiling_decimal_magnitude(value: Decimal):
     with pytest.raises(BudgetValidationError):
         _policy(daily_budget=value)
 
 
-@pytest.mark.parametrize("value", [1.0, Decimal("1E+1000000"), Decimal("1000000000000.01")])
+@pytest.mark.parametrize(
+    "value",
+    [1.0, Decimal("1E+1000000"), Decimal("0E+1000000"), Decimal("-0E+1000000"), Decimal("1000000000000.01")],
+)
 def test_public_budget_decision_rejects_unsafe_decimal_before_serialization(value: object):
     with pytest.raises(BudgetValidationError):
         BudgetDecision(True, "authorized", "decision-id", value)
+
+
+def test_budget_decision_revalidates_decimal_at_serialization_boundary():
+    decision = BudgetDecision(
+        True, "authorized", "decision-id", Decimal("0.01")
+    )
+    object.__setattr__(decision, "estimated_cost", Decimal("0E+13"))
+
+    with pytest.raises(BudgetValidationError):
+        decision.to_dict()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("0E+12"), Decimal("-0E+12"), Decimal("1E+12"), Decimal("1E-8")],
+)
+def test_budget_decimal_accepts_explicit_exponent_boundaries(value: Decimal):
+    policy = _policy(daily_budget=value)
+
+    assert policy.daily_budget.as_tuple() == value.as_tuple()
+
+
+@pytest.mark.parametrize("value", [Decimal("0E+13"), Decimal("-0E+13"), Decimal("1E+13"), Decimal("1E-9")])
+def test_budget_decimal_rejects_values_outside_exponent_boundaries(value: Decimal):
+    with pytest.raises(BudgetValidationError):
+        _policy(daily_budget=value)
+
+
+def test_guard_snapshots_policy_values_and_input_mappings_against_alias_mutation(tmp_path):
+    descriptor = _trusted_adapter()
+    policy = _policy(free_only=True)
+    policies = {"paid-test": policy}
+    trusted = {"paid-test": descriptor}
+    guard = BudgetGuard(
+        UsageStore(tmp_path / "data"), policies, trusted_adapters=trusted
+    )
+
+    object.__setattr__(policy, "free_only", False)
+    object.__setattr__(policy, "daily_budget", Decimal("1000000000000"))
+    policies.clear()
+    trusted.clear()
+
+    decision = guard.authorize(
+        _trusted_adapter(), estimated_cost=Decimal("0.01"), now=NOW
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "free_only"
+    assert guard.usage_store.records(now=NOW) == ()
+
+
+def test_guard_snapshots_descriptor_primitives_against_object_setattr_mutation(tmp_path):
+    descriptor = _trusted_adapter()
+    guard = BudgetGuard(
+        UsageStore(tmp_path / "data"),
+        {"paid-test": _policy(free_only=True)},
+        trusted_adapters={"paid-test": descriptor},
+    )
+
+    object.__setattr__(descriptor, "billing_model", BillingModel.FREE_NO_KEY)
+    object.__setattr__(descriptor, "adapter_id", "mutated-id")
+
+    with pytest.raises(BudgetValidationError, match="trusted"):
+        guard.authorize(descriptor, estimated_cost=Decimal("0"), now=NOW)
+
+    unchanged = guard.authorize(
+        _trusted_adapter(), estimated_cost=Decimal("0.01"), now=NOW
+    )
+    assert unchanged.allowed is False
+    assert unchanged.reason == "free_only"

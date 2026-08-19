@@ -19,6 +19,7 @@ from data_sources.usage_store import (
     UsageRecord,
     UsageStore,
     UsageStoreError,
+    UsageSummary,
     UsageValidationError,
 )
 
@@ -354,7 +355,13 @@ def test_configurable_ledger_size_has_a_hard_upper_bound(tmp_path, max_ledger_by
 
 @pytest.mark.parametrize(
     "value",
-    [Decimal("1E+1000000"), Decimal("1000000000000.01"), Decimal("9" * 29)],
+    [
+        Decimal("1E+1000000"),
+        Decimal("0E+1000000"),
+        Decimal("-0E+1000000"),
+        Decimal("1000000000000.01"),
+        Decimal("9" * 29),
+    ],
 )
 def test_usage_decimal_rejects_pathological_or_above_ceiling_magnitude(store: UsageStore, value: Decimal):
     with pytest.raises(UsageValidationError):
@@ -365,6 +372,85 @@ def test_usage_decimal_rejects_pathological_or_above_ceiling_magnitude(store: Us
             monthly_budget=Decimal("1000000000000"),
             now=NOW,
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [Decimal("0E+12"), Decimal("-0E+12"), Decimal("1E+12"), Decimal("1E-8")],
+)
+def test_usage_decimal_accepts_explicit_exponent_boundaries(store: UsageStore, value: Decimal):
+    record = store.reserve(
+        "paid-test",
+        estimated_cost=value,
+        daily_budget=Decimal("1000000000000"),
+        monthly_budget=Decimal("1000000000000"),
+        now=NOW,
+    )
+
+    assert record.estimated_cost.as_tuple() == value.as_tuple()
+
+
+def test_direct_usage_record_and_summary_reject_extreme_zero_exponents():
+    with pytest.raises(UsageValidationError):
+        UsageRecord(
+            reservation_id="extreme-record",
+            adapter_id="paid-test",
+            authorized_at=NOW,
+            recorded_at=None,
+            estimated_cost=Decimal("0E+1000000"),
+            actual_cost=None,
+            request_count=0,
+            status="reserved",
+            units=Decimal("0"),
+        )
+
+    with pytest.raises(UsageValidationError):
+        UsageSummary(
+            adapter_id="paid-test",
+            day="2026-08-19",
+            month="2026-08",
+            daily_cost=Decimal("0E+1000000"),
+            monthly_cost=Decimal("0"),
+            daily_request_count=0,
+            monthly_request_count=0,
+            daily_units=Decimal("0"),
+            monthly_units=Decimal("0"),
+        )
+
+
+def test_extreme_exponent_ledger_is_rejected_before_fixed_point_formatting(
+    store: UsageStore, monkeypatch: pytest.MonkeyPatch
+):
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "reservation_id": "extreme-ledger",
+                        "adapter_id": "paid-test",
+                        "authorized_at": "2026-08-19T12:00:00Z",
+                        "recorded_at": None,
+                        "estimated_cost": "0E+1000000",
+                        "actual_cost": None,
+                        "request_count": 0,
+                        "status": "reserved",
+                        "units": "0",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def forbidden_format(_value):
+        raise AssertionError("invalid exponent reached fixed-point formatting")
+
+    monkeypatch.setattr("data_sources.usage_store._decimal_text", forbidden_format)
+
+    with pytest.raises(UsageStoreError):
+        store.records(now=NOW)
 
 
 def test_request_count_has_a_hard_ceiling_before_serialization(store: UsageStore):
@@ -473,7 +559,7 @@ def test_lock_timeout_fails_closed_before_writing(store: UsageStore, monkeypatch
     assert not store.path.exists()
 
 
-def test_process_lock_cleans_only_stale_matching_regular_temp_files(tmp_path):
+def test_process_lock_preserves_preexisting_matching_and_foreign_temp_files(tmp_path):
     store = UsageStore(tmp_path / "data")
     store.root.mkdir(parents=True)
     stale = store.root / ".usage.abcdef12.tmp"
@@ -486,7 +572,7 @@ def test_process_lock_cleans_only_stale_matching_regular_temp_files(tmp_path):
 
     store.records(now=NOW)
 
-    assert not stale.exists()
+    assert stale.exists()
     assert recent.exists()
     assert foreign.exists()
 
@@ -519,21 +605,39 @@ def test_stale_temp_cleanup_does_not_unlink_reparse_candidate(
     assert candidate.exists()
 
 
-def test_stale_temp_cleanup_bounds_directory_scan(tmp_path, monkeypatch: pytest.MonkeyPatch):
+def test_process_lock_does_not_scan_for_preexisting_temp_files(tmp_path, monkeypatch: pytest.MonkeyPatch):
     store = UsageStore(tmp_path / "data")
-    yielded = 0
 
-    def many_foreign_entries(_path):
-        nonlocal yielded
-        for index in range(2_000):
-            yielded += 1
-            yield store.root / f"foreign-{index}"
+    def forbidden_scan(_path):
+        raise AssertionError("usage lock must not scan unknown temp files")
 
-    monkeypatch.setattr("data_sources.usage_store.Path.iterdir", many_foreign_entries)
+    monkeypatch.setattr("data_sources.usage_store.Path.iterdir", forbidden_scan)
 
     store.records(now=NOW)
 
-    assert yielded == 1_024
+
+def test_process_lock_never_unlinks_old_matching_replacement_target(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    store = UsageStore(tmp_path / "data")
+    store.root.mkdir(parents=True)
+    candidate = store.root / ".usage.replaced.tmp"
+    candidate.write_text("must remain", encoding="utf-8")
+    old = datetime.now(tz=timezone.utc).timestamp() - (25 * 60 * 60)
+    os.utime(candidate, (old, old))
+    original_unlink = Path.unlink
+    unlinked: list[Path] = []
+
+    def record_unlink(path, *args, **kwargs):
+        unlinked.append(Path(path))
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr("data_sources.usage_store.Path.unlink", record_unlink)
+
+    store.records(now=NOW)
+
+    assert unlinked == []
+    assert candidate.read_text(encoding="utf-8") == "must remain"
 
 
 @pytest.mark.parametrize("timeout", [True, False, "1", None, 0, -1, 0.0, math.nan, math.inf, -math.inf, 10**1000])
