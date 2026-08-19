@@ -100,6 +100,11 @@ class _DefaultCredentialStore:
 
 
 _MAX_AUTHORIZATION_CONTEXTS = 4_096
+_VALIDATION_USAGE_STATUSES = frozenset({
+    "validation_success",
+    "validation_partial",
+    "validation_failure",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,12 +142,17 @@ class _AuthorizationSettlement:
             raise BudgetValidationError("authorization settlement is invalid")
         if (
             not self.actual_cost.is_finite()
-            or self.actual_cost < 0
+            or self.actual_cost != 0
             or not self.units.is_finite()
             or self.units < 0
-            or self.request_count < 0
-            or self.request_count > 1_000_000_000
-            or not _USAGE_MODE.fullmatch(self.status)
+            or self.units != self.units.to_integral_value()
+            or self.units > 1_000_000_000
+            or self.request_count != 1
+            or self.status not in _VALIDATION_USAGE_STATUSES
+            or (
+                self.status == "validation_failure"
+                and self.units != 0
+            )
         ):
             raise BudgetValidationError("authorization settlement is invalid")
 
@@ -274,11 +284,9 @@ class _ServerAuthorizationGuard:
                 context = replace(context, settlement=settlement)
                 self._contexts[reservation_id] = context
             try:
-                intent = context.usage_store.stage_reconciliation(
+                context.usage_store._stage_validation_reconciliation(
                     settlement.adapter_id,
                     reservation_id=settlement.reservation_id,
-                    actual_cost=settlement.actual_cost,
-                    request_count=settlement.request_count,
                     status=settlement.status,
                     units=settlement.units,
                     recorded_at=settlement.recorded_at,
@@ -303,17 +311,51 @@ class _ServerAuthorizationGuard:
                 except (BudgetValidationError, UsageConflictError, UsageStoreError):
                     self._service._mark_usage_reconciliation_pending()
                     raise
+            self._completed_contexts.add(reservation_id)
+            return record
+
+    def cancel_unattempted(
+        self, adapter_id: str, *, reservation_id: str, now: datetime,
+    ):
+        """Close a pre-probe reservation without creating replay authority."""
+        if (
+            type(adapter_id) is not str
+            or type(reservation_id) is not str
+            or type(now) is not datetime
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            raise BudgetValidationError("authorization cancellation is invalid")
+        with self._context_lock:
+            context = self._contexts.get(reservation_id)
+            if (
+                context is None
+                or context.adapter_id != adapter_id
+                or context.reservation_id != reservation_id
+                or context.settlement is not None
+                or context.decision.allowed is not True
+                or context.decision.reservation_id != reservation_id
+            ):
+                raise BudgetValidationError("authorization context is unavailable")
+            kwargs = {
+                "reservation_id": reservation_id,
+                "actual_cost": Decimal("0"),
+                "request_count": 0,
+                "status": "validation_not_attempted",
+                "units": Decimal("0"),
+                "now": now,
+            }
             try:
-                completion_now = self._service._now()
-                if completion_now < settlement.recorded_at:
-                    completion_now = settlement.recorded_at
-                context.usage_store.complete_reconciliation(
-                    intent,
-                    now=completion_now,
-                )
-            except (DataSourceUnavailable, UsageStoreError):
+                record = context.guard.record(adapter_id, **kwargs)
+            except (BudgetValidationError, UsageConflictError):
                 self._service._mark_usage_reconciliation_pending()
                 raise
+            except UsageStoreError:
+                try:
+                    record = context.guard.record(adapter_id, **kwargs)
+                except (BudgetValidationError, UsageConflictError, UsageStoreError):
+                    self._service._mark_usage_reconciliation_pending()
+                    raise
             self._completed_contexts.add(reservation_id)
             return record
 
@@ -407,7 +449,13 @@ class DataSourceService:
 
     def _assert_usage_reconciliation_ready(self) -> None:
         with self._usage_recovery_lock:
-            if not self._usage_recovery_attempted or not self._usage_recovery_ready:
+            if self._usage_recovery_attempted and self._usage_recovery_ready:
+                return
+        # One bounded pass per controlled authorization entry prevents a
+        # transient in-flight observation from becoming a permanent latch.
+        self.recover_usage_reconciliation()
+        with self._usage_recovery_lock:
+            if not self._usage_recovery_ready:
                 raise UsageStoreError("usage reconciliation is pending")
 
     def recover_usage_reconciliation(self) -> dict[str, object]:
@@ -957,10 +1005,11 @@ class DataSourceService:
         if type(decision.reservation_id) is not str:
             raise DataSourceUnavailable("usage_store_unavailable")
 
-        request_count = 0
-        usage_status = "validation_not_attempted"
+        probe_started = False
+        usage_status = "validation_failure"
         units = Decimal("0")
         result: Mapping[str, Any] | None = None
+        recorded_at: datetime | None = None
         try:
             # Registry resolution and the bounded health probe are both after
             # authorization. Missing implementations consume no request.
@@ -978,8 +1027,7 @@ class DataSourceService:
             if capability_id is None:
                 raise DataSourceConflict("configuration_barrier")
             provider = self._provider_registry.adapter(adapter_id)
-            request_count = 1
-            usage_status = "validation_failure"
+            probe_started = True
             result = probe_data_source_adapter(provider, capability_id)
             probe_status = result.get("status")
             usage_status = {
@@ -988,22 +1036,31 @@ class DataSourceService:
             }.get(probe_status, "validation_failure")
             returned_items = result.get("returned_items")
             if (
-                type(returned_items) is int
+                usage_status != "validation_failure"
+                and type(returned_items) is int
                 and 0 <= returned_items <= 1_000_000_000
             ):
                 units = Decimal(returned_items)
         finally:
             try:
-                self._budget_guard.record(
-                    adapter_id,
-                    reservation_id=decision.reservation_id,
-                    actual_cost=Decimal("0"),
-                    request_count=request_count,
-                    status=usage_status,
-                    units=units,
-                    now=now,
-                )
-            except (BudgetValidationError, UsageStoreError):
+                recorded_at = self._now()
+                if probe_started:
+                    self._budget_guard.record(
+                        adapter_id,
+                        reservation_id=decision.reservation_id,
+                        actual_cost=Decimal("0"),
+                        request_count=1,
+                        status=usage_status,
+                        units=units,
+                        now=recorded_at,
+                    )
+                else:
+                    self._budget_guard.cancel_unattempted(
+                        adapter_id,
+                        reservation_id=decision.reservation_id,
+                        now=recorded_at,
+                    )
+            except (BudgetValidationError, UsageConflictError, UsageStoreError):
                 raise DataSourceUnavailable("usage_store_unavailable") from None
 
         if result is None:
@@ -1016,7 +1073,7 @@ class DataSourceService:
             "status": status,
             "connected": connected,
             "health_failure": result.get("status") == "failure",
-            "last_validated_at": self._timestamp(now) if connected else None,
+            "last_validated_at": self._timestamp(recorded_at) if connected else None,
         }
 
     @staticmethod

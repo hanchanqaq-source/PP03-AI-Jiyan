@@ -563,7 +563,9 @@ def test_permanent_reconcile_error_is_redacted_and_preserves_fail_closed_reserva
     assert provider.calls == ["macro_indicator"]
     assert len(records) == 1
     assert records[0].actual_cost is None
-    assert records[0].status == "reserved"
+    assert records[0].recorded_at == NOW
+    assert records[0].request_count == 1
+    assert records[0].status == "validation_success"
 
     usage.reconcile = original_reconcile
     recovered = service._budget_guard.record(
