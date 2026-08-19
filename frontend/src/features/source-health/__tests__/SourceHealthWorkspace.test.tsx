@@ -83,6 +83,7 @@ describe("SourceHealthWorkspace", () => {
       finished_at: "2026-08-18T06:31:00Z", total: 5, completed: 5, success: 3, partial: 1,
       failure: 1, current_source: "财经资讯源",
     });
+    vi.spyOn(api, "dataSourceCatalog").mockRejectedValue(new Error("catalog unavailable"));
   });
 
   it("renders the real compact summary and complete source library directly on the page", async () => {
@@ -258,10 +259,13 @@ describe("SourceHealthWorkspace", () => {
       portfolio_relation: { status: "unavailable_no_holdings" }, capabilities: [],
       families: [{ source_family_id: "news", source_family_name: "公开资讯家族", region: "CN", market: "news", source_roles: ["news_publisher"], independent_evidence_eligible: true, commercial_use_status: "publisher_terms_apply", catalog_status: "catalog_only", health_status: "unexamined", adapters: [] }],
     };
-    vi.spyOn(api, "dataSourceCatalog").mockResolvedValue(catalog);
+    const load = vi.spyOn(api, "dataSourceCatalog").mockResolvedValue(catalog);
+    const legacy = vi.spyOn(api, "sourceHealthSources");
     render(<SourceHealthWorkspace />);
     expect(await screen.findByText("公开资讯家族")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "数据源健康状态栏" })).toBeInTheDocument();
     expect(screen.getByText("108 个资讯来源")).toBeInTheDocument();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(legacy).not.toHaveBeenCalled();
   });
 });

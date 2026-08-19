@@ -49,6 +49,10 @@ function SourceRow({ source }: { source: SourceHealthSource }) {
         <p>最近成功：{lastSuccess}</p><p>连续失败：{source.consecutive_failures}</p>
         <p>修复价值：{repairLabels[source.repair_value] || source.repair_value || "暂无建议"}</p>
       </div>
+      <div className="mt-3 grid gap-2 border-t border-border/45 pt-3 text-xs text-muted-foreground sm:grid-cols-2">
+        <p className="break-all">配置公开地址：{source.configured_reference || "暂无公开地址"}</p>
+        <p className="break-all">观测公开地址：{source.observed_final_reference || "尚未体检"}</p>
+      </div>
       {hasFailureDetails && (
         <div className="mt-3 border-t border-border/45 pt-3">
           <button onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} aria-label={`${expanded ? "收起" : "查看"}失败详情 ${source.source_name}`} className="inline-flex items-center gap-1 text-xs font-medium text-warning hover:text-foreground">
@@ -58,9 +62,6 @@ function SourceRow({ source }: { source: SourceHealthSource }) {
             <div className="mt-3 grid gap-2 rounded-lg border border-warning/25 bg-warning/5 p-3 text-xs text-muted-foreground sm:grid-cols-2">
               <p>错误类型：{errorLabels[source.error_type] || "未知错误"}</p>
               <p>脱敏原因：{source.error_message_redacted || "暂无公开错误说明"}</p>
-              <p className="break-all sm:col-span-2">配置公开地址：{source.configured_reference || "暂无公开地址"}</p>
-              {source.observed_final_reference && <p className="break-all sm:col-span-2">观测公开地址：{source.observed_final_reference}</p>}
-              {!source.observed_final_reference && <p className="sm:col-span-2">观测公开地址：尚未体检</p>}
               <p>是否重定向：{source.redirected ? "是" : "否"}</p>
               <p>是否有备用来源：{source.fallback_available ? "是" : "否"}</p>
               <p className="sm:col-span-2">建议处理：{source.repair_reason || "继续观察公开来源"}</p>
@@ -74,6 +75,7 @@ function SourceRow({ source }: { source: SourceHealthSource }) {
 
 export function SourceHealthDrawer({ open, onClose, refreshToken = 0 }: SourceHealthDrawerProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLElement>(null);
   const [sources, setSources] = useState<SourceHealthSource[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
@@ -83,7 +85,15 @@ export function SourceHealthDrawer({ open, onClose, refreshToken = 0 }: SourceHe
   useEffect(() => {
     if (!open) return;
     closeRef.current?.focus();
-    const handleKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { onClose(); return; }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])') || []);
+      if (!focusable.length) return;
+      const first = focusable[0]; const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
   }, [onClose, open]);
@@ -113,7 +123,7 @@ export function SourceHealthDrawer({ open, onClose, refreshToken = 0 }: SourceHe
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 bg-black/65" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
-      <aside role="dialog" aria-modal="true" aria-label="数据源健康详情" className="ml-auto flex h-full w-full max-w-5xl flex-col border-l border-primary/25 bg-background/95 shadow-2xl backdrop-blur-xl">
+      <aside ref={dialogRef} role="dialog" aria-modal="true" aria-label="数据源健康详情" className="ml-auto flex h-full w-full max-w-5xl flex-col border-l border-primary/25 bg-background/95 shadow-2xl backdrop-blur-xl">
         <header className="flex items-start justify-between border-b border-border/60 px-5 py-4">
           <div><h2 className="text-xl font-bold">数据源健康详情</h2><p className="mt-1 text-xs text-muted-foreground">仅显示公开探测结果和脱敏后的修复信息</p></div>
           <button ref={closeRef} onClick={onClose} aria-label="关闭数据源健康详情" className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-foreground"><X className="h-5 w-5" /></button>

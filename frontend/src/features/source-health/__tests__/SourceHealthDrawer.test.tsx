@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { directEvent, marketNewsResponse } from "@/features/market-news/__tests__/fixtures";
@@ -19,6 +19,8 @@ const sources = [
     data_as_of_date: "2026-08-18", freshness_seconds: 0, field_completeness_pct: 100, used_cache: false,
     cache_status: "not_used", fallback_available: true, redirected: false, final_reference: "https://fund.example.test/public",
     rating_score: 96, rating: "healthy", rating_confidence: "initial", repair_value: "none", repair_reason: "无需处理", consecutive_failures: 0, last_success_at: "2026-08-18T06:30:00+00:00",
+    source_family_id: "eastmoney", adapter_id: "eastmoney-direct", capability_id: "profile",
+    configured_reference: "https://fund.example.test/configured", observed_final_reference: "https://fund.example.test/public",
   },
   {
     source_id: "news:finance", source_name: "财经资讯源", group: "news", capability: "公开资讯",
@@ -96,5 +98,27 @@ describe("source health drawer through MarketNews", () => {
     expect(screen.queryByText("东方财富基金")).not.toBeInTheDocument();
     expect(screen.getByText("财经资讯源")).toBeInTheDocument();
     expect(screen.getByText("状态：失败")).toBeInTheDocument();
+  });
+
+  it("shows configured and observed public references for a healthy source without failure expansion", async () => {
+    const user = await openDrawer();
+    await user.click(screen.getByRole("button", { name: "只看基金与行情 Provider" }));
+    expect(screen.getByText("稳定身份：eastmoney / eastmoney-direct / profile")).toBeInTheDocument();
+    expect(screen.getByText("配置公开地址：https://fund.example.test/configured")).toBeInTheDocument();
+    expect(screen.getByText("观测公开地址：https://fund.example.test/public")).toBeInTheDocument();
+  });
+
+  it("contains Tab navigation and keeps Escape closing the drawer", async () => {
+    const user = await openDrawer();
+    const drawer = screen.getByRole("dialog", { name: "数据源健康详情" });
+    const close = within(drawer).getByRole("button", { name: "关闭数据源健康详情" });
+    const last = within(drawer).getByRole("button", { name: "查看失败详情 财经资讯源" });
+    expect(close).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(last).toHaveFocus();
+    await user.tab();
+    expect(close).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "数据源健康详情" })).not.toBeInTheDocument();
   });
 });

@@ -9,18 +9,19 @@ const initialFilters: CatalogFiltersValue = { search: "", billing: "all", catalo
 
 function matches(family: SourceFamilyView, filters: CatalogFiltersValue): boolean {
   const phrase = filters.search.trim().toLocaleLowerCase("zh-CN");
-  const adapters = family.adapters.filter((adapter) => (filters.billing === "all" || adapter.billing_model === filters.billing) && (filters.catalogStatus === "all" || adapter.catalog_status === filters.catalogStatus) && (filters.healthStatus === "all" || adapter.health_status === filters.healthStatus || adapter.capabilities.some((capability) => capability.health_status === filters.healthStatus)));
-  if (filters.billing !== "all" || filters.catalogStatus !== "all" || filters.healthStatus !== "all") return adapters.length > 0;
-  if (!phrase) return true;
-  return [family.source_family_name, family.source_family_id, ...family.adapters.flatMap((adapter) => [adapter.adapter_name, adapter.adapter_id, ...adapter.capabilities.flatMap((capability) => [capability.capability_name, capability.capability_id])])].some((value) => value.toLocaleLowerCase("zh-CN").includes(phrase));
+  const textMatches = !phrase || [family.source_family_name, family.source_family_id, ...family.adapters.flatMap((adapter) => [adapter.adapter_name, adapter.adapter_id, ...adapter.capabilities.flatMap((capability) => [capability.capability_name, capability.capability_id])])].some((value) => value.toLocaleLowerCase("zh-CN").includes(phrase));
+  const statusMatches = filters.healthStatus === "all" || family.health_status === filters.healthStatus || family.adapters.some((adapter) => adapter.health_status === filters.healthStatus || adapter.capabilities.some((capability) => capability.health_status === filters.healthStatus));
+  const adapters = family.adapters.filter((adapter) => (filters.billing === "all" || adapter.billing_model === filters.billing) && (filters.catalogStatus === "all" || adapter.catalog_status === filters.catalogStatus));
+  const selectMatches = (filters.billing === "all" && filters.catalogStatus === "all" || adapters.length > 0) && statusMatches;
+  return textMatches && selectMatches;
 }
 
-export function SourceCatalogWorkspace() {
+export function SourceCatalogWorkspace({ onCatalogUnavailable }: { onCatalogUnavailable?: () => void }) {
   const [catalog, setCatalog] = useState<DataSourceCatalogResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [filters, setFilters] = useState(initialFilters);
-  useEffect(() => { let active = true; api.dataSourceCatalog().then((value) => { if (active) { setCatalog(value); setError(false); } }).catch(() => { if (active) setError(true); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, []);
+  useEffect(() => { let active = true; api.dataSourceCatalog().then((value) => { if (active) { setCatalog(value); setError(false); } }).catch(() => { if (active) { setError(true); onCatalogUnavailable?.(); } }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [onCatalogUnavailable]);
   const families = useMemo(() => catalog?.families.filter((family) => matches(family, filters)) || [], [catalog, filters]);
   return <section className="rounded-xl border border-border/60 bg-background/45" aria-label="来源目录">
     <header className="flex flex-wrap items-start justify-between gap-3 border-b border-border/55 p-4"><div><h2 className="font-semibold">来源目录</h2><p className="mt-1 text-xs text-muted-foreground">目录身份独立于体检观测；展开家族后查看接入方式与能力。</p></div>{catalog && <div className="flex flex-wrap gap-2 text-xs"><span className="rounded border border-border px-2 py-1">{catalog.registration.news_sources} 个资讯来源</span><span className="rounded border border-border px-2 py-1">已观测 {catalog.observed.sources} 项</span></div>}</header>

@@ -268,11 +268,6 @@ export function SourceHealthWorkspace() {
   }, []);
   // Catalog owns registration and list rendering. Legacy source-health clients remain
   // available for compatibility consumers, but this workspace no longer treats them as a registry.
-  useEffect(() => {
-    let active = true;
-    api.dataSourceCatalog().catch(() => { if (active) setCatalogUnavailable(true); });
-    return () => { active = false; };
-  }, []);
   useEffect(() => { if (catalogUnavailable) void loadSources(); }, [catalogUnavailable, loadSources, refreshToken]);
 
   const normalizedSearch = search.trim().toLocaleLowerCase("zh-CN");
@@ -294,9 +289,8 @@ export function SourceHealthWorkspace() {
 
   if (!catalogUnavailable) return <div className="mt-4 space-y-4">
     <SourceHealthSummary variant="bar" refreshToken={refreshToken} onUpdated={() => setRefreshToken((value) => value + 1)} />
-    <SourceCatalogWorkspace />
+    <SourceCatalogWorkspace onCatalogUnavailable={() => setCatalogUnavailable(true)} />
   </div>;
-
   return <div className="mt-4 space-y-4">
     <SourceHealthSummary variant="bar" refreshToken={refreshToken} onUpdated={() => setRefreshToken((value) => value + 1)} />
 

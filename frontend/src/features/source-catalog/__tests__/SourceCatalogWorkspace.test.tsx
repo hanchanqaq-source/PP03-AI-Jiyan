@@ -57,4 +57,24 @@ describe("SourceCatalogWorkspace", () => {
     await user.selectOptions(screen.getByRole("combobox", { name: "按健康状态过滤" }), "unexamined");
     expect(screen.getByText("1 个来源家族")).toBeInTheDocument();
   });
+
+  it("combines text and select filters instead of bypassing the text phrase", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "dataSourceCatalog").mockResolvedValue({ ...catalog, families: [eastmoneyFamily, { ...eastmoneyFamily, source_family_id: "tencent", source_family_name: "腾讯行情", adapters: [{ ...eastmoneyFamily.adapters[0], adapter_id: "tencent-quote", adapter_name: "腾讯行情" }] }] });
+    render(<SourceCatalogWorkspace />);
+    await screen.findByText("东方财富数据家族");
+    await user.type(screen.getByRole("searchbox", { name: "来源目录搜索" }), "AKShare");
+    await user.selectOptions(screen.getByRole("combobox", { name: "按计费模式过滤" }), "free_no_key");
+    expect(screen.getByText("东方财富数据家族")).toBeInTheDocument();
+    expect(screen.queryByText("腾讯行情")).not.toBeInTheDocument();
+  });
+
+  it("finds a family by its displayed aggregate health status", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "dataSourceCatalog").mockResolvedValue({ ...catalog, families: [{ ...eastmoneyFamily, health_status: "partial_degraded" }] });
+    render(<SourceCatalogWorkspace />);
+    await screen.findByText("东方财富数据家族");
+    await user.selectOptions(screen.getByRole("combobox", { name: "按健康状态过滤" }), "partial_degraded");
+    expect(screen.getByText("东方财富数据家族")).toBeInTheDocument();
+  });
 });
