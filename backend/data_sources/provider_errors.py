@@ -9,7 +9,10 @@ class ProviderError(RuntimeError):
 
     def __init__(self, code: str, *, reference: str = "") -> None:
         self.code = code
-        self.public_reference = public_source_reference(reference)
+        try:
+            self.public_reference = public_source_reference(reference)
+        except ValueError:
+            self.public_reference = ""
         super().__init__(redact_probe_message(f"provider_error:{code}"))
 
 

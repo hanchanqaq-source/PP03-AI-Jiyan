@@ -17,6 +17,16 @@ from .provider_errors import ProviderRateLimited, ProviderSchemaChanged, Provide
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _TEST_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_SENSITIVE_HEADER_MARKERS = (
+    "authorization",
+    "cookie",
+    "token",
+    "secret",
+    "api-key",
+    "apikey",
+    "credential",
+    "password",
+)
 
 
 class SafeHttpClient:
@@ -24,6 +34,9 @@ class SafeHttpClient:
 
     Callers decide whether and when to retry a failed safe request.  This class
     performs no hidden retry and never exposes credentials or full request URLs.
+    It deliberately bypasses all Session request preparation, so an injected
+    Session contributes only its transport adapter, not auth, cookies, netrc,
+    proxy, certificate, or default-header state.
     """
 
     def __init__(
@@ -81,7 +94,7 @@ class SafeHttpClient:
         current_params = params
         redirects = 0
         while True:
-            self._validate_url(current_url, redirect=redirects > 0)
+            self._validate_url(current_url)
             response = self._request(current_url, headers=headers, params=current_params)
             current_params = None
             try:
@@ -94,7 +107,7 @@ class SafeHttpClient:
                         raise ProviderUnavailable("redirect_limit", reference=current_url)
                     next_url = urljoin(current_url, location)
                     try:
-                        self._validate_url(next_url, redirect=True)
+                        self._validate_url(next_url)
                     except ProviderUnavailable as error:
                         raise ProviderUnavailable("insecure_redirect", reference=current_url) from error
                     current_url = next_url
@@ -112,19 +125,24 @@ class SafeHttpClient:
         headers: Mapping[str, str] | None,
         params: Mapping[str, object] | None,
     ) -> Any:
-        request_headers = {
-            key: value for key, value in (headers or {}).items() if key.lower() != "user-agent"
-        }
+        request_headers: dict[str, str] = {}
+        for key, value in (headers or {}).items():
+            if not isinstance(key, str) or self._is_sensitive_header(key):
+                raise ProviderUnavailable("unsafe_request_headers", reference=url)
+            if key.lower() != "user-agent":
+                request_headers[key] = value
         request_headers["User-Agent"] = self._user_agent
         try:
-            return self._session.get(
-                url,
-                headers=request_headers,
-                params=params,
+            prepared = requests.Request(
+                "GET", url, headers=request_headers, params=params
+            ).prepare()
+            return self._session.get_adapter(url).send(
+                prepared,
                 timeout=(self._timeout, self._timeout),
                 verify=True,
                 stream=True,
-                allow_redirects=False,
+                proxies={},
+                cert=None,
             )
         except requests.Timeout as error:
             raise ProviderUnavailable("timeout", reference=url) from error
@@ -171,12 +189,18 @@ class SafeHttpClient:
             raise ProviderUnavailable("read_failed", reference=url) from error
         return b"".join(chunks)
 
-    def _validate_url(self, url: str, *, redirect: bool) -> None:
+    @staticmethod
+    def _is_sensitive_header(header_name: str) -> bool:
+        lowered = header_name.strip().lower()
+        return any(marker in lowered for marker in _SENSITIVE_HEADER_MARKERS)
+
+    def _validate_url(self, url: str) -> None:
         try:
             parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+            _ = parts.port
         except ValueError as error:
             raise ProviderUnavailable("insecure_url", reference=url) from error
-        host = (parts.hostname or "").lower()
         if parts.username or parts.password or not host:
             raise ProviderUnavailable("insecure_url", reference=url)
         if parts.scheme == "https":
