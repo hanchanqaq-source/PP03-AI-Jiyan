@@ -29,6 +29,11 @@ _FACTORIES: Mapping[str, _ProviderFactory] = {
     "fred": _ProviderFactory("data_sources.providers.fred", "FredAdapter", True, True),
     "eia": _ProviderFactory("data_sources.providers.eia", "EiaAdapter", True, True),
     "tushare": _ProviderFactory("data_sources.providers.tushare", "TushareAdapter", True, True),
+    "alpha-vantage": _ProviderFactory("data_sources.providers.alpha_vantage", "AlphaVantageAdapter", True, True),
+    "finnhub": _ProviderFactory("data_sources.providers.finnhub", "FinnhubAdapter", True, True),
+    "twelve-data": _ProviderFactory("data_sources.providers.twelve_data", "TwelveDataAdapter", True, True),
+    "nasdaq-data-link": _ProviderFactory("data_sources.providers.nasdaq_data_link", "NasdaqDataLinkAdapter", True, True),
+    "news-api": _ProviderFactory("data_sources.providers.news_api", "NewsApiAdapter", True, True),
 }
 
 
