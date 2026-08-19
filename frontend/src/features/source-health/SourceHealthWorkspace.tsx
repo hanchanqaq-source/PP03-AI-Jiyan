@@ -284,12 +284,13 @@ export function SourceHealthWorkspace() {
   const openDetail = (source: SourceHealthSource, trigger: HTMLButtonElement) => { detailTriggerRef.current = trigger; setSelected(source); };
   const closeDetail = () => { setSelected(null); detailTriggerRef.current?.focus(); };
   const closeAdd = useCallback(() => { setAddOpen(false); addTriggerRef.current?.focus(); }, []);
+  const handleCatalogUnavailable = useCallback(() => setCatalogUnavailable(true), []);
   const toggleProvider = (key: string) => setExpandedProviders((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; });
   const addCandidate = (candidate: CandidateSource) => setCandidates((current) => [...current.filter((row) => row.id !== candidate.id), candidate]);
 
   if (!catalogUnavailable) return <div className="mt-4 space-y-4">
     <SourceHealthSummary variant="bar" refreshToken={refreshToken} onUpdated={() => setRefreshToken((value) => value + 1)} />
-    <SourceCatalogWorkspace onCatalogUnavailable={() => setCatalogUnavailable(true)} />
+    <SourceCatalogWorkspace onCatalogUnavailable={handleCatalogUnavailable} />
   </div>;
   return <div className="mt-4 space-y-4">
     <SourceHealthSummary variant="bar" refreshToken={refreshToken} onUpdated={() => setRefreshToken((value) => value + 1)} />

@@ -80,8 +80,8 @@ describe("source health drawer through MarketNews", () => {
     expect(screen.getByText("错误类型：超时")).toBeInTheDocument();
     expect(screen.getByText("脱敏原因：公开请求超时，未包含凭证")).toBeInTheDocument();
     expect(screen.getByText("稳定身份：news-publisher:finance / news-feed:finance / feed")).toBeInTheDocument();
-    expect(screen.getByText("配置公开地址：https://news.example.test/configured")).toBeInTheDocument();
-    expect(screen.getByText("观测公开地址：https://news.example.test/public")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://news.example.test/configured" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://news.example.test/public" })).toBeInTheDocument();
     expect(screen.getByText("是否重定向：是")).toBeInTheDocument();
     expect(screen.getByText("是否有备用来源：否")).toBeInTheDocument();
     expect(screen.getByText("建议处理：评估替换公开来源")).toBeInTheDocument();
@@ -100,12 +100,36 @@ describe("source health drawer through MarketNews", () => {
     expect(screen.getByText("状态：失败")).toBeInTheDocument();
   });
 
-  it("shows configured and observed public references for a healthy source without failure expansion", async () => {
+  it("renders configured and observed HTTP(S) references as safe external links for healthy and degraded sources", async () => {
+    (api as any).sourceHealthSources.mockResolvedValue([
+      sources[0],
+      {
+        ...sources[0], source_id: "fund:degraded", source_name: "降级基金来源", rating: "degraded",
+        configured_reference: "https://degraded.example.test/configured", observed_final_reference: "https://degraded.example.test/observed",
+      },
+    ]);
     const user = await openDrawer();
     await user.click(screen.getByRole("button", { name: "只看基金与行情 Provider" }));
-    expect(screen.getByText("稳定身份：eastmoney / eastmoney-direct / profile")).toBeInTheDocument();
-    expect(screen.getByText("配置公开地址：https://fund.example.test/configured")).toBeInTheDocument();
-    expect(screen.getByText("观测公开地址：https://fund.example.test/public")).toBeInTheDocument();
+    expect(screen.getAllByText("稳定身份：eastmoney / eastmoney-direct / profile")).toHaveLength(2);
+    for (const reference of [
+      "https://fund.example.test/configured",
+      "https://fund.example.test/public",
+      "https://degraded.example.test/configured",
+      "https://degraded.example.test/observed",
+    ]) {
+      expect(screen.getByRole("link", { name: reference })).toHaveAttribute("href", reference);
+      expect(screen.getByRole("link", { name: reference })).toHaveAttribute("target", "_blank");
+      expect(screen.getByRole("link", { name: reference })).toHaveAttribute("rel", "noreferrer");
+    }
+  });
+
+  it("does not render unsafe configured or observed references as links", async () => {
+    (api as any).sourceHealthSources.mockResolvedValue([{
+      ...sources[0], source_id: "fund:unsafe", source_name: "不安全地址来源",
+      configured_reference: "javascript:alert(1)", observed_final_reference: "data:text/html,unsafe",
+    }]);
+    await openDrawer();
+    expect(screen.queryByRole("link", { name: /javascript:|data:/ })).not.toBeInTheDocument();
   });
 
   it("contains Tab navigation and keeps Escape closing the drawer", async () => {

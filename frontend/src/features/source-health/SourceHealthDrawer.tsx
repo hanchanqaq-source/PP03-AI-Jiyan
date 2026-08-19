@@ -31,6 +31,21 @@ function formatTime(value: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "暂无记录";
 }
 
+function safePublicReference(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function PublicReference({ label, value, emptyLabel }: { label: string; value: string | null | undefined; emptyLabel: string }) {
+  const reference = safePublicReference(value);
+  return <p className="break-all">{label}：{reference ? <a href={reference} target="_blank" rel="noreferrer" className="text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background">{reference}</a> : value ? "未提供可用公开地址" : emptyLabel}</p>;
+}
+
 function SourceRow({ source }: { source: SourceHealthSource }) {
   const [expanded, setExpanded] = useState(false);
   const hasFailureDetails = source.probe_status === "failure" || source.rating === "failed";
@@ -50,8 +65,8 @@ function SourceRow({ source }: { source: SourceHealthSource }) {
         <p>修复价值：{repairLabels[source.repair_value] || source.repair_value || "暂无建议"}</p>
       </div>
       <div className="mt-3 grid gap-2 border-t border-border/45 pt-3 text-xs text-muted-foreground sm:grid-cols-2">
-        <p className="break-all">配置公开地址：{source.configured_reference || "暂无公开地址"}</p>
-        <p className="break-all">观测公开地址：{source.observed_final_reference || "尚未体检"}</p>
+        <PublicReference label="配置公开地址" value={source.configured_reference} emptyLabel="暂无公开地址" />
+        <PublicReference label="观测公开地址" value={source.observed_final_reference} emptyLabel="尚未体检" />
       </div>
       {hasFailureDetails && (
         <div className="mt-3 border-t border-border/45 pt-3">
