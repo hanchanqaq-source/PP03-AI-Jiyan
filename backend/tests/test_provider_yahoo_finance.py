@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from data_sources.provider_contract import ProviderRequest
-from data_sources.provider_errors import ProviderUnavailable
+from data_sources.provider_errors import ProviderSchemaChanged, ProviderUnavailable
 from data_sources.providers.yahoo_finance import YahooFinanceAdapter
 
 
@@ -18,9 +18,12 @@ class FakeTicker:
             "currency": "USD",
             "exchange": "NMS",
         }
+        self.history_result = None
 
     def history(self, **kwargs):
         self.history_calls.append(kwargs)
+        if self.history_result is not None:
+            return self.history_result
         return [
             {
                 "Date": "2026-08-18T16:00:00+00:00",
@@ -70,6 +73,32 @@ def test_yahoo_finance_normalizes_overseas_history_as_non_official_reference():
     assert rows[0].as_of_date.isoformat() == "2026-08-18"
     assert rows[0].value["upstream_timestamp"] == "2026-08-18T16:00:00+00:00"
     assert rows[0].value["official_evidence_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    "history_result",
+    [
+        [{"Close": 10.5, "Currency": "USD"}],
+        [{"Date": "2026-08-18T16:00:00+00:00", "Currency": "USD", "unexpected": 10.5}],
+    ],
+)
+def test_yahoo_finance_rejects_history_schema_without_timestamp_or_price_columns(history_result):
+    fake = FakeYahooFinance()
+    fake.ticker.history_result = history_result
+
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        YahooFinanceAdapter(client=fake).fetch(research_request())
+
+
+def test_yahoo_finance_preserves_null_price_and_unknown_currency_when_columns_are_present():
+    fake = FakeYahooFinance()
+    fake.ticker.history_result = [{"Date": "2026-08-18T16:00:00+00:00", "Close": None}]
+
+    rows = YahooFinanceAdapter(client=fake).fetch(research_request())
+
+    assert rows[0].value["close"] is None
+    assert rows[0].value["currency"] is None
+    assert rows[0].unit == "unknown"
 
 
 @pytest.mark.parametrize("capability_id", ["overseas_stock_history", "overseas_etf_history", "overseas_index_history"])

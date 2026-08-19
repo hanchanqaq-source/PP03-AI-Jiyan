@@ -83,41 +83,92 @@ class BaoStockAdapter(BaseProvider):
         return tuple(rows)
 
     @staticmethod
-    def _require(parameters: Mapping[str, object], name: str) -> str:
+    def _required_text(parameters: Mapping[str, object], name: str) -> str:
         value = _empty_to_none(parameters.get(name))
         if value is None:
             raise ProviderUnavailable("missing_required_parameter", reference=_REFERENCE)
-        return str(value)
+        if not isinstance(value, str):
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        return value
+
+    @staticmethod
+    def _optional_date(parameters: Mapping[str, object], name: str, *, required: bool = False) -> str | None:
+        value = _empty_to_none(parameters.get(name))
+        if value is None:
+            if required:
+                raise ProviderUnavailable("missing_required_parameter", reference=_REFERENCE)
+            return None
+        if not isinstance(value, str):
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        try:
+            return date.fromisoformat(value).isoformat()
+        except ValueError as exc:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE) from exc
+
+    @staticmethod
+    def _financial_period(parameters: Mapping[str, object]) -> tuple[int, int]:
+        year = parameters.get("year")
+        quarter = parameters.get("quarter")
+        if year is None or quarter is None:
+            raise ProviderUnavailable("missing_required_parameter", reference=_REFERENCE)
+        if type(year) is not int or type(quarter) is not int:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        if not 1990 <= year <= datetime.now(timezone.utc).year or not 1 <= quarter <= 4:
+            raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        return year, quarter
+
+    def _validated_request(self, request: ProviderRequest) -> ProviderRequest:
+        parameters = dict(request.parameters)
+        capability = request.capability_id
+        if capability in {"stock_history", "stock_history_adjusted", "stock_valuation"}:
+            parameters["code"] = self._required_text(parameters, "code")
+            parameters["start_date"] = self._optional_date(parameters, "start_date")
+            parameters["end_date"] = self._optional_date(parameters, "end_date")
+            if parameters["start_date"] and parameters["end_date"] and parameters["start_date"] > parameters["end_date"]:
+                raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+        elif capability == "stock_financials":
+            parameters["code"] = self._required_text(parameters, "code")
+            parameters["year"], parameters["quarter"] = self._financial_period(parameters)
+        elif capability == "stock_industry_reference":
+            parameters["code"] = self._required_text(parameters, "code")
+            parameters["date"] = self._optional_date(parameters, "date")
+        elif capability == "index_calendar":
+            start_date = self._optional_date(parameters, "start_date", required=True)
+            end_date = self._optional_date(parameters, "end_date", required=True)
+            if start_date > end_date:
+                raise ProviderUnavailable("invalid_request_parameter", reference=_REFERENCE)
+            parameters["start_date"], parameters["end_date"] = start_date, end_date
+        return ProviderRequest(capability, parameters)
 
     def _query(self, client: Any, request: ProviderRequest) -> tuple[dict[str, object], ...]:
         parameters = request.parameters
         capability = request.capability_id
         if capability == "stock_history":
             return self._result_rows(client.query_history_k_data_plus(
-                self._require(parameters, "code"),
+                parameters["code"],
                 "date,code,open,high,low,close,volume,amount,adjustflag",
                 start_date=parameters.get("start_date"), end_date=parameters.get("end_date"),
                 frequency="d", adjustflag="3",
             ))
         if capability == "stock_history_adjusted":
             return self._result_rows(client.query_adjust_factor(
-                self._require(parameters, "code"), start_date=parameters.get("start_date"), end_date=parameters.get("end_date"),
+                parameters["code"], start_date=parameters.get("start_date"), end_date=parameters.get("end_date"),
             ))
         if capability == "stock_financials":
             return self._result_rows(client.query_profit_data(
-                self._require(parameters, "code"), int(parameters.get("year", 0)), int(parameters.get("quarter", 0)),
+                parameters["code"], parameters["year"], parameters["quarter"],
             ))
         if capability == "stock_industry_reference":
             return self._result_rows(client.query_stock_industry(
-                code=self._require(parameters, "code"), date=parameters.get("date"),
+                code=parameters["code"], date=parameters.get("date"),
             ))
         if capability == "index_calendar":
             return self._result_rows(client.query_trade_dates(
-                self._require(parameters, "start_date"), self._require(parameters, "end_date"),
+                parameters["start_date"], parameters["end_date"],
             ))
         if capability == "stock_valuation":
             return self._result_rows(client.query_history_k_data_plus(
-                self._require(parameters, "code"), "date,code,peTTM,psTTM,pbMRQ",
+                parameters["code"], "date,code,peTTM,psTTM,pbMRQ",
                 start_date=parameters.get("start_date"), end_date=parameters.get("end_date"),
                 frequency="d", adjustflag="3",
             ))
@@ -155,6 +206,7 @@ class BaoStockAdapter(BaseProvider):
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         if request.capability_id not in _SUPPORTED_CAPABILITIES:
             raise ProviderUnavailable("unsupported_capability", reference=_REFERENCE)
+        request = self._validated_request(request)
         client = self._client_or_unavailable()
         try:
             login = client.login()

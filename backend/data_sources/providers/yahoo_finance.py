@@ -16,6 +16,7 @@ _REFERENCE = "https://ranaroussi.github.io/yfinance/"
 _HISTORY_CAPABILITIES = {"overseas_stock_history", "overseas_etf_history", "overseas_index_history"}
 _PROFILE_CAPABILITY = "overseas_profile_reference"
 _SUPPORTED_CAPABILITIES = _HISTORY_CAPABILITIES | {_PROFILE_CAPABILITY}
+_PRICE_COLUMNS = ("Open", "High", "Low", "Close")
 
 
 def _now() -> datetime:
@@ -99,6 +100,24 @@ class YahooFinanceAdapter(BaseProvider):
             return tuple((_mapping(row).get("Date"), _mapping(row)) for row in history)
         raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
 
+    @staticmethod
+    def _history_timestamp(timestamp: object, row: Mapping[str, object]) -> str:
+        for candidate in (timestamp, row.get("Date"), row.get("Datetime")):
+            value = _timestamp(candidate)
+            if value is not None and value.strip():
+                _as_date(value)
+                return value
+        raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+
+    @classmethod
+    def _validated_history_rows(cls, history: object) -> tuple[tuple[str, dict[str, object]], ...]:
+        rows: list[tuple[str, dict[str, object]]] = []
+        for timestamp, row in cls._history_rows(history):
+            if not any(column in row for column in _PRICE_COLUMNS):
+                raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
+            rows.append((cls._history_timestamp(timestamp, row), row))
+        return tuple(rows)
+
     def _value(self, *, request: ProviderRequest, row: Mapping[str, object], timestamp: object, currency: object) -> ProviderValue:
         upstream_timestamp = _timestamp(timestamp or row.get("Date") or row.get("Datetime"))
         return ProviderValue(
@@ -156,7 +175,7 @@ class YahooFinanceAdapter(BaseProvider):
             history = ticker.history(
                 start=request.parameters.get("start_date"), end=request.parameters.get("end_date"), interval="1d", auto_adjust=False,
             )
-            rows = tuple(self._history_rows(history))
+            rows = self._validated_history_rows(history)
             if not rows:
                 raise ProviderUnavailable("empty_upstream_response", reference=_REFERENCE)
             currency = next((row.get("Currency") for _stamp, row in rows if row.get("Currency")), None)

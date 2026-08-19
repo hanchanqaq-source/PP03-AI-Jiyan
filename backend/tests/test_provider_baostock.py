@@ -150,7 +150,46 @@ def test_baostock_rejects_unsupported_capabilities_without_querying(fake_baostoc
     assert fake_baostock.logout_calls == 0
 
 
-def test_baostock_descriptor_states_its_independent_non_official_boundary(fake_baostock):
+@pytest.mark.parametrize(
+    ("capability_id", "parameters", "error_code"),
+    [
+        ("stock_history", {"start_date": "2026-08-01"}, "missing_required_parameter"),
+        ("stock_history", {"code": "sh.600000", "start_date": "2026-08-40"}, "invalid_request_parameter"),
+        ("stock_history_adjusted", {"code": "sh.600000", "start_date": "2026-08-19", "end_date": "2026-08-18"}, "invalid_request_parameter"),
+        ("stock_history_adjusted", {"code": 600000}, "invalid_request_parameter"),
+        ("stock_financials", {"code": "sh.600000", "quarter": 2}, "missing_required_parameter"),
+        ("stock_financials", {"code": "sh.600000", "year": "2026", "quarter": 2}, "invalid_request_parameter"),
+        ("stock_financials", {"code": "sh.600000", "year": 2026, "quarter": 5}, "invalid_request_parameter"),
+        ("stock_industry_reference", {"code": "sh.600000", "date": "not-a-date"}, "invalid_request_parameter"),
+        ("index_calendar", {"start_date": "2026-08-19", "end_date": "2026-08-18"}, "invalid_request_parameter"),
+        ("stock_valuation", {"code": "sh.600000", "end_date": 20260818}, "invalid_request_parameter"),
+    ],
+)
+def test_baostock_rejects_invalid_parameters_before_login_or_query(fake_baostock, capability_id, parameters, error_code):
+    with pytest.raises(ProviderUnavailable, match=error_code):
+        BaoStockAdapter(client=fake_baostock).fetch(ProviderRequest(capability_id, parameters))
+
+    assert fake_baostock.login_calls == 0
+    assert fake_baostock.logout_calls == 0
+    assert fake_baostock.history_calls == []
+
+
+def test_baostock_rejects_invalid_parameters_before_optional_client_load():
+    client_load_calls = []
+
+    def loader():
+        client_load_calls.append("called")
+        raise AssertionError("invalid requests must not load BaoStock")
+
+    with pytest.raises(ProviderUnavailable, match="missing_required_parameter"):
+        BaoStockAdapter(client_loader=loader).fetch(
+            ProviderRequest("stock_financials", {"code": "sh.600000", "year": 2026})
+        )
+
+    assert client_load_calls == []
+
+
+def test_baostock_descriptor_states_independence_and_cninfo_nav_exclusions(fake_baostock):
     descriptor = BaoStockAdapter(client=fake_baostock).descriptor
 
     assert descriptor.adapter_id == "baostock"
