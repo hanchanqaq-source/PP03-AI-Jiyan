@@ -69,3 +69,17 @@ def test_catalog_keeps_yahoo_finance_disabled_and_non_official_for_personal_rese
         "overseas_index_history",
         "overseas_profile_reference",
     )
+
+
+def test_catalog_registers_official_evidence_adapters_without_claiming_a_fixture_connection():
+    """Catches official adapters being omitted from Catalog or pre-labelled as connected."""
+    catalog = build_catalog(news_config={"sources": []})
+
+    assert catalog.family("sec_edgar").source_roles == (SourceRole.OFFICIAL_EVIDENCE, SourceRole.PRIMARY_DATA)
+    assert catalog.adapter("sec-edgar").catalog_status.value == "configured"
+    assert catalog.capability("sec_company_facts").primary_families == ("sec_edgar",)
+    assert catalog.adapter("sse-official-evidence").source_roles == (SourceRole.OFFICIAL_EVIDENCE,)
+    assert catalog.adapter("hkexnews-official-evidence").catalog_status.value == "configured"
+    assert catalog.adapter("fund-company-official-evidence").catalog_status.value == "unconfigured"
+    assert catalog.adapter("index-company-official-evidence").catalog_status.value == "unconfigured"
+    assert all(family.catalog_status.value != "connected" for family in catalog.families)

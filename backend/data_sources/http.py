@@ -5,6 +5,8 @@ import math
 import socket
 from collections.abc import Mapping
 import ssl
+from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -27,6 +29,15 @@ _SENSITIVE_HEADER_TERMS = (
     "credential",
     "password",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SafeHttpDocument:
+    """Bounded public response metadata for adapters that must validate redirects."""
+
+    body: bytes
+    final_url: str
+    headers: Mapping[str, str]
 
 
 class SafeHttpClient:
@@ -90,6 +101,17 @@ class SafeHttpClient:
         headers: Mapping[str, str] | None = None,
         params: Mapping[str, object] | None = None,
     ) -> bytes:
+        return self.get_document(url, headers=headers, params=params).body
+
+    def get_document(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        params: Mapping[str, object] | None = None,
+        redirect_validator: Callable[[str, str], bool] | None = None,
+    ) -> SafeHttpDocument:
+        """GET a bounded document, refusing redirects rejected by the caller's identity policy."""
         current_url = url
         current_params = params
         redirects = 0
@@ -110,11 +132,17 @@ class SafeHttpClient:
                         self._validate_url(next_url)
                     except ProviderUnavailable as error:
                         raise ProviderUnavailable("insecure_redirect", reference=current_url) from error
+                    if redirect_validator is not None and not redirect_validator(current_url, next_url):
+                        raise ProviderUnavailable("redirect_disallowed", reference=current_url)
                     current_url = next_url
                     redirects += 1
                     continue
                 self._raise_for_status(status, response, current_url)
-                return self._read_bounded(response, current_url)
+                return SafeHttpDocument(
+                    body=self._read_bounded(response, current_url),
+                    final_url=current_url,
+                    headers={str(key): str(value) for key, value in response.headers.items()},
+                )
             finally:
                 response.close()
 

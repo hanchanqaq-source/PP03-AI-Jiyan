@@ -140,6 +140,14 @@ def _capabilities() -> tuple[CapabilityDescriptor, ...]:
         CapabilityDescriptor("overseas_etf_history", "海外 ETF 历史行情参考", "quote", 3 * _DAY_SECONDS, False, "upstream_currency", "daily", (), ("yahoo_finance",), ()),
         CapabilityDescriptor("overseas_index_history", "海外指数历史行情参考", "quote", 3 * _DAY_SECONDS, False, "upstream_currency", "daily", (), ("yahoo_finance",), ()),
         CapabilityDescriptor("overseas_profile_reference", "海外证券档案参考", "reference", _DAY_SECONDS, False, "upstream_currency", "event_driven", (), ("yahoo_finance",), ()),
+        CapabilityDescriptor("sec_company_submissions", "SEC 公司申报目录", "official_disclosure", _DAY_SECONDS, True, "metadata", "event_driven", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("sec_filing_index_metadata", "SEC 申报索引元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "event_driven", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("sec_10k_metadata", "SEC 10-K 索引元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "annual", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("sec_10q_metadata", "SEC 10-Q 索引元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "quarterly", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("sec_8k_metadata", "SEC 8-K 索引元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "event_driven", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("sec_13f_metadata", "SEC 13F 索引元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "quarterly", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("sec_company_facts", "SEC Company Facts 元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "event_driven", ("sec_edgar",), (), ()),
+        CapabilityDescriptor("official_evidence_link", "官方披露链接核验", "official_disclosure", None, True, "metadata", "event_driven", ("sse", "szse", "cninfo", "hkexnews", "csrc"), ("fund_company_official", "index_company_official"), ()),
     )
 
 
@@ -151,6 +159,13 @@ def _families() -> tuple[SourceFamily, ...]:
         SourceFamily("danjuan", "蛋卷基金", "CN", "CN", (SourceRole.FALLBACK_DATA,), True, "public_upstream_terms_apply", CatalogStatus.CONFIGURED),
         SourceFamily("baostock", "BaoStock", "CN", "CN", (SourceRole.PRIMARY_DATA, SourceRole.MARKET_DATA, SourceRole.CROSS_CHECK), True, "public_upstream_terms_apply", CatalogStatus.CONFIGURED),
         SourceFamily("yahoo_finance", "Yahoo Finance／yfinance", "global", "overseas", (SourceRole.FALLBACK_DATA,), False, "non_official_reference_terms_apply", CatalogStatus.DISABLED),
+        SourceFamily("sec_edgar", "SEC EDGAR", "US", "US", (SourceRole.OFFICIAL_EVIDENCE, SourceRole.PRIMARY_DATA), True, "sec_public_data_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("sse", "上海证券交易所披露", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "exchange_public_disclosure_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("szse", "深圳证券交易所披露", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "exchange_public_disclosure_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("hkexnews", "香港交易所披露易", "HK", "HK", (SourceRole.OFFICIAL_EVIDENCE,), True, "exchange_public_disclosure_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("csrc", "中国证监会", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "government_public_disclosure_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("fund_company_official", "基金公司官方公告", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "official_company_host_review_required", CatalogStatus.UNCONFIGURED),
+        SourceFamily("index_company_official", "指数公司官方公告", "CN", "CN", (SourceRole.OFFICIAL_EVIDENCE,), True, "official_company_host_review_required", CatalogStatus.UNCONFIGURED),
     )
 
 
@@ -187,6 +202,14 @@ def _static_adapters() -> tuple[AdapterDescriptor, ...]:
         _adapter("akshare-danjuan", "AKShare／蛋卷基金", "danjuan", "akshare", (SourceRole.FALLBACK_DATA,), ("search", "profile", "nav_history", "holdings"), "https://danjuanfunds.com/", 50, usage_note="AKShare 是访问路径；仅访问公开蛋卷基金数据。"),
         _adapter("baostock", "BaoStock", "baostock", "baostock", (SourceRole.PRIMARY_DATA, SourceRole.MARKET_DATA, SourceRole.CROSS_CHECK), ("stock_history", "stock_history_adjusted", "stock_financials", "stock_industry_reference", "index_calendar", "stock_valuation"), "https://www.baostock.com/", 30, usage_note="独立于东方财富和腾讯；仅限公开数据，不能替代巨潮资讯行业证据或基金正式净值。"),
         _adapter("yahoo-finance", "Yahoo Finance／yfinance", "yahoo_finance", "yfinance", (SourceRole.FALLBACK_DATA,), ("overseas_stock_history", "overseas_etf_history", "overseas_index_history", "overseas_profile_reference"), "https://ranaroussi.github.io/yfinance/", 200, default_enabled=False, catalog_status=CatalogStatus.DISABLED, license_note="非官方参考路径；使用须遵守 yfinance 与 Yahoo Finance 条款。", usage_note="默认关闭；只限 personal_research，不得提升为官方证据或独立证据。"),
+        _adapter("sec-edgar", "SEC EDGAR", "sec_edgar", "http_client", (SourceRole.OFFICIAL_EVIDENCE, SourceRole.PRIMARY_DATA), ("sec_company_submissions", "sec_filing_index_metadata", "sec_10k_metadata", "sec_10q_metadata", "sec_8k_metadata", "sec_13f_metadata", "sec_company_facts"), "https://data.sec.gov/", 10, license_note="SEC 公开 EDGAR 数据；使用须遵守 SEC 条款和公平访问策略。", usage_note="只请求明确 CIK、表单和索引元数据；不抓取 filing body；不使用凭据。"),
+        _adapter("sse-official-evidence", "上交所官方披露链接", "sse", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "https://www.sse.com.cn/", 10, license_note="上交所公开披露入口；使用须遵守发布者条款。", usage_note="仅核验允许的公开链接；拒绝跨发布者重定向和受保护页面。"),
+        _adapter("szse-official-evidence", "深交所官方披露链接", "szse", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "https://www.szse.cn/", 10, license_note="深交所公开披露入口；使用须遵守发布者条款。", usage_note="仅核验允许的公开链接；拒绝跨发布者重定向和受保护页面。"),
+        _adapter("cninfo-official-evidence", "巨潮资讯官方披露链接", "cninfo", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "https://www.cninfo.com.cn/", 10, license_note="巨潮资讯公开披露入口；使用须遵守发布者条款。", usage_note="仅核验允许的公开链接；拒绝跨发布者重定向和受保护页面。"),
+        _adapter("hkexnews-official-evidence", "港交所披露易官方链接", "hkexnews", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "https://www.hkexnews.hk/", 10, license_note="港交所披露易公开入口；使用须遵守发布者条款。", usage_note="仅核验允许的公开链接；拒绝跨发布者重定向和受保护页面。"),
+        _adapter("csrc-official-evidence", "中国证监会官方链接", "csrc", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "https://www.csrc.gov.cn/", 10, license_note="中国证监会公开披露入口；使用须遵守发布者条款。", usage_note="仅核验允许的公开链接；拒绝跨发布者重定向和受保护页面。"),
+        _adapter("fund-company-official-evidence", "基金公司官方公告链接", "fund_company_official", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "", 30, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="必须先逐项登记官方基金公司主机并核验公开条款。", usage_note="未登记官方主机时不得请求；不使用登录、Cookie 或 CAPTCHA 绕过。"),
+        _adapter("index-company-official-evidence", "指数公司官方公告链接", "index_company_official", "official_evidence_link", (SourceRole.OFFICIAL_EVIDENCE,), ("official_evidence_link",), "", 30, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="必须先逐项登记官方指数公司主机并核验公开条款。", usage_note="未登记官方主机时不得请求；不使用登录、Cookie 或 CAPTCHA 绕过。"),
     )
 
 
