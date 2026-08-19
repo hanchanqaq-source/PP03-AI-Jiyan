@@ -149,7 +149,8 @@ def _capabilities() -> tuple[CapabilityDescriptor, ...]:
         CapabilityDescriptor("sec_company_facts", "SEC Company Facts 元数据", "official_disclosure", _DAY_SECONDS, True, "metadata", "event_driven", ("sec_edgar",), (), ()),
         CapabilityDescriptor("official_evidence_link", "官方披露链接核验", "official_disclosure", None, True, "metadata", "event_driven", ("sse", "szse", "cninfo", "hkexnews", "csrc"), ("fund_company_official", "index_company_official"), ()),
         CapabilityDescriptor("macro_indicator", "宏观指标", "macro", 31 * _DAY_SECONDS, True, "provider_native", "provider_native", ("world_bank",), (), ()),
-        CapabilityDescriptor("macro_series", "宏观时间序列", "macro", 31 * _DAY_SECONDS, True, "provider_native", "provider_native", ("oecd",), ("imf",), ()),
+        CapabilityDescriptor("macro_series", "宏观时间序列", "macro", 31 * _DAY_SECONDS, True, "provider_native", "provider_native", ("oecd",), ("imf", "fred", "eia"), ()),
+        CapabilityDescriptor("fund_holdings", "基金持仓明细", "fund", 200 * _DAY_SECONDS, True, "provider_native", "quarterly", (), ("tushare",), ()),
         CapabilityDescriptor("news_discovery", "资讯候选发现", "news", None, False, "candidate", "event_driven", (), ("gdelt",), ()),
     )
 
@@ -173,6 +174,9 @@ def _families() -> tuple[SourceFamily, ...]:
         SourceFamily("oecd", "OECD SDMX", "global", "global", (SourceRole.MACRO_DATA,), True, "oecd_public_terms_apply", CatalogStatus.CONFIGURED),
         SourceFamily("imf", "IMF public SDMX", "global", "global", (SourceRole.MACRO_DATA,), True, "imf_public_sdmx_live_status_unverified", CatalogStatus.CATALOG_ONLY),
         SourceFamily("gdelt", "GDELT DOC 2.0", "global", "news", (SourceRole.COLLECTOR, SourceRole.CANDIDATE), False, "gdelt_public_terms_apply", CatalogStatus.CONFIGURED),
+        SourceFamily("fred", "FRED", "US", "US", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK), True, "fred_public_api_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("eia", "U.S. EIA", "US", "US", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK), True, "eia_public_api_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("tushare", "Tushare Pro", "CN", "CN", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "tushare_account_terms_apply", CatalogStatus.UNCONFIGURED),
     )
 
 
@@ -190,11 +194,17 @@ def _adapter(
     catalog_status: CatalogStatus = CatalogStatus.CONFIGURED,
     license_note: str = "公开入口；使用须遵守上游条款。",
     usage_note: str = "仅访问公开可用数据；不使用凭据。",
+    billing_model: BillingModel = BillingModel.FREE_NO_KEY,
+    auth_type: str = "none",
+    credential_env_names: tuple[str, ...] = (),
+    data_delay: str = "以来源实际披露和响应为准",
+    quota_policy: str = "未声明；按公开入口合理限速",
+    cost_policy: str = "免费无需密钥；不自动购买或升级",
 ) -> AdapterDescriptor:
     return AdapterDescriptor(
         adapter_id, adapter_name, source_family_id, provider_type, source_roles, capability_ids,
-        BillingModel.FREE_NO_KEY, "none", (), default_enabled, license_note, usage_note,
-        "以来源实际披露和响应为准", "未声明；按公开入口合理限速", "免费无需密钥；不自动购买或升级",
+        billing_model, auth_type, credential_env_names, default_enabled, license_note, usage_note,
+        data_delay, quota_policy, cost_policy,
         configured_reference, priority, catalog_status,
     )
 
@@ -221,6 +231,9 @@ def _static_adapters() -> tuple[AdapterDescriptor, ...]:
         _adapter("oecd", "OECD SDMX", "oecd", "http_client", (SourceRole.MACRO_DATA,), ("macro_series",), "https://sdmx.oecd.org/public/", 30, license_note="OECD SDMX 公开数据；使用须遵守上游条款。", usage_note="仅请求明确 dataset 与 series key；不使用凭据。"),
         _adapter("imf", "IMF public SDMX", "imf", "http_client", (SourceRole.MACRO_DATA,), ("macro_series",), "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest/", 40, default_enabled=False, catalog_status=CatalogStatus.CATALOG_ONLY, license_note="IMF public SDMX contract is registered; current live accessibility is not asserted.", usage_note="Catalog-only pending a bounded official live validation; no credentials or fallback scraping."),
         _adapter("gdelt", "GDELT DOC 2.0", "gdelt", "http_client", (SourceRole.COLLECTOR, SourceRole.CANDIDATE), ("news_discovery",), "https://api.gdeltproject.org/api/v2/doc/doc", 100, license_note="GDELT public discovery API；使用须遵守上游条款。", usage_note="仅返回候选及原发布者标识；不得作为可信或独立证据。"),
+        _adapter("fred", "FRED", "fred", "http_client", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK), ("macro_series",), "https://api.stlouisfed.org/fred/", 20, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="FRED API key required; public data terms apply.", usage_note="Free-key macro series adapter; no paid request or automatic upgrade.", billing_model=BillingModel.FREE_KEY, auth_type="api_key", credential_env_names=("FRED_API_KEY",), data_delay="以 FRED 发布和修订为准", quota_policy="以账户实际配额为准", cost_policy="免费密钥；本适配器不预留或消费付费预算"),
+        _adapter("eia", "U.S. EIA", "eia", "http_client", (SourceRole.MACRO_DATA, SourceRole.CROSS_CHECK), ("macro_series",), "https://api.eia.gov/v2/", 20, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="EIA API key required; public data terms apply.", usage_note="Free-key energy series adapter; no paid request or automatic upgrade.", billing_model=BillingModel.FREE_KEY, auth_type="api_key", credential_env_names=("EIA_API_KEY",), data_delay="以 EIA 发布和修订为准", quota_policy="以账户实际配额为准", cost_policy="免费密钥；本适配器不预留或消费付费预算"),
+        _adapter("tushare", "Tushare Pro", "tushare", "safe_post_client_required", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("fund_holdings", "stock_history", "stock_financials", "index_calendar"), "https://api.tushare.pro/", 50, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Tushare Pro token and capability-specific account permission required.", usage_note="Configured capability access depends on actual points/plan; denials are not provider-health failures.", billing_model=BillingModel.FREEMIUM, auth_type="api_token", credential_env_names=("TUSHARE_TOKEN",), data_delay="以 Tushare Pro 发布和修订为准", quota_policy="以账户实际积分和套餐权限为准", cost_policy="免费/增值边界按实际账户；不自动购买或升级"),
     )
 
 

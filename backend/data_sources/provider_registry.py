@@ -6,6 +6,7 @@ import threading
 from typing import Any, Callable, Mapping
 
 from .catalog import build_catalog
+from .credentials import EnvironmentCredentialStore
 from .http import SafeHttpClient
 
 
@@ -14,6 +15,7 @@ class _ProviderFactory:
     module_name: str
     class_name: str
     requires_http: bool = False
+    requires_credentials: bool = False
 
 
 _FACTORIES: Mapping[str, _ProviderFactory] = {
@@ -24,6 +26,9 @@ _FACTORIES: Mapping[str, _ProviderFactory] = {
     "sec-edgar": _ProviderFactory("data_sources.providers.sec_edgar", "SecEdgarAdapter", True),
     "world-bank": _ProviderFactory("data_sources.providers.world_bank", "WorldBankAdapter", True),
     "yahoo-finance": _ProviderFactory("data_sources.providers.yahoo_finance", "YahooFinanceAdapter"),
+    "fred": _ProviderFactory("data_sources.providers.fred", "FredAdapter", True, True),
+    "eia": _ProviderFactory("data_sources.providers.eia", "EiaAdapter", True, True),
+    "tushare": _ProviderFactory("data_sources.providers.tushare", "TushareAdapter", True, True),
 }
 
 
@@ -39,6 +44,8 @@ class ProviderRegistry:
         catalog: Any | None = None,
         *,
         http_factory: Callable[[], Any] = SafeHttpClient,
+        credential_factory: Callable[[Mapping[str, tuple[str, ...]]], Any] = EnvironmentCredentialStore,
+        budget_guard_factory: Callable[[str], Any | None] | None = None,
     ) -> None:
         self._catalog = catalog or build_catalog({"sources": []})
         catalog_adapter_ids = {adapter.adapter_id for adapter in self._catalog.adapters}
@@ -46,6 +53,8 @@ class ProviderRegistry:
         if unknown:
             raise ValueError(f"Provider registry IDs missing from Catalog: {', '.join(sorted(unknown))}")
         self._http_factory = http_factory
+        self._credential_factory = credential_factory
+        self._budget_guard_factory = budget_guard_factory
         self._instances: dict[str, Any] = {}
         self._instance_lock = threading.RLock()
 
@@ -62,6 +71,12 @@ class ProviderRegistry:
                 module = importlib.import_module(factory.module_name)
                 adapter_type = getattr(module, factory.class_name)
                 kwargs = {"http": self._http_factory()} if factory.requires_http else {}
+                if factory.requires_credentials:
+                    catalog_descriptor = self._catalog.adapter(normalized)
+                    scope = {normalized: tuple(catalog_descriptor.credential_env_names)}
+                    kwargs["credentials"] = self._credential_factory(scope)
+                    if self._budget_guard_factory is not None:
+                        kwargs["budget_guard"] = self._budget_guard_factory(normalized)
                 adapter = adapter_type(**kwargs)
                 descriptor = getattr(adapter, "descriptor", None)
                 if getattr(descriptor, "adapter_id", None) != normalized:
