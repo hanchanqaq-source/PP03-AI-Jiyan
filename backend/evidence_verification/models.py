@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Mapping
 
 
 class VerificationStatus(str, Enum):
@@ -89,6 +90,16 @@ class EvidenceSnapshot:
     snapshot_id: str
     generated_at: datetime
     events: tuple[EvidenceEvent, ...]
+    raw_snapshot_id: str | None = None
+    recovery_metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.raw_snapshot_id:
+            return
+        metadata = dict(self.recovery_metadata)
+        metadata["legacy_identity"] = True
+        object.__setattr__(self, "raw_snapshot_id", self.snapshot_id)
+        object.__setattr__(self, "recovery_metadata", metadata)
 
 
 @dataclass(frozen=True, slots=True)

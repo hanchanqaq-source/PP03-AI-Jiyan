@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import json
 
 from evidence_verification.models import EvidenceEvent, EvidenceSnapshot, StatusTransition, VerificationStatus
-from evidence_verification.storage import EvidenceStorage
+from evidence_verification.storage import EvidenceStorage, snapshot_document
 
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
@@ -107,3 +107,29 @@ def test_history_ledger_failure_after_current_publish_does_not_relabel_completed
     assert marker["status"] == "completed"
     assert marker["history_status"] == "failed"
     assert marker["history_error"] == "OSError"
+
+
+def test_legacy_evidence_document_uses_snapshot_id_as_explicit_compatibility_identity(tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    snapshot = EvidenceSnapshot(snapshot_id="legacy-snapshot", generated_at=NOW, events=())
+    document = snapshot_document(snapshot)
+    document.pop("raw_snapshot_id", None)
+    document.pop("recovery_metadata", None)
+    storage.root.mkdir(parents=True)
+    storage.current_path.write_text(json.dumps(document), encoding="utf-8")
+
+    recovered = storage.load_current()
+
+    assert recovered.raw_snapshot_id == "legacy-snapshot"
+    assert recovered.recovery_metadata == {"legacy_identity": True}
+
+
+def test_evidence_document_preserves_allocated_raw_snapshot_identity():
+    snapshot = EvidenceSnapshot(
+        snapshot_id="evidence-raw-1",
+        raw_snapshot_id="raw-1",
+        generated_at=NOW,
+        events=(),
+    )
+
+    assert snapshot_document(snapshot)["raw_snapshot_id"] == "raw-1"

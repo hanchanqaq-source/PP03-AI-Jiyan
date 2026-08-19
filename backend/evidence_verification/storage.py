@@ -135,12 +135,17 @@ def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
 
 
 def snapshot_document(snapshot: EvidenceSnapshot) -> dict[str, Any]:
-    return {
+    document = {
         "schema_version": 1,
         "snapshot_id": snapshot.snapshot_id,
         "generated_at": snapshot.generated_at.isoformat(),
         "events": [event_document(event) for event in snapshot.events],
     }
+    if snapshot.raw_snapshot_id:
+        document["raw_snapshot_id"] = snapshot.raw_snapshot_id
+    if snapshot.recovery_metadata:
+        document["recovery_metadata"] = dict(snapshot.recovery_metadata)
+    return document
 
 
 def _parse_datetime(value: Any) -> datetime:
@@ -204,6 +209,23 @@ def _event_from_document(row: dict[str, Any]) -> EvidenceEvent:
     )
 
 
+def evidence_snapshot_from_document(document: dict[str, Any]) -> EvidenceSnapshot:
+    snapshot_id = str(document["snapshot_id"])
+    raw_snapshot_id = document.get("raw_snapshot_id")
+    recovery_metadata = document.get("recovery_metadata")
+    metadata = dict(recovery_metadata) if isinstance(recovery_metadata, dict) else {}
+    if not isinstance(raw_snapshot_id, str) or not raw_snapshot_id:
+        raw_snapshot_id = snapshot_id
+        metadata["legacy_identity"] = True
+    return EvidenceSnapshot(
+        snapshot_id=snapshot_id,
+        raw_snapshot_id=raw_snapshot_id,
+        generated_at=_parse_datetime(document["generated_at"]),
+        events=tuple(_event_from_document(row) for row in document.get("events") or [] if isinstance(row, dict)),
+        recovery_metadata=metadata,
+    )
+
+
 class EvidenceStorage:
     def __init__(self, root: str | os.PathLike[str] | None = None, *, now: Callable[[], datetime] | None = None) -> None:
         if root is not None:
@@ -255,11 +277,7 @@ class EvidenceStorage:
         if not document:
             return None
         try:
-            return EvidenceSnapshot(
-                snapshot_id=str(document["snapshot_id"]),
-                generated_at=_parse_datetime(document["generated_at"]),
-                events=tuple(_event_from_document(row) for row in document.get("events") or [] if isinstance(row, dict)),
-            )
+            return evidence_snapshot_from_document(document)
         except (KeyError, TypeError, ValueError):
             return None
 
