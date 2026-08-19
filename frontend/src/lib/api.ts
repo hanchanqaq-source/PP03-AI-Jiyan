@@ -25,7 +25,20 @@ import type {
   SourceHealthSource,
   SourceHealthSummaryData,
 } from "@/features/source-health/types";
-import type { DataSourceCatalogResponse, SourceFamilyView } from "@/features/source-catalog/types";
+import type {
+  AdapterActionResponse,
+  AdapterConfigMutationResponse,
+  AdapterConfigUpdate,
+  AdapterConfigurationView,
+  AdapterCostView,
+  AdapterUsageView,
+  CredentialState,
+  DataSourceCatalogResponse,
+  DataSourceConfigurationResponse,
+  DataSourceCostResponse,
+  DataSourceUsageResponse,
+  SourceFamilyView,
+} from "@/features/source-catalog/types";
 import type {
   EvidenceEventDetail,
   EvidenceEventList,
@@ -95,7 +108,7 @@ export async function downloadReport(id: string, name: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: unknown): Promise<T> {
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
@@ -125,6 +138,188 @@ async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET
 }
 
 const get = <T>(path: string) => request<T>(path, "GET");
+
+function dataSourceRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ApiError("数据源配置响应无效", 502);
+  }
+  return value as Record<string, unknown>;
+}
+
+function dataSourceString(value: unknown): string {
+  if (typeof value !== "string") throw new ApiError("数据源配置响应无效", 502);
+  return value;
+}
+
+function dataSourceNullableString(value: unknown): string | null {
+  if (value === null) return null;
+  return dataSourceString(value);
+}
+
+function dataSourceBoolean(value: unknown): boolean {
+  if (typeof value !== "boolean") throw new ApiError("数据源配置响应无效", 502);
+  return value;
+}
+
+function dataSourceBillingModel(value: unknown): AdapterConfigurationView["billing_model"] {
+  if (!["free_no_key", "free_key", "freemium", "paid_api", "enterprise_license", "internal_only"].includes(String(value))) {
+    throw new ApiError("数据源配置响应无效", 502);
+  }
+  return value as AdapterConfigurationView["billing_model"];
+}
+
+function dataSourceCatalogStatus(value: unknown): AdapterConfigurationView["catalog_status"] {
+  if (!["connected", "configured", "unconfigured", "catalog_only", "license_required", "disabled"].includes(String(value))) {
+    throw new ApiError("数据源配置响应无效", 502);
+  }
+  return value as AdapterConfigurationView["catalog_status"];
+}
+
+function dataSourceNullableInteger(value: unknown): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new ApiError("数据源配置响应无效", 502);
+  }
+  return value;
+}
+
+function credentialState(value: unknown): CredentialState {
+  const row = dataSourceRecord(value);
+  return {
+    configured: dataSourceBoolean(row.configured),
+    status: dataSourceString(row.status),
+    last_validated_at: dataSourceNullableString(row.last_validated_at),
+    credential_source: dataSourceString(row.credential_source),
+  };
+}
+
+function adapterConfiguration(value: unknown): AdapterConfigurationView {
+  const row = dataSourceRecord(value);
+  return {
+    adapter_id: dataSourceString(row.adapter_id),
+    billing_model: dataSourceBillingModel(row.billing_model),
+    catalog_status: dataSourceCatalogStatus(row.catalog_status),
+    enabled: dataSourceBoolean(row.enabled),
+    usage_mode: dataSourceNullableString(row.usage_mode),
+    daily_budget: dataSourceNullableString(row.daily_budget),
+    monthly_budget: dataSourceNullableString(row.monthly_budget),
+    per_request_budget: dataSourceNullableString(row.per_request_budget),
+    daily_request_limit: dataSourceNullableInteger(row.daily_request_limit),
+    monthly_request_limit: dataSourceNullableInteger(row.monthly_request_limit),
+    credential: credentialState(row.credential),
+  };
+}
+
+function dataSourceConfiguration(value: unknown): DataSourceConfigurationResponse {
+  const row = dataSourceRecord(value);
+  if (!Array.isArray(row.adapters)) throw new ApiError("数据源配置响应无效", 502);
+  return { free_only: dataSourceBoolean(row.free_only), adapters: row.adapters.map(adapterConfiguration) };
+}
+
+function usageStatus(value: unknown): "observed" | "unobserved" {
+  if (value !== "observed" && value !== "unobserved") throw new ApiError("数据源用量响应无效", 502);
+  return value;
+}
+
+function statusCounts(value: unknown): Record<string, number> {
+  const row = dataSourceRecord(value);
+  const result: Record<string, number> = {};
+  Object.entries(row).forEach(([key, count]) => {
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) {
+      throw new ApiError("数据源用量响应无效", 502);
+    }
+    result[key] = count;
+  });
+  return result;
+}
+
+function adapterUsage(value: unknown): AdapterUsageView {
+  const row = dataSourceRecord(value);
+  return {
+    adapter_id: dataSourceString(row.adapter_id),
+    day: dataSourceString(row.day),
+    month: dataSourceString(row.month),
+    usage_status: usageStatus(row.usage_status),
+    daily_cost: dataSourceNullableString(row.daily_cost),
+    monthly_cost: dataSourceNullableString(row.monthly_cost),
+    daily_request_count: dataSourceNullableInteger(row.daily_request_count),
+    monthly_request_count: dataSourceNullableInteger(row.monthly_request_count),
+    daily_units: dataSourceNullableString(row.daily_units),
+    monthly_units: dataSourceNullableString(row.monthly_units),
+    status_counts: statusCounts(row.status_counts),
+    open_reservations: dataSourceNullableInteger(row.open_reservations),
+  };
+}
+
+function dataSourceUsage(value: unknown): DataSourceUsageResponse {
+  const row = dataSourceRecord(value);
+  if (!Array.isArray(row.adapters)) throw new ApiError("数据源用量响应无效", 502);
+  return {
+    as_of: dataSourceString(row.as_of),
+    timezone: dataSourceString(row.timezone),
+    usage_status: usageStatus(row.usage_status),
+    adapters: row.adapters.map(adapterUsage),
+  };
+}
+
+function adapterCost(value: unknown): AdapterCostView {
+  const row = dataSourceRecord(value);
+  return {
+    adapter_id: dataSourceString(row.adapter_id),
+    billing_model: dataSourceBillingModel(row.billing_model),
+    enabled: dataSourceBoolean(row.enabled),
+    credential_configured: dataSourceBoolean(row.credential_configured),
+    status: dataSourceString(row.status),
+    usage_status: usageStatus(row.usage_status),
+    day: dataSourceString(row.day),
+    month: dataSourceString(row.month),
+    daily_budget: dataSourceNullableString(row.daily_budget),
+    monthly_budget: dataSourceNullableString(row.monthly_budget),
+    per_request_budget: dataSourceNullableString(row.per_request_budget),
+    daily_cost: dataSourceNullableString(row.daily_cost),
+    monthly_cost: dataSourceNullableString(row.monthly_cost),
+    daily_remaining: dataSourceNullableString(row.daily_remaining),
+    monthly_remaining: dataSourceNullableString(row.monthly_remaining),
+    open_reservations: dataSourceNullableInteger(row.open_reservations),
+  };
+}
+
+function dataSourceCost(value: unknown): DataSourceCostResponse {
+  const row = dataSourceRecord(value);
+  if (!Array.isArray(row.adapters)) throw new ApiError("数据源费用响应无效", 502);
+  return {
+    as_of: dataSourceString(row.as_of),
+    timezone: dataSourceString(row.timezone),
+    free_only: dataSourceBoolean(row.free_only),
+    usage_status: usageStatus(row.usage_status),
+    adapters: row.adapters.map(adapterCost),
+  };
+}
+
+function adapterConfigMutation(value: unknown): AdapterConfigMutationResponse {
+  const row = dataSourceRecord(value);
+  const rawConfig = dataSourceRecord(row.config);
+  const config: Record<string, string | number | boolean | null> = {};
+  for (const key of ["enabled", "usage_mode", "daily_budget", "monthly_budget", "per_request_budget", "daily_request_limit", "monthly_request_limit", "last_validated_at"]) {
+    const item = rawConfig[key];
+    if (item === null || typeof item === "string" || typeof item === "boolean" || (typeof item === "number" && Number.isSafeInteger(item))) config[key] = item;
+  }
+  return { adapter_id: dataSourceString(row.adapter_id), config };
+}
+
+function adapterAction(value: unknown): AdapterActionResponse {
+  const row = dataSourceRecord(value);
+  const result: AdapterActionResponse = {
+    adapter_id: dataSourceString(row.adapter_id),
+    status: dataSourceString(row.status),
+    connected: dataSourceBoolean(row.connected),
+  };
+  if (row.action === "enable" || row.action === "disable") result.action = row.action;
+  if (typeof row.enabled === "boolean") result.enabled = row.enabled;
+  if (typeof row.health_failure === "boolean") result.health_failure = row.health_failure;
+  if (row.last_validated_at === null || typeof row.last_validated_at === "string") result.last_validated_at = row.last_validated_at;
+  return result;
+}
 
 function marketNewsPath(path: string, query: MarketNewsQuery): string {
   const params = new URLSearchParams({
@@ -346,6 +541,16 @@ export const api = {
   dataSourceFamilies: () => get<SourceFamilyView[]>("/data-sources/families"),
   dataSourceFamily: (familyId: string) => get<SourceFamilyView>(`/data-sources/families/${encodeURIComponent(familyId)}`),
   dataSourceRefresh: () => request<SourceHealthRunStarted>("/data-sources/refresh", "POST"),
+  dataSourceConfig: () => request<unknown>("/data-sources/config").then(dataSourceConfiguration),
+  dataSourceUpdateFreeOnly: (freeOnly: boolean) => request<unknown>("/data-sources/config", "PUT", { free_only: freeOnly }).then(dataSourceConfiguration),
+  dataSourceUpdateAdapterConfig: (adapterId: string, updates: AdapterConfigUpdate) => request<unknown>(`/data-sources/${encodeURIComponent(adapterId)}/config`, "PUT", updates).then(adapterConfigMutation),
+  dataSourcePutCredential: (adapterId: string, credential: string) => request<unknown>(`/data-sources/${encodeURIComponent(adapterId)}/credentials`, "PUT", { credential }).then(credentialState),
+  dataSourceDeleteCredential: (adapterId: string) => request<unknown>(`/data-sources/${encodeURIComponent(adapterId)}/credentials`, "DELETE").then(credentialState),
+  dataSourceUsage: (adapterId?: string) => request<unknown>(`/data-sources/usage${adapterId ? `?adapter_id=${encodeURIComponent(adapterId)}` : ""}`).then(dataSourceUsage),
+  dataSourceCost: (adapterId?: string) => request<unknown>(`/data-sources/cost${adapterId ? `?adapter_id=${encodeURIComponent(adapterId)}` : ""}`).then(dataSourceCost),
+  dataSourceEnable: (adapterId: string, confirmPaidUsage: boolean) => request<unknown>(`/data-sources/${encodeURIComponent(adapterId)}/enable`, "POST", { confirm_paid_usage: confirmPaidUsage }).then(adapterAction),
+  dataSourceDisable: (adapterId: string) => request<unknown>(`/data-sources/${encodeURIComponent(adapterId)}/disable`, "POST", {}).then(adapterAction),
+  dataSourceValidate: (adapterId: string) => request<unknown>(`/data-sources/${encodeURIComponent(adapterId)}/validate`, "POST", {}).then(adapterAction),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),

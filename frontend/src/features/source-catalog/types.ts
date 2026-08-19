@@ -66,3 +66,107 @@ export interface DataSourceCatalogResponse {
   families: SourceFamilyView[];
   capabilities: CapabilityView[];
 }
+
+export interface CredentialState {
+  configured: boolean;
+  status: string;
+  last_validated_at: string | null;
+  credential_source: string;
+}
+
+export interface AdapterConfigurationView {
+  adapter_id: string;
+  billing_model: BillingModel;
+  catalog_status: CatalogStatus;
+  enabled: boolean;
+  usage_mode: string | null;
+  daily_budget: string | null;
+  monthly_budget: string | null;
+  per_request_budget: string | null;
+  daily_request_limit: number | null;
+  monthly_request_limit: number | null;
+  credential: CredentialState;
+}
+
+export interface DataSourceConfigurationResponse {
+  free_only: boolean;
+  adapters: AdapterConfigurationView[];
+}
+
+export interface AdapterUsageView {
+  adapter_id: string;
+  day: string;
+  month: string;
+  usage_status: "observed" | "unobserved";
+  daily_cost: string | null;
+  monthly_cost: string | null;
+  daily_request_count: number | null;
+  monthly_request_count: number | null;
+  daily_units: string | null;
+  monthly_units: string | null;
+  status_counts: Record<string, number>;
+  open_reservations: number | null;
+}
+
+export interface DataSourceUsageResponse {
+  as_of: string;
+  timezone: string;
+  usage_status: "observed" | "unobserved";
+  adapters: AdapterUsageView[];
+}
+
+export interface AdapterCostView {
+  adapter_id: string;
+  billing_model: BillingModel;
+  enabled: boolean;
+  credential_configured: boolean;
+  status: string;
+  usage_status: "observed" | "unobserved";
+  day: string;
+  month: string;
+  daily_budget: string | null;
+  monthly_budget: string | null;
+  per_request_budget: string | null;
+  daily_cost: string | null;
+  monthly_cost: string | null;
+  daily_remaining: string | null;
+  monthly_remaining: string | null;
+  open_reservations: number | null;
+}
+
+export interface DataSourceCostResponse {
+  as_of: string;
+  timezone: string;
+  free_only: boolean;
+  usage_status: "observed" | "unobserved";
+  adapters: AdapterCostView[];
+}
+
+export interface AdapterConfigUpdate {
+  usage_mode?: string;
+  daily_budget?: string;
+  monthly_budget?: string;
+  per_request_budget?: string;
+  daily_request_limit?: number;
+  monthly_request_limit?: number;
+}
+
+export interface AdapterConfigMutationResponse {
+  adapter_id: string;
+  config: Record<string, string | number | boolean | null>;
+}
+
+export interface AdapterActionResponse {
+  adapter_id: string;
+  action?: "enable" | "disable";
+  status: string;
+  enabled?: boolean;
+  connected: boolean;
+  health_failure?: boolean;
+  last_validated_at?: string | null;
+}
+
+export interface BudgetGateState {
+  valid: boolean;
+  saved: boolean;
+}
