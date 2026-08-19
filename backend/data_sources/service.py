@@ -1,16 +1,93 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+import re
+import threading
 from typing import Any, Callable, Mapping
 
 import source_health
 
+from cache_io_lock import CACHE_IO_LOCK
 from .catalog import DataSourceCatalog, build_catalog
+from .config_store import ConfigValidationError, DataSourceConfigStore
+from .credentials import (
+    CredentialState,
+    CredentialStoreUnavailable,
+    CredentialWriteNotSupported,
+    EnvironmentCredentialStore,
+    KeyringCredentialStore,
+)
+from .models import BillingModel, CatalogStatus
+from .provider_registry import ProviderRegistry
 from .references import public_source_reference
+from .usage_store import UsageStore, UsageStoreError
 
 
 _EXCLUDED_HEALTH_STATUSES = {"unconfigured", "license_required", "catalog_only", "disabled"}
+_DECIMAL_TEXT = re.compile(r"^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,8})?$")
+_USAGE_MODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ADAPTER_CONFIG_FIELDS = {
+    "usage_mode", "daily_budget", "monthly_budget", "per_request_budget",
+    "daily_request_limit", "monthly_request_limit",
+}
+_CREDENTIAL_MARKERS = (
+    "credential", "secret", "token", "password", "api_key", "apikey", "access_key",
+)
+_MAX_BUDGET = Decimal("1000000000000")
+
+
+class DataSourceRequestInvalid(ValueError):
+    pass
+
+
+class DataSourceConflict(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class DataSourceUnavailable(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class _DefaultCredentialStore:
+    """Keyring-first credential access with a read-only environment fallback."""
+
+    def __init__(self, scope: Mapping[str, tuple[str, ...]]) -> None:
+        self._keyring = KeyringCredentialStore(scope)
+        self._environment = EnvironmentCredentialStore(scope)
+
+    def get(self, adapter_id: str, env_name: str) -> str | None:
+        return self._keyring.get(adapter_id, env_name) or self._environment.get(adapter_id, env_name)
+
+    def set(self, adapter_id: str, env_name: str, value: str) -> None:
+        if self._environment.get(adapter_id, env_name) is not None and not self._keyring.state(adapter_id).configured:
+            raise CredentialWriteNotSupported("environment credentials are read-only")
+        self._keyring.set(adapter_id, env_name, value)
+
+    def delete(self, adapter_id: str, env_name: str) -> None:
+        keyring_state = self._keyring.state(adapter_id)
+        if keyring_state.configured:
+            self._keyring.delete(adapter_id, env_name)
+            return
+        if self._environment.get(adapter_id, env_name) is not None:
+            raise CredentialWriteNotSupported("environment credentials are read-only")
+        self._keyring.delete(adapter_id, env_name)
+
+    def state(self, adapter_id: str) -> CredentialState:
+        keyring_state = self._keyring.state(adapter_id)
+        if keyring_state.configured:
+            return keyring_state
+        environment_state = self._environment.state(adapter_id)
+        if environment_state.configured:
+            return environment_state
+        return keyring_state if keyring_state.status == "credential_store_unavailable" else environment_state
 
 
 def _document(value: Any) -> Any:
@@ -60,13 +137,38 @@ class DataSourceService:
         *,
         catalog_builder: Callable[[], DataSourceCatalog] = build_catalog,
         health_service_factory: Callable[[], Any] | None = None,
+        config_store: Any | None = None,
+        credential_store: Any | None = None,
+        budget_guard: Any | None = None,
+        usage_store: Any | None = None,
+        provider_registry: Any | None = None,
+        now_factory: Callable[[], datetime] | None = None,
     ) -> None:
         self._catalog_builder = catalog_builder
         self._health_service_factory = health_service_factory or (lambda: source_health.get_service())
         self._adapter_enabled: dict[str, bool] = {}
+        self._config_store = config_store
+        self._credential_store = credential_store
+        self._budget_guard = budget_guard
+        self._usage_store = usage_store
+        self._provider_registry = provider_registry
+        self._now_factory = now_factory or (lambda: datetime.now(timezone.utc))
+        self._mutation_lock = threading.RLock()
 
     def _catalog(self) -> DataSourceCatalog:
         return self._catalog_builder()
+
+    def _ensure_configuration_dependencies(self) -> None:
+        catalog = self._catalog()
+        scope = {row.adapter_id: tuple(row.credential_env_names) for row in catalog.adapters if row.credential_env_names}
+        if self._config_store is None:
+            self._config_store = DataSourceConfigStore(catalog=catalog)
+        if self._credential_store is None:
+            self._credential_store = _DefaultCredentialStore(scope)
+        if self._usage_store is None:
+            self._usage_store = UsageStore()
+        if self._provider_registry is None:
+            self._provider_registry = ProviderRegistry(catalog=catalog)
 
     def _observations(self, catalog: DataSourceCatalog) -> dict[tuple[str, str, str], dict[str, Any]]:
         known = {
@@ -293,3 +395,324 @@ class DataSourceService:
             "connected": False,
             **self.refresh(),
         }
+
+    def _adapter(self, adapter_id: str):
+        if type(adapter_id) is not str:
+            raise KeyError(adapter_id)
+        return self._catalog().adapter(adapter_id)
+
+    def _now(self) -> datetime:
+        value = self._now_factory()
+        if type(value) is not datetime or value.tzinfo is None:
+            raise DataSourceUnavailable("clock_unavailable")
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _timestamp(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def _load_config(self) -> dict[str, Any]:
+        self._ensure_configuration_dependencies()
+        try:
+            return self._config_store.load()
+        except (ConfigValidationError, OSError):
+            raise DataSourceUnavailable("configuration_store_unavailable") from None
+
+    def _credential_state(self, adapter: Any, config: Mapping[str, Any]) -> dict[str, object]:
+        entry = config.get("adapters", {}).get(adapter.adapter_id, {})
+        last_validated_at = entry.get("last_validated_at")
+        if adapter.catalog_status is CatalogStatus.LICENSE_REQUIRED:
+            return CredentialState(False, "license_required", None, "none").to_dict()
+        if not adapter.credential_env_names:
+            return CredentialState(True, "not_required", None, "none").to_dict()
+        try:
+            state = self._credential_store.state(adapter.adapter_id)
+        except CredentialStoreUnavailable:
+            raise DataSourceUnavailable("credential_store_unavailable") from None
+        document = state.to_dict()
+        document["last_validated_at"] = last_validated_at
+        if document["configured"] and last_validated_at:
+            document["status"] = "validated"
+        return document
+
+    def config_document(self) -> dict[str, object]:
+        catalog = self._catalog()
+        config = self._load_config()
+        rows = []
+        for adapter in catalog.adapters:
+            entry = config["adapters"].get(adapter.adapter_id, {})
+            rows.append({
+                "adapter_id": adapter.adapter_id,
+                "billing_model": adapter.billing_model.value,
+                "catalog_status": adapter.catalog_status.value,
+                "enabled": entry.get("enabled", adapter.default_enabled),
+                "usage_mode": entry.get("usage_mode"),
+                "daily_budget": entry.get("daily_budget"),
+                "monthly_budget": entry.get("monthly_budget"),
+                "per_request_budget": entry.get("per_request_budget"),
+                "daily_request_limit": entry.get("daily_request_limit"),
+                "monthly_request_limit": entry.get("monthly_request_limit"),
+                "credential": self._credential_state(adapter, config),
+            })
+        return {"free_only": config["free_only"], "adapters": rows}
+
+    def _atomic_update_free_only(self, free_only: bool) -> None:
+        if type(self._config_store) is DataSourceConfigStore:
+            # Keep the Task 1 cross-process lock across read/merge/write so a
+            # concurrent adapter update cannot be overwritten.
+            with CACHE_IO_LOCK:
+                with self._config_store._process_lock():
+                    current = self._config_store._load_unlocked()
+                    validated = self._config_store._validate({
+                        "free_only": free_only, "adapters": current["adapters"],
+                    })
+                    self._config_store._atomic_write(validated)
+            return
+        current = self._config_store.load()
+        self._config_store.save({"free_only": free_only, "adapters": current["adapters"]})
+
+    def update_free_only(self, free_only: object) -> dict[str, object]:
+        if type(free_only) is not bool:
+            raise DataSourceRequestInvalid("invalid configuration")
+        self._ensure_configuration_dependencies()
+        with self._mutation_lock:
+            try:
+                self._atomic_update_free_only(free_only)
+            except (ConfigValidationError, OSError):
+                raise DataSourceUnavailable("configuration_store_unavailable") from None
+        return self.config_document()
+
+    @staticmethod
+    def _normalize_adapter_updates(updates: object) -> dict[str, object]:
+        if type(updates) is not dict or not updates or set(updates) - _ADAPTER_CONFIG_FIELDS:
+            raise DataSourceRequestInvalid("invalid adapter configuration")
+        normalized: dict[str, object] = {}
+        for field, value in updates.items():
+            if field in {"daily_budget", "monthly_budget", "per_request_budget"}:
+                if type(value) is not str or not _DECIMAL_TEXT.fullmatch(value):
+                    raise DataSourceRequestInvalid("invalid adapter configuration")
+                try:
+                    parsed = Decimal(value)
+                except InvalidOperation:
+                    raise DataSourceRequestInvalid("invalid adapter configuration") from None
+                if not parsed.is_finite() or parsed < 0 or parsed > _MAX_BUDGET:
+                    raise DataSourceRequestInvalid("invalid adapter configuration")
+            elif field in {"daily_request_limit", "monthly_request_limit"}:
+                if type(value) is not int or value < 0 or value > 1_000_000_000:
+                    raise DataSourceRequestInvalid("invalid adapter configuration")
+            elif (
+                type(value) is not str
+                or not _USAGE_MODE.fullmatch(value)
+                or any(marker in value.lower() for marker in _CREDENTIAL_MARKERS)
+            ):
+                raise DataSourceRequestInvalid("invalid adapter configuration")
+            normalized[field] = value
+        return normalized
+
+    def update_adapter_config(self, adapter_id: str, updates: object) -> dict[str, object]:
+        self._adapter(adapter_id)
+        normalized = self._normalize_adapter_updates(updates)
+        self._ensure_configuration_dependencies()
+        with self._mutation_lock:
+            try:
+                document = self._config_store.update_adapter(adapter_id, normalized)
+            except (ConfigValidationError, OSError):
+                raise DataSourceUnavailable("configuration_store_unavailable") from None
+        return {"adapter_id": adapter_id, "config": document["adapters"][adapter_id]}
+
+    @staticmethod
+    def _conflict_for_catalog(adapter: Any) -> None:
+        if adapter.catalog_status is CatalogStatus.LICENSE_REQUIRED:
+            raise DataSourceConflict("license_required")
+        if adapter.catalog_status is CatalogStatus.CATALOG_ONLY:
+            raise DataSourceConflict("catalog_only")
+        if adapter.catalog_status is CatalogStatus.DISABLED:
+            raise DataSourceConflict("disabled")
+
+    @staticmethod
+    def _has_positive_budgets(entry: Mapping[str, Any]) -> bool:
+        try:
+            return all(Decimal(entry.get(field, "0")) > 0 for field in (
+                "daily_budget", "monthly_budget", "per_request_budget",
+            ))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+
+    def enable_adapter(self, adapter_id: str, *, confirm_paid_usage: object = False) -> dict[str, object]:
+        if type(confirm_paid_usage) is not bool:
+            raise DataSourceRequestInvalid("invalid confirmation")
+        adapter = self._adapter(adapter_id)
+        self._conflict_for_catalog(adapter)
+        config = self._load_config()
+        entry = config["adapters"].get(adapter_id, {})
+        credential = self._credential_state(adapter, config)
+        is_paid = adapter.billing_model in {BillingModel.PAID_API, BillingModel.ENTERPRISE_LICENSE}
+        if adapter.credential_env_names and not credential["configured"]:
+            raise DataSourceConflict("unconfigured")
+        if is_paid:
+            if config["free_only"]:
+                raise DataSourceConflict("free_only")
+            if not self._has_positive_budgets(entry):
+                raise DataSourceConflict("budget_required")
+            if not confirm_paid_usage:
+                raise DataSourceConflict("explicit_confirmation_required")
+        if adapter.credential_env_names:
+            # No current keyed/paid descriptor has reviewed, secret-safe validation
+            # transport metadata. Fail closed before resolving an implementation.
+            raise DataSourceConflict("unsupported_credential_transport")
+        if adapter.billing_model is not BillingModel.FREE_NO_KEY or adapter.auth_type != "none":
+            raise DataSourceConflict("configuration_barrier")
+        with self._mutation_lock:
+            try:
+                self._config_store.update_adapter(adapter_id, {"enabled": True})
+            except (ConfigValidationError, OSError):
+                raise DataSourceUnavailable("configuration_store_unavailable") from None
+            self._adapter_enabled[adapter_id] = True
+        return {"adapter_id": adapter_id, "action": "enable", "status": "enabled", "enabled": True, "connected": False}
+
+    def disable_adapter(self, adapter_id: str) -> dict[str, object]:
+        adapter = self._adapter(adapter_id)
+        self._conflict_for_catalog(adapter)
+        self._ensure_configuration_dependencies()
+        with self._mutation_lock:
+            try:
+                self._config_store.update_adapter(adapter_id, {"enabled": False})
+            except (ConfigValidationError, OSError):
+                raise DataSourceUnavailable("configuration_store_unavailable") from None
+            self._adapter_enabled[adapter_id] = False
+        return {"adapter_id": adapter_id, "action": "disable", "status": "disabled", "enabled": False, "connected": False}
+
+    def validate_adapter(self, adapter_id: str) -> dict[str, object]:
+        adapter = self._adapter(adapter_id)
+        self._conflict_for_catalog(adapter)
+        config = self._load_config()
+        credential = self._credential_state(adapter, config)
+        if adapter.credential_env_names and not credential["configured"]:
+            return {"adapter_id": adapter_id, "status": "unconfigured", "connected": False, "health_failure": False, "last_validated_at": None}
+        # An explicit trusted validation_transport_supported flag does not yet
+        # exist in Catalog/runtime metadata. Do not resolve or call a Provider.
+        raise DataSourceConflict("unsupported_credential_transport")
+
+    def put_credential(self, adapter_id: str, value: object) -> dict[str, object]:
+        adapter = self._adapter(adapter_id)
+        self._conflict_for_catalog(adapter)
+        if len(adapter.credential_env_names) != 1:
+            raise DataSourceConflict("credential_not_supported")
+        if type(value) is not str or not value.strip() or len(value) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise DataSourceRequestInvalid("invalid credential")
+        self._ensure_configuration_dependencies()
+        env_name = adapter.credential_env_names[0]
+        with self._mutation_lock:
+            try:
+                self._config_store.update_adapter(adapter_id, {"enabled": False, "last_validated_at": None})
+                self._credential_store.set(adapter_id, env_name, value)
+            except CredentialWriteNotSupported:
+                raise DataSourceConflict("credential_source_read_only") from None
+            except CredentialStoreUnavailable:
+                raise DataSourceUnavailable("credential_store_unavailable") from None
+            except (ConfigValidationError, OSError):
+                raise DataSourceUnavailable("configuration_store_unavailable") from None
+            state = self._credential_store.state(adapter_id).to_dict()
+            state["last_validated_at"] = None
+            return state
+
+    def delete_credential(self, adapter_id: str) -> dict[str, object]:
+        adapter = self._adapter(adapter_id)
+        self._conflict_for_catalog(adapter)
+        if len(adapter.credential_env_names) != 1:
+            raise DataSourceConflict("credential_not_supported")
+        self._ensure_configuration_dependencies()
+        env_name = adapter.credential_env_names[0]
+        with self._mutation_lock:
+            try:
+                self._config_store.update_adapter(adapter_id, {"enabled": False, "last_validated_at": None})
+                self._credential_store.delete(adapter_id, env_name)
+                state = self._credential_store.state(adapter_id).to_dict()
+            except CredentialWriteNotSupported:
+                raise DataSourceConflict("credential_source_read_only") from None
+            except CredentialStoreUnavailable:
+                raise DataSourceUnavailable("credential_store_unavailable") from None
+            except (ConfigValidationError, OSError):
+                raise DataSourceUnavailable("configuration_store_unavailable") from None
+            state["last_validated_at"] = None
+            return state
+
+    def _usage_rows(self, adapter_id: str | None) -> tuple[datetime, list[dict[str, object]]]:
+        catalog = self._catalog()
+        adapters = [self._adapter(adapter_id)] if adapter_id is not None else list(catalog.adapters)
+        self._ensure_configuration_dependencies()
+        now = self._now()
+        try:
+            records = self._usage_store.records(now=now)
+        except UsageStoreError:
+            raise DataSourceUnavailable("usage_store_unavailable") from None
+        day, month = now.date().isoformat(), now.strftime("%Y-%m")
+        rows: list[dict[str, object]] = []
+        for adapter in adapters:
+            daily_cost = monthly_cost = Decimal("0")
+            daily_units = monthly_units = Decimal("0")
+            daily_requests = monthly_requests = 0
+            statuses: Counter[str] = Counter()
+            open_count = 0
+            for record in records:
+                if record.adapter_id != adapter.adapter_id or record.authorized_at.strftime("%Y-%m") != month:
+                    continue
+                cost = record.actual_cost if record.actual_cost is not None else record.estimated_cost
+                monthly_cost += cost
+                monthly_units += record.units
+                monthly_requests += record.request_count
+                statuses[record.status] += 1
+                if record.actual_cost is None:
+                    open_count += 1
+                if record.authorized_at.date().isoformat() == day:
+                    daily_cost += cost
+                    daily_units += record.units
+                    daily_requests += record.request_count
+            rows.append({
+                "adapter_id": adapter.adapter_id, "day": day, "month": month,
+                "daily_cost": format(daily_cost, "f"), "monthly_cost": format(monthly_cost, "f"),
+                "daily_request_count": daily_requests, "monthly_request_count": monthly_requests,
+                "daily_units": format(daily_units, "f"), "monthly_units": format(monthly_units, "f"),
+                "status_counts": dict(sorted(statuses.items())), "open_reservations": open_count,
+            })
+        return now, rows
+
+    def usage_document(self, adapter_id: str | None = None) -> dict[str, object]:
+        now, rows = self._usage_rows(adapter_id)
+        return {"as_of": self._timestamp(now), "timezone": "UTC", "adapters": rows}
+
+    def cost_document(self, adapter_id: str | None = None) -> dict[str, object]:
+        config = self._load_config()
+        now, usage_rows = self._usage_rows(adapter_id)
+        usage_by_id = {row["adapter_id"]: row for row in usage_rows}
+        adapters = [self._adapter(adapter_id)] if adapter_id is not None else list(self._catalog().adapters)
+        rows = []
+        for adapter in adapters:
+            entry = config["adapters"].get(adapter.adapter_id, {})
+            usage = usage_by_id[adapter.adapter_id]
+            credential = self._credential_state(adapter, config)
+            enabled = entry.get("enabled", adapter.default_enabled)
+            if adapter.catalog_status is CatalogStatus.LICENSE_REQUIRED:
+                status = "license_required"
+            elif not enabled:
+                status = "disabled"
+            elif adapter.credential_env_names and not credential["configured"]:
+                status = "unconfigured"
+            elif config["free_only"] and adapter.billing_model in {BillingModel.PAID_API, BillingModel.ENTERPRISE_LICENSE}:
+                status = "free_only"
+            else:
+                status = "configured"
+            daily_budget, monthly_budget = entry.get("daily_budget"), entry.get("monthly_budget")
+            daily_remaining = None if daily_budget is None else format(max(Decimal(daily_budget) - Decimal(usage["daily_cost"]), Decimal("0")), "f")
+            monthly_remaining = None if monthly_budget is None else format(max(Decimal(monthly_budget) - Decimal(usage["monthly_cost"]), Decimal("0")), "f")
+            rows.append({
+                "adapter_id": adapter.adapter_id, "billing_model": adapter.billing_model.value,
+                "enabled": enabled, "credential_configured": credential["configured"], "status": status,
+                "day": usage["day"], "month": usage["month"],
+                "daily_budget": daily_budget, "monthly_budget": monthly_budget,
+                "per_request_budget": entry.get("per_request_budget"),
+                "daily_cost": usage["daily_cost"], "monthly_cost": usage["monthly_cost"],
+                "daily_remaining": daily_remaining, "monthly_remaining": monthly_remaining,
+                "open_reservations": usage["open_reservations"],
+            })
+        return {"as_of": self._timestamp(now), "timezone": "UTC", "free_only": config["free_only"], "adapters": rows}
