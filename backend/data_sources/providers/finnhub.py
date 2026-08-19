@@ -57,21 +57,15 @@ class FinnhubAdapter(BaseProvider):
     )
 
     def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None,
-                 entitlement_resolver: Any | None = None, cache_getter: Callable[[ProviderRequest], object | None] | None = None,
+                 cache_getter: Callable[[ProviderRequest], object | None] | None = None,
                  fetched_at: Callable[[], datetime] = _now) -> None:
         self._http, self._credentials, self._budget_guard = http, credentials, budget_guard
-        self._entitlement_resolver = entitlement_resolver
         self._cache_getter, self._fetched_at = cache_getter, fetched_at
 
     def _credential(self) -> str | None:
         try: value = self._credentials.get(self.descriptor.adapter_id, _ENV_NAME)
         except Exception: return None
         return value if type(value) is str and value.strip() else None
-
-    def _trusted_entitlement(self, capability: str, now: datetime) -> tuple[str | None, object | None]:
-        from data_sources.provider_registry import FreemiumEntitlementResolver
-        if type(self._entitlement_resolver) is not FreemiumEntitlementResolver: return "entitlement_unavailable", None
-        return self._entitlement_resolver.resolve(self.descriptor.adapter_id, capability, self.descriptor.billing_model, now=now)
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[str, dict[str, object]]:
@@ -100,8 +94,7 @@ class FinnhubAdapter(BaseProvider):
         if "key" in message or "auth" in message or "token" in message: raise ProviderUnavailable("authentication", reference=_REFERENCE)
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
-    def _parse_quote(self, payload: object, request: ProviderRequest, *, now: datetime, ent: object, cached: bool) -> tuple[ProviderValue, ...]:
-        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(ent, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now): raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
+    def _parse_quote(self, payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
         if type(payload) is not dict: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._payload_error(payload)
         if set(payload) != {"c", "d", "dp", "h", "l", "o", "pc", "t"}: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -110,12 +103,11 @@ class FinnhubAdapter(BaseProvider):
         observed = datetime.fromtimestamp(timestamp, timezone.utc)
         if observed > now: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         public = {name: _number(payload[field]) for name, field in (("current", "c"), ("change", "d"), ("change_percent", "dp"), ("high", "h"), ("low", "l"), ("open", "o"), ("previous_close", "pc"))}
-        metadata = {"symbol": str(request.parameters["symbol"]), "provider_timestamp": observed.isoformat(), "publisher_role": "market_provider", "plan_name": ent.plan_name, "quota_remaining": "unknown" if ent.quota_remaining is None else str(ent.quota_remaining), "source_reference": _REFERENCE}
+        metadata = {"symbol": str(request.parameters["symbol"]), "provider_timestamp": observed.isoformat(), "publisher_role": "market_provider", "source_reference": _REFERENCE}
         if cached: metadata["cache_status"] = "fallback"
         return (ProviderValue(public, "finnhub", "finnhub", request.capability_id, observed.date(), now, "cached" if cached else "upstream_reported", "Finnhub account terms apply", 130, None, "unknown", "intraday", metadata),)
 
-    def _parse_news(self, payload: object, request: ProviderRequest, *, now: datetime, ent: object, cached: bool) -> tuple[ProviderValue, ...]:
-        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(ent, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now): raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
+    def _parse_news(self, payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
         if type(payload) is dict:
             self._payload_error(payload)
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -137,7 +129,7 @@ class FinnhubAdapter(BaseProvider):
             except ValueError: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from None
             domain = parts.hostname.lower()
             public = {"title": title, "summary": summary, "publisher_name": publisher, "publisher_url": url, "origin_domain": domain, "published_at": published.isoformat(), "category": category, "collector": "finnhub", "candidate": True, "independent_evidence_eligible": False}
-            metadata = {"collector": "finnhub", "collector_relation": "discovery_only", "origin_domain": domain, "origin_identity": domain, "plan_name": ent.plan_name, "quota_remaining": "unknown" if ent.quota_remaining is None else str(ent.quota_remaining), "source_reference": _REFERENCE, "delay_seconds": str(int((now - published).total_seconds()))}
+            metadata = {"collector": "finnhub", "collector_relation": "discovery_only", "origin_domain": domain, "origin_identity": domain, "source_reference": _REFERENCE, "delay_seconds": str(int((now - published).total_seconds()))}
             if cached: metadata["cache_status"] = "fallback"
             rows.append(ProviderValue(public, "finnhub", "finnhub", request.capability_id, published.date(), now, "cached_candidate" if cached else "candidate", "Finnhub discovery index; original publisher must be verified", 130, None, "candidate", "event_driven", metadata))
         return tuple(rows)

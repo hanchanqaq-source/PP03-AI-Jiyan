@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -10,7 +10,6 @@ from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
-from data_sources.provider_registry import FreemiumEntitlementResolver
 
 
 NOW = datetime(2025, 7, 2, 12, tzinfo=timezone.utc)
@@ -38,17 +37,6 @@ def credentials(configured=True):
     return store
 
 
-def resolver(**overrides):
-    record = {
-        "adapter_id": "twelve-data", "capability_id": "stock_history", "billing_model": "freemium",
-        "plan_name": "fixture-basic", "available": True, "quota_remaining": 7,
-        "estimated_cost": Decimal("0"), "actual_cost": Decimal("0"),
-        "observed_at": NOW - timedelta(minutes=5), "expires_at": NOW + timedelta(hours=1), "provenance": "deterministic_test_fixture",
-    }
-    record.update(overrides)
-    return FreemiumEntitlementResolver.from_test_records((record,))
-
-
 def request(**overrides):
     values = {"symbol": "AAPL", "interval": "1day", "outputsize": 2}; values.update(overrides)
     return ProviderRequest("stock_history", values)
@@ -65,24 +53,21 @@ def fixture():
     }
 
 
-def adapter(http=None, *, configured=True, entitlement_resolver=None, guard=None):
+def adapter(http=None, *, configured=True, guard=None):
     from data_sources.providers.twelve_data import TwelveDataAdapter
-    return TwelveDataAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, entitlement_resolver=entitlement_resolver, fetched_at=lambda: NOW)
+    return TwelveDataAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, fetched_at=lambda: NOW)
 
 
 def parse(payload, req=None, *, cached=False):
-    active_resolver = resolver(); active = adapter(entitlement_resolver=active_resolver)
-    reason, snapshot = active._trusted_entitlement("stock_history", NOW)
-    assert reason is None and snapshot is not None
-    return active._parse(payload, req or request(), now=NOW, entitlement=snapshot, cached=cached)
+    return adapter()._parse(payload, req or request(), now=NOW, cached=cached)
 
 
 def test_twelve_data_credentials_and_query_auth_precede_request_budget_transport():
     http, guard = FakeHttp(), FakeBudget()
-    missing = adapter(http, configured=False, entitlement_resolver=resolver(), guard=guard)
+    missing = adapter(http, configured=False, guard=guard)
     assert missing.probe("stock_history", parameters={"symbol": object()})["status"] == "unconfigured"
     with pytest.raises(ProviderUnavailable, match="unconfigured"): missing.fetch(ProviderRequest("stock_history", {"symbol": object()}))
-    active = adapter(http, entitlement_resolver=resolver(), guard=guard)
+    active = adapter(http, guard=guard)
     assert active.probe("stock_history")["status"] == "unsupported_credential_transport"
     with pytest.raises(ProviderUnavailable, match="unsupported_credential_transport"): active.fetch(request())
     assert guard.calls == [] and http.calls == []
@@ -93,7 +78,7 @@ def test_twelve_data_parser_preserves_symbol_interval_timezone_currency_and_cred
     assert len(rows) == 2
     assert row.value == {"open": Decimal("208"), "high": Decimal("212"), "low": Decimal("207"), "close": Decimal("210.5"), "volume": Decimal("1000")}
     assert row.as_of_date.isoformat() == "2025-07-01" and row.unit == "USD" and row.frequency == "1day"
-    assert row.source_metadata == {"symbol": "AAPL", "interval": "1day", "timezone": "America/New_York", "credits_used": "2", "plan_name": "fixture-basic", "quota_remaining": "7", "source_reference": "https://api.twelvedata.com/"}
+    assert row.source_metadata == {"symbol": "AAPL", "interval": "1day", "timezone": "America/New_York", "credits_used": "2", "source_reference": "https://api.twelvedata.com/"}
     assert SECRET not in repr(rows)
 
 

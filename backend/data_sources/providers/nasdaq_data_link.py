@@ -48,24 +48,15 @@ class NasdaqDataLinkAdapter(BaseProvider):
         _REFERENCE, 140, CatalogStatus.UNCONFIGURED,
     )
 
-    def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None, entitlement_resolver: Any | None = None,
+    def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None,
                  cache_getter: Callable[[ProviderRequest], object | None] | None = None, fetched_at: Callable[[], datetime] = _now) -> None:
         self._http, self._credentials, self._budget_guard = http, credentials, budget_guard
-        self._entitlement_resolver = entitlement_resolver
         self._cache_getter, self._fetched_at = cache_getter, fetched_at
 
     def _credential(self) -> str | None:
         try: value = self._credentials.get(self.descriptor.adapter_id, _ENV_NAME)
         except Exception: return None
         return value if type(value) is str and value.strip() else None
-
-    def _trusted_entitlement(self, capability_id: str, now: datetime) -> tuple[str | None, object | None]:
-        from data_sources.provider_registry import FreemiumEntitlementResolver
-        if type(self._entitlement_resolver) is not FreemiumEntitlementResolver:
-            return "entitlement_unavailable", None
-        return self._entitlement_resolver.resolve(
-            self.descriptor.adapter_id, capability_id, self.descriptor.billing_model, now=now
-        )
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[str, str, int]:
@@ -89,21 +80,15 @@ class NasdaqDataLinkAdapter(BaseProvider):
         if code.startswith("QEP") or "subscription" in message.lower(): raise ProviderUnavailable("plan_unavailable", reference=_REFERENCE)
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
-    def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, entitlement: object, cached: bool) -> tuple[ProviderValue, ...]:
-        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(
-            entitlement, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now
-        ):
-            raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
+    def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
         if type(payload) is not dict: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._error(payload)
         dataset = payload.get("dataset")
         if type(dataset) is not dict: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         required = {"id", "dataset_code", "database_code", "name", "description", "refreshed_at", "newest_available_date", "oldest_available_date", "column_names", "frequency", "type", "premium", "data", "database_name"}
         if set(dataset) != required or type(dataset["premium"]) is not bool: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
-        if dataset["premium"] and not entitlement.premium_access:
-            raise ProviderUnavailable("plan_unavailable", reference=_REFERENCE)
         requested_resource = (request.parameters.get("database_code"), request.parameters.get("dataset_code"))
-        entitlement_label = "premium_entitled" if dataset["premium"] else ("known_free_dataset" if requested_resource in _KNOWN_FREE else "account_entitled")
+        access_observation = "premium_dataset" if dataset["premium"] else ("known_free_dataset" if requested_resource in _KNOWN_FREE else "nonpremium_dataset")
         database, code, name, database_name = (_text(dataset[field]) for field in ("database_code", "dataset_code", "name", "database_name"))
         newest, frequency, columns, data = _text(dataset["newest_available_date"]), _text(dataset["frequency"]), dataset["column_names"], dataset["data"]
         if database != request.parameters.get("database_code") or code != request.parameters.get("dataset_code") or type(columns) is not list or type(data) is not list or columns != ["Date", "Value"]: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -120,7 +105,7 @@ class NasdaqDataLinkAdapter(BaseProvider):
             try: as_of = date.fromisoformat(raw_date)
             except ValueError: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from None
             if as_of > now.date(): raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
-            metadata = {"database_code": database, "dataset_code": code, "database_name": database_name, "dataset_name": name, "newest_available_date": newest, "entitlement": entitlement_label, "plan_name": entitlement.plan_name, "quota_remaining": "unknown" if entitlement.quota_remaining is None else str(entitlement.quota_remaining), "source_reference": _REFERENCE}
+            metadata = {"database_code": database, "dataset_code": code, "database_name": database_name, "dataset_name": name, "newest_available_date": newest, "dataset_access_observation": access_observation, "source_reference": _REFERENCE}
             if cached: metadata["cache_status"] = "fallback"
             stale = type(max_age) is int and (now.date() - as_of).days > max_age
             rows.append(ProviderValue(_number(item[1]), "nasdaq_data_link", "nasdaq-data-link", request.capability_id, as_of, now, "cached" if cached else ("stale" if stale else "upstream_reported"), "Nasdaq Data Link dataset terms apply", 140, None, "unknown", frequency, metadata))

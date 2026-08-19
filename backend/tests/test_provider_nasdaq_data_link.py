@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -10,7 +10,6 @@ from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
-from data_sources.provider_registry import FreemiumEntitlementResolver
 
 
 NOW = datetime(2025, 7, 2, 12, tzinfo=timezone.utc)
@@ -38,17 +37,6 @@ def credentials(configured=True):
     return store
 
 
-def resolver(**overrides):
-    record = {
-        "adapter_id": "nasdaq-data-link", "capability_id": "macro_series", "billing_model": "freemium",
-        "plan_name": "fixture-plan", "available": True, "quota_remaining": 5,
-        "estimated_cost": Decimal("0"), "actual_cost": Decimal("0"), "premium_access": False,
-        "observed_at": NOW - timedelta(minutes=5), "expires_at": NOW + timedelta(hours=1), "provenance": "deterministic_test_fixture",
-    }
-    record.update(overrides)
-    return FreemiumEntitlementResolver.from_test_records((record,))
-
-
 def request(database_code="FRED", dataset_code="DFF", **overrides):
     values = {"database_code": database_code, "dataset_code": dataset_code, "limit": 2}; values.update(overrides)
     return ProviderRequest("macro_series", values)
@@ -63,40 +51,36 @@ def fixture(*, premium=False, database="FRED", dataset="DFF"):
     }}
 
 
-def adapter(http=None, *, configured=True, entitlement_resolver=None, guard=None):
+def adapter(http=None, *, configured=True, guard=None):
     from data_sources.providers.nasdaq_data_link import NasdaqDataLinkAdapter
-    return NasdaqDataLinkAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, entitlement_resolver=entitlement_resolver, fetched_at=lambda: NOW)
+    return NasdaqDataLinkAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, fetched_at=lambda: NOW)
 
 
-def parse(payload, req=None, *, cached=False, premium_access=False):
-    active_resolver = resolver(premium_access=premium_access); active = adapter(entitlement_resolver=active_resolver)
-    reason, snapshot = active._trusted_entitlement("macro_series", NOW)
-    assert reason is None and snapshot is not None
-    return active._parse(payload, req or request(), now=NOW, entitlement=snapshot, cached=cached)
+def parse(payload, req=None, *, cached=False):
+    return adapter()._parse(payload, req or request(), now=NOW, cached=cached)
 
 
 def test_nasdaq_no_key_and_query_auth_never_build_url_authorize_or_transport():
     http, guard = FakeHttp(), FakeBudget()
-    missing = adapter(http, configured=False, entitlement_resolver=resolver(), guard=guard)
+    missing = adapter(http, configured=False, guard=guard)
     assert missing.probe("macro_series", parameters={"database_code": object()})["status"] == "unconfigured"
     with pytest.raises(ProviderUnavailable, match="unconfigured"): missing.fetch(ProviderRequest("macro_series", {"database_code": object()}))
-    active = adapter(http, entitlement_resolver=resolver(), guard=guard)
+    active = adapter(http, guard=guard)
     assert active.probe("macro_series")["status"] == "unsupported_credential_transport"
     with pytest.raises(ProviderUnavailable, match="unsupported_credential_transport"): active.fetch(request())
     assert guard.calls == [] and http.calls == []
 
 
-def test_nasdaq_parser_distinguishes_known_free_and_premium_entitlement():
-    assert parse(fixture())[0].source_metadata["entitlement"] == "known_free_dataset"
-    with pytest.raises(ProviderUnavailable, match="plan_unavailable"): parse(fixture(premium=True), premium_access=False)
-    assert parse(fixture(premium=True), premium_access=True)[0].source_metadata["entitlement"] == "premium_entitled"
+def test_nasdaq_parser_reports_free_or_premium_dataset_observation_without_authorizing_access():
+    assert parse(fixture())[0].source_metadata["dataset_access_observation"] == "known_free_dataset"
+    assert parse(fixture(premium=True))[0].source_metadata["dataset_access_observation"] == "premium_dataset"
 
 
 def test_nasdaq_parser_preserves_database_dataset_date_frequency_unknown_unit():
     row = parse(fixture())[0]
     assert row.value == Decimal("4.33") and row.as_of_date.isoformat() == "2025-07-01"
     assert row.unit == "unknown" and row.frequency == "daily"
-    assert row.source_metadata == {"database_code": "FRED", "dataset_code": "DFF", "database_name": "Federal Reserve Economic Data", "dataset_name": "Federal Funds Rate", "newest_available_date": "2025-07-01", "entitlement": "known_free_dataset", "plan_name": "fixture-plan", "quota_remaining": "5", "source_reference": "https://data.nasdaq.com/"}
+    assert row.source_metadata == {"database_code": "FRED", "dataset_code": "DFF", "database_name": "Federal Reserve Economic Data", "dataset_name": "Federal Funds Rate", "newest_available_date": "2025-07-01", "dataset_access_observation": "known_free_dataset", "source_reference": "https://data.nasdaq.com/"}
     assert SECRET not in repr(row)
 
 

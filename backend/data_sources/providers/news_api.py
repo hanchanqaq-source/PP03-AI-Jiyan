@@ -36,24 +36,15 @@ class NewsApiAdapter(BaseProvider):
         _REFERENCE, 160, CatalogStatus.UNCONFIGURED,
     )
 
-    def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None, entitlement_resolver: Any | None = None,
+    def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None,
                  cache_getter: Callable[[ProviderRequest], object | None] | None = None, fetched_at: Callable[[], datetime] = _now) -> None:
         self._http, self._credentials, self._budget_guard = http, credentials, budget_guard
-        self._entitlement_resolver = entitlement_resolver
         self._cache_getter, self._fetched_at = cache_getter, fetched_at
 
     def _credential(self) -> str | None:
         try: value = self._credentials.get(self.descriptor.adapter_id, _ENV_NAME)
         except Exception: return None
         return value if type(value) is str and value.strip() else None
-
-    def _trusted_entitlement(self, capability_id: str, now: datetime) -> tuple[str | None, object | None]:
-        from data_sources.provider_registry import FreemiumEntitlementResolver
-        if type(self._entitlement_resolver) is not FreemiumEntitlementResolver:
-            return "entitlement_unavailable", None
-        return self._entitlement_resolver.resolve(
-            self.descriptor.adapter_id, capability_id, self.descriptor.billing_model, now=now
-        )
 
     @staticmethod
     def _request(request: ProviderRequest) -> dict[str, object]:
@@ -79,11 +70,7 @@ class NewsApiAdapter(BaseProvider):
         if code in {"apiKeyExhausted", "parameterInvalid"}: raise ProviderUnavailable("plan_unavailable", reference=_REFERENCE)
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
-    def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, entitlement: object, cached: bool) -> tuple[ProviderValue, ...]:
-        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(
-            entitlement, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now
-        ):
-            raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
+    def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
         if type(payload) is not dict: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._error(payload)
         total, articles = payload.get("totalResults"), payload.get("articles")
@@ -109,7 +96,7 @@ class NewsApiAdapter(BaseProvider):
             except ValueError: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from None
             domain = parts.hostname.lower()
             public = {"title": title, "summary": summary, "publisher_name": publisher, "publisher_url": url, "origin_domain": domain, "published_at": published.isoformat(), "collector": "news_api", "candidate": True, "independent_evidence_eligible": False}
-            metadata = {"collector": "news_api", "collector_relation": "discovery_only", "origin_domain": domain, "origin_identity": domain, "publisher_id": publisher_id or "unknown", "delay_seconds": str(int((now - published).total_seconds())), "plan_name": entitlement.plan_name, "quota_remaining": "unknown" if entitlement.quota_remaining is None else str(entitlement.quota_remaining), "source_reference": _REFERENCE}
+            metadata = {"collector": "news_api", "collector_relation": "discovery_only", "origin_domain": domain, "origin_identity": domain, "publisher_id": publisher_id or "unknown", "delay_seconds": str(int((now - published).total_seconds())), "reported_total_results": str(total), "source_reference": _REFERENCE}
             if cached: metadata["cache_status"] = "fallback"
             rows.append(ProviderValue(public, "news_api", "news-api", request.capability_id, published.date(), now, "cached_candidate" if cached else "candidate", "NewsAPI discovery index; original publisher must be verified", 160, None, "candidate", "event_driven", metadata))
         return tuple(rows)

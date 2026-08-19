@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
+import inspect
 
 import pytest
 import requests
@@ -9,10 +10,9 @@ import requests
 from data_sources.budgets import BudgetGuard, BudgetPolicy
 from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
-from data_sources.models import BillingModel, SourceRole
+from data_sources.models import SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
-from data_sources.provider_registry import FreemiumEntitlementResolver
 from data_sources.usage_store import UsageStore
 
 
@@ -49,18 +49,6 @@ def credentials(configured=True):
     return store
 
 
-def resolver(**overrides):
-    record = {
-        "adapter_id": "alpha-vantage", "capability_id": "stock_history", "billing_model": "freemium",
-        "plan_name": "deterministic-fixture", "available": True, "quota_remaining": 24,
-        "estimated_cost": Decimal("0"), "actual_cost": Decimal("0"),
-        "observed_at": NOW - timedelta(minutes=5), "expires_at": NOW + timedelta(hours=1),
-        "provenance": "deterministic_test_fixture",
-    }
-    record.update(overrides)
-    return FreemiumEntitlementResolver.from_test_records((record,))
-
-
 def request(**overrides):
     parameters = {"symbol": "IBM", "function": "TIME_SERIES_DAILY", "interval": "daily"}
     parameters.update(overrides)
@@ -74,25 +62,20 @@ def fixture():
     }
 
 
-def adapter(http=None, *, configured=True, entitlement_resolver=None, guard=None):
+def adapter(http=None, *, configured=True, guard=None):
     from data_sources.providers.alpha_vantage import AlphaVantageAdapter
     return AlphaVantageAdapter(
-        http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard,
-        entitlement_resolver=entitlement_resolver, fetched_at=lambda: NOW,
+        http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, fetched_at=lambda: NOW,
     )
 
 
-def parse(payload, req=None, *, cached=False, entitlement_resolver=None):
-    active_resolver = entitlement_resolver or resolver()
-    active = adapter(entitlement_resolver=active_resolver)
-    reason, snapshot = active._trusted_entitlement("stock_history", NOW)
-    assert reason is None and snapshot is not None
-    return active._parse(payload, req or request(), now=NOW, entitlement=snapshot, cached=cached)
+def parse(payload, req=None, *, cached=False):
+    return adapter()._parse(payload, req or request(), now=NOW, cached=cached)
 
 
 def test_alpha_vantage_no_key_short_circuits_before_request_budget_and_transport():
     http, guard = FakeHttp(), FakeBudget()
-    active = adapter(http, configured=False, entitlement_resolver=resolver(), guard=guard)
+    active = adapter(http, configured=False, guard=guard)
     hostile = ProviderRequest("stock_history", {"symbol": object()})
     assert active.probe("stock_history", parameters=hostile.parameters) == {"status": "unconfigured", "connected": False, "health_failure": False}
     with pytest.raises(ProviderUnavailable, match="unconfigured"):
@@ -102,7 +85,7 @@ def test_alpha_vantage_no_key_short_circuits_before_request_budget_and_transport
 
 def test_alpha_vantage_configured_query_only_auth_is_explicitly_unsupported():
     http, guard = FakeHttp(), FakeBudget()
-    active = adapter(http, entitlement_resolver=resolver(), guard=guard)
+    active = adapter(http, guard=guard)
     assert active.probe("stock_history")["status"] == "unsupported_credential_transport"
     with pytest.raises(ProviderUnavailable, match="unsupported_credential_transport"):
         active.fetch(request())
@@ -116,7 +99,7 @@ def test_alpha_vantage_pure_parser_preserves_low_frequency_fields_without_secret
     assert row.unit == "unknown" and row.frequency == "daily"
     assert row.source_metadata == {
         "function": "TIME_SERIES_DAILY", "interval": "daily", "symbol": "IBM", "timezone": "US/Eastern",
-        "plan_name": "deterministic-fixture", "quota_remaining": "24", "source_reference": "https://www.alphavantage.co/",
+        "source_reference": "https://www.alphavantage.co/",
     }
     assert SECRET not in repr(row)
 
@@ -158,55 +141,25 @@ def test_alpha_vantage_request_builder_is_bounded_and_secret_free():
         adapter()._request(request(symbol=object()))
 
 
-def test_freemium_resolver_rejects_caller_authority_stale_mismatch_and_mutation():
-    active_resolver = resolver()
-    active = adapter(entitlement_resolver=active_resolver)
-    reason, snapshot = active._trusted_entitlement("stock_history", NOW)
-    assert reason is None and snapshot is not None
-    assert not active_resolver.validate_snapshot({"plan_name": "lookalike"}, "alpha-vantage", "stock_history", BillingModel.FREEMIUM, now=NOW)
-    assert not active_resolver.validate_snapshot(snapshot, "alpha-vantage", "wrong", BillingModel.FREEMIUM, now=NOW)
-    object.__setattr__(snapshot, "available", False)
-    with pytest.raises(ProviderUnavailable, match="entitlement_invalid"):
-        active._parse(fixture(), request(), now=NOW, entitlement=snapshot, cached=False)
-    stale = resolver(expires_at=NOW - timedelta(seconds=1), observed_at=NOW - timedelta(hours=1))
-    assert stale.resolve("alpha-vantage", "stock_history", BillingModel.FREEMIUM, now=NOW)[0] == "entitlement_stale"
+def test_task4_production_has_no_freemium_entitlement_authority_or_injection_surface():
+    import data_sources.provider_registry as registry_module
+    from data_sources.providers import alpha_vantage, finnhub, nasdaq_data_link, news_api, twelve_data
+
+    production_source = "\n".join(inspect.getsource(module) for module in (
+        registry_module, alpha_vantage, finnhub, twelve_data, nasdaq_data_link, news_api,
+    ))
+    for forbidden in ("FreemiumEntitlementResolver", "_FreemiumEntitlementSnapshot", "from_server_records", "_SERVER_RESOLVER_TOKEN", "entitlement_resolver"):
+        assert forbidden not in production_source
 
 
-@pytest.mark.parametrize(("change", "reason"), [
-    ({"available": False}, "plan_unavailable"),
-    ({"quota_remaining": 0}, "quota_exhausted"),
-    ({"estimated_cost": None, "actual_cost": None}, "cost_unknown"),
-])
-def test_freemium_resolver_fails_closed_on_plan_quota_and_unknown_cost(change, reason):
-    assert resolver(**change).resolve("alpha-vantage", "stock_history", BillingModel.FREEMIUM, now=NOW) == (reason, None)
+def test_registry_and_adapter_constructors_reject_caller_entitlement_injection():
+    from data_sources.provider_registry import ProviderRegistry
+    from data_sources.providers.alpha_vantage import AlphaVantageAdapter
 
-
-@pytest.mark.parametrize("record_change", [
-    {"estimated_cost": Decimal("0.01"), "actual_cost": None},
-    {"billing_model": "paid"},
-    {"provenance": "caller_claim"},
-    {"expires_at": NOW + timedelta(days=32)},
-])
-def test_freemium_resolver_rejects_untrusted_or_incomplete_entitlement_records(record_change):
-    with pytest.raises(ValueError):
-        resolver(**record_change)
-
-
-def test_test_fixture_provenance_cannot_be_constructed_as_server_evidence():
-    with pytest.raises(ValueError, match="provenance"):
-        FreemiumEntitlementResolver.from_server_records(({
-            "adapter_id": "alpha-vantage", "capability_id": "stock_history", "billing_model": "freemium",
-            "plan_name": "deterministic-fixture", "available": True, "quota_remaining": 24,
-            "estimated_cost": Decimal("0"), "actual_cost": Decimal("0"),
-            "observed_at": NOW - timedelta(minutes=5), "expires_at": NOW + timedelta(hours=1),
-            "provenance": "deterministic_test_fixture",
-        },))
-
-
-def test_resolver_canonical_record_map_is_immutable_after_validation():
-    active = resolver()
-    with pytest.raises(TypeError):
-        active._records[("alpha-vantage", "stock_history")] = ()
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        ProviderRegistry(build_catalog({"sources": []}), entitlement_resolver=object())
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        AlphaVantageAdapter(http=FakeHttp(), credentials=credentials(), entitlement_resolver=object())
 
 
 def test_alpha_vantage_catalog_is_stable_disabled_low_frequency_fallback():
@@ -227,25 +180,12 @@ def test_default_registry_with_configured_fake_alpha_key_makes_zero_network_call
     assert http.calls == []
 
 
-def test_registry_composition_is_the_only_adapter_resolver_injection_boundary():
-    from data_sources.provider_registry import ProviderRegistry
-    active_resolver = resolver()
-    registry = ProviderRegistry(
-        build_catalog({"sources": []}), http_factory=FakeHttp,
-        credential_factory=lambda _scope: credentials(True), entitlement_resolver=active_resolver,
-    )
-    active = registry.adapter("alpha-vantage")
-    reason, snapshot = active._trusted_entitlement("stock_history", NOW)
-    assert reason is None and snapshot is not None
-    assert active_resolver.validate_snapshot(snapshot, "alpha-vantage", "stock_history", BillingModel.FREEMIUM, now=NOW)
-
-
 def test_alpha_vantage_query_only_credential_is_unsupported_before_budget_or_transport(tmp_path):
     descriptor = build_catalog({"sources": []}).adapter("alpha-vantage")
     usage = UsageStore(tmp_path / "alpha-usage")
     guard = BudgetGuard(usage, {"alpha-vantage": BudgetPolicy("alpha-vantage", True, True, False, Decimal("1"), Decimal("5"), Decimal("1"))}, trusted_adapters={"alpha-vantage": descriptor})
     http = FakeHttp()
-    active = adapter(http, entitlement_resolver=resolver(estimated_cost=Decimal("0.01"), actual_cost=Decimal("0.01")), guard=guard)
+    active = adapter(http, guard=guard)
     with pytest.raises(ProviderUnavailable, match="unsupported_credential_transport"):
         active.fetch(request())
     assert http.calls == [] and usage.records(now=NOW) == ()

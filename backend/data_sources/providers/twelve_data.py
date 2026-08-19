@@ -47,24 +47,15 @@ class TwelveDataAdapter(BaseProvider):
         "套餐成本未知；无可信能力级权益时禁止请求", _REFERENCE, 125, CatalogStatus.UNCONFIGURED,
     )
 
-    def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None, entitlement_resolver: Any | None = None,
+    def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None,
                  cache_getter: Callable[[ProviderRequest], object | None] | None = None, fetched_at: Callable[[], datetime] = _now) -> None:
         self._http, self._credentials, self._budget_guard = http, credentials, budget_guard
-        self._entitlement_resolver = entitlement_resolver
         self._cache_getter, self._fetched_at = cache_getter, fetched_at
 
     def _credential(self) -> str | None:
         try: value = self._credentials.get(self.descriptor.adapter_id, _ENV_NAME)
         except Exception: return None
         return value if type(value) is str and value.strip() else None
-
-    def _trusted_entitlement(self, capability_id: str, now: datetime) -> tuple[str | None, object | None]:
-        from data_sources.provider_registry import FreemiumEntitlementResolver
-        if type(self._entitlement_resolver) is not FreemiumEntitlementResolver:
-            return "entitlement_unavailable", None
-        return self._entitlement_resolver.resolve(
-            self.descriptor.adapter_id, capability_id, self.descriptor.billing_model, now=now
-        )
 
     @staticmethod
     def _request(request: ProviderRequest) -> dict[str, object]:
@@ -87,11 +78,7 @@ class TwelveDataAdapter(BaseProvider):
         if code == 403 or "plan" in message.lower(): raise ProviderUnavailable("plan_unavailable", reference=_REFERENCE)
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
-    def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, entitlement: object, cached: bool) -> tuple[ProviderValue, ...]:
-        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(
-            entitlement, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now
-        ):
-            raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
+    def _parse(self, payload: object, request: ProviderRequest, *, now: datetime, cached: bool) -> tuple[ProviderValue, ...]:
         if type(payload) is not dict: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._error(payload)
         if payload.get("status") != "ok": raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -111,7 +98,7 @@ class TwelveDataAdapter(BaseProvider):
             except ValueError: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE) from None
             if as_of > now.date(): raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
             public = {field: _number(item[field]) for field in ("open", "high", "low", "close", "volume")}
-            metadata = {"symbol": symbol, "interval": interval, "timezone": timezone_name, "credits_used": str(credits), "plan_name": entitlement.plan_name, "quota_remaining": "unknown" if entitlement.quota_remaining is None else str(entitlement.quota_remaining), "source_reference": _REFERENCE}
+            metadata = {"symbol": symbol, "interval": interval, "timezone": timezone_name, "credits_used": str(credits), "source_reference": _REFERENCE}
             if cached: metadata["cache_status"] = "fallback"
             stale = type(max_age) is int and (now.date() - as_of).days > max_age
             rows.append(ProviderValue(public, "twelve_data", "twelve-data", request.capability_id, as_of, now, "cached" if cached else ("stale" if stale else "upstream_reported"), "Twelve Data account terms apply", 125, None, currency or "unknown", interval, metadata))

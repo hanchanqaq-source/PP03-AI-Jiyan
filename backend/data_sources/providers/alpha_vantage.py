@@ -63,11 +63,9 @@ class AlphaVantageAdapter(BaseProvider):
     )
 
     def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None,
-                 entitlement_resolver: Any | None = None,
                  cache_getter: Callable[[ProviderRequest], object | None] | None = None,
                  fetched_at: Callable[[], datetime] = _now) -> None:
         self._http, self._credentials, self._budget_guard = http, credentials, budget_guard
-        self._entitlement_resolver = entitlement_resolver
         self._cache_getter, self._fetched_at = cache_getter, fetched_at
 
     def _credential(self) -> str | None:
@@ -76,14 +74,6 @@ class AlphaVantageAdapter(BaseProvider):
         except Exception:
             return None
         return value if type(value) is str and value.strip() else None
-
-    def _trusted_entitlement(self, capability_id: str, now: datetime) -> tuple[str | None, object | None]:
-        from data_sources.provider_registry import FreemiumEntitlementResolver
-        if type(self._entitlement_resolver) is not FreemiumEntitlementResolver:
-            return "entitlement_unavailable", None
-        return self._entitlement_resolver.resolve(
-            self.descriptor.adapter_id, capability_id, self.descriptor.billing_model, now=now
-        )
 
     @staticmethod
     def _request(request: ProviderRequest) -> dict[str, object]:
@@ -112,11 +102,7 @@ class AlphaVantageAdapter(BaseProvider):
             raise ProviderUnavailable("authentication", reference=_REFERENCE)
 
     def _parse(self, payload: object, request: ProviderRequest, *, now: datetime,
-               entitlement: object, cached: bool) -> tuple[ProviderValue, ...]:
-        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(
-            entitlement, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now
-        ):
-            raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
+               cached: bool) -> tuple[ProviderValue, ...]:
         if type(payload) is not dict:
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._payload_error(payload)
@@ -152,7 +138,6 @@ class AlphaVantageAdapter(BaseProvider):
             public = {"close": _number(values["4. close"]), "volume": _number(values["5. volume"])}
             source_metadata = {
                 "function": "TIME_SERIES_DAILY", "interval": "daily", "symbol": symbol, "timezone": timezone_name,
-                "plan_name": entitlement.plan_name, "quota_remaining": "unknown" if entitlement.quota_remaining is None else str(entitlement.quota_remaining),
                 "source_reference": _REFERENCE,
             }
             if cached:

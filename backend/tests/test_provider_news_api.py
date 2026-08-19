@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from datetime import datetime, timezone
 
 import pytest
 import requests
@@ -11,7 +10,6 @@ from data_sources.credentials import MemoryCredentialStore
 from data_sources.models import SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
-from data_sources.provider_registry import FreemiumEntitlementResolver
 from data_sources.routing import CapabilityRouter
 
 
@@ -40,17 +38,6 @@ def credentials(configured=True):
     return store
 
 
-def resolver(**overrides):
-    record = {
-        "adapter_id": "news-api", "capability_id": "news_discovery", "billing_model": "freemium",
-        "plan_name": "fixture-developer", "available": True, "quota_remaining": 30,
-        "estimated_cost": Decimal("0"), "actual_cost": Decimal("0"),
-        "observed_at": NOW - timedelta(minutes=5), "expires_at": NOW + timedelta(hours=1), "provenance": "deterministic_test_fixture",
-    }
-    record.update(overrides)
-    return FreemiumEntitlementResolver.from_test_records((record,))
-
-
 def request(**overrides):
     values = {"query": "semiconductor", "from": "2025-07-01", "to": "2025-07-02", "page_size": 10}; values.update(overrides)
     return ProviderRequest("news_discovery", values)
@@ -64,24 +51,21 @@ def fixture():
     }]}
 
 
-def adapter(http=None, *, configured=True, entitlement_resolver=None, guard=None):
+def adapter(http=None, *, configured=True, guard=None):
     from data_sources.providers.news_api import NewsApiAdapter
-    return NewsApiAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, entitlement_resolver=entitlement_resolver, fetched_at=lambda: NOW)
+    return NewsApiAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, fetched_at=lambda: NOW)
 
 
 def parse(payload, *, cached=False):
-    active_resolver = resolver(); active = adapter(entitlement_resolver=active_resolver)
-    reason, snapshot = active._trusted_entitlement("news_discovery", NOW)
-    assert reason is None and snapshot is not None
-    return active._parse(payload, request(), now=NOW, entitlement=snapshot, cached=cached)
+    return adapter()._parse(payload, request(), now=NOW, cached=cached)
 
 
 def test_news_api_no_key_and_query_auth_fail_before_request_budget_transport():
     http, guard = FakeHttp(), FakeBudget()
-    missing = adapter(http, configured=False, entitlement_resolver=resolver(), guard=guard)
+    missing = adapter(http, configured=False, guard=guard)
     assert missing.probe("news_discovery", parameters={"query": object()})["status"] == "unconfigured"
     with pytest.raises(ProviderUnavailable, match="unconfigured"): missing.fetch(ProviderRequest("news_discovery", {"query": object()}))
-    active = adapter(http, entitlement_resolver=resolver(), guard=guard)
+    active = adapter(http, guard=guard)
     assert active.probe("news_discovery")["status"] == "unsupported_credential_transport"
     with pytest.raises(ProviderUnavailable, match="unsupported_credential_transport"): active.fetch(request())
     assert guard.calls == [] and http.calls == []
@@ -92,7 +76,7 @@ def test_news_api_parser_retains_publisher_but_never_content_source_or_corrobora
     assert row.value == {"title": "Chip update", "summary": "A bounded public excerpt.", "publisher_name": "Reuters", "publisher_url": "https://www.reuters.com/technology/chip-update", "origin_domain": "www.reuters.com", "published_at": "2025-07-02T10:00:00+00:00", "collector": "news_api", "candidate": True, "independent_evidence_eligible": False}
     assert "content" not in row.value and "copyrighted" not in repr(rows)
     assert row.data_status == "candidate" and row.unit == "candidate"
-    assert row.source_metadata == {"collector": "news_api", "collector_relation": "discovery_only", "origin_domain": "www.reuters.com", "origin_identity": "www.reuters.com", "publisher_id": "reuters", "delay_seconds": "7200", "plan_name": "fixture-developer", "quota_remaining": "30", "source_reference": "https://newsapi.org/"}
+    assert row.source_metadata == {"collector": "news_api", "collector_relation": "discovery_only", "origin_domain": "www.reuters.com", "origin_identity": "www.reuters.com", "publisher_id": "reuters", "delay_seconds": "7200", "reported_total_results": "1", "source_reference": "https://newsapi.org/"}
     assert SECRET not in repr(rows)
     catalog = build_catalog({"sources": []}); descriptor = catalog.adapter("news-api")
     assert catalog.family("news_api").independent_evidence_eligible is False
