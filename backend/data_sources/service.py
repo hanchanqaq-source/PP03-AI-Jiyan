@@ -448,11 +448,10 @@ class DataSourceService:
             self._usage_recovery_ready = False
 
     def _assert_usage_reconciliation_ready(self) -> None:
-        with self._usage_recovery_lock:
-            if self._usage_recovery_attempted and self._usage_recovery_ready:
-                return
-        # One bounded pass per controlled authorization entry prevents a
-        # transient in-flight observation from becoming a permanent latch.
+        # Revalidate the shared ledger at every controlled authorization
+        # boundary. A prior ready result is only a point-in-time observation;
+        # another process may have reserved after it. This remains one bounded,
+        # payload-free pass and does not recurse through authorization.
         self.recover_usage_reconciliation()
         with self._usage_recovery_lock:
             if not self._usage_recovery_ready:

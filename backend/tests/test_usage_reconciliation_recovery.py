@@ -732,6 +732,210 @@ def test_redundant_external_intent_matching_closed_ledger_is_inert_and_preserved
     assert usage.records(now=NOW) == (settled,)
 
 
+def test_prewarmed_service_rechecks_later_fresh_reservation_without_request_limit(
+    tmp_path, monkeypatch,
+):
+    service, _config, usage, provider, _registry = _service(tmp_path, [_success()])
+    assert service.recover_usage_reconciliation() == {
+        "status": "closed", "attempted": 0, "recovered": 0, "retained": 0,
+    }
+    owner_usage = UsageStore(tmp_path / "usage")
+    owner_usage.reserve(
+        "world-bank",
+        estimated_cost=Decimal("0"),
+        daily_budget=Decimal("0"),
+        monthly_budget=Decimal("0"),
+        now=NOW,
+    )
+    before = owner_usage.path.read_bytes()
+    recovery_calls = 0
+    original_recover = usage.recover_reconciliations
+
+    def counted_recover(*args, **kwargs):
+        nonlocal recovery_calls
+        recovery_calls += 1
+        return original_recover(*args, **kwargs)
+
+    monkeypatch.setattr(usage, "recover_reconciliations", counted_recover)
+
+    with pytest.raises(DataSourceUnavailable, match="usage_store_unavailable"):
+        service.validate_adapter("world-bank")
+
+    assert recovery_calls == 1
+    assert provider.calls == []
+    assert owner_usage.path.read_bytes() == before
+    remaining = owner_usage.records(now=NOW)
+    assert len(remaining) == 1
+    assert remaining[0].actual_cost is None
+
+
+def test_prewarmed_service_retries_after_owner_completion_without_duplicate_usage(
+    tmp_path,
+):
+    catalog = build_catalog({"sources": []})
+    config_root = tmp_path / "config"
+    usage_root = tmp_path / "usage"
+    entered = threading.Event()
+    release = threading.Event()
+    provider_a = _BlockingProbe(catalog.adapter("world-bank"), entered, release)
+    provider_b = _Probe(catalog.adapter("world-bank"), [_success(2)])
+    service_a = DataSourceService(
+        catalog_builder=lambda: catalog,
+        health_service_factory=lambda: _NoHealth(),
+        config_store=DataSourceConfigStore(config_root, catalog=catalog),
+        credential_store=MemoryCredentialStore(_credential_scope(catalog)),
+        usage_store=UsageStore(usage_root),
+        provider_registry=_Registry(provider_a),
+        now_factory=lambda: NOW,
+    )
+    service_b = DataSourceService(
+        catalog_builder=lambda: catalog,
+        health_service_factory=lambda: _NoHealth(),
+        config_store=DataSourceConfigStore(config_root, catalog=catalog),
+        credential_store=MemoryCredentialStore(_credential_scope(catalog)),
+        usage_store=UsageStore(usage_root),
+        provider_registry=_Registry(provider_b),
+        now_factory=lambda: NOW,
+    )
+    assert service_b.recover_usage_reconciliation()["status"] == "closed"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        owner = executor.submit(service_a.validate_adapter, "world-bank")
+        assert entered.wait(timeout=5)
+        try:
+            with pytest.raises(DataSourceUnavailable, match="usage_store_unavailable"):
+                service_b.validate_adapter("world-bank")
+            assert provider_b.calls == []
+        finally:
+            release.set()
+        assert owner.result(timeout=5)["status"] == "success"
+
+    assert service_b.validate_adapter("world-bank")["status"] == "success"
+    records = UsageStore(usage_root).records(now=NOW)
+    assert provider_a.calls == ["macro_indicator"]
+    assert provider_b.calls == ["macro_indicator"]
+    assert len(records) == 2
+    assert len({record.reservation_id for record in records}) == 2
+    assert all(record.actual_cost == Decimal("0") for record in records)
+    assert all(record.request_count == 1 for record in records)
+
+
+def test_prewarmed_service_blocks_later_stale_orphan_without_request_limit(
+    tmp_path, monkeypatch,
+):
+    clock = [NOW]
+    service, _config, usage, provider, _registry = _service(
+        tmp_path,
+        [_success()],
+        now_factory=lambda: clock[0],
+    )
+    assert service.recover_usage_reconciliation()["status"] == "closed"
+    owner_usage = UsageStore(tmp_path / "usage")
+    owner_usage.reserve(
+        "world-bank",
+        estimated_cost=Decimal("0"),
+        daily_budget=Decimal("0"),
+        monthly_budget=Decimal("0"),
+        now=NOW,
+    )
+    before = owner_usage.path.read_bytes()
+    clock[0] = NOW + timedelta(minutes=5, microseconds=1)
+    recovery_calls = 0
+    original_recover = usage.recover_reconciliations
+
+    def counted_recover(*args, **kwargs):
+        nonlocal recovery_calls
+        recovery_calls += 1
+        return original_recover(*args, **kwargs)
+
+    monkeypatch.setattr(usage, "recover_reconciliations", counted_recover)
+
+    with pytest.raises(DataSourceUnavailable, match="usage_store_unavailable"):
+        service.validate_adapter("world-bank")
+
+    assert recovery_calls == 1
+    assert provider.calls == []
+    assert owner_usage.path.read_bytes() == before
+    remaining = owner_usage.records(now=clock[0])
+    assert len(remaining) == 1
+    assert remaining[0].actual_cost is None
+
+
+def test_exact_legacy_zero_intent_matching_settled_ledger_is_inert_and_preserved(
+    tmp_path,
+):
+    usage = UsageStore(tmp_path / "usage")
+    reservation = usage.reserve(
+        "world-bank",
+        estimated_cost=Decimal("0"),
+        daily_budget=Decimal("0"),
+        monthly_budget=Decimal("0"),
+        now=NOW,
+    )
+    settled = usage.reconcile(
+        "world-bank",
+        reservation_id=reservation.reservation_id,
+        actual_cost=Decimal("0"),
+        request_count=0,
+        status="validation_not_attempted",
+        units=Decimal("0"),
+        now=NOW,
+    )
+    raw = _write_reconciliation_document(
+        usage,
+        _intent_document(
+            settled,
+            request_count=0,
+            status="validation_not_attempted",
+            units="0",
+        ),
+    )
+    before = usage.path.read_bytes()
+
+    diagnostic = _recovery_only_service(usage).recover_usage_reconciliation()
+
+    assert diagnostic == {
+        "status": "closed", "attempted": 0, "recovered": 0, "retained": 0,
+    }
+    assert usage.path.read_bytes() == before
+    assert usage.reconciliation_path.read_bytes() == raw
+    assert usage.records(now=NOW) == (settled,)
+
+
+def test_exact_legacy_zero_intent_against_open_reservation_blocks_without_mutation(
+    tmp_path,
+):
+    usage = UsageStore(tmp_path / "usage")
+    reservation = usage.reserve(
+        "world-bank",
+        estimated_cost=Decimal("0"),
+        daily_budget=Decimal("0"),
+        monthly_budget=Decimal("0"),
+        now=NOW,
+    )
+    raw = _write_reconciliation_document(
+        usage,
+        _intent_document(
+            reservation,
+            request_count=0,
+            status="validation_not_attempted",
+            units="0",
+        ),
+    )
+    before = usage.path.read_bytes()
+
+    diagnostic = _recovery_only_service(usage).recover_usage_reconciliation()
+
+    assert diagnostic == {
+        "status": "blocked", "attempted": 0, "recovered": 0, "retained": 2,
+    }
+    assert usage.path.read_bytes() == before
+    assert usage.reconciliation_path.read_bytes() == raw
+    remaining = usage.records(now=NOW)
+    assert remaining == (reservation,)
+    assert remaining[0].actual_cost is None
+
+
 def test_two_services_treat_fresh_reservation_as_pending_then_retry_after_owner_finishes(
     tmp_path,
 ):

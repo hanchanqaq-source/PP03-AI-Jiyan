@@ -50,6 +50,7 @@ _VALIDATION_SETTLEMENT_STATUSES = frozenset({
     "validation_partial",
     "validation_failure",
 })
+_LEGACY_ZERO_SETTLEMENT_STATUS = "validation_not_attempted"
 _VALIDATION_IN_FLIGHT_WINDOW = timedelta(minutes=5)
 _MAX_CLOCK_SKEW = timedelta(seconds=5)
 _DEFAULT_MAX_LEDGER_BYTES = 4 * 1024 * 1024
@@ -255,15 +256,26 @@ class _ReconciliationIntent:
             or self.request_count > _MAX_REQUEST_COUNT
         ):
             raise UsageValidationError("request_count must be a non-negative integer")
-        normalized_status, normalized_units = _validate_validation_settlement(
-            self.status, self.units,
-        )
+        if self.request_count == 0:
+            normalized_status = _validate_status(self.status)
+            normalized_units = _validate_decimal(self.units, "units")
+            if (
+                normalized_status != _LEGACY_ZERO_SETTLEMENT_STATUS
+                or normalized_units != 0
+            ):
+                raise UsageValidationError(
+                    "validation reconciliation facts are invalid"
+                )
+        else:
+            normalized_status, normalized_units = _validate_validation_settlement(
+                self.status, self.units,
+            )
         object.__setattr__(self, "status", normalized_status)
         object.__setattr__(self, "units", normalized_units)
         if (
             self.estimated_cost != 0
             or self.actual_cost != 0
-            or self.request_count != 1
+            or self.request_count not in {0, 1}
         ):
             raise UsageValidationError("validation reconciliation facts are invalid")
 
@@ -1104,7 +1116,7 @@ class UsageStore:
                             or record.recorded_at != intent.recorded_at
                             or record.estimated_cost != intent.estimated_cost
                             or record.actual_cost != intent.actual_cost
-                            or record.request_count != 1
+                            or record.request_count != intent.request_count
                             or record.status != intent.status
                             or record.units != intent.units
                         ):
