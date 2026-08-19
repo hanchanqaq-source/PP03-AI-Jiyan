@@ -23,6 +23,31 @@ from .models import (
 )
 
 
+_MAX_EVIDENCE_DOCUMENT_BYTES = 1_048_576
+
+
+def _strict_json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if type(key) is not str or key in document:
+            raise ValueError("invalid JSON object")
+        document[key] = value
+    return document
+
+
+def _strict_json_int(raw: str) -> int:
+    if len(raw) > 11:
+        raise ValueError("JSON integer is too large")
+    value = int(raw)
+    if value < -1_000_000_000 or value > 1_000_000_000:
+        raise ValueError("JSON integer is too large")
+    return value
+
+
+def _reject_json_number(_raw: str) -> float:
+    raise ValueError("non-integer JSON numbers are not allowed")
+
+
 def _timestamp(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -317,9 +342,20 @@ class EvidenceStorage:
     def _read_json(self, path: Path) -> dict[str, Any] | None:
         try:
             with CACHE_IO_LOCK:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else None
-        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                with path.open("rb") as handle:
+                    raw = handle.read(_MAX_EVIDENCE_DOCUMENT_BYTES + 1)
+                if len(raw) > _MAX_EVIDENCE_DOCUMENT_BYTES:
+                    return None
+                value = json.loads(
+                    raw.decode("utf-8"),
+                    object_pairs_hook=_strict_json_object,
+                    parse_int=_strict_json_int,
+                    parse_float=_reject_json_number,
+                    parse_constant=_reject_json_number,
+                )
+            _exact_builtin(value)
+            return value if type(value) is dict else None
+        except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError, RecursionError, json.JSONDecodeError):
             return None
 
     def load_current(self) -> EvidenceSnapshot | None:

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import tempfile
 import time
 from typing import Any, Callable, Iterator
@@ -16,7 +17,7 @@ from evidence_verification.models import EvidenceSnapshot
 from evidence_verification.storage import evidence_snapshot_from_document, snapshot_document
 from source_health.probe_errors import redact_probe_message
 
-from .models import PipelineCounts, PipelinePhase, PipelineRun, RawSnapshot, TrustedSnapshot
+from .models import PipelineAuthority, PipelineCounts, PipelinePhase, PipelineRun, RawSnapshot, TrustedSnapshot
 
 
 _SAFE_ID = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
@@ -32,6 +33,7 @@ _NEXT = {
 }
 _MAX_BYTES, _MAX_DEPTH, _MAX_ENTRIES, _MAX_TEXT, _MAX_INT = 1_048_576, 16, 5_000, 8_192, 1_000_000_000
 _RUN_KEYS = {"schema_version", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id", "phase", "counts", "created_at", "updated_at", "redacted_error", "displayed_trusted_snapshot_id", "owner_id", "lease_expires_at"}
+_AUTHORITY_KEYS = {"schema_version", "token", "generation", "expires_at", "diagnostic_name"}
 
 
 def _json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -99,9 +101,17 @@ def _timestamp(value: object) -> datetime:
     if type(value) is not str or len(value) > 64:
         raise ValueError("invalid timestamp")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("timestamp timezone is required")
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(None):
+        raise ValueError("timestamp must be UTC")
     return parsed
+
+
+def _safe_error(value: str) -> str:
+    """Keep only a bounded diagnostic code when input resembles sensitive data."""
+    redacted = redact_probe_message(value)
+    if re.search(r"(?i)(https?://|[a-z][a-z0-9-]*\s*:|\b(?:state|code|token|secret|key|session|cookie|authorization)\s*=|(?:^|\s)/(?:[^\s]+)|\\\\[^\s]+)", redacted):
+        return "storage_error"
+    return redacted[:120] or "storage_error"
 
 
 def _counts(value: object) -> PipelineCounts:
@@ -121,6 +131,8 @@ class NewsPipelineStorage:
         self.root = Path(root)
         self.raw_root, self.evidence_root, self.trusted_root, self.runs_root = (self.root / name for name in ("raw", "evidence", "trusted", "runs"))
         self.current_pointer_path, self._lock_path = self.root / "current-trusted.json", self.root / ".news-pipeline.lock"
+        self._authority_path = self.root / ".news-pipeline-authority.json"
+        self._authority: PipelineAuthority | None = None
         self._now, self.owner_id = now or (lambda: datetime.now(timezone.utc)), _optional_id(owner_id, "owner_id")
         if type(lock_timeout_seconds) not in (int, float) or lock_timeout_seconds <= 0:
             raise ValueError("invalid lock timeout")
@@ -128,9 +140,9 @@ class NewsPipelineStorage:
 
     def _clock(self) -> datetime:
         value = self._now()
-        if not isinstance(value, datetime):
-            raise ValueError("invalid clock")
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError("clock must be aware UTC")
+        return value
 
     def _prepare(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -239,15 +251,63 @@ class NewsPipelineStorage:
         if set(document) != keys or type(document.get("schema_version")) is not int or document["schema_version"] != 1:
             raise ValueError("invalid pipeline schema")
 
-    def write_raw(self, snapshot: RawSnapshot) -> None:
+    def _load_authority(self) -> PipelineAuthority | None:
+        document = self._read(self._authority_path)
+        if document is None:
+            if self._authority_path.exists():
+                raise OSError("pipeline authority is corrupt")
+            return None
+        try:
+            self._schema(document, _AUTHORITY_KEYS)
+            token = document["token"]
+            generation = document["generation"]
+            diagnostic = document["diagnostic_name"]
+            if type(token) is not str or not re.fullmatch(r"[0-9a-f]{64}", token) or type(generation) is not int or generation < 1 or type(diagnostic) is not str or len(diagnostic) > 120:
+                raise ValueError("invalid authority")
+            return PipelineAuthority(token, generation, _timestamp(document["expires_at"]), diagnostic)
+        except (KeyError, TypeError, ValueError):
+            raise OSError("pipeline authority is corrupt") from None
+
+    def _claim_authority_unlocked(self, diagnostic_name: str, lease_seconds: int) -> PipelineAuthority:
+        now = self._clock()
+        current = self._load_authority()
+        if current is not None and current.expires_at > now:
+            raise ValueError("pipeline authority is active")
+        authority = PipelineAuthority(secrets.token_hex(32), (current.generation if current else 0) + 1, now + __import__("datetime").timedelta(seconds=lease_seconds), diagnostic_name)
+        self._atomic_write(self._authority_path, {"schema_version": 1, "token": authority.token, "generation": authority.generation, "expires_at": authority.expires_at.isoformat(), "diagnostic_name": authority.diagnostic_name})
+        self._authority = authority
+        return authority
+
+    def claim_authority(self, diagnostic_name: str, *, lease_seconds: int = 30) -> PipelineAuthority:
+        if type(diagnostic_name) is not str or not diagnostic_name or len(diagnostic_name) > 120:
+            raise ValueError("invalid diagnostic name")
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 300:
+            raise ValueError("invalid lease_seconds")
+        with CACHE_IO_LOCK, self._process_lock():
+            return self._claim_authority_unlocked(diagnostic_name, lease_seconds)
+
+    def _require_authority(self, authority: PipelineAuthority | None) -> PipelineAuthority:
+        supplied = authority or self._authority
+        if supplied is None:
+            supplied = self._claim_authority_unlocked(self.owner_id or "storage", 30)
+        if type(supplied) is not PipelineAuthority:
+            raise ValueError("invalid authority")
+        current = self._load_authority()
+        now = self._clock()
+        if current is None or current.expires_at <= now or supplied.token != current.token or supplied.generation != current.generation:
+            raise ValueError("authority is stale or invalid")
+        return supplied
+
+    def write_raw(self, snapshot: RawSnapshot, *, authority: PipelineAuthority | None = None) -> None:
         raw_id = _id(snapshot.raw_snapshot_id, "raw_snapshot_id")
-        if not isinstance(snapshot.collected_at, datetime):
-            raise ValueError("invalid collected_at")
+        if not isinstance(snapshot.collected_at, datetime) or snapshot.collected_at.tzinfo is None or snapshot.collected_at.utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError("collected_at must be aware UTC")
         items = _bounded(list(snapshot.items))
         if type(items) is not list or any(type(item) is not dict for item in items):
             raise ValueError("raw items must be a list of objects")
         document: dict[str, object] = {"schema_version": 1, "raw_snapshot_id": raw_id, "collected_at": snapshot.collected_at.isoformat(), "items": items}
         with CACHE_IO_LOCK, self._process_lock():
+            self._require_authority(authority)
             previous = self._load_raw(raw_id)
             if previous is not None and previous != snapshot:
                 raise ValueError("raw snapshot identity is immutable")
@@ -270,7 +330,7 @@ class NewsPipelineStorage:
         with CACHE_IO_LOCK, self._process_lock():
             return self._load_raw(_id(raw_snapshot_id, "raw_snapshot_id"))
 
-    def write_evidence(self, snapshot: EvidenceSnapshot) -> None:
+    def write_evidence(self, snapshot: EvidenceSnapshot, *, authority: PipelineAuthority | None = None) -> None:
         if snapshot.recovery_metadata.get("legacy_identity") is True:
             raise ValueError("legacy evidence identity cannot be published as a new pipeline artifact")
         _id(snapshot.snapshot_id, "snapshot_id")
@@ -278,6 +338,7 @@ class NewsPipelineStorage:
         document = snapshot_document(snapshot)
         _bounded(document)
         with CACHE_IO_LOCK, self._process_lock():
+            self._require_authority(authority)
             self._atomic_write(self._path(self.evidence_root, raw_id), document)
 
     def _load_evidence(self, raw_id: str) -> EvidenceSnapshot | None:
@@ -294,16 +355,20 @@ class NewsPipelineStorage:
         with CACHE_IO_LOCK, self._process_lock():
             return self._load_evidence(_id(raw_snapshot_id, "raw_snapshot_id"))
 
-    def publish_trusted(self, snapshot: TrustedSnapshot) -> None:
+    def publish_trusted(self, snapshot: TrustedSnapshot, *, authority: PipelineAuthority | None = None) -> None:
         raw_id = _id(snapshot.raw_snapshot_id, "raw_snapshot_id")
-        if not isinstance(snapshot.published_at, datetime):
-            raise ValueError("invalid published_at")
+        if not isinstance(snapshot.published_at, datetime) or snapshot.published_at.tzinfo is None or snapshot.published_at.utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError("published_at must be aware UTC")
         events = _bounded(list(snapshot.events))
         if type(events) is not list or any(type(item) is not dict for item in events):
             raise ValueError("trusted events must be a list of objects")
         with CACHE_IO_LOCK, self._process_lock():
-            if self._load_raw(raw_id) is None or self._load_evidence(raw_id) is None:
+            self._require_authority(authority)
+            evidence = self._load_evidence(raw_id)
+            if self._load_raw(raw_id) is None or evidence is None:
                 raise ValueError("raw and evidence artifacts must be durable before trusted publish")
+            if evidence.recovery_metadata.get("legacy_identity") is True:
+                raise ValueError("legacy evidence must be deterministically reverified before trusted publish")
             self._atomic_write(self._path(self.trusted_root, raw_id), {"schema_version": 1, "raw_snapshot_id": raw_id, "published_at": snapshot.published_at.isoformat(), "events": events})
             if self._load_trusted(raw_id) is None:
                 raise OSError("trusted snapshot did not become durable")
@@ -346,11 +411,13 @@ class NewsPipelineStorage:
     def _run_document(self, run: PipelineRun) -> dict[str, object]:
         if type(run.phase) is not PipelinePhase or type(run.counts) is not PipelineCounts or not isinstance(run.created_at, datetime) or not isinstance(run.updated_at, datetime):
             raise ValueError("invalid pipeline run")
+        if any(value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(None) for value in (run.created_at, run.updated_at)):
+            raise ValueError("run timestamps must be aware UTC")
         if run.redacted_error is not None and type(run.redacted_error) is not str:
             raise ValueError("invalid redacted_error")
-        if run.lease_expires_at is not None and not isinstance(run.lease_expires_at, datetime):
-            raise ValueError("invalid lease_expires_at")
-        return {"schema_version": 1, "run_id": _id(run.run_id, "run_id"), "raw_snapshot_id": _id(run.raw_snapshot_id, "raw_snapshot_id"), "evidence_snapshot_id": _optional_id(run.evidence_snapshot_id, "evidence_snapshot_id"), "trusted_snapshot_id": _optional_id(run.trusted_snapshot_id, "trusted_snapshot_id"), "phase": run.phase.value, "counts": asdict(_counts(asdict(run.counts))), "created_at": run.created_at.isoformat(), "updated_at": run.updated_at.isoformat(), "redacted_error": redact_probe_message(run.redacted_error)[:500] if run.redacted_error else None, "displayed_trusted_snapshot_id": _optional_id(run.displayed_trusted_snapshot_id, "displayed_trusted_snapshot_id"), "owner_id": _optional_id(run.owner_id, "owner_id"), "lease_expires_at": run.lease_expires_at.isoformat() if isinstance(run.lease_expires_at, datetime) else None}
+        if run.lease_expires_at is not None and (not isinstance(run.lease_expires_at, datetime) or run.lease_expires_at.tzinfo is None or run.lease_expires_at.utcoffset() != timezone.utc.utcoffset(None)):
+            raise ValueError("lease_expires_at must be aware UTC")
+        return {"schema_version": 1, "run_id": _id(run.run_id, "run_id"), "raw_snapshot_id": _id(run.raw_snapshot_id, "raw_snapshot_id"), "evidence_snapshot_id": _optional_id(run.evidence_snapshot_id, "evidence_snapshot_id"), "trusted_snapshot_id": _optional_id(run.trusted_snapshot_id, "trusted_snapshot_id"), "phase": run.phase.value, "counts": asdict(_counts(asdict(run.counts))), "created_at": run.created_at.isoformat(), "updated_at": run.updated_at.isoformat(), "redacted_error": _safe_error(run.redacted_error) if run.redacted_error else None, "displayed_trusted_snapshot_id": _optional_id(run.displayed_trusted_snapshot_id, "displayed_trusted_snapshot_id"), "owner_id": _optional_id(run.owner_id, "owner_id"), "lease_expires_at": run.lease_expires_at.isoformat() if isinstance(run.lease_expires_at, datetime) else None}
 
     def _load_run(self, run_id: str) -> PipelineRun | None:
         document = self._read(self._run_path(run_id))
@@ -374,13 +441,20 @@ class NewsPipelineStorage:
             raise ValueError("raw snapshot must be durable before raw_saved")
         if run.phase is PipelinePhase.EVIDENCE_SAVED and (raw is None or evidence is None):
             raise ValueError("raw and evidence artifacts must be durable before evidence_saved")
+        if run.phase is PipelinePhase.EVIDENCE_SAVED and (run.evidence_snapshot_id is None or evidence.snapshot_id != run.evidence_snapshot_id or evidence.recovery_metadata.get("legacy_identity") is True):
+            raise ValueError("snapshot IDs must match durable non-legacy evidence")
         if run.phase is PipelinePhase.TRUSTED_PUBLISHED and (raw is None or evidence is None or self._load_trusted(run.raw_snapshot_id) is None or (current := self._load_current()) is None or current.raw_snapshot_id != run.raw_snapshot_id):
             raise ValueError("raw, evidence, trusted, and current pointer must be durable before trusted_published")
+        if run.phase is PipelinePhase.TRUSTED_PUBLISHED and (run.evidence_snapshot_id is None or evidence.snapshot_id != run.evidence_snapshot_id or run.trusted_snapshot_id != run.raw_snapshot_id or evidence.recovery_metadata.get("legacy_identity") is True):
+            raise ValueError("snapshot IDs must match durable non-legacy artifacts")
 
-    def write_run(self, run: PipelineRun, *, expected_phase: PipelinePhase | None = None) -> None:
+    def write_run(self, run: PipelineRun, *, expected_phase: PipelinePhase | None = None, authority: PipelineAuthority | None = None) -> None:
         document = self._run_document(run)
         with CACHE_IO_LOCK, self._process_lock():
+            self._require_authority(authority)
             current = self._load_run(run.run_id)
+            if current is None and self._run_path(run.run_id).exists():
+                raise OSError("pipeline run is corrupt")
             if current is None:
                 if run.phase is not PipelinePhase.QUEUED or expected_phase is not None:
                     raise ValueError("new runs must begin queued")
@@ -408,9 +482,11 @@ class NewsPipelineStorage:
             return self._load_run(_id(run_id, "run_id"))
 
     def recover_incomplete_runs(self, *, recovery_owner_id: str) -> int:
-        _id(recovery_owner_id, "recovery_owner_id")
+        if type(recovery_owner_id) is not str or not recovery_owner_id or len(recovery_owner_id) > 120:
+            raise ValueError("invalid recovery diagnostic name")
         interrupted = 0
         with CACHE_IO_LOCK, self._process_lock():
+            self._claim_authority_unlocked(recovery_owner_id, 30)
             if not self.runs_root.exists():
                 return 0
             now = self._clock()

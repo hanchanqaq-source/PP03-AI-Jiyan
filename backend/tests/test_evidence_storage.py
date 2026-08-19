@@ -157,3 +157,13 @@ def test_evidence_parser_rejects_future_schema_and_non_builtin_identity_values()
     hostile["snapshot_id"] = HostileString("evidence-raw-1")
     with pytest.raises(ValueError):
         evidence_snapshot_from_document(hostile)
+
+
+def test_evidence_storage_rejects_duplicate_key_disk_json_before_legacy_recovery(tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    snapshot = EvidenceSnapshot(snapshot_id="evidence-raw-1", raw_snapshot_id="raw-1", generated_at=NOW, events=())
+    document = json.dumps(snapshot_document(snapshot), ensure_ascii=False)
+    storage.root.mkdir(parents=True)
+    storage.current_path.write_text('{"snapshot_id":"forged",' + document[1:], encoding="utf-8")
+
+    assert storage.load_current() is None

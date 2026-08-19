@@ -83,11 +83,11 @@ def test_current_pointer_is_not_switched_before_trusted_snapshot_is_durable(tmp_
 
 
 def test_explicit_recovery_marks_all_nonterminal_runs_interrupted(tmp_path):
-    storage = NewsPipelineStorage(tmp_path)
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
     queued = pipeline_run(phase=PipelinePhase.QUEUED)
     storage.write_run(queued)
 
-    restarted = NewsPipelineStorage(tmp_path)
+    restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=31))
     assert restarted.load_run("run-1").phase is PipelinePhase.QUEUED
     restarted.recover_incomplete_runs(recovery_owner_id="restart-owner")
     recovered = restarted.load_run("run-1")
@@ -194,7 +194,8 @@ def test_constructor_does_not_interrupt_active_owner_but_explicit_stale_recovery
     active.write_run(queued)
 
     other = NewsPipelineStorage(tmp_path, owner_id="owner-b", now=lambda: NOW)
-    other.recover_incomplete_runs(recovery_owner_id="owner-b")
+    with pytest.raises(ValueError, match="authority is active"):
+        other.recover_incomplete_runs(recovery_owner_id="owner-b")
     assert other.load_run("run-1").phase is PipelinePhase.QUEUED
 
     stale = NewsPipelineStorage(tmp_path, owner_id="owner-b", now=lambda: NOW + timedelta(minutes=6))
@@ -212,7 +213,7 @@ def test_run_owner_cannot_overwrite_another_active_owner(tmp_path):
     owner_a.write_run(queued)
 
     owner_b = NewsPipelineStorage(tmp_path, owner_id="owner-b", now=lambda: NOW)
-    with pytest.raises(ValueError, match="active owner"):
+    with pytest.raises(ValueError, match="authority is active"):
         owner_b.write_run(
             replace(queued, phase=PipelinePhase.FETCHING),
             expected_phase=PipelinePhase.QUEUED,
@@ -227,8 +228,8 @@ def test_run_owner_cannot_overwrite_another_active_owner(tmp_path):
     PipelinePhase.EVIDENCE_SAVED,
 ])
 def test_explicit_recovery_interrupts_every_nonterminal_phase(tmp_path, phase):
-    storage = NewsPipelineStorage(tmp_path)
-    run = replace(pipeline_run(phase=PipelinePhase.QUEUED), run_id=f"run-{phase.value}")
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    run = replace(pipeline_run(phase=PipelinePhase.QUEUED), run_id=f"run-{phase.value}", evidence_snapshot_id="evidence-raw-1")
     storage.write_run(run)
     if phase in {PipelinePhase.RAW_SAVED, PipelinePhase.VERIFYING, PipelinePhase.EVIDENCE_SAVED}:
         storage.write_raw(raw_snapshot(run.raw_snapshot_id))
@@ -247,9 +248,10 @@ def test_explicit_recovery_interrupts_every_nonterminal_phase(tmp_path, phase):
             if next_phase is phase:
                 break
 
-    storage.recover_incomplete_runs(recovery_owner_id="restart-owner")
+    restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=31))
+    restarted.recover_incomplete_runs(recovery_owner_id="restart-owner")
 
-    assert storage.load_run(run.run_id).phase is PipelinePhase.INTERRUPTED
+    assert restarted.load_run(run.run_id).phase is PipelinePhase.INTERRUPTED
 
 
 def test_load_raw_rejects_future_schema_unknown_keys_wrong_path_and_oversize(tmp_path):
@@ -341,3 +343,94 @@ def test_ids_reject_windows_reserved_noncanonical_and_case_colliding_forms(tmp_p
 
     with pytest.raises(ValueError, match="raw_snapshot_id"):
         storage.write_raw(raw_snapshot(raw_snapshot_id))
+
+
+def test_trusted_publish_rejects_legacy_evidence_document_even_when_path_identity_matches(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    legacy = EvidenceSnapshot(
+        snapshot_id="evidence-raw-1",
+        raw_snapshot_id="raw-1",
+        generated_at=NOW,
+        events=(),
+        recovery_metadata={"legacy_identity": True},
+    )
+    storage.evidence_root.mkdir(parents=True)
+    (storage.evidence_root / "raw-1.json").write_text(json.dumps(__import__("evidence_verification.storage", fromlist=["snapshot_document"]).snapshot_document(legacy)), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="legacy evidence"):
+        storage.publish_trusted(trusted_snapshot("raw-1"))
+
+
+def test_persisted_phase_requires_present_matching_snapshot_ids(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
+    storage.write_run(queued)
+    storage.write_raw(raw_snapshot("raw-1"))
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    raw_saved = replace(fetching, phase=PipelinePhase.RAW_SAVED)
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
+    storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
+    storage.write_evidence(evidence_snapshot("raw-1"))
+
+    with pytest.raises(ValueError, match="snapshot IDs"):
+        storage.write_run(
+            replace(verifying, phase=PipelinePhase.EVIDENCE_SAVED),
+            expected_phase=PipelinePhase.VERIFYING,
+        )
+
+
+def test_naive_datetimes_are_rejected_before_persistence(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    naive = NOW.replace(tzinfo=None)
+
+    with pytest.raises(ValueError, match="UTC"):
+        storage.write_raw(RawSnapshot("raw-1", naive, ()))
+
+
+def test_corrupt_existing_run_fails_closed_instead_of_being_overwritten(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.runs_root.mkdir(parents=True)
+    (storage.runs_root / "run-1.json").write_text('{"schema_version":2}', encoding="utf-8")
+
+    with pytest.raises(OSError, match="corrupt"):
+        storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+
+
+def test_redacted_error_removes_unix_unc_state_and_arbitrary_headers(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    run = replace(
+        pipeline_run(phase=PipelinePhase.QUEUED),
+        redacted_error="X-Session: abc state=secret /srv/private \\server\\share https://host.test/?state=secret",
+    )
+
+    storage.write_run(run)
+
+    error = storage.load_run("run-1").redacted_error
+    assert all(value not in error for value in ("abc", "secret", "/srv/private", "\\server\\share", "host.test"))
+
+
+def test_fenced_authority_rejects_spoof_and_stale_writer_after_recovery(tmp_path):
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    first = storage.claim_authority("worker", lease_seconds=1)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
+    storage.write_run(queued, authority=first)
+
+    with pytest.raises(ValueError, match="authority"):
+        NewsPipelineStorage(tmp_path, now=lambda: NOW).write_run(
+            replace(queued, phase=PipelinePhase.FETCHING),
+            expected_phase=PipelinePhase.QUEUED,
+            authority=replace(first, token="spoof"),
+        )
+
+    restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=2))
+    second = restarted.claim_authority("worker", lease_seconds=1)
+    assert second.generation > first.generation
+    with pytest.raises(ValueError, match="authority"):
+        restarted.write_run(
+            replace(queued, phase=PipelinePhase.FETCHING),
+            expected_phase=PipelinePhase.QUEUED,
+            authority=first,
+        )
