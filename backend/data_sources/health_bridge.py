@@ -5,6 +5,10 @@ import hashlib
 import json
 from typing import Any, Iterable, Mapping, Sequence
 
+from fund_data.providers.akshare_provider import AkshareDanjuanProvider, AkshareEastmoneyProvider
+from fund_data.providers.cninfo_industry import CninfoIndustryProvider
+from fund_data.providers.eastmoney_direct import EastmoneyDirectProvider
+from fund_data.providers.tencent_quote import TencentQuoteProvider
 from source_health.models import ProbeObservation, SourceDescriptor
 
 
@@ -14,6 +18,14 @@ _EXCLUDED_CATALOG_STATUSES = {
     "catalog_only",
     "disabled",
 }
+
+_PROVIDER_ADAPTER_IDS: tuple[tuple[type[Any], str], ...] = (
+    (CninfoIndustryProvider, "cninfo-industry"),
+    (EastmoneyDirectProvider, "eastmoney-direct"),
+    (TencentQuoteProvider, "tencent-quote"),
+    (AkshareEastmoneyProvider, "akshare-eastmoney"),
+    (AkshareDanjuanProvider, "akshare-danjuan"),
+)
 
 
 def _status_name(status: Any) -> str:
@@ -34,7 +46,13 @@ def news_adapter_id(source: Mapping[str, Any]) -> str:
 
 
 def _provider_adapter_id(provider: Any) -> str:
-    return str(getattr(provider, "adapter_id", getattr(provider, "name", type(provider).__name__)))
+    configured_adapter_id = str(getattr(provider, "adapter_id", "")).strip()
+    if configured_adapter_id:
+        return configured_adapter_id
+    for provider_type, adapter_id in _PROVIDER_ADAPTER_IDS:
+        if isinstance(provider, provider_type):
+            return adapter_id
+    raise ValueError(f"Provider {type(provider).__name__} has no stable catalog adapter mapping")
 
 
 def _source_group(capability_id: str) -> str:
@@ -130,9 +148,10 @@ def catalog_probe_descriptors(
     adapters_by_id = {adapter.adapter_id: adapter for adapter in catalog.adapters}
     descriptors: list[SourceDescriptor] = []
     for provider in provider_rows:
-        adapter = adapters_by_id.get(_provider_adapter_id(provider))
+        provider_adapter_id = _provider_adapter_id(provider)
+        adapter = adapters_by_id.get(provider_adapter_id)
         if adapter is None:
-            continue
+            raise ValueError(f"Provider {type(provider).__name__} maps to unknown adapter {provider_adapter_id}")
         available_capabilities = set(getattr(provider, "capabilities", set()))
         source_name = str(getattr(provider, "name", adapter.adapter_name))
         priority = int(getattr(provider, "priority", adapter.current_provider_priority))
@@ -158,6 +177,7 @@ def catalog_probe_descriptors(
                 configured_reference=adapter.configured_reference,
             ))
 
+    registered_news_adapter_ids: set[str] = set()
     for source in news_config.get("sources") or []:
         if not isinstance(source, Mapping):
             continue
@@ -167,9 +187,12 @@ def catalog_probe_descriptors(
         if not hint or not name or not url:
             continue
         adapter_id = news_adapter_id(source)
+        if adapter_id in registered_news_adapter_ids:
+            continue
         adapter = adapters_by_id.get(adapter_id)
         if adapter is None:
             continue
+        registered_news_adapter_ids.add(adapter_id)
         descriptors.append(SourceDescriptor(
             source_id=f"{adapter.adapter_id}:feed",
             source_name=name,

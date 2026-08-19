@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from data_sources.catalog import build_catalog
 from data_sources.health_bridge import catalog_probe_descriptors, merge_health
+from fund_data.providers.eastmoney_direct import EastmoneyDirectProvider
 from source_health.models import ProbeObservation
-from source_health.registry import build_provider_descriptors
+from source_health.registry import build_provider_descriptors, build_registry
 
 
 class EastmoneyProvider:
@@ -64,6 +65,33 @@ def test_runtime_source_name_does_not_change_family_identity():
     assert first.source_family_id == second.source_family_id == "eastmoney"
     assert first.adapter_id == second.adapter_id == "eastmoney-direct"
     assert first.source_id == second.source_id == "eastmoney-direct:stock_snapshot"
+
+
+def test_actual_provider_uses_stable_catalog_adapter_when_display_name_changes():
+    class RenamedEastmoneyProvider(EastmoneyDirectProvider):
+        name = "东方财富运行时展示名"
+
+    row = next(
+        item
+        for item in build_provider_descriptors([RenamedEastmoneyProvider(session=object())])
+        if item.capability_id == "stock_snapshot"
+    )
+
+    assert row.source_family_id == "eastmoney"
+    assert row.adapter_id == "eastmoney-direct"
+    assert row.source_id == "eastmoney-direct:stock_snapshot"
+
+
+def test_build_registry_deduplicates_exact_duplicate_news_configurations():
+    source = {
+        "hint": "ai", "name": "Public feed", "url": "https://public.example.test/rss",
+        "language": "zh-CN", "region": "CN",
+    }
+
+    rows = build_registry([], {"sources": [source, dict(source)]})
+
+    assert len(rows) == 1
+    assert rows[0].source_id.startswith("news-feed:")
 
 
 def test_catalog_descriptors_keep_configured_reference_as_source_reference_alias():

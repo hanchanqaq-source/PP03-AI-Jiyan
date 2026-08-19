@@ -16,12 +16,14 @@ from source_health.samples import select_public_samples
 
 class FakeProvider:
     name = "eastmoney-direct"
+    adapter_id = "eastmoney-direct"
     priority = 10
     capabilities = {"search", "nav_history", "stock_snapshot"}
 
 
 class FakeIndustryProvider:
     name = "cninfo-industry"
+    adapter_id = "cninfo-industry"
     priority = 5
     capabilities = {"stock_industry_classification"}
 

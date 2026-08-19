@@ -191,6 +191,23 @@ def test_runner_maps_news_probe_reference_to_health_final_reference(reference_fi
     [observation] = runner.run("full")
 
     assert observation.final_reference == "https://public.example.test/final.xml"
+    assert observation.observed_final_reference == observation.final_reference
+    runner.shutdown()
+
+
+def test_runner_retains_configured_reference_when_a_probe_fails():
+    row = descriptor("news:failed", source_name="failed", group="news", capability="feed")
+    runner = SourceHealthRunner(
+        [row], providers=[], news_sources={row.source_id: {"name": "failed"}},
+        news_probe=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("timeout")),
+        now=lambda: NOW,
+    )
+
+    [observation] = runner.run("full")
+
+    assert observation.configured_reference == "https://public.example.test/source"
+    assert observation.observed_final_reference is None
+    assert observation.final_reference is None
     runner.shutdown()
 
 
