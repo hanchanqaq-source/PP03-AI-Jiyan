@@ -81,3 +81,43 @@ The companion [free provider matrix](free-provider-matrix.md) records the
 individual Provider/connector state, while
 [source repair decisions](source-repair-decisions.md) retains every news-source
 decision row.
+
+## Phase 3 Catalog overlay
+
+Phase 3 begins at reviewed Phase 2 end `8f830f4a82b4844103e78e54dd9cc004ff94edce`
+and is qualified after the separate credential-URL security fix at
+`0f04e493d3fb071c105cd2f9ac78b3665369637f`. The runtime query used the unchanged
+108-source `backend/news_sources.json`; it did not read holdings or user data.
+
+| Measure | Phase 2 qualified | Phase 3 runtime Catalog | Phase 3 change |
+| --- | ---: | ---: | ---: |
+| RSS/Atom configurations | 108 | 108 | 0 |
+| Catalog families | 125 | 147 | +22 |
+| Catalog adapters | 128 | 150 | +22 |
+| Capabilities | 29 | 30 | +1 |
+| Feed-capability adapters | 108 | 108 | 0 |
+| Registration fingerprint | `90eb099370e7054a04dfd0ce3983e88179961f2992c8071da86854022910d7b5` | `b51d725f8ea653b54fb6ac39bea47e29fa592549cc5a07805087121726ed6f79` | Static Catalog change only |
+
+Phase 3 adds 2 `free_key`, 6 `freemium` (including Tushare), 5 `paid_api`,
+and 9 `enterprise_license` adapters. The full adapter billing totals are 128
+`free_no_key`, 2 `free_key`, 6 `freemium`, 5 `paid_api`, and 9
+`enterprise_license`.
+
+| Static Catalog state | Families | Adapters | Connection meaning |
+| --- | ---: | ---: | --- |
+| `configured` | 13 | 15 | Configuration exists; not a Phase 3 Live connection claim |
+| `unconfigured` | 15 | 15 | Credentialed Adapter is registered but lacks a usable configured boundary |
+| `license_required` | 9 | 9 | Enterprise static shell; no SDK, health, or connection |
+| `catalog_only` | 109 | 109 | Includes the unchanged 108 feed registrations and IMF |
+| `disabled` | 1 | 2 | Default-disabled Catalog boundary |
+
+The fresh isolated no-key qualification probed 13 credentialed adapters and 17
+capabilities and made zero network calls; all were `unconfigured` and none was
+a health failure. Connected Phase 3 credentialed, paid, and enterprise
+providers: 0. This overlay does not overwrite the authoritative Phase 2
+108-source audit (`85 success / 16 partial / 7 failure` before and after), does
+not claim a news-source repair, and does not relabel any parser fixture as Live.
+
+Detailed boundaries: [credentialed/freemium matrix](freemium-provider-matrix.md),
+[paid matrix](paid-provider-matrix.md), and
+[enterprise Catalog](enterprise-provider-catalog.md).
