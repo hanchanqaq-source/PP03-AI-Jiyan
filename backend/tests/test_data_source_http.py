@@ -277,6 +277,8 @@ def test_http_client_rejects_non_finite_safety_bounds(options: dict[str, float])
         "Cookie",
         "cOoKiE",
         "Proxy-Authorization",
+        "X-Key",
+        "X-Auth",
         "X-Api-Key",
         "X-Auth-Token",
         "X-API_Key",
@@ -284,6 +286,7 @@ def test_http_client_rejects_non_finite_safety_bounds(options: dict[str, float])
         "Access_Token",
         "Secret-Key",
         "Credential",
+        "X-Kеy",
     ],
 )
 def test_http_client_rejects_sensitive_caller_headers_before_the_session(

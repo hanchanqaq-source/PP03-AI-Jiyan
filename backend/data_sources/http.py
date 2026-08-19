@@ -24,11 +24,11 @@ _SENSITIVE_HEADER_TERMS = (
     "cookie",
     "token",
     "secret",
-    "api-key",
     "apikey",
     "credential",
     "password",
 )
+_GENERIC_SENSITIVE_HEADERS = {"xauth", "xkey"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,10 +236,15 @@ class SafeHttpClient:
 
     @staticmethod
     def _is_sensitive_header(header_name: str) -> bool:
+        if not header_name.isascii():
+            return True
         normalized = "".join(
             character.lower() for character in header_name if character.isascii() and character.isalnum()
         )
-        return any(term in normalized for term in _SENSITIVE_HEADER_TERMS)
+        return (
+            normalized in _GENERIC_SENSITIVE_HEADERS
+            or any(term in normalized for term in _SENSITIVE_HEADER_TERMS)
+        )
 
     def _validate_url(self, url: str) -> None:
         try:

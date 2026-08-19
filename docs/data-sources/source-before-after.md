@@ -1,30 +1,78 @@
-# Phase 1 source Catalog before/after
+# A2-W1 source Catalog — Phase 1 before / Phase 2 qualified after
 
 ## Scope and evidence boundary
 
-Baseline is `9dfd8246290a04555ed1886ded92c39de9a001f4`; Phase 1 evidence is serialized at `d61090f2167ac421e7aafe27e333c0d8fbb7d629`. This comparison is registration evidence, not live-source evidence. No provider, RSS feed, credential, enterprise license, paid endpoint, or holding was read or changed for it.
+This is a Phase 2 qualification at `08b4b72ab41be9c513824e118010e9ddcf617fb3`
+before the Task 7 documentation/safety-fix commit. Phase 1 started from
+`9dfd8246290a04555ed1886ded92c39de9a001f4` and its reviewed end / Phase 2
+start is `e4c0d930e80266dc8ebaacd2b26807690e830daa`.
 
-| Measure | Baseline (`9dfd824`) | Phase 1 (`d61090f`) | Meaning |
+Registration is not a connection claim. Catalog states (`configured`,
+`unconfigured`, `catalog_only`, and `disabled`), optional-package availability,
+and isolated live observations are separate facts. No fund, portfolio, user
+note, credential, key, cookie, paid endpoint, enterprise service, or Phase 3
+provider was read or used in this phase.
+
+| Measure | Phase 1 | Phase 2 fixed HEAD | Meaning |
 | --- | ---: | ---: | --- |
-| Existing RSS/Atom configurations | 108 | 108 | Preserved; `backend/news_sources.json` is unchanged. |
-| Catalog families | not serialized (no Catalog) | 112 | 4 non-news families + 108 publisher families. |
-| Catalog adapters | not serialized (no Catalog) | 114 | 6 non-news adapters + 108 feed adapters. |
-| Capabilities | not serialized (no Catalog) | 8 | Stable Catalog capability registration. |
-| Feed-capability adapters | not serialized (no Catalog) | 108 | Exact qualified feed registration count. |
-| Eastmoney families | not serialized (no Catalog) | 1 | One `eastmoney` family only. |
-| Eastmoney adapters | not serialized (no Catalog) | 3 | `eastmoney-direct`, `akshare-eastmoney`, `efinance-eastmoney`; the last is default-disabled. |
-| Registration fingerprint | not applicable | `665d677dea1706a5c8ce0675a771de03d72f081f250e1a086dd3e40c82718fde` | Deterministic static registration digest. |
-| Fingerprint after sample fund relation `017811` | not applicable | identical | Relation input is deliberately ignored by the registration fingerprint. |
-| Live connected sources | not measured | not measured | No live validation occurred; do not substitute registration for connection. |
+| RSS/Atom configurations | 108 | 108 | Preserved exactly; Task 6 made no parser/config migration. |
+| Catalog families | 112 | 125 | 17 static families plus 108 publisher families; no holdings relation affects this count. |
+| Catalog adapters | 114 | 128 | 20 static adapters plus 108 feed adapters. |
+| Capabilities | 8 | 29 | 21 Phase 2 capabilities were added with stable IDs. |
+| Feed-capability adapters | 108 | 108 | Publisher registration remains one family/adapter per configured feed identity. |
+| Family state totals | not recorded here | 13 configured; 2 unconfigured; 1 disabled; 109 catalog-only | State is static Catalog configuration, not health. |
+| Adapter state totals | not recorded here | 15 configured; 2 unconfigured; 2 disabled; 109 catalog-only | The 109 catalog-only adapters are 108 feeds plus IMF. |
+| Registration fingerprint | `665d677dea1706a5c8ce0675a771de03d72f081f250e1a086dd3e40c82718fde` | `90eb099370e7054a04dfd0ce3983e88179961f2992c8071da86854022910d7b5` | Deterministic static registration digest; it remains holdings-independent. |
+| Connected free Provider families | not measured | 1: `world_bank` | Connection means a successful bounded public request only. |
 
-## What changed in Phase 1
+## Phase 2 registrations and boundaries
 
-Phase 1 introduced the holdings-independent Catalog, stable family/adapter/capability IDs, the health overlay bridge, compatible Catalog read APIs, and a family-first UI. The baseline retained the 108 RSS/Atom configuration records but had no Catalog serialization, so catalog counts cannot honestly be backfilled for it.
+Phase 2 adds 13 static families, 14 static adapters, and 21 capabilities.
+The 14 adapter registrations are BaoStock, Yahoo Finance/yfinance, SEC EDGAR,
+seven official-evidence link entries (SSE, SZSE, CNInfo, HKEXnews, CSRC, fund
+company, index company), World Bank, OECD, IMF, and GDELT. The lazy runtime
+registry exposes only the seven executable Provider adapters: BaoStock,
+yfinance, SEC EDGAR, World Bank, OECD, IMF, and GDELT. Official-link entries
+are implemented as bounded connector/validation adapters; they were registered
+but not treated as connected without a successful, permitted validation.
 
-The observed-health overlay remains separate from registration. A missing observation is `unexamined`/`尚未体检`; `catalog_only` and `disabled` are configuration states, not health failures. `configured_reference` stays visible from the Catalog, while `observed_final_reference` exists only after a real, safe successful request. Both paths must be sanitized and never contain credential values, Authorization, Cookie, Token, or sensitive query parameters.
+BaoStock is independent of Eastmoney/Tencent but does not replace CNInfo
+industry evidence or official fund NAV. yfinance is disabled unless explicitly
+used for `personal_research` and remains non-official. GDELT is collector /
+candidate only; its routing cannot make it independent evidence. IMF remains
+catalog-only. Catalog health does not promote official-evidence eligibility or
+trusted-news admission.
 
-## Qualification assertions at Phase 1 HEAD
+## Corrected isolated news audit
 
-`backend/tests/test_data_source_catalog.py` asserts unique family IDs and adapter IDs, exactly 108 feed registrations, exactly one Eastmoney family with exactly three adapters, and the same registration fingerprint before/after `["017811"]`. The production contract was already GREEN when this qualification test was added, so no artificial RED was recorded. This is coverage for a pre-existing Phase 1 contract, not a runtime code change.
+Task 6's corrected matched v2 audit is authoritative for Phase 2 live-news
+evidence. It used the unchanged 108-source configuration hash
+`fbb2239676aa22d16a755780a80621a433b9ceb60f19499967440eac20c1f33e`,
+8-second bounds, a 500,000-byte cap, 12 workers, TLS verification for HTTPS,
+and no request for configured HTTP references. All data, cache, log and report
+paths were task-local.
 
-The matrix in [source-family-matrix.md](source-family-matrix.md) contains every registered family/adapter pair, capability routing, billing/key/license/default boundary, actual unobserved connection state, shell-only status, limits, and replacement rules.
+| Audit | Success | Partial | Failure | Evidence |
+| --- | ---: | ---: | ---: | --- |
+| Before v2 | 85 | 16 | 7 | `.tmp/acceptance/a2-w1-phase2-before/public-audit.json` |
+| After v2 | 85 | 16 | 7 | `.tmp/acceptance/a2-w1-phase2-after/public-audit.json` |
+
+The v1 audit files are superseded. The matched v2 runs have the same source-ID
+set, configuration hash, limits, and aggregate result; this is not a claim of
+network repair or a GDELT independent-evidence result.
+
+## Repair result and unresolved observations
+
+No news parser or configuration change was evidence-qualified: repaired 0,
+updated 0, replaced 0, and disabled 0. Of the 23 degraded/failure observations,
+21 remain `观察` pending a minimal RED fixture or same-publisher HTTPS/identity
+proof; 动点科技 is `需要凭据` after its public 403; WSJ Markets is `需要许可证`
+because a stale public feed does not establish fresh-content rights. The three
+configured HTTP feeds are partial `insecure_transport` and were deliberately
+not requested. TLS, DNS, redirect, 502, parse and empty-payload observations
+remain visible rather than being converted into successful registration claims.
+
+The companion [free provider matrix](free-provider-matrix.md) records the
+individual Provider/connector state, while
+[source repair decisions](source-repair-decisions.md) retains every news-source
+decision row.
