@@ -9,7 +9,7 @@ from typing import Any
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.http import SafeHttpClient
 from data_sources.provider_contract import ProviderRequest
-from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.provider_errors import ProviderError, ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
 
 from .base import BaseProvider
 
@@ -217,15 +217,24 @@ class SecEdgarAdapter(BaseProvider):
             details["form"] = form
         return (self._value(output_capability, payload, canonical_url=url, value=details),)
 
+    def _probe_request(self, capability_id: str) -> ProviderRequest:
+        output_capability, capability, _parameters = self._normalise_capability(
+            ProviderRequest(capability_id, {})
+        )
+        if capability not in _INTERNAL_CAPABILITIES:
+            raise ProviderUnavailable("unsupported_capability", reference=_DATA_REFERENCE)
+        if capability in {"company_submissions", "company_facts"}:
+            return ProviderRequest(output_capability, {"cik": "0000320193"})
+        # Filing probes need caller-supplied accession/form identifiers.  A health
+        # probe can only attest the public submissions endpoint without inventing one.
+        return ProviderRequest("company_submissions", {"cik": "0000320193"})
+
     def probe(self, capability_id: str) -> Mapping[str, object]:
         if capability_id not in _SUPPORTED_CAPABILITIES:
             return {"status": "unsupported_capability", "connected": False}
-        probe_request = ProviderRequest("company_submissions", {"cik": "0000320193"})
-        if capability_id == "company_facts":
-            probe_request = ProviderRequest("company_facts", {"cik": "0000320193"})
         try:
-            self.fetch(probe_request)
-        except ProviderUnavailable as error:
+            self.fetch(self._probe_request(capability_id))
+        except ProviderError as error:
             status = "unconfigured_contact" if error.code == "authentication" else error.code
             return {"status": status, "connected": False}
         return {"status": "success", "connected": True}

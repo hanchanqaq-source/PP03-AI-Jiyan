@@ -233,3 +233,38 @@ def test_sec_marks_contact_unconfigured_when_official_service_rejects_the_public
     assert SecEdgarAdapter(http=http).probe("company_submissions") == {
         "status": "unconfigured_contact", "connected": False
     }
+
+
+def test_sec_company_facts_public_probe_requests_and_validates_company_facts_not_submissions():
+    """Catches the public Company Facts health capability being silently satisfied by a submissions probe."""
+    from data_sources.providers.sec_edgar import SecEdgarAdapter
+
+    http = FakeHttp([submissions_fixture()])
+
+    assert SecEdgarAdapter(http=http).probe("sec_company_facts") == {
+        "status": "schema_changed", "connected": False
+    }
+    assert [url for url, _headers in http.calls] == [
+        "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "response", "expected_url"),
+    [
+        ("company_submissions", submissions_fixture(), "https://data.sec.gov/submissions/CIK0000320193.json"),
+        ("sec_company_submissions", submissions_fixture(), "https://data.sec.gov/submissions/CIK0000320193.json"),
+        ("company_facts", {"cik": "0000320193", "facts": {}}, "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json"),
+        ("sec_company_facts", {"cik": "0000320193", "facts": {}}, "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json"),
+    ],
+)
+def test_sec_probe_uses_the_same_alias_normalization_as_fetch(
+    capability_id: str, response: object, expected_url: str
+):
+    """Catches fetch and health probes resolving an SEC public capability name differently."""
+    from data_sources.providers.sec_edgar import SecEdgarAdapter
+
+    http = FakeHttp([response])
+
+    assert SecEdgarAdapter(http=http).probe(capability_id) == {"status": "success", "connected": True}
+    assert [url for url, _headers in http.calls] == [expected_url]
