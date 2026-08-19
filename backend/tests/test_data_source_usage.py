@@ -46,6 +46,34 @@ class _CustomRecordMapping(dict):
     pass
 
 
+class _ExplosiveTruthString(str):
+    calls = 0
+
+    def __bool__(self) -> bool:
+        type(self).calls += 1
+        raise AssertionError("attacker-controlled truthiness executed")
+
+
+class _FalseValuedObject:
+    calls = 0
+
+    def __bool__(self) -> bool:
+        type(self).calls += 1
+        return False
+
+
+class _ExplosiveEqualityString(str):
+    calls = 0
+
+    def __eq__(self, _other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("attacker-controlled equality executed")
+
+    def __ne__(self, _other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("attacker-controlled inequality executed")
+
+
 @pytest.fixture
 def store(tmp_path) -> UsageStore:
     return UsageStore(tmp_path / "data", lock_timeout_seconds=0.05)
@@ -133,6 +161,33 @@ def test_usage_reservation_rejects_custom_string_identities(
             **arguments,
         )
 
+    assert not store.path.exists()
+
+
+def test_reservation_id_type_is_checked_before_truthiness(store: UsageStore):
+    _ExplosiveTruthString.calls = 0
+
+    with pytest.raises(UsageValidationError):
+        _reserve(store, reservation_id=_ExplosiveTruthString("reservation-1"))
+
+    assert _ExplosiveTruthString.calls == 0
+    assert not store.path.exists()
+
+
+def test_empty_exact_reservation_id_is_rejected_instead_of_generating_uuid(store: UsageStore):
+    with pytest.raises(UsageValidationError):
+        _reserve(store, reservation_id="")
+
+    assert not store.path.exists()
+
+
+def test_false_valued_custom_reservation_object_is_rejected_without_bool(store: UsageStore):
+    _FalseValuedObject.calls = 0
+
+    with pytest.raises(UsageValidationError):
+        _reserve(store, reservation_id=_FalseValuedObject())
+
+    assert _FalseValuedObject.calls == 0
     assert not store.path.exists()
 
 
@@ -348,6 +403,41 @@ def test_usage_record_parser_rejects_custom_mapping_before_key_equality():
 
     with pytest.raises(UsageValidationError):
         UsageRecord.from_dict(row)
+
+
+def test_open_record_status_type_is_checked_before_equality():
+    _ExplosiveEqualityString.calls = 0
+    row = {
+        "reservation_id": "reservation-1",
+        "adapter_id": "paid-test",
+        "authorized_at": "2026-08-19T12:00:00Z",
+        "recorded_at": None,
+        "estimated_cost": "0.10",
+        "actual_cost": None,
+        "request_count": 0,
+        "status": _ExplosiveEqualityString("reserved"),
+        "units": "0",
+    }
+
+    with pytest.raises(UsageValidationError):
+        UsageRecord.from_dict(row)
+
+    assert _ExplosiveEqualityString.calls == 0
+
+
+@pytest.mark.parametrize("environment_key", ["VR_DATA_DIR", "USERPROFILE"])
+def test_environment_path_type_is_checked_before_truthiness(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, environment_key: str
+):
+    _ExplosiveTruthString.calls = 0
+    environment: dict[str, object] = {}
+    environment[environment_key] = _ExplosiveTruthString(str(tmp_path / "data"))
+    monkeypatch.setattr("data_sources.usage_store.os.environ", environment)
+
+    with pytest.raises(UsageValidationError):
+        UsageStore()
+
+    assert _ExplosiveTruthString.calls == 0
 
 
 def test_usage_record_revalidates_exact_scalar_types_when_serialized():

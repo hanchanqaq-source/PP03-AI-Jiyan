@@ -96,10 +96,12 @@ def _validate_identifier(value: object, field: str) -> str:
     return value.encode("utf-8").decode("utf-8")
 
 
-def _validate_status(value: object) -> str:
+def _validate_status(value: object, *, allow_reserved: bool = False) -> str:
     if type(value) is not str or not _SAFE_STATUS.fullmatch(value):
         raise UsageValidationError("status is invalid")
-    if any(marker in value.lower() for marker in _CREDENTIAL_TERMS) or value == "reserved":
+    if any(marker in value.lower() for marker in _CREDENTIAL_TERMS) or (
+        value == "reserved" and not allow_reserved
+    ):
         raise UsageValidationError("status is invalid")
     return value.encode("utf-8").decode("utf-8")
 
@@ -228,7 +230,7 @@ class UsageRecord:
             or request_count > _MAX_REQUEST_COUNT
         ):
             raise UsageValidationError("request_count is invalid")
-        status = value["status"]
+        status = _validate_status(value["status"], allow_reserved=True)
         units = _parse_decimal_text(value["units"], "units")
         if actual_cost is None:
             if recorded_at is not None or request_count != 0 or status != "reserved" or units != 0:
@@ -301,11 +303,20 @@ class UsageStore:
     ) -> None:
         if root is None:
             configured = os.environ.get("VR_DATA_DIR")
-            root = (
-                Path(configured)
-                if configured and configured.strip()
-                else Path(os.environ.get("USERPROFILE") or Path.home()) / ".vibe-research"
-            )
+            if configured is not None and type(configured) is not str:
+                raise UsageValidationError("VR_DATA_DIR is invalid")
+            if configured is not None and configured.strip():
+                root = Path(configured)
+            else:
+                user_profile = os.environ.get("USERPROFILE")
+                if user_profile is not None and type(user_profile) is not str:
+                    raise UsageValidationError("USERPROFILE is invalid")
+                profile_root = (
+                    Path(user_profile)
+                    if user_profile is not None and user_profile.strip()
+                    else Path.home()
+                )
+                root = profile_root / ".vibe-research"
         if type(lock_timeout_seconds) not in (int, float):
             raise UsageValidationError("lock timeout is invalid")
         try:
@@ -546,7 +557,8 @@ class UsageStore:
         monthly_limit = _validate_decimal(monthly_budget, "monthly_budget")
         normalized_now = _utc_datetime(now)
         normalized_reservation = _validate_identifier(
-            reservation_id or uuid.uuid4().hex, "reservation_id"
+            uuid.uuid4().hex if reservation_id is None else reservation_id,
+            "reservation_id",
         )
         with CACHE_IO_LOCK:
             with self._process_lock():
