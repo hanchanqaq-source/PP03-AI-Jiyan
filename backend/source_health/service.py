@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import secrets
 import threading
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 from cache_io_lock import CACHE_IO_LOCK
 from fund_data.service import default_fund_providers
@@ -215,29 +215,39 @@ class SourceHealthService:
             "reclaimable_bytes": 0,
         }
 
-    def _new_run(self, scope: RunScope) -> dict[str, Any]:
+    def _selected_descriptors(
+        self,
+        scope: RunScope,
+        excluded_adapter_ids: tuple[str, ...],
+    ) -> list[Any]:
+        if not excluded_adapter_ids:
+            return self.runner.select(scope)
+        return self.runner.select(scope, excluded_adapter_ids=excluded_adapter_ids)
+
+    def _new_run(self, scope: RunScope, excluded_adapter_ids: tuple[str, ...] = ()) -> dict[str, Any]:
         return {
             "run_id": secrets.token_hex(10),
             "scope": scope,
             "status": "queued",
             "started_at": self._now().isoformat(),
             "finished_at": None,
-            "total": len(self.runner.select(scope)),
+            "total": len(self._selected_descriptors(scope, excluded_adapter_ids)),
             "completed": 0,
             "success": 0,
             "partial": 0,
             "failure": 0,
             "current_source": "",
+            "excluded_adapter_ids": list(excluded_adapter_ids),
         }
 
-    def _start_locked(self, scope: RunScope) -> dict[str, Any]:
+    def _start_locked(self, scope: RunScope, excluded_adapter_ids: tuple[str, ...] = ()) -> dict[str, Any]:
         if self._shutdown:
             raise RuntimeError("source-health service is shutdown")
         if scope == "full" and self._active_full is not None:
             active = self._runs.get(self._active_full)
             if active and active.get("status") in {"queued", "running"}:
                 raise FullRunConflict("数据源体检正在运行")
-        run = self._new_run(scope)
+        run = self._new_run(scope, excluded_adapter_ids)
         self._runs[run["run_id"]] = run
         if scope == "full":
             self._active_full = run["run_id"]
@@ -252,9 +262,15 @@ class SourceHealthService:
         self._coordinator.submit(self._execute, run["run_id"])
         return dict(run)
 
-    def start_run(self, scope: RunScope = "full") -> dict[str, Any]:
+    def start_run(
+        self,
+        scope: RunScope = "full",
+        *,
+        excluded_adapter_ids: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        excluded = tuple(sorted({str(adapter_id) for adapter_id in excluded_adapter_ids if str(adapter_id)}))
         with self._lock:
-            return self._start_locked(scope)
+            return self._start_locked(scope, excluded)
 
     def schedule_quick_if_due(self) -> dict[str, Any] | None:
         with self._lock:
@@ -302,13 +318,16 @@ class SourceHealthService:
             run = self._runs[run_id]
             run["status"] = "running"
             scope: RunScope = run["scope"]
+            excluded_adapter_ids = tuple(str(adapter_id) for adapter_id in run.get("excluded_adapter_ids") or ())
         try:
             history_documents = self.storage.load_history(now=self._now())
-            observations = self.runner.run(
-                scope,
-                on_probe_complete=lambda row: self._record_result(run_id, row),
-                history_documents=history_documents,
-            )
+            run_kwargs = {
+                "on_probe_complete": lambda row: self._record_result(run_id, row),
+                "history_documents": history_documents,
+            }
+            if excluded_adapter_ids:
+                run_kwargs["excluded_adapter_ids"] = excluded_adapter_ids
+            observations = self.runner.run(scope, **run_kwargs)
             finished_at = self._now().isoformat()
             refreshed_rows = [row.to_dict() for row in observations]
             with self._lock:

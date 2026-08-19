@@ -22,6 +22,7 @@ def descriptor(
     source_name: str,
     group: str = "fund",
     capability: str = "profile",
+    adapter_id: str = "",
     critical: bool = False,
     freshness_max_age_seconds: int | None = None,
 ) -> SourceDescriptor:
@@ -37,6 +38,7 @@ def descriptor(
         probe_kind="news_feed" if group == "news" else "provider",
         probe_args={"code": "000001"} if group != "news" else {"hint": "ai"},
         freshness_max_age_seconds=freshness_max_age_seconds,
+        adapter_id=adapter_id,
     )
 
 
@@ -60,8 +62,9 @@ def successful_result(source_name: str = "公开测试源") -> dict:
 
 
 class Provider:
-    def __init__(self, name: str):
+    def __init__(self, name: str, adapter_id: str | None = None):
         self.name = name
+        self.adapter_id = adapter_id or name
 
 
 def test_quick_selects_only_critical_rows_while_full_selects_every_row():
@@ -192,6 +195,35 @@ def test_runner_maps_news_probe_reference_to_health_final_reference(reference_fi
 
     assert observation.final_reference == "https://public.example.test/final.xml"
     assert observation.observed_final_reference == observation.final_reference
+    runner.shutdown()
+
+
+def test_full_run_excludes_disabled_catalog_adapter_by_stable_id():
+    rows = [
+        descriptor("fund:tencent:stock_snapshot", source_name="tencent", adapter_id="tencent-quote"),
+        descriptor("fund:eastmoney:stock_snapshot", source_name="eastmoney", adapter_id="eastmoney-direct"),
+    ]
+    probed = []
+    runner = SourceHealthRunner(
+        rows,
+        providers=[
+            Provider("tencent", "tencent-quote"),
+            Provider("eastmoney", "eastmoney-direct"),
+        ],
+        news_sources={},
+        provider_probe=lambda provider, *_args, **_kwargs: probed.append(provider.name) or successful_result(),
+        now=lambda: NOW,
+    )
+
+    runner.run("full", excluded_adapter_ids={"tencent-quote"})
+
+    assert probed == ["eastmoney"]
+    assert [row.source_id for row in runner.select("full", excluded_adapter_ids={"tencent-quote"})] == [
+        "fund:eastmoney:stock_snapshot"
+    ]
+    assert {row.source_id for row in runner.select("full")} == {
+        "fund:tencent:stock_snapshot", "fund:eastmoney:stock_snapshot"
+    }
     runner.shutdown()
 
 

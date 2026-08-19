@@ -237,8 +237,19 @@ class DataSourceService:
             for capability in catalog.capabilities
         ]
 
+    def _disabled_adapter_ids(self, catalog: DataSourceCatalog) -> tuple[str, ...]:
+        return tuple(
+            adapter.adapter_id
+            for adapter in catalog.adapters
+            if not self._adapter_enabled.get(adapter.adapter_id, adapter.default_enabled)
+        )
+
     def refresh(self) -> dict[str, object]:
-        run = self._health_service_factory().start_run("full")
+        catalog = self._catalog()
+        run = self._health_service_factory().start_run(
+            "full",
+            excluded_adapter_ids=self._disabled_adapter_ids(catalog),
+        )
         return {"run_id": str(run["run_id"])}
 
     def adapter_action(self, adapter_id: str, action: str) -> dict[str, object]:

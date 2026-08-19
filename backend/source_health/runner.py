@@ -114,12 +114,20 @@ class SourceHealthRunner:
             configured_cache_source_ids = tuple(str(source_id) for source_id in reliable_cache_source_ids)
             self._load_reliable_cache_source_ids = lambda: configured_cache_source_ids
 
-    def select(self, scope: RunScope) -> list[SourceDescriptor]:
+    def select(
+        self,
+        scope: RunScope,
+        *,
+        excluded_adapter_ids: Iterable[str] = (),
+    ) -> list[SourceDescriptor]:
+        excluded = {str(adapter_id) for adapter_id in excluded_adapter_ids if str(adapter_id)}
         if scope == "quick":
-            return [descriptor for descriptor in self._descriptors if descriptor.critical]
-        if scope == "full":
-            return list(self._descriptors)
-        raise ValueError(f"unsupported source-health scope: {scope}")
+            selected = [descriptor for descriptor in self._descriptors if descriptor.critical]
+        elif scope == "full":
+            selected = list(self._descriptors)
+        else:
+            raise ValueError(f"unsupported source-health scope: {scope}")
+        return [descriptor for descriptor in selected if descriptor.adapter_id not in excluded]
 
     def _public_sample_code(self) -> str:
         if self._sample_code is not None:
@@ -363,6 +371,7 @@ class SourceHealthRunner:
         self,
         scope: RunScope,
         *,
+        excluded_adapter_ids: Iterable[str] = (),
         on_probe_complete: ResultCallback | None = None,
         on_final_result: ResultCallback | None = None,
         history_documents: Iterable[Mapping[str, Any]] = (),
@@ -381,7 +390,7 @@ class SourceHealthRunner:
                 if source_id:
                     history_by_source[source_id].append(row)
         futures: list[Future[_ProbeOutcome]] = []
-        for descriptor in self.select(scope):
+        for descriptor in self.select(scope, excluded_adapter_ids=excluded_adapter_ids):
             pool = self._news_pool if descriptor.group == "news" else self._fund_pool
             futures.append(pool.submit(self._run_one, descriptor, history_by_source[descriptor.source_id]))
         outcomes: list[_ProbeOutcome] = []
