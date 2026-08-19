@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import re
 from typing import Any
 from urllib.parse import urlsplit
 
-from data_sources.budgets import BudgetDecision
 from data_sources.models import AdapterDescriptor, BillingModel, CatalogStatus, ProviderValue, SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
@@ -24,9 +22,6 @@ _ENV_NAME = "FINNHUB_API_KEY"
 _MAX_ROWS = 1_000
 _MAX_TEXT = 4_096
 _SYMBOL = re.compile(r"^[A-Za-z0-9.^_-]{1,64}$")
-_PLAN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
-_CACHEABLE = {"timeout", "tls", "dns", "connection", "server_error", "rate_limited"}
-_SENSITIVE = ("api_key", "apikey", "bearer", "credential", "password", "secret", "token")
 
 
 def _now() -> datetime: return datetime.now(timezone.utc)
@@ -50,42 +45,6 @@ def _number(value: object) -> Decimal:
     return parsed
 
 
-def _cost(value: object) -> Decimal | None:
-    if value is None: return None
-    if type(value) is not Decimal or not value.is_finite() or value < 0 or value > Decimal("1000000") or len(value.as_tuple().digits) > 28 or not -8 <= value.as_tuple().exponent <= 12:
-        raise ValueError("estimated_cost is invalid")
-    return Decimal(value)
-
-
-@dataclass(frozen=True, slots=True)
-class FinnhubEntitlement:
-    capability_id: str
-    plan_name: str
-    available: bool
-    estimated_cost: Decimal | None
-    quota_remaining: int | None
-
-    def __post_init__(self) -> None:
-        if self.capability_id not in {"stock_snapshot", "news_discovery"} or type(self.plan_name) is not str or not _PLAN.fullmatch(self.plan_name): raise ValueError("invalid Finnhub entitlement")
-        if type(self.available) is not bool: raise ValueError("available must be boolean")
-        object.__setattr__(self, "estimated_cost", _cost(self.estimated_cost))
-        if self.quota_remaining is not None and (type(self.quota_remaining) is not int or not 0 <= self.quota_remaining <= 1_000_000_000): raise ValueError("quota_remaining is invalid")
-
-
-def _decision(value: object, estimate: Decimal) -> tuple[bool, str, str | None]:
-    if type(value) is not BudgetDecision: raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-    try: row = value.to_dict()
-    except Exception: raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
-    if (type(row) is not dict or set(row) != {"allowed", "reason", "reservation_id", "estimated_cost", "health_failure"}
-        or type(row["allowed"]) is not bool or type(row["reason"]) is not str or (row["reservation_id"] is not None and type(row["reservation_id"]) is not str)
-        or type(row["estimated_cost"]) is not str or type(row["health_failure"]) is not bool or row["estimated_cost"] != format(estimate, "f")
-        or row["health_failure"] is not False or row["allowed"] is not (row["reason"] == "authorized") or (not row["allowed"] and row["reservation_id"] is not None)
-        or (row["allowed"] and estimate > 0 and row["reservation_id"] is None)):
-        raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-    if row["reservation_id"] is not None and any(term in row["reservation_id"].lower() for term in _SENSITIVE): raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE)
-    return row["allowed"], row["reason"], row["reservation_id"]
-
-
 class FinnhubAdapter(BaseProvider):
     descriptor = AdapterDescriptor(
         "finnhub", "Finnhub", "finnhub", "http_client",
@@ -98,16 +57,10 @@ class FinnhubAdapter(BaseProvider):
     )
 
     def __init__(self, *, http: Any, credentials: Any, budget_guard: Any | None = None,
-                 entitlements: tuple[FinnhubEntitlement, ...] = (), cache_getter: Callable[[ProviderRequest], object | None] | None = None,
+                 entitlement_resolver: Any | None = None, cache_getter: Callable[[ProviderRequest], object | None] | None = None,
                  fetched_at: Callable[[], datetime] = _now) -> None:
-        if type(entitlements) is not tuple or any(type(item) is not FinnhubEntitlement for item in entitlements): raise ValueError("invalid Finnhub entitlements")
-        if len({item.capability_id for item in entitlements}) != len(entitlements): raise ValueError("duplicate capability entitlement")
         self._http, self._credentials, self._budget_guard = http, credentials, budget_guard
-        self._entitlements = {
-            item.capability_id: FinnhubEntitlement(
-                item.capability_id, item.plan_name, item.available, item.estimated_cost, item.quota_remaining
-            ) for item in entitlements
-        }
+        self._entitlement_resolver = entitlement_resolver
         self._cache_getter, self._fetched_at = cache_getter, fetched_at
 
     def _credential(self) -> str | None:
@@ -115,16 +68,10 @@ class FinnhubAdapter(BaseProvider):
         except Exception: return None
         return value if type(value) is str and value.strip() else None
 
-    def _preflight(self, capability: str, now: datetime) -> tuple[str | None, FinnhubEntitlement | None]:
-        if self._budget_guard is None: return "budget_guard_unavailable", None
-        ent = self._entitlements.get(capability)
-        if ent is None or ent.estimated_cost is None: return "cost_unknown", None
-        if not ent.available: return "plan_unavailable", ent
-        if ent.quota_remaining == 0: return "quota_exhausted", ent
-        try: decision = self._budget_guard.authorize(self.descriptor, estimated_cost=ent.estimated_cost, now=now)
-        except Exception: raise ProviderUnavailable("budget_status_invalid", reference=_REFERENCE) from None
-        allowed, reason, _reservation = _decision(decision, ent.estimated_cost)
-        return (None, ent) if allowed else (reason, ent)
+    def _trusted_entitlement(self, capability: str, now: datetime) -> tuple[str | None, object | None]:
+        from data_sources.provider_registry import FreemiumEntitlementResolver
+        if type(self._entitlement_resolver) is not FreemiumEntitlementResolver: return "entitlement_unavailable", None
+        return self._entitlement_resolver.resolve(self.descriptor.adapter_id, capability, self.descriptor.billing_model, now=now)
 
     @staticmethod
     def _request(request: ProviderRequest) -> tuple[str, dict[str, object]]:
@@ -153,7 +100,8 @@ class FinnhubAdapter(BaseProvider):
         if "key" in message or "auth" in message or "token" in message: raise ProviderUnavailable("authentication", reference=_REFERENCE)
         raise ProviderUnavailable("provider_error", reference=_REFERENCE)
 
-    def _parse_quote(self, payload: object, request: ProviderRequest, *, now: datetime, ent: FinnhubEntitlement, cached: bool) -> tuple[ProviderValue, ...]:
+    def _parse_quote(self, payload: object, request: ProviderRequest, *, now: datetime, ent: object, cached: bool) -> tuple[ProviderValue, ...]:
+        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(ent, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now): raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
         if type(payload) is not dict: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
         self._payload_error(payload)
         if set(payload) != {"c", "d", "dp", "h", "l", "o", "pc", "t"}: raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -166,7 +114,8 @@ class FinnhubAdapter(BaseProvider):
         if cached: metadata["cache_status"] = "fallback"
         return (ProviderValue(public, "finnhub", "finnhub", request.capability_id, observed.date(), now, "cached" if cached else "upstream_reported", "Finnhub account terms apply", 130, None, "unknown", "intraday", metadata),)
 
-    def _parse_news(self, payload: object, request: ProviderRequest, *, now: datetime, ent: FinnhubEntitlement, cached: bool) -> tuple[ProviderValue, ...]:
+    def _parse_news(self, payload: object, request: ProviderRequest, *, now: datetime, ent: object, cached: bool) -> tuple[ProviderValue, ...]:
+        if self._entitlement_resolver is None or not self._entitlement_resolver.validate_snapshot(ent, self.descriptor.adapter_id, request.capability_id, self.descriptor.billing_model, now=now): raise ProviderUnavailable("entitlement_invalid", reference=_REFERENCE)
         if type(payload) is dict:
             self._payload_error(payload)
             raise ProviderSchemaChanged("schema_changed", reference=_REFERENCE)
@@ -193,38 +142,17 @@ class FinnhubAdapter(BaseProvider):
             rows.append(ProviderValue(public, "finnhub", "finnhub", request.capability_id, published.date(), now, "cached_candidate" if cached else "candidate", "Finnhub discovery index; original publisher must be verified", 130, None, "candidate", "event_driven", metadata))
         return tuple(rows)
 
-    def _execute(self, request: ProviderRequest, credential: str, now: datetime, ent: FinnhubEntitlement) -> tuple[ProviderValue, ...]:
-        endpoint, params = self._request(request); transport_params = dict(params); transport_params["token"] = credential
-        try: payload = self._http.get_json(endpoint, headers={"Accept": "application/json"}, params=transport_params)
-        except ProviderUnavailable as error:
-            if self._cache_getter is None or error.code not in _CACHEABLE: raise
-            payload = self._cache_getter(request)
-            if payload is None: raise
-            cached = True
-        else: cached = False
-        return self._parse_quote(payload, request, now=now, ent=ent, cached=cached) if request.capability_id == "stock_snapshot" else self._parse_news(payload, request, now=now, ent=ent, cached=cached)
-
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
         credential = self._credential()
         if credential is None: raise ProviderUnavailable("unconfigured", reference=_REFERENCE)
-        now = self._fetched_at(); blocked, ent = self._preflight(request.capability_id, now)
-        if blocked is not None or ent is None: raise ProviderUnavailable(blocked or "budget_status_invalid", reference=_REFERENCE)
-        return self._execute(request, credential, now, ent)
+        del credential, request
+        raise ProviderUnavailable("unsupported_credential_transport", reference=_REFERENCE)
 
     def probe(self, capability_id: str, *, parameters: Mapping[str, object] | None = None) -> Mapping[str, object]:
         credential = self._credential()
         if credential is None: return {"status": "unconfigured", "connected": False, "health_failure": False}
-        now = self._fetched_at(); blocked, ent = self._preflight(capability_id, now)
-        if blocked is not None or ent is None: return {"status": blocked or "budget_status_invalid", "connected": False, "health_failure": False, "capability_id": capability_id}
-        defaults = {"stock_snapshot": {"symbol": "AAPL"}, "news_discovery": {"symbol": "AAPL", "from": now.date().isoformat(), "to": now.date().isoformat()}}
-        request = ProviderRequest(capability_id, defaults.get(capability_id, {}) if parameters is None else parameters)
-        try: rows = self._execute(request, credential, now, ent)
-        except ProviderRateLimited as error: return {"status": "rate_limited", "connected": False, "health_failure": False, "capability_id": capability_id, "retry_after_seconds": error.retry_after_seconds}
-        except ProviderSchemaChanged: return {"status": "schema_changed", "connected": False, "health_failure": True, "capability_id": capability_id}
-        except ProviderUnavailable as error:
-            status = "authentication_failed" if error.code == "authentication" else error.code
-            return {"status": status, "connected": False, "health_failure": error.code not in {"authentication", "plan_unavailable", "quota_exhausted", "empty_result"}, "capability_id": capability_id}
-        return {"status": "available", "connected": True, "health_failure": False, "capability_id": capability_id, "returned_count": len(rows)}
+        del credential, parameters
+        return {"status": "unsupported_credential_transport", "connected": False, "health_failure": False, "capability_id": capability_id}
 
 
-__all__ = ["FinnhubAdapter", "FinnhubEntitlement"]
+__all__ = ["FinnhubAdapter"]

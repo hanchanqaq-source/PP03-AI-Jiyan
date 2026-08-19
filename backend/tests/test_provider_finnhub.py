@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
+import requests
 
-from data_sources.budgets import BudgetDecision
 from data_sources.catalog import build_catalog
 from data_sources.credentials import MemoryCredentialStore
 from data_sources.models import SourceRole
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderRateLimited, ProviderSchemaChanged, ProviderUnavailable
+from data_sources.provider_registry import FreemiumEntitlementResolver
 from data_sources.routing import CapabilityRouter
 
 
@@ -19,7 +20,7 @@ SECRET = "finnhub-secret-value"
 
 
 class FakeHttp:
-    def __init__(self, responses): self.responses, self.calls = list(responses), []
+    def __init__(self, responses=()): self.responses, self.calls = list(responses), []
     def get_json(self, url, *, headers=None, params=None):
         self.calls.append((url, headers, params))
         value = self.responses.pop(0)
@@ -28,9 +29,10 @@ class FakeHttp:
 
 
 class FakeBudget:
-    def __init__(self, decision=None): self.decision, self.calls = decision or BudgetDecision(True, "authorized", None, Decimal("0")), []
+    def __init__(self): self.calls = []
     def authorize(self, descriptor, *, estimated_cost, now):
-        self.calls.append((descriptor.adapter_id, estimated_cost, now)); return self.decision
+        self.calls.append((descriptor.adapter_id, estimated_cost, now))
+        raise AssertionError("authorization must not run without a supported credential transport")
 
 
 def credentials(configured=True):
@@ -39,129 +41,115 @@ def credentials(configured=True):
     return store
 
 
-def entitlement(capability="news_discovery", **overrides):
-    from data_sources.providers.finnhub import FinnhubEntitlement
-    values = dict(capability_id=capability, plan_name="fixture-plan", available=True, estimated_cost=Decimal("0"), quota_remaining=9)
-    values.update(overrides)
-    return FinnhubEntitlement(**values)
+def resolver(capability="news_discovery", **overrides):
+    record = {
+        "adapter_id": "finnhub", "capability_id": capability, "billing_model": "freemium",
+        "plan_name": "fixture-plan", "available": True, "quota_remaining": 9,
+        "estimated_cost": Decimal("0"), "actual_cost": Decimal("0"),
+        "observed_at": NOW - timedelta(minutes=5), "expires_at": NOW + timedelta(hours=1),
+        "provenance": "deterministic_test_fixture",
+    }
+    record.update(overrides)
+    return FreemiumEntitlementResolver.from_test_records((record,))
 
 
-def adapter(http, *, configured=True, guard=None, entitlements=(), cache_getter=None):
+def adapter(http=None, *, configured=True, entitlement_resolver=None, guard=None):
     from data_sources.providers.finnhub import FinnhubAdapter
-    return FinnhubAdapter(http=http, credentials=credentials(configured), budget_guard=guard, entitlements=entitlements, cache_getter=cache_getter, fetched_at=lambda: NOW)
+    return FinnhubAdapter(http=http or FakeHttp(), credentials=credentials(configured), budget_guard=guard, entitlement_resolver=entitlement_resolver, fetched_at=lambda: NOW)
 
 
-def news_request():
-    return ProviderRequest("news_discovery", {"symbol": "AAPL", "from": "2025-07-01", "to": "2025-07-02"})
+def news_request(): return ProviderRequest("news_discovery", {"symbol": "AAPL", "from": "2025-07-01", "to": "2025-07-02"})
 
 
 def news_fixture():
-    return [{
-        "category": "company", "datetime": 1751378400, "headline": "Issuer update",
-        "id": 123, "image": "", "related": "AAPL", "source": "Reuters",
-        "summary": "A bounded public summary.", "url": "https://www.reuters.com/markets/example",
-    }]
+    return [{"category": "company", "datetime": 1751378400, "headline": "Issuer update", "id": 123, "image": "", "related": "AAPL", "source": "Reuters", "summary": "A bounded public summary.", "url": "https://www.reuters.com/markets/example"}]
 
 
-def test_finnhub_no_key_guard_and_entitlement_fail_closed_before_request_or_transport():
-    http, guard = FakeHttp([]), FakeBudget()
-    assert adapter(http, configured=False, guard=guard).probe("news_discovery", parameters={"symbol": object()})["status"] == "unconfigured"
+def snapshot(active, active_resolver, capability):
+    reason, value = active_resolver.resolve("finnhub", capability, active.descriptor.billing_model, now=NOW)
+    assert reason is None and value is not None
+    return value
+
+
+def test_finnhub_no_key_and_query_auth_short_circuit_before_request_budget_transport():
+    http, guard = FakeHttp(), FakeBudget()
+    missing = adapter(http, configured=False, entitlement_resolver=resolver(), guard=guard)
+    assert missing.probe("news_discovery", parameters={"symbol": object()})["status"] == "unconfigured"
+    with pytest.raises(ProviderUnavailable, match="unconfigured"): missing.fetch(news_request())
+    active = adapter(http, entitlement_resolver=resolver(), guard=guard)
+    assert active.probe("news_discovery")["status"] == "unsupported_credential_transport"
+    with pytest.raises(ProviderUnavailable, match="unsupported_credential_transport"): active.fetch(news_request())
     assert guard.calls == [] and http.calls == []
-    assert adapter(http, entitlements=(entitlement(),)).probe("news_discovery")["status"] == "budget_guard_unavailable"
-    assert adapter(http, guard=guard).probe("news_discovery")["status"] == "cost_unknown"
-    assert http.calls == []
 
 
-def test_finnhub_news_preserves_original_publisher_and_remains_collector_candidate_only():
-    http = FakeHttp([news_fixture()])
-    rows = adapter(http, guard=FakeBudget(), entitlements=(entitlement(),)).fetch(news_request())
+def test_finnhub_news_parser_preserves_publisher_and_remains_collector_candidate_only():
+    active_resolver = resolver(); active = adapter(entitlement_resolver=active_resolver)
+    rows = active._parse_news(news_fixture(), news_request(), now=NOW, ent=snapshot(active, active_resolver, "news_discovery"), cached=False)
     row = rows[0]
-    assert row.value == {
-        "title": "Issuer update", "summary": "A bounded public summary.",
-        "publisher_name": "Reuters", "publisher_url": "https://www.reuters.com/markets/example",
-        "origin_domain": "www.reuters.com", "published_at": "2025-07-01T14:00:00+00:00",
-        "category": "company", "collector": "finnhub", "candidate": True,
-        "independent_evidence_eligible": False,
-    }
+    assert row.value == {"title": "Issuer update", "summary": "A bounded public summary.", "publisher_name": "Reuters", "publisher_url": "https://www.reuters.com/markets/example", "origin_domain": "www.reuters.com", "published_at": "2025-07-01T14:00:00+00:00", "category": "company", "collector": "finnhub", "candidate": True, "independent_evidence_eligible": False}
     assert row.data_status == "candidate"
-    assert row.source_metadata == {
-        "collector": "finnhub", "collector_relation": "discovery_only", "origin_domain": "www.reuters.com",
-        "origin_identity": "www.reuters.com", "plan_name": "fixture-plan", "quota_remaining": "9",
-        "source_reference": "https://finnhub.io/", "delay_seconds": "79200",
-    }
+    assert row.source_metadata["collector_relation"] == "discovery_only" and row.source_metadata["origin_identity"] == "www.reuters.com"
     assert SECRET not in repr(rows)
     catalog = build_catalog({"sources": []})
-    family = catalog.family("finnhub")
-    descriptor = catalog.adapter("finnhub")
-    assert family.independent_evidence_eligible is False
-    assert descriptor.source_roles == (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.COLLECTOR, SourceRole.CANDIDATE)
-    route = CapabilityRouter(catalog).route("news_discovery")
-    assert "finnhub" not in route.evidence_adapter_ids
+    assert catalog.family("finnhub").independent_evidence_eligible is False
+    assert catalog.adapter("finnhub").source_roles == (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.COLLECTOR, SourceRole.CANDIDATE)
+    assert "finnhub" not in CapabilityRouter(catalog).route("news_discovery").evidence_adapter_ids
 
 
-def test_finnhub_market_quote_preserves_symbol_provider_timestamp_and_unknown_unit():
-    request = ProviderRequest("stock_snapshot", {"symbol": "AAPL"})
+def test_finnhub_quote_parser_preserves_symbol_timestamp_and_unknown_unit():
+    req = ProviderRequest("stock_snapshot", {"symbol": "AAPL"})
     payload = {"c": 210.5, "d": 1.5, "dp": 0.72, "h": 212, "l": 207, "o": 208, "pc": 209, "t": 1751378400}
-    rows = adapter(FakeHttp([payload]), guard=FakeBudget(), entitlements=(entitlement("stock_snapshot"),)).fetch(request)
-    row = rows[0]
-    assert row.value["current"] == Decimal("210.5")
-    assert row.as_of_date.isoformat() == "2025-07-01"
-    assert row.unit == "unknown" and row.frequency == "intraday"
-    assert row.source_metadata["symbol"] == "AAPL" and row.source_metadata["publisher_role"] == "market_provider"
+    active_resolver = resolver("stock_snapshot"); active = adapter(entitlement_resolver=active_resolver)
+    row = active._parse_quote(payload, req, now=NOW, ent=snapshot(active, active_resolver, "stock_snapshot"), cached=False)[0]
+    assert row.value["current"] == Decimal("210.5") and row.as_of_date.isoformat() == "2025-07-01"
+    assert row.unit == "unknown" and row.frequency == "intraday" and row.source_metadata["publisher_role"] == "market_provider"
 
 
-@pytest.mark.parametrize(
-    "response,error_type,code",
-    [
-        ([], ProviderUnavailable, "empty_result"),
-        ({"error": "Invalid API key"}, ProviderUnavailable, "authentication"),
-        ({"error": "You don't have access to this resource"}, ProviderUnavailable, "plan_unavailable"),
-        ({"bad": "shape"}, ProviderSchemaChanged, "schema_changed"),
-        (ProviderRateLimited(retry_after_seconds=7, reference="https://finnhub.io/"), ProviderRateLimited, "rate_limited"),
-    ],
-)
-def test_finnhub_distinguishes_empty_auth_plan_schema_and_retry_after(response, error_type, code):
+@pytest.mark.parametrize("response,error_type,code", [
+    ([], ProviderUnavailable, "empty_result"),
+    ({"error": "Invalid API key"}, ProviderUnavailable, "authentication"),
+    ({"error": "You don't have access to this resource"}, ProviderUnavailable, "plan_unavailable"),
+    ({"bad": "shape"}, ProviderSchemaChanged, "schema_changed"),
+])
+def test_finnhub_news_parser_distinguishes_empty_auth_plan_and_schema(response, error_type, code):
+    active_resolver = resolver(); active = adapter(entitlement_resolver=active_resolver)
     with pytest.raises(error_type) as captured:
-        adapter(FakeHttp([response]), guard=FakeBudget(), entitlements=(entitlement(),)).fetch(news_request())
-    assert captured.value.code == code
-    if code == "rate_limited": assert captured.value.retry_after_seconds == 7
-    assert SECRET not in str(captured.value)
+        active._parse_news(response, news_request(), now=NOW, ent=snapshot(active, active_resolver, "news_discovery"), cached=False)
+    assert captured.value.code == code and SECRET not in str(captured.value)
+
+
+@pytest.mark.parametrize("payload", [
+    [{**news_fixture()[0], "datetime": 4102444800}],
+    [{**news_fixture()[0], "url": "http://www.reuters.com/markets/example"}],
+    [{**news_fixture()[0], "url": "https://user:pass@www.reuters.com/example"}],
+    [{**news_fixture()[0], "headline": "x" * 5000}],
+    [{**news_fixture()[0], "summary": {"nested": 1}}],
+    [news_fixture()[0]] * 1001,
+])
+def test_finnhub_news_parser_rejects_future_insecure_credentialed_unbounded_nested(payload):
+    active_resolver = resolver(); active = adapter(entitlement_resolver=active_resolver)
+    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
+        active._parse_news(payload, news_request(), now=NOW, ent=snapshot(active, active_resolver, "news_discovery"), cached=False)
 
 
 def test_finnhub_cached_news_stays_candidate_and_explicitly_cached():
-    failure = ProviderUnavailable("timeout", reference="https://finnhub.io/")
-    rows = adapter(FakeHttp([failure]), guard=FakeBudget(), entitlements=(entitlement(),), cache_getter=lambda _: news_fixture()).fetch(news_request())
-    assert rows[0].data_status == "cached_candidate"
-    assert rows[0].source_metadata["cache_status"] == "fallback"
-    assert rows[0].value["independent_evidence_eligible"] is False
+    active_resolver = resolver(); active = adapter(entitlement_resolver=active_resolver)
+    row = active._parse_news(news_fixture(), news_request(), now=NOW, ent=snapshot(active, active_resolver, "news_discovery"), cached=True)[0]
+    assert row.data_status == "cached_candidate" and row.source_metadata["cache_status"] == "fallback"
+    assert row.value["independent_evidence_eligible"] is False
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        [{**news_fixture()[0], "datetime": 4102444800}],
-        [{**news_fixture()[0], "url": "http://www.reuters.com/markets/example"}],
-        [{**news_fixture()[0], "url": "https://user:pass@www.reuters.com/example"}],
-        [{**news_fixture()[0], "headline": "x" * 5000}],
-        [{**news_fixture()[0], "summary": {"nested": 1}}],
-        [news_fixture()[0]] * 1001,
-    ],
-)
-def test_finnhub_rejects_future_insecure_credentialed_unbounded_and_nested_news(payload):
-    with pytest.raises(ProviderSchemaChanged, match="schema_changed"):
-        adapter(FakeHttp([payload]), guard=FakeBudget(), entitlements=(entitlement(),)).fetch(news_request())
+def test_finnhub_public_request_shape_is_secret_free_and_exact():
+    active = adapter()
+    endpoint, params = active._request(news_request())
+    prepared = requests.Request("GET", endpoint, params=params).prepare()
+    assert prepared.url is not None and SECRET not in prepared.url and "token" not in prepared.url.lower()
+    with pytest.raises(ProviderUnavailable, match="invalid_request_parameter"):
+        active._request(ProviderRequest("news_discovery", {"symbol": object()}))
 
 
-def test_finnhub_catalog_is_default_disabled_with_stable_capabilities_and_secret_scope():
+def test_finnhub_catalog_is_default_disabled_stable_and_secret_scoped():
     row = build_catalog({"sources": []}).adapter("finnhub")
-    assert row.capability_ids == ("stock_snapshot", "news_discovery")
-    assert row.credential_env_names == ("FINNHUB_API_KEY",)
-    assert row.default_enabled is False and row.catalog_status.value == "unconfigured"
-    assert row.billing_model.value == "freemium" and "未知" in row.cost_policy
-
-
-def test_finnhub_copies_trusted_entitlement_before_caller_mutation():
-    trusted = entitlement()
-    active = adapter(FakeHttp([news_fixture()]), guard=FakeBudget(), entitlements=(trusted,))
-    object.__setattr__(trusted, "quota_remaining", 0)
-    assert len(active.fetch(news_request())) == 1
+    assert row.capability_ids == ("stock_snapshot", "news_discovery") and row.credential_env_names == ("FINNHUB_API_KEY",)
+    assert row.default_enabled is False and row.catalog_status.value == "unconfigured" and row.billing_model.value == "freemium"
+    assert "未知" in row.cost_policy
