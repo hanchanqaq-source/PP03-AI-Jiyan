@@ -2693,9 +2693,12 @@ def test_archive_v2_native_journal_rejects_unindexed_canonical_bucket_row(tmp_pa
         NOW,
     )
     _write_bucket_for_test(archive, archive_module._bucket_name(stray), [stray])
+    legacy_state_before = archive.state_path.read_bytes()
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
+
+    assert archive.state_path.read_bytes() == legacy_state_before
 
 
 @pytest.mark.parametrize("budget_dimension", ("bytes", "rows", "nodes", "files"))
@@ -4380,7 +4383,7 @@ def test_archive_v2_recovery_falls_back_to_unique_event_window_when_mtime_moved(
         "b" * 20: f"{newer_base_time.date().isoformat()}.jsonl",
         "i" * 20: f"{imported_time.date().isoformat()}.jsonl",
     }
-    assert recovered_states[0]["cutoff"] == newer_base_time - timedelta(days=90)
+    assert recovered_states[0]["cutoff"] == transaction_time - timedelta(days=90)
     assert [row["event_id"] for row in archive.query(days=90)] == ["r" * 20]
 
 
@@ -4513,3 +4516,356 @@ def test_archive_legacy_migration_fails_closed_when_final_state_read_exceeds_sha
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
+
+
+def test_archive_v2_mtime_cannot_predate_authenticated_row_causality(tmp_path, monkeypatch):
+    clock = [NOW]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    imported_time = NOW - timedelta(days=30)
+    row_contract_time = NOW + timedelta(minutes=4)
+    selected = snapshot(
+        replace(
+            event(
+                "i" * 20,
+                published_at=imported_time,
+                history=(StatusTransition(
+                    None,
+                    VerificationStatus.VERIFIED,
+                    row_contract_time,
+                    "reason-verified",
+                ),),
+            ),
+            verified_at=row_contract_time,
+            evidence_as_of=row_contract_time,
+        ),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=NOW,
+    )
+    journal = _journal_only_document(archive, selected, 2)
+    archive.archive_root.mkdir(parents=True)
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _set_journal_mtime(archive, NOW + timedelta(minutes=1))
+
+    recovered_states: list[dict[str, object]] = []
+    real_recover = archive._recover_prepared_authority
+
+    def record_recovery(state, **kwargs):
+        recovered_states.append(state)
+        return real_recover(state, **kwargs)
+
+    monkeypatch.setattr(archive, "_recover_prepared_authority", record_recovery)
+    clock[0] = NOW + timedelta(days=91)
+    archive.upsert(snapshot(
+        _timed_event("n" * 20, clock[0]),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+        generated_at=clock[0],
+    ))
+
+    assert recovered_states[0]["cutoff"] == row_contract_time - timedelta(days=90)
+    assert recovered_states[0]["target_index"] == {
+        "i" * 20: f"{imported_time.date().isoformat()}.jsonl",
+    }
+
+
+def test_archive_v2_fallback_includes_pruned_physical_rows_with_bounded_work(
+    tmp_path,
+    monkeypatch,
+):
+    expired_time = NOW - timedelta(days=91)
+    newer_base_time = NOW - timedelta(days=1)
+    imported_time = NOW - timedelta(days=30)
+    clock = [NOW - timedelta(days=2)]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    archive.upsert(snapshot(
+        _timed_event("o" * 20, expired_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=expired_time,
+    ))
+    clock[0] = newer_base_time
+    archive.upsert(snapshot(
+        _timed_event("b" * 20, newer_base_time),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+        generated_at=newer_base_time,
+    ))
+    clock[0] = NOW
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            _timed_event("i" * 20, imported_time),
+            snapshot_id="5" * 20,
+            raw_snapshot_id="6" * 20,
+            generated_at=NOW,
+        ),
+    )
+    journal = _rewrite_pending_journal_as_v2(archive)
+    expected_target = {
+        "b" * 20: f"{newer_base_time.date().isoformat()}.jsonl",
+        "i" * 20: f"{imported_time.date().isoformat()}.jsonl",
+    }
+    assert journal["target_index_digest"] == archive._payload_digest(
+        archive._index_payload(expected_target)
+    )
+    archive._write_index(expected_target)
+    _set_journal_mtime(archive, NOW + timedelta(days=91))
+    monkeypatch.setattr(archive_module, "_MAX_V2_CUTOFF_CANDIDATES", 8)
+
+    recovered_states: list[dict[str, object]] = []
+    real_recover = archive._recover_prepared_authority
+
+    def record_recovery(state, **kwargs):
+        recovered_states.append(state)
+        return real_recover(state, **kwargs)
+
+    monkeypatch.setattr(archive, "_recover_prepared_authority", record_recovery)
+    clock[0] = NOW + timedelta(days=91)
+    archive.upsert(snapshot(
+        _timed_event("n" * 20, clock[0]),
+        snapshot_id="7" * 20,
+        raw_snapshot_id="8" * 20,
+        generated_at=clock[0],
+    ))
+
+    assert recovered_states[0]["target_index"] == expected_target
+    assert recovered_states[0]["cutoff"] == NOW - timedelta(days=90)
+    assert [row["event_id"] for row in archive.query(days=90)] == ["n" * 20]
+
+
+def test_archive_v2_fallback_derives_large_known_target_without_candidate_enumeration(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(days=91))
+    physical_rows: dict[str, dict[str, object]] = {}
+    locations: dict[str, set[str]] = {}
+    for offset in range(20):
+        event_time = NOW - timedelta(days=120 - (offset * 2))
+        event_id = f"{offset:020d}"
+        selected = snapshot(
+            _timed_event(event_id, event_time),
+            snapshot_id=f"{offset + 100:020d}",
+            raw_snapshot_id=f"{offset + 200:020d}",
+            generated_at=event_time,
+        )
+        row = archive_module._archive_document(
+            selected,
+            archive_module.event_document(selected.events[0]),
+            event_time,
+        )
+        physical_rows[event_id] = row
+        locations[event_id] = {archive_module._bucket_name(row)}
+
+    imported_time = NOW - timedelta(days=100)
+    generated_at = NOW - timedelta(days=30)
+    imported = snapshot(
+        _timed_event("j" * 20, imported_time),
+        snapshot_id="7" * 20,
+        raw_snapshot_id="8" * 20,
+        generated_at=generated_at,
+    )
+    journal_row = archive_module._archive_document(
+        imported,
+        archive_module.event_document(imported.events[0]),
+        generated_at,
+    )
+    target_index = {
+        event_id: archive_module._bucket_name(row)
+        for event_id, row in physical_rows.items()
+        if NOW - timedelta(days=90) <= archive_module._event_time(row) <= NOW
+    }
+    target_digest = archive._payload_digest(archive._index_payload(target_index))
+    journal = {
+        "legacy": False,
+        "native_schema_version": 2,
+        "rows": [journal_row],
+        "base_index_digest": archive_module._MISSING_DIGEST,
+        "target_index_digest": target_digest,
+        "transaction_mtime": NOW + timedelta(days=200),
+    }
+    monkeypatch.setattr(archive_module, "_MAX_V2_CUTOFF_CANDIDATES", 8)
+
+    cutoff, recovered_target = archive._resolve_v2_transaction_projection(
+        journal,
+        target_index,
+        physical_rows=physical_rows,
+        locations=locations,
+        physical_index_digest=target_digest,
+        now=NOW + timedelta(days=91),
+    )
+
+    assert recovered_target == target_index
+    assert {
+        event_id: archive_module._bucket_name(row)
+        for event_id, row in {**physical_rows, journal_row["event_id"]: journal_row}.items()
+        if cutoff <= archive_module._event_time(row) <= cutoff + timedelta(days=90)
+    } == target_index
+
+
+@pytest.mark.parametrize("budget_dimension", ("bytes", "files"))
+def test_archive_state_budget_is_rejected_before_payload_io(
+    tmp_path,
+    monkeypatch,
+    budget_dimension,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("s" * 20)))
+    state_size = archive.state_path.stat().st_size
+    if budget_dimension == "bytes":
+        monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", state_size - 1)
+    else:
+        monkeypatch.setattr(archive_module, "_MAX_SCAN_FILES", 0)
+    reads: list[Path] = []
+    real_read = archive._read_bytes
+
+    def record_reads(path: Path, maximum: int, **kwargs):
+        if path == archive.state_path:
+            reads.append(path)
+        return real_read(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_read_bytes", record_reads)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert reads == []
+
+
+def test_archive_prepared_state_row_budget_is_rejected_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    state_bytes = archive.state_path.read_bytes()
+    monkeypatch.setattr(archive_module, "_MAX_SCAN_ROWS", 0)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_state_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == state_bytes:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_state_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+def test_archive_duplicate_state_rows_cannot_bypass_preparse_row_budget(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    original = archive.state_path.read_bytes()
+    state_bytes = b'{"rows":[],' + original[1:]
+    archive.state_path.write_bytes(state_bytes)
+    monkeypatch.setattr(archive_module, "_MAX_SCAN_ROWS", 0)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_state_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == state_bytes:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_state_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+def test_archive_journal_budget_is_rejected_before_payload_io(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    archive.journal_path.write_text(
+        json.dumps(_empty_v2_journal(archive), ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _set_journal_mtime(archive, NOW)
+    monkeypatch.setattr(
+        archive_module,
+        "_MAX_SCAN_BYTES",
+        archive.journal_path.stat().st_size - 1,
+    )
+    reads: list[Path] = []
+    real_read = archive._read_bytes
+
+    def record_reads(path: Path, maximum: int, **kwargs):
+        if path == archive.journal_path:
+            reads.append(path)
+        return real_read(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_read_bytes", record_reads)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert reads == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_archive_first_publication_skips_canonical_symlink_before_legacy_authority(tmp_path):
+    root = tmp_path / "store"
+    archive_root = root / "archive"
+    archive_root.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"outside":"must-not-be-read"}\n', encoding="utf-8")
+    os.symlink(outside, archive_root / "2026-08-20.jsonl")
+    archive = EvidenceArchive(root, now=lambda: NOW)
+
+    assert archive.query(days=90) == []
+    assert not archive.lock_path.exists()
+
+
+def test_archive_query_skips_one_unmanifested_future_schema_row_with_diagnostic(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    selected = snapshot(event("v" * 20))
+    valid = archive_module._archive_document(
+        selected,
+        archive_module.event_document(selected.events[0]),
+        NOW,
+    )
+    future = json.loads(json.dumps(valid, ensure_ascii=False))
+    future["event_id"] = "z" * 20
+    future["schema_version"] = 99
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    bucket.write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+            for row in (_legacy_v1_row(valid), future)
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["v" * 20]
+    assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
