@@ -2749,8 +2749,14 @@ class EvidenceArchive:
             observed_digests[name] = resolved_digest
         return rows
 
-    def _bucket_names(self) -> list[str]:
-        self._prepare()
+    def _bucket_names(
+        self,
+        *,
+        diagnostics: dict[str, int] | None = None,
+        prepare: bool = True,
+    ) -> list[str]:
+        if prepare:
+            self._prepare()
         names: list[str] = []
         entry_count = 0
         try:
@@ -2760,7 +2766,10 @@ class EvidenceArchive:
                     if entry_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
                         raise OSError("storage_corrupt")
                     if _valid_bucket_name(entry.name):
-                        if self._safe_file(self.archive_root / entry.name) is None:
+                        path = self.archive_root / entry.name
+                        if self._safe_file(path) is None:
+                            if diagnostics is not None and self._entry_present(path):
+                                self._increment(diagnostics, "skipped_files")
                             continue
                         names.append(entry.name)
                         if len(names) > _MAX_ARCHIVE_FILES:
@@ -2768,6 +2777,39 @@ class EvidenceArchive:
         except OSError:
             raise OSError("storage_corrupt") from None
         return sorted(names)
+
+    def _preflight_bucket_mutation_paths(
+        self,
+        names: Iterator[str] | list[str] | set[str] | tuple[str, ...],
+    ) -> dict[str, tuple[int, int, int, int, int, int, int, int] | None]:
+        records: dict[str, tuple[int, int, int, int, int, int, int, int] | None] = {}
+        for name in sorted(self._bounded_bucket_candidates(names)):
+            path = self.archive_root / name
+            self._verify_parent(path)
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                records[name] = None
+                continue
+            except OSError:
+                raise OSError("storage_error") from None
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or getattr(metadata, "st_reparse_tag", 0)
+                or metadata.st_nlink != 1
+            ):
+                raise OSError("storage_error")
+            records[name] = _file_signature(metadata)
+        return records
+
+    def _bucket_mutation_records_are_current(
+        self,
+        records: dict[str, tuple[int, int, int, int, int, int, int, int] | None],
+    ) -> bool:
+        try:
+            return self._preflight_bucket_mutation_paths(records) == records
+        except OSError:
+            return False
 
     @staticmethod
     def _payload_digest(payload: bytes | None) -> str:
@@ -3812,7 +3854,7 @@ class EvidenceArchive:
         dict[str, set[str]],
     ]:
         names = self._bounded_bucket_candidates(
-            self._bucket_names() if include_discovered else (),
+            self._bucket_names(diagnostics=diagnostics) if include_discovered else (),
             required_names,
         )
         bucket_rows: dict[str, list[dict[str, Any]]] = {}
@@ -3875,7 +3917,7 @@ class EvidenceArchive:
             observed_index_record.append(physical_index_record)
         active_cutoff = _shift_days(now, -90)
         active_upper = _shift_datetime(now, _MAX_CLOCK_SKEW)
-        discovered = self._bucket_names()
+        discovered = self._bucket_names(diagnostics=diagnostics)
         active_manifest = {
             name: digest
             for name, digest in state["target_bucket_digests"].items()
@@ -4121,7 +4163,14 @@ class EvidenceArchive:
         bucket_payloads = recovery_plan["bucket_payloads"]
         index_payload = recovery_plan["index_payload"]
         finalized_payload = recovery_plan["finalized_payload"]
+        mutation_names = self._bounded_bucket_candidates(
+            state["target_bucket_digests"],
+            affected,
+        )
+        bucket_records = self._preflight_bucket_mutation_paths(mutation_names)
         if not self._index_record_is_current(recovery_plan["physical_index_record"]):
+            raise OSError("storage_corrupt")
+        if not self._bucket_mutation_records_are_current(bucket_records):
             raise OSError("storage_corrupt")
         for name in sorted(affected):
             if observed[name] != state["target_bucket_digests"][name]:
@@ -4215,7 +4264,12 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
+        bucket_records = self._preflight_bucket_mutation_paths(
+            prepared["target_bucket_digests"],
+        )
         if not self._index_record_is_current(recovery_plan["physical_index_record"]):
+            raise OSError("storage_corrupt")
+        if not self._bucket_mutation_records_are_current(bucket_records):
             raise OSError("storage_corrupt")
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         self._recover_prepared_authority(
@@ -4257,7 +4311,9 @@ class EvidenceArchive:
             if physical_index_record is None
             else physical_index_record["digest"]
         )
-        legacy_files = physical_index_record is not None or bool(self._bucket_names())
+        legacy_files = physical_index_record is not None or bool(
+            self._bucket_names(diagnostics=diagnostics)
+        )
         journal_only = legacy_state is None and not legacy_files
         state_document = None if legacy_state is None else legacy_state["document"]
         if state_document is not None:
@@ -4354,6 +4410,13 @@ class EvidenceArchive:
                 physical_index_record=physical_index_record,
             )
             if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
+                raise OSError("storage_corrupt")
+            bucket_records = self._preflight_bucket_mutation_paths(
+                prepared["target_bucket_digests"],
+            )
+            if not self._index_record_is_current(recovery_plan["physical_index_record"]):
+                raise OSError("storage_corrupt")
+            if not self._bucket_mutation_records_are_current(bucket_records):
                 raise OSError("storage_corrupt")
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
             self._recover_prepared_authority(
@@ -4550,7 +4613,12 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
+        bucket_records = self._preflight_bucket_mutation_paths(
+            prepared["target_bucket_digests"],
+        )
         if not self._index_record_is_current(recovery_plan["physical_index_record"]):
+            raise OSError("storage_corrupt")
+        if not self._bucket_mutation_records_are_current(bucket_records):
             raise OSError("storage_corrupt")
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         self._recover_prepared_authority(
@@ -4615,7 +4683,7 @@ class EvidenceArchive:
                 )
 
             if state is None:
-                if self._entry_present(self.index_path) or self._bucket_names():
+                if self._entry_present(self.index_path) or self._bucket_names(diagnostics=diagnostics):
                     raise OSError("storage_corrupt")
                 bucket_rows: dict[str, list[dict[str, Any]]] = {}
                 observed_bucket_digests: dict[str, str] = {}
@@ -4739,7 +4807,12 @@ class EvidenceArchive:
                 raise ValueError("archive snapshot mutation budget exceeded")
 
             expected_index_record = None if state is None else base_index_record
+            bucket_records = self._preflight_bucket_mutation_paths(
+                target_bucket_digests,
+            )
             if not self._index_record_is_current(expected_index_record):
+                raise OSError("storage_corrupt")
+            if not self._bucket_mutation_records_are_current(bucket_records):
                 raise OSError("storage_corrupt")
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
             write_order = sorted(target_names) + sorted(affected - target_names)
@@ -4813,6 +4886,11 @@ class EvidenceArchive:
     def _query_without_lock(self, days: int, status: str | None) -> list[dict[str, Any]]:
         del days, status
         diagnostics = self._diagnostics()
+        if (
+            self._read_directory_present(self.root)
+            and self._read_directory_present(self.archive_root)
+        ):
+            self._bucket_names(diagnostics=diagnostics, prepare=False)
         self._last_diagnostics = diagnostics
         return []
 

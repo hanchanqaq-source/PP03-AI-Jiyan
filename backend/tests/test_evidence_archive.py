@@ -5935,3 +5935,325 @@ def test_archive_index_cas_binds_complete_open_descriptor_signature_to_record(
     monkeypatch.setattr(os, "fstat", changed_descriptor_stat)
 
     assert archive._index_record_is_current(record) is False
+
+
+def _rewrite_pending_journal_as_native_schema(
+    archive: EvidenceArchive,
+    schema_version: int,
+) -> bytes:
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    if schema_version == 2:
+        document = _rewrite_pending_journal_as_v2(archive)
+    else:
+        document = {
+            "schema_version": 3,
+            "transaction_id": prepared["transaction_id"],
+            "base_generation": prepared["base_generation"],
+            "target_generation": prepared["target_generation"],
+            "base_index_digest": prepared["base_index_digest"],
+            "target_index_digest": prepared["target_index_digest"],
+            "base_bucket_digests": prepared["base_bucket_digests"],
+            "target_bucket_digests": prepared["target_bucket_digests"],
+            "cutoff": prepared["cutoff"],
+            "target_index": prepared["target_index"],
+            "rows": prepared["rows"],
+        }
+        archive.journal_path.write_text(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        archive.state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "generation": prepared["base_generation"],
+                    "phase": "finalized",
+                    "transaction_id": "0" * 64,
+                    "index_digest": prepared["base_index_digest"],
+                    "bucket_digests": {},
+                },
+                separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+    assert document["schema_version"] == schema_version
+    return archive.journal_path.read_bytes()
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_archive_native_legacy_journal_migration_rejects_absent_to_present_index_before_state_write(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    selected = snapshot(event("j" * 20))
+    with archive._process_lock():
+        pass
+    journal = _journal_only_document(archive, selected, schema_version)
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _set_journal_mtime(archive, NOW)
+    journal_bytes = archive.journal_path.read_bytes()
+    real_plan = archive._plan_prepared_authority
+
+    def install_index_after_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        archive.index_path.write_bytes(archive._index_payload({}))
+        return plan
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", install_index_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert not archive.state_path.exists()
+    assert archive.journal_path.read_bytes() == journal_bytes
+    monkeypatch.setattr(archive, "_plan_prepared_authority", real_plan)
+    monkeypatch.setattr(archive, "_atomic_write", real_atomic_write)
+    archive.index_path.unlink()
+    assert [row["event_id"] for row in archive.query(days=90)] == ["j" * 20]
+    assert archive.journal_path.read_bytes() == journal_bytes
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+@pytest.mark.parametrize("mutation", ("same_bytes_new_inode", "same_inode_metadata"))
+def test_archive_native_legacy_journal_migration_rechecks_index_identity_before_state_write(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+    mutation,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    journal_bytes = _rewrite_pending_journal_as_native_schema(archive, schema_version)
+    state_bytes = archive.state_path.read_bytes()
+    index_bytes = archive.index_path.read_bytes()
+    real_plan = archive._plan_prepared_authority
+
+    def mutate_index_after_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        if mutation == "same_bytes_new_inode":
+            replacement = archive.archive_root / "replacement-index.json"
+            replacement.write_bytes(index_bytes)
+            os.replace(replacement, archive.index_path)
+        else:
+            metadata = archive.index_path.stat(follow_symlinks=False)
+            os.utime(
+                archive.index_path,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+            )
+        return plan
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", mutate_index_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert archive.state_path.read_bytes() == state_bytes
+    assert archive.index_path.read_bytes() == index_bytes
+    assert archive.journal_path.read_bytes() == journal_bytes
+    monkeypatch.setattr(archive, "_plan_prepared_authority", real_plan)
+    monkeypatch.setattr(archive, "_atomic_write", real_atomic_write)
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+    assert archive.journal_path.read_bytes() == journal_bytes
+
+
+def _install_unsafe_bucket_entry(bucket: Path, outside: Path, kind: str) -> None:
+    if kind == "hardlink":
+        os.link(outside, bucket)
+    else:
+        os.symlink(outside, bucket)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "hardlink",
+        pytest.param("symlink", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX symlink case")),
+    ),
+)
+def test_archive_read_only_scan_skips_unsafe_canonical_bucket_with_diagnostic(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.archive_root.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside_bytes = b'{"outside":"foreign"}\n'
+    outside.write_bytes(outside_bytes)
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    _install_unsafe_bucket_entry(bucket, outside, kind)
+
+    def reject_payload_read(*args, **kwargs):
+        raise AssertionError("unsafe canonical bucket reached payload read")
+
+    monkeypatch.setattr(archive, "_read_bytes", reject_payload_read)
+
+    assert archive.query(days=90) == []
+    assert archive.last_diagnostics["skipped_files"] == 1
+    assert outside.read_bytes() == outside_bytes
+    assert not archive.lock_path.exists()
+
+
+def test_archive_read_only_scan_does_not_count_a_disappeared_candidate_as_unsafe(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive._prepare()
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    bucket.write_bytes(b"\n")
+    diagnostics = archive._diagnostics()
+    real_safe_file = archive._safe_file
+
+    def disappear_before_lstat(path: Path):
+        if path == bucket:
+            bucket.unlink()
+            return None
+        return real_safe_file(path)
+
+    monkeypatch.setattr(archive, "_safe_file", disappear_before_lstat)
+
+    assert archive._bucket_names(diagnostics=diagnostics, prepare=False) == []
+    assert diagnostics["skipped_files"] == 0
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "hardlink",
+        pytest.param("symlink", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX symlink case")),
+    ),
+)
+def test_archive_upsert_preflights_every_target_bucket_before_any_mutation(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.archive_root.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside_bytes = b'{"outside":"foreign"}\n'
+    outside.write_bytes(outside_bytes)
+    unsafe_bucket = archive.archive_root / "2026-08-20.jsonl"
+    _install_unsafe_bucket_entry(unsafe_bucket, outside, kind)
+    earlier = NOW - timedelta(days=1)
+    selected = EvidenceSnapshot(
+        snapshot_id="e" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW,
+        events=(
+            event("a" * 20, published_at=earlier),
+            event("b" * 20, published_at=NOW),
+        ),
+    )
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_(?:error|corrupt)"):
+        archive.upsert(selected)
+
+    assert writes == []
+    assert not archive.state_path.exists()
+    assert not archive.index_path.exists()
+    assert not (archive.archive_root / "2026-08-19.jsonl").exists()
+    assert outside.read_bytes() == outside_bytes
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "hardlink",
+        pytest.param("symlink", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX symlink case")),
+    ),
+)
+def test_archive_legacy_migration_preflights_affected_bucket_identity_before_state_write(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(archive, (snapshot(event("a" * 20)),))
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    bucket_bytes = bucket.read_bytes()
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(bucket_bytes)
+    state_bytes = archive.state_path.read_bytes()
+    index_bytes = archive.index_path.read_bytes()
+    diagnostics = archive._diagnostics()
+    budget = archive_module._new_scan_budget()
+    legacy_state = archive._read_authority_state(
+        NOW,
+        diagnostics=diagnostics,
+        budget=budget,
+    )
+    real_plan = archive._plan_prepared_authority
+
+    def replace_bucket_after_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        bucket.unlink()
+        _install_unsafe_bucket_entry(bucket, outside, kind)
+        return plan
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", replace_bucket_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with archive._process_lock(), pytest.raises(OSError, match="storage_(?:error|corrupt)"):
+        archive._migrate_legacy_authority(
+            legacy_state,
+            now=NOW,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
+
+    assert writes == []
+    assert archive.state_path.read_bytes() == state_bytes
+    assert archive.index_path.read_bytes() == index_bytes
+    assert outside.read_bytes() == bucket_bytes
+    assert legacy["state_bytes"] == state_bytes
+    monkeypatch.setattr(archive, "_plan_prepared_authority", real_plan)
+    monkeypatch.setattr(archive, "_atomic_write", real_atomic_write)
+    bucket.unlink()
+    bucket.write_bytes(bucket_bytes)
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert outside.read_bytes() == bucket_bytes
