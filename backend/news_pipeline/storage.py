@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import stat
 import tempfile
 import time
@@ -32,9 +31,11 @@ _NEXT = {
 }
 _MAX_BYTES, _MAX_DEPTH, _MAX_ENTRIES, _MAX_TEXT, _MAX_INT = 1_048_576, 16, 5_000, 8_192, 1_000_000_000
 _RUN_KEYS = {"schema_version", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id", "phase", "counts", "created_at", "updated_at", "redacted_error", "displayed_trusted_snapshot_id"}
-_AUTHORITY_KEYS = {"schema_version", "token", "generation", "expires_at"}
+_GENERATION_KEYS = {"schema_version", "generation"}
 _POINTER_KEYS = {"schema_version", "generation", "raw_snapshot_id"}
 _TRUSTED_KEYS = {"schema_version", "pointer_generation", "raw_snapshot_id", "published_at", "events"}
+_INTENT_KEYS = {"schema_version", "expected_generation", "target_generation", "raw_snapshot_id"}
+_COMPLETE_KEYS = {"schema_version", "generation", "raw_snapshot_id"}
 _SAFE_ERROR_CODES = {
     "collection_failed",
     "evidence_persistence_failed",
@@ -48,9 +49,8 @@ _SAFE_ERROR_CODES = {
 
 @dataclass(frozen=True, slots=True)
 class _WriterCapability:
-    token: str
     generation: int
-    expires_at: datetime
+    lock_handle: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +63,37 @@ class _TrustedRecord:
 class _PointerRecord:
     raw_snapshot_id: str
     generation: int
+
+
+_SOURCE_KEYS = {
+    "source_name", "source_url", "original_url", "published_at", "fetched_at",
+    "title", "summary_or_excerpt", "language", "region", "data_status",
+}
+_MARKET_EVENT_KEYS = {
+    "event_id", "title", "summary", "summary_status", "category",
+    "published_at_first", "published_at_latest", "sources", "source_count",
+    "related_tags", "tag_evidence", "related_companies", "related_funds",
+    "relation_level", "relation_evidence", "impact_tendency", "impact_basis",
+    "confidence", "original_links", "data_status", "missing_information",
+    "importance_score", "verification_status", "verification_reason", "verified_at",
+    "verified_key_fields",
+}
+_TAG_KEYS = {"id", "name"}
+_TAG_EVIDENCE_KEYS = {"id", "name", "provenance"}
+_COMPANY_KEYS = {"stock_code", "stock_name"}
+_FUND_KEYS = {"fund_code", "fund_name"}
+_RELATION_FULL_KEYS = {
+    "fund_code", "fund_name", "holding_disclosure_date", "stock_code", "stock_name",
+    "industry_classification", "classification_standard", "matched_kind", "matched_value",
+    "source_name", "source_reference",
+}
+_RELATION_WATCH_KEYS = {"matched_kind", "matched_value", "tag_id"}
+_VERIFIED_FIELD_KEYS = {
+    "field_name", "raw_value", "normalized_value", "verification_status",
+    "evidence_ids", "reason",
+}
+_VERIFICATION_STATUSES = {"verified", "corroborated", "unverified", "conflicting", "corrected", "disproved"}
+_TRUSTED_STATUSES = {"verified", "corroborated"}
 
 
 def _json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -149,6 +180,152 @@ def _counts(value: object) -> PipelineCounts:
     return PipelineCounts(**value)
 
 
+def _row(value: object, keys: set[str], name: str) -> dict[str, object]:
+    if type(value) is not dict or set(value) != keys:
+        raise ValueError(f"invalid {name} schema")
+    return value
+
+
+def _text(value: object, name: str) -> str:
+    if type(value) is not str or len(value) > _MAX_TEXT:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _nullable_text(value: object, name: str) -> str | None:
+    return None if value is None else _text(value, name)
+
+
+def _text_list(value: object, name: str) -> list[str]:
+    if type(value) is not list or len(value) > _MAX_ENTRIES:
+        raise ValueError(f"invalid {name}")
+    return [_text(item, name) for item in value]
+
+
+def _datetime_text(value: object, name: str, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    try:
+        if type(value) is not str or len(value) > 64:
+            raise ValueError("invalid timestamp")
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timestamp timezone is required")
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid {name}") from None
+    return value
+
+
+def _validate_source(value: object) -> dict[str, object]:
+    row = _row(value, _SOURCE_KEYS, "source")
+    for key in _SOURCE_KEYS - {"published_at"}:
+        _text(row[key], f"source {key}")
+    _datetime_text(row["published_at"], "source published_at", optional=True)
+    _datetime_text(row["fetched_at"], "source fetched_at")
+    return row
+
+
+def _validate_tag(value: object, *, evidence: bool = False) -> dict[str, object]:
+    keys = _TAG_EVIDENCE_KEYS if evidence else _TAG_KEYS
+    row = _row(value, keys, "tag evidence" if evidence else "tag")
+    for key in keys:
+        _text(row[key], f"tag {key}")
+    return row
+
+
+def _validate_named_row(value: object, keys: set[str], name: str) -> dict[str, object]:
+    row = _row(value, keys, name)
+    for key in keys:
+        item = row[key]
+        if item is not None:
+            _text(item, f"{name} {key}")
+    return row
+
+
+def _validate_relation(value: object) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ValueError("invalid relation evidence schema")
+    keys = set(value)
+    if keys == _RELATION_FULL_KEYS:
+        return _validate_named_row(value, _RELATION_FULL_KEYS, "relation evidence")
+    if keys == _RELATION_WATCH_KEYS:
+        return _validate_named_row(value, _RELATION_WATCH_KEYS, "relation evidence")
+    raise ValueError("invalid relation evidence schema")
+
+
+def _validate_verified_field(value: object) -> dict[str, object]:
+    row = _row(value, _VERIFIED_FIELD_KEYS, "verified key field")
+    for key in ("field_name", "raw_value", "normalized_value", "reason"):
+        _text(row[key], f"verified key field {key}")
+    status = _text(row["verification_status"], "verified key field status")
+    if status not in _TRUSTED_STATUSES:
+        raise ValueError("invalid verified key field status")
+    _text_list(row["evidence_ids"], "verified key field evidence_ids")
+    return row
+
+
+def _validate_market_event(value: object, *, trusted: bool) -> dict[str, object]:
+    row = _row(value, _MARKET_EVENT_KEYS, "trusted event" if trusted else "raw event")
+    for key in (
+        "event_id", "title", "summary", "summary_status", "category", "relation_level",
+        "impact_tendency", "confidence", "data_status",
+    ):
+        _text(row[key], f"event {key}")
+    _datetime_text(row["published_at_first"], "published_at_first", optional=True)
+    _datetime_text(row["published_at_latest"], "published_at_latest", optional=True)
+    for key, validator in (
+        ("sources", _validate_source),
+        ("related_tags", _validate_tag),
+        ("tag_evidence", lambda item: _validate_tag(item, evidence=True)),
+        ("related_companies", lambda item: _validate_named_row(item, _COMPANY_KEYS, "related company")),
+        ("related_funds", lambda item: _validate_named_row(item, _FUND_KEYS, "related fund")),
+        ("relation_evidence", _validate_relation),
+        ("verified_key_fields", _validate_verified_field),
+    ):
+        values = row[key]
+        if type(values) is not list or len(values) > _MAX_ENTRIES:
+            raise ValueError(f"invalid event {key}")
+        for item in values:
+            validator(item)
+    if type(row["source_count"]) is not int or row["source_count"] != len(row["sources"]):
+        raise ValueError("invalid event source_count")
+    if type(row["importance_score"]) is not int or not 0 <= row["importance_score"] <= _MAX_INT:
+        raise ValueError("invalid event importance_score")
+    for key in ("impact_basis", "original_links", "missing_information"):
+        _text_list(row[key], f"event {key}")
+    status = _nullable_text(row["verification_status"], "verification_status")
+    if status is not None and status not in _VERIFICATION_STATUSES:
+        raise ValueError("invalid verification_status")
+    if trusted and status not in _TRUSTED_STATUSES:
+        raise ValueError("invalid trusted verification_status")
+    _nullable_text(row["verification_reason"], "verification_reason")
+    verified_at = row["verified_at"]
+    _datetime_text(verified_at, "verified_at", optional=not trusted)
+    if not trusted and verified_at is None and status is not None:
+        raise ValueError("verification status requires verified_at")
+    return row
+
+
+def _validate_raw_items(value: object) -> list[dict[str, object]]:
+    if type(value) is not list or len(value) > _MAX_ENTRIES:
+        raise ValueError("raw items must be a list")
+    result: list[dict[str, object]] = []
+    for item in value:
+        if type(item) is not dict:
+            raise ValueError("invalid raw event schema")
+        if set(item) == _SOURCE_KEYS:
+            result.append(_validate_source(item))
+        else:
+            result.append(_validate_market_event(item, trusted=False))
+    return result
+
+
+def _validate_trusted_events(value: object) -> list[dict[str, object]]:
+    if type(value) is not list or len(value) > _MAX_ENTRIES:
+        raise ValueError("trusted events must be a list")
+    return [_validate_market_event(item, trusted=True) for item in value]
+
+
 class NewsPipelineStorage:
     def __init__(self, root: str | os.PathLike[str] | None = None, *, now: Callable[[], datetime] | None = None, lock_timeout_seconds: float = 2.0) -> None:
         if root is None:
@@ -157,8 +334,12 @@ class NewsPipelineStorage:
         self.root = Path(root)
         self.raw_root, self.evidence_root, self.trusted_root, self.runs_root = (self.root / name for name in ("raw", "evidence", "trusted", "runs"))
         self.current_pointer_path, self._lock_path = self.root / "current-trusted.json", self.root / ".news-pipeline.lock"
-        self._authority_path = self.root / ".news-pipeline-authority.json"
-        self._authority: _WriterCapability | None = None
+        self._generation_path = self.root / ".news-pipeline-generation.json"
+        self._writer_lock_path = self.root / ".news-pipeline-writer.lock"
+        self._publication_intent_path = self.root / ".current-trusted-intent.json"
+        self._publication_complete_path = self.root / ".current-trusted-complete.json"
+        self._writer: _WriterCapability | None = None
+        self._closed = False
         self._now = now or (lambda: datetime.now(timezone.utc))
         if type(lock_timeout_seconds) not in (int, float) or lock_timeout_seconds <= 0:
             raise ValueError("invalid lock timeout")
@@ -171,9 +352,36 @@ class NewsPipelineStorage:
         return value
 
     def _prepare(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        if not self.root.is_dir():
-            raise OSError("pipeline root unavailable")
+        self._ensure_directory(self.root)
+
+    @staticmethod
+    def _is_safe_directory(path: Path) -> bool:
+        try:
+            info = path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISDIR(info.st_mode) and not getattr(info, "st_reparse_tag", 0)
+
+    @classmethod
+    def _ensure_directory(cls, path: Path) -> None:
+        missing: list[Path] = []
+        cursor = path
+        while not cursor.exists():
+            missing.append(cursor)
+            parent = cursor.parent
+            if parent == cursor:
+                raise OSError("storage_error")
+            cursor = parent
+        if not cls._is_safe_directory(cursor):
+            raise OSError("storage_error")
+        for directory in reversed(missing):
+            try:
+                directory.mkdir()
+                cls._sync_dir(directory.parent)
+            except OSError:
+                raise OSError("storage_error") from None
+            if not cls._is_safe_directory(directory):
+                raise OSError("storage_error")
 
     @staticmethod
     def _try_lock(handle: Any) -> bool:
@@ -208,14 +416,17 @@ class NewsPipelineStorage:
 
     @contextmanager
     def _process_lock(self) -> Iterator[None]:
-        self._prepare()
-        handle = self._lock_path.open("a+b")
+        try:
+            self._prepare()
+            handle = self._lock_path.open("a+b")
+        except OSError:
+            raise OSError("storage_error") from None
         acquired = False
         try:
             deadline = time.monotonic() + self._lock_timeout
             while not (acquired := self._try_lock(handle)):
                 if time.monotonic() >= deadline:
-                    raise OSError("pipeline lock unavailable")
+                    raise OSError("storage_lock_unavailable")
                 time.sleep(0.01)
             yield
         finally:
@@ -225,6 +436,30 @@ class NewsPipelineStorage:
 
     @staticmethod
     def _sync_dir(path: Path) -> None:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            create_file = ctypes.windll.kernel32.CreateFileW
+            create_file.argtypes = (
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            )
+            create_file.restype = wintypes.HANDLE
+            handle = create_file(str(path), 0x80000000, 0x1 | 0x2 | 0x4, None, 3, 0x02000000, None)
+            invalid = ctypes.c_void_p(-1).value
+            if handle == invalid:
+                raise OSError("storage_error")
+            try:
+                if not ctypes.windll.kernel32.FlushFileBuffers(handle):
+                    error = ctypes.windll.kernel32.GetLastError()
+                    # Some supported Windows filesystems do not expose directory
+                    # flushes. File publication still uses MOVEFILE_WRITE_THROUGH.
+                    if error not in {1, 5, 50}:
+                        raise OSError("storage_error")
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            return
         descriptor = os.open(str(path), os.O_RDONLY)
         try:
             os.fsync(descriptor)
@@ -268,28 +503,57 @@ class NewsPipelineStorage:
         payload = (json.dumps(checked, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         if len(payload) > _MAX_BYTES:
             raise ValueError("JSON document too large")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        temporary = Path(raw)
-        opened = os.fstat(descriptor)
-        identity = (opened.st_dev, opened.st_ino)
+        descriptor: int | None = None
+        temporary: Path | None = None
+        identity: tuple[int, int] | None = None
         try:
-            with os.fdopen(descriptor, "wb") as handle:
+            self._ensure_directory(path.parent)
+            descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+            temporary = Path(raw)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            handle = os.fdopen(descriptor, "wb")
+            descriptor = None
+            with handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             self._replace_durable(temporary, path)
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary is not None and identity is not None:
+                self._cleanup_owned_temp(temporary, identity)
+            raise OSError("storage_error") from None
         except BaseException:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            self._cleanup_owned_temp(temporary, identity)
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary is not None and identity is not None:
+                self._cleanup_owned_temp(temporary, identity)
             raise
 
     def _read(self, path: Path) -> dict[str, object] | None:
         try:
-            with path.open("rb") as handle:
+            before = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(before.st_mode) or getattr(before, "st_reparse_tag", 0):
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                os.close(descriptor)
+                return None
+            with os.fdopen(descriptor, "rb") as handle:
                 raw = handle.read(_MAX_BYTES + 1)
             if len(raw) > _MAX_BYTES:
                 return None
@@ -310,85 +574,89 @@ class NewsPipelineStorage:
         if set(document) != keys or type(document.get("schema_version")) is not int or document["schema_version"] != 1:
             raise ValueError("invalid pipeline schema")
 
-    def _load_authority(self) -> _WriterCapability | None:
-        document = self._read(self._authority_path)
+    def _load_generation(self) -> int | None:
+        document = self._read(self._generation_path)
         if document is None:
-            if self._authority_path.exists():
-                raise OSError("pipeline authority is corrupt")
+            if self._generation_path.exists():
+                raise OSError("storage_corrupt")
             return None
         try:
-            self._schema(document, _AUTHORITY_KEYS)
-            token = document["token"]
+            self._schema(document, _GENERATION_KEYS)
             generation = document["generation"]
-            if type(token) is not str or not re.fullmatch(r"[0-9a-f]{64}", token) or type(generation) is not int or generation < 1:
-                raise ValueError("invalid authority")
-            return _WriterCapability(token, generation, _timestamp(document["expires_at"]))
+            if type(generation) is not int or generation < 1:
+                raise ValueError("invalid generation")
+            return generation
         except (KeyError, TypeError, ValueError):
-            raise OSError("pipeline authority is corrupt") from None
+            raise OSError("storage_corrupt") from None
 
-    def _claim_authority_unlocked(self) -> _WriterCapability:
-        now = self._clock()
-        current = self._load_authority()
-        if current is not None and current.expires_at > now:
-            raise ValueError("pipeline authority is active")
-        authority = _WriterCapability(
-            secrets.token_hex(32),
-            (current.generation if current else 0) + 1,
-            now + __import__("datetime").timedelta(seconds=30),
-        )
-        self._atomic_write(
-            self._authority_path,
-            {
-                "schema_version": 1,
-                "token": authority.token,
-                "generation": authority.generation,
-                "expires_at": authority.expires_at.isoformat(),
-            },
-        )
-        self._authority = authority
-        return authority
+    def _has_persisted_state_without_generation(self) -> bool:
+        if self.current_pointer_path.exists() or self._publication_intent_path.exists() or self._publication_complete_path.exists():
+            return True
+        for directory in (self.raw_root, self.evidence_root, self.trusted_root, self.runs_root):
+            try:
+                if directory.exists() and any(directory.iterdir()):
+                    return True
+            except OSError:
+                raise OSError("storage_corrupt") from None
+        return False
 
-    def _require_authority(self) -> _WriterCapability:
-        supplied = self._authority
-        if supplied is None:
-            supplied = self._claim_authority_unlocked()
-        current = self._load_authority()
-        now = self._clock()
-        if current is None or supplied.token != current.token or supplied.generation != current.generation:
-            raise ValueError("authority is stale or invalid")
-        if current.expires_at <= now:
-            renewed = _WriterCapability(
-                supplied.token,
-                supplied.generation,
-                now + __import__("datetime").timedelta(seconds=30),
-            )
-            self._atomic_write(
-                self._authority_path,
-                {
-                    "schema_version": 1,
-                    "token": renewed.token,
-                    "generation": renewed.generation,
-                    "expires_at": renewed.expires_at.isoformat(),
-                },
-            )
-            self._authority = renewed
-            return renewed
-        return supplied
+    def _claim_writer_unlocked(self) -> _WriterCapability:
+        if self._closed:
+            raise ValueError("pipeline storage is closed")
+        if self._writer is not None:
+            generation = self._load_generation()
+            if generation != self._writer.generation:
+                raise ValueError("pipeline writer generation is stale")
+            return self._writer
+        try:
+            handle = self._writer_lock_path.open("a+b")
+        except OSError:
+            raise OSError("storage_error") from None
+        if not self._try_lock(handle):
+            handle.close()
+            raise ValueError("pipeline writer is active")
+        try:
+            current = self._load_generation()
+            if current is None and self._has_persisted_state_without_generation():
+                raise OSError("storage_corrupt")
+            generation = (current or 0) + 1
+            self._atomic_write(self._generation_path, {"schema_version": 1, "generation": generation})
+            capability = _WriterCapability(generation, handle)
+            self._writer = capability
+            return capability
+        except BaseException:
+            self._unlock(handle)
+            handle.close()
+            raise
+
+    def _require_writer(self) -> _WriterCapability:
+        return self._claim_writer_unlocked()
+
+    def close(self) -> None:
+        writer, self._writer = self._writer, None
+        self._closed = True
+        if writer is not None:
+            self._unlock(writer.lock_handle)
+            writer.lock_handle.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def write_raw(self, snapshot: RawSnapshot) -> None:
         raw_id = _id(snapshot.raw_snapshot_id, "raw_snapshot_id")
         if not isinstance(snapshot.collected_at, datetime) or snapshot.collected_at.tzinfo is None or snapshot.collected_at.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError("collected_at must be aware UTC")
-        items = _bounded(list(snapshot.items))
-        if type(items) is not list or any(type(item) is not dict for item in items):
-            raise ValueError("raw items must be a list of objects")
+        items = _validate_raw_items(_bounded(list(snapshot.items)))
         document: dict[str, object] = {"schema_version": 1, "raw_snapshot_id": raw_id, "collected_at": snapshot.collected_at.isoformat(), "items": items}
         with CACHE_IO_LOCK, self._process_lock():
-            self._require_authority()
+            self._require_writer()
             path = self._path(self.raw_root, raw_id)
             previous = self._load_raw(raw_id)
             if previous is None and path.exists():
-                raise OSError("raw snapshot is corrupt")
+                raise OSError("storage_corrupt")
             if previous is not None and previous != snapshot:
                 raise ValueError("raw snapshot identity is immutable")
             if previous is None:
@@ -401,9 +669,9 @@ class NewsPipelineStorage:
                 return None
             self._schema(document, {"schema_version", "raw_snapshot_id", "collected_at", "items"})
             identity, items = _id(document["raw_snapshot_id"], "raw_snapshot_id"), document["items"]
-            if identity != raw_id or type(items) is not list or any(type(item) is not dict for item in items):
+            if identity != raw_id:
                 return None
-            return RawSnapshot(identity, _timestamp(document["collected_at"]), tuple(items))
+            return RawSnapshot(identity, _timestamp(document["collected_at"]), tuple(_validate_raw_items(items)))
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -419,12 +687,12 @@ class NewsPipelineStorage:
         document = snapshot_document(snapshot)
         _bounded(document)
         with CACHE_IO_LOCK, self._process_lock():
-            self._require_authority()
+            self._require_writer()
             path = self._path(self.evidence_root, raw_id)
             previous = self._load_evidence(raw_id)
             if previous is None and path.exists():
-                raise OSError("evidence snapshot is corrupt")
-            if previous is not None and previous != snapshot:
+                raise OSError("storage_corrupt")
+            if previous is not None and snapshot_document(previous) != document:
                 raise ValueError("evidence snapshot identity is immutable")
             if previous is None:
                 self._atomic_write(path, document)
@@ -447,32 +715,32 @@ class NewsPipelineStorage:
         raw_id = _id(snapshot.raw_snapshot_id, "raw_snapshot_id")
         if not isinstance(snapshot.published_at, datetime) or snapshot.published_at.tzinfo is None or snapshot.published_at.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError("published_at must be aware UTC")
-        events = _bounded(list(snapshot.events))
-        if type(events) is not list or any(type(item) is not dict for item in events):
-            raise ValueError("trusted events must be a list of objects")
+        events = _validate_trusted_events(_bounded(list(snapshot.events)))
         with CACHE_IO_LOCK, self._process_lock():
-            self._require_authority()
+            self._require_writer()
             evidence = self._load_evidence(raw_id)
             if self._load_raw(raw_id) is None or evidence is None:
                 raise ValueError("raw and evidence artifacts must be durable before trusted publish")
             if evidence.recovery_metadata.get("legacy_identity") is True:
                 raise ValueError("legacy evidence must be deterministically reverified before trusted publish")
-            pointer = self._load_pointer_record()
+            pointer = self._load_pointer_record(allow_initial_intent=raw_id)
             current_generation = pointer.generation if pointer is not None else 0
             target_generation = current_generation + 1
             path = self._path(self.trusted_root, raw_id)
             existing = self._load_trusted_record(raw_id)
             if existing is None and path.exists():
-                raise OSError("trusted snapshot is corrupt")
+                raise OSError("storage_corrupt")
             if existing is not None and existing.snapshot != snapshot:
                 raise ValueError("trusted snapshot identity is immutable")
             if pointer is not None and pointer.raw_snapshot_id == raw_id:
                 if existing is None or existing.pointer_generation != pointer.generation:
                     raise OSError("trusted pointer is corrupt")
+                self._write_publication_complete(raw_id, pointer.generation)
                 return
             if existing is not None and existing.pointer_generation != target_generation:
                 raise ValueError("trusted pointer cannot move backwards")
             if existing is None:
+                self._write_publication_intent(raw_id, current_generation, target_generation)
                 self._atomic_write(
                     path,
                     {
@@ -489,7 +757,7 @@ class NewsPipelineStorage:
             self._write_current_pointer(raw_id, expected_generation=current_generation)
 
     def _write_current_pointer(self, raw_id: str, *, expected_generation: int) -> None:
-        current = self._load_pointer_record()
+        current = self._load_pointer_record(allow_initial_intent=raw_id if expected_generation == 0 else None)
         actual_generation = current.generation if current is not None else 0
         if actual_generation != expected_generation:
             raise ValueError("trusted pointer generation changed")
@@ -501,6 +769,61 @@ class NewsPipelineStorage:
                 "raw_snapshot_id": _id(raw_id, "raw_snapshot_id"),
             },
         )
+        self._write_publication_complete(raw_id, expected_generation + 1)
+
+    def _write_publication_complete(self, raw_id: str, generation: int) -> None:
+        current = self._load_publication_complete()
+        expected = {"raw_snapshot_id": raw_id, "generation": generation}
+        if current == expected:
+            return
+        self._atomic_write(
+            self._publication_complete_path,
+            {"schema_version": 1, "generation": generation, "raw_snapshot_id": raw_id},
+        )
+
+    def _load_publication_complete(self) -> dict[str, object] | None:
+        document = self._read(self._publication_complete_path)
+        if document is None:
+            if self._publication_complete_path.exists():
+                raise OSError("storage_corrupt")
+            return None
+        try:
+            self._schema(document, _COMPLETE_KEYS)
+            raw_id = _id(document["raw_snapshot_id"], "raw_snapshot_id")
+            generation = document["generation"]
+            if type(generation) is not int or generation < 1:
+                raise ValueError("invalid publication completion")
+            return {"raw_snapshot_id": raw_id, "generation": generation}
+        except (KeyError, TypeError, ValueError):
+            raise OSError("storage_corrupt") from None
+
+    def _write_publication_intent(self, raw_id: str, expected_generation: int, target_generation: int) -> None:
+        self._atomic_write(
+            self._publication_intent_path,
+            {
+                "schema_version": 1,
+                "expected_generation": expected_generation,
+                "target_generation": target_generation,
+                "raw_snapshot_id": raw_id,
+            },
+        )
+
+    def _load_publication_intent(self) -> dict[str, object] | None:
+        document = self._read(self._publication_intent_path)
+        if document is None:
+            if self._publication_intent_path.exists():
+                raise OSError("storage_corrupt")
+            return None
+        try:
+            self._schema(document, _INTENT_KEYS)
+            raw_id = _id(document["raw_snapshot_id"], "raw_snapshot_id")
+            expected = document["expected_generation"]
+            target = document["target_generation"]
+            if type(expected) is not int or type(target) is not int or expected < 0 or target != expected + 1:
+                raise ValueError("invalid publication intent")
+            return {"raw_snapshot_id": raw_id, "expected_generation": expected, "target_generation": target}
+        except (KeyError, TypeError, ValueError):
+            raise OSError("storage_corrupt") from None
 
     def _load_trusted_record(self, raw_id: str) -> _TrustedRecord | None:
         document = self._read(self._path(self.trusted_root, raw_id))
@@ -522,7 +845,7 @@ class NewsPipelineStorage:
             ):
                 return None
             return _TrustedRecord(
-                TrustedSnapshot(identity, _timestamp(document["published_at"]), tuple(events)),
+                TrustedSnapshot(identity, _timestamp(document["published_at"]), tuple(_validate_trusted_events(events))),
                 pointer_generation,
             )
         except (KeyError, TypeError, ValueError):
@@ -536,11 +859,40 @@ class NewsPipelineStorage:
         with CACHE_IO_LOCK, self._process_lock():
             return self._load_trusted(_id(raw_snapshot_id, "raw_snapshot_id"))
 
-    def _load_pointer_record(self) -> _PointerRecord | None:
+    def _trusted_artifact_names(self) -> list[str]:
+        if not self.trusted_root.exists():
+            return []
+        try:
+            return sorted(
+                entry.name for entry in os.scandir(self.trusted_root)
+                if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)
+            )
+        except OSError:
+            raise OSError("storage_corrupt") from None
+
+    def _load_pointer_record(self, *, allow_initial_intent: str | None = None) -> _PointerRecord | None:
         document = self._read(self.current_pointer_path)
         if document is None:
             if self.current_pointer_path.exists():
-                raise OSError("trusted pointer is corrupt")
+                raise OSError("storage_corrupt")
+            artifacts = self._trusted_artifact_names()
+            if artifacts:
+                intent = self._load_publication_intent()
+                completed = self._load_publication_complete()
+                permitted = (
+                    allow_initial_intent is not None
+                    and completed is None
+                    and artifacts == [f"{allow_initial_intent}.json"]
+                    and intent == {
+                        "raw_snapshot_id": allow_initial_intent,
+                        "expected_generation": 0,
+                        "target_generation": 1,
+                    }
+                    and (trusted := self._load_trusted_record(allow_initial_intent)) is not None
+                    and trusted.pointer_generation == 1
+                )
+                if not permitted:
+                    raise OSError("storage_corrupt")
             return None
         try:
             self._schema(document, _POINTER_KEYS)
@@ -552,7 +904,7 @@ class NewsPipelineStorage:
                 raise ValueError("pointer target is unavailable")
             return _PointerRecord(raw_id, generation)
         except (KeyError, TypeError, ValueError):
-            raise OSError("trusted pointer is corrupt") from None
+            raise OSError("storage_corrupt") from None
 
     def _load_current(self) -> TrustedSnapshot | None:
         pointer = self._load_pointer_record()
@@ -580,7 +932,7 @@ class NewsPipelineStorage:
             if _id(document["run_id"], "run_id") != run_id or type(document["phase"]) is not str:
                 return None
             error = document["redacted_error"]
-            if error is not None and type(error) is not str:
+            if error is not None and (type(error) is not str or error not in _SAFE_ERROR_CODES):
                 return None
             return PipelineRun(run_id, _id(document["raw_snapshot_id"], "raw_snapshot_id"), _optional_id(document["evidence_snapshot_id"], "evidence_snapshot_id"), _optional_id(document["trusted_snapshot_id"], "trusted_snapshot_id"), PipelinePhase(document["phase"]), _counts(document["counts"]), _timestamp(document["created_at"]), _timestamp(document["updated_at"]), error, _optional_id(document["displayed_trusted_snapshot_id"], "displayed_trusted_snapshot_id"))
         except (KeyError, TypeError, ValueError, OverflowError):
@@ -602,10 +954,10 @@ class NewsPipelineStorage:
     def write_run(self, run: PipelineRun, *, expected_phase: PipelinePhase | None = None) -> None:
         document = self._run_document(run)
         with CACHE_IO_LOCK, self._process_lock():
-            self._require_authority()
+            self._require_writer()
             current = self._load_run(run.run_id)
             if current is None and self._run_path(run.run_id).exists():
-                raise OSError("pipeline run is corrupt")
+                raise OSError("storage_corrupt")
             if current is None:
                 if run.phase is not PipelinePhase.QUEUED or expected_phase is not None:
                     raise ValueError("new runs must begin queued")
@@ -631,11 +983,19 @@ class NewsPipelineStorage:
     def recover_incomplete_runs(self) -> int:
         interrupted = 0
         with CACHE_IO_LOCK, self._process_lock():
-            self._claim_authority_unlocked()
+            self._claim_writer_unlocked()
             if not self.runs_root.exists():
                 return 0
             now = self._clock()
-            for path in sorted(self.runs_root.glob("*.json")):
+            try:
+                paths = sorted(
+                    Path(entry.path)
+                    for entry in os.scandir(self.runs_root)
+                    if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)
+                )
+            except OSError:
+                raise OSError("storage_corrupt") from None
+            for path in paths:
                 try:
                     run = self._load_run(_id(path.stem, "run_id"))
                 except ValueError:

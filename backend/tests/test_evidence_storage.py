@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import os
@@ -87,7 +88,7 @@ def test_evidence_atomic_failure_cleans_only_its_own_temp_identity(monkeypatch, 
 
     monkeypatch.setattr("evidence_verification.storage._replace_durable", swap_then_fail)
 
-    with pytest.raises(OSError, match="replace failed"):
+    with pytest.raises(OSError, match="^storage_error$"):
         storage.publish(snapshot)
 
     assert swapped[0].read_text(encoding="utf-8") == "must survive"
@@ -283,6 +284,16 @@ def test_evidence_writer_reader_preserves_metadata_and_aware_datetimes_exactly()
     assert evidence_snapshot_from_document(snapshot_document(snapshot)) == snapshot
 
 
+def test_evidence_publication_timestamps_preserve_aware_source_offsets():
+    snapshot = rich_evidence_snapshot()
+    offset = timezone(__import__("datetime").timedelta(hours=8))
+    event = snapshot.events[0]
+    item = replace(event.primary_evidence[0], published_at=NOW.astimezone(offset))
+    shifted = replace(snapshot, events=(replace(event, published_at=NOW.astimezone(offset), primary_evidence=(item,)),))
+
+    assert evidence_snapshot_from_document(snapshot_document(shifted)) == shifted
+
+
 def test_evidence_writer_rejects_naive_datetimes_before_persistence(tmp_path):
     snapshot = EvidenceSnapshot(
         snapshot_id="evidence-raw-1",
@@ -337,3 +348,132 @@ def test_evidence_writer_rejects_naive_transition_datetime():
 
     with pytest.raises(ValueError, match="timezone"):
         snapshot_document(invalid)
+
+
+@pytest.mark.parametrize("field", ["generated_at", "verified_at", "evidence_as_of", "changed_at"])
+def test_required_evidence_datetimes_validate_before_any_storage_mutation(tmp_path, field):
+    snapshot = rich_evidence_snapshot()
+    event = snapshot.events[0]
+    if field == "generated_at":
+        invalid = replace(snapshot, generated_at=None)
+    elif field == "changed_at":
+        invalid_transition = replace(event.status_history[0], changed_at=None)
+        invalid = replace(snapshot, events=(replace(event, status_history=(invalid_transition,)),))
+    else:
+        invalid = replace(snapshot, events=(replace(event, **{field: None}),))
+
+    direct = EvidenceStorage(root=tmp_path / "direct")
+    with pytest.raises(ValueError, match="timestamp"):
+        direct.publish(invalid)
+    assert not direct.current_path.exists()
+    assert not direct.last_refresh_path.exists()
+
+    pipeline = __import__("news_pipeline.storage", fromlist=["NewsPipelineStorage"]).NewsPipelineStorage(tmp_path / "pipeline")
+    with pytest.raises(ValueError, match="timestamp"):
+        pipeline.write_evidence(invalid)
+    assert not pipeline.evidence_root.exists()
+    assert not (pipeline.root / ".news-pipeline-generation.json").exists()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"future": "unsupported"},
+        {"legacy_identity": "true"},
+        {"source": object()},
+        {"recovered_at": "not-a-time"},
+    ],
+)
+def test_recovery_metadata_uses_an_explicit_bounded_schema(metadata):
+    snapshot = replace(rich_evidence_snapshot(), recovery_metadata=metadata)
+
+    with pytest.raises(ValueError, match="recovery metadata"):
+        snapshot_document(snapshot)
+
+
+def test_evidence_immutable_retry_compares_the_canonical_projected_document(tmp_path):
+    snapshot = rich_evidence_snapshot()
+    event = snapshot.events[0]
+    pending = replace(
+        event.key_fields[0],
+        raw_value="12亿元",
+        verification_status=FieldVerificationStatus.UNVERIFIED,
+    )
+    long_evidence = replace(event.primary_evidence[0], excerpt="x" * 2_000)
+    projected = replace(
+        snapshot,
+        events=(replace(
+            event,
+            title="建设算力中心 12亿元",
+            summary="项目投资 12亿元",
+            key_fields=(pending,),
+            primary_evidence=(long_evidence,),
+        ),),
+    )
+    storage = __import__("news_pipeline.storage", fromlist=["NewsPipelineStorage"]).NewsPipelineStorage(tmp_path)
+
+    storage.write_evidence(projected)
+    storage.write_evidence(projected)
+
+    assert storage.load_evidence("raw-1") is not None
+
+
+def test_evidence_atomic_writer_closes_fstat_failure_and_normalizes_oserror(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    real_fstat = os.fstat
+    observed: list[int] = []
+
+    def fail_fstat(descriptor: int):
+        observed.append(descriptor)
+        raise OSError("C:\\private\\evidence")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.fstat", fail_fstat)
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage.publish(EvidenceSnapshot("snapshot", NOW, ()))
+
+    assert observed
+    with pytest.raises(OSError):
+        real_fstat(observed[0])
+
+
+def test_evidence_reader_closes_descriptor_when_fstat_fails(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    storage.publish(EvidenceSnapshot("snapshot", NOW, ()))
+    real_fstat = os.fstat
+    observed: list[int] = []
+
+    def fail_fstat(descriptor: int):
+        observed.append(descriptor)
+        raise OSError("C:\\private\\read")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.fstat", fail_fstat)
+        assert storage.load_current() is None
+
+    assert observed
+    with pytest.raises(OSError):
+        real_fstat(observed[-1])
+
+
+def test_evidence_atomic_writer_does_not_double_close_reused_descriptor(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("survive", encoding="utf-8")
+    reused: list[int] = []
+
+    def fail_after_reuse(_source, _destination):
+        reused.append(os.open(victim, os.O_RDONLY))
+        raise OSError("D:\\private\\replace")
+
+    monkeypatch.setattr("evidence_verification.storage._replace_durable", fail_after_reuse)
+    try:
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage.publish(EvidenceSnapshot("snapshot", NOW, ()))
+        assert os.fstat(reused[0]).st_size == len("survive")
+    finally:
+        if reused:
+            try:
+                os.close(reused[0])
+            except OSError:
+                pass

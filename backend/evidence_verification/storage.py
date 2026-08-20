@@ -72,6 +72,61 @@ _TRANSITION_KEYS = {"from_status", "to_status", "changed_at", "reason"}
 _TAG_KEYS = {"id", "name"}
 
 
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(str(path), 0x80000000, 0x1 | 0x2 | 0x4, None, 3, 0x02000000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise OSError("storage_error")
+        try:
+            if not ctypes.windll.kernel32.FlushFileBuffers(handle):
+                error = ctypes.windll.kernel32.GetLastError()
+                if error not in {1, 5, 50}:
+                    raise OSError("storage_error")
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        return
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _safe_directory(path: Path) -> bool:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and not getattr(info, "st_reparse_tag", 0)
+
+
+def _ensure_directory(path: Path) -> None:
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            raise OSError("storage_error")
+        cursor = parent
+    if not _safe_directory(cursor):
+        raise OSError("storage_error")
+    for directory in reversed(missing):
+        directory.mkdir()
+        _sync_directory(directory.parent)
+        if not _safe_directory(directory):
+            raise OSError("storage_error")
+
+
 def _replace_durable(source: Path, destination: Path) -> None:
     if os.name == "nt":
         import ctypes
@@ -121,12 +176,42 @@ def _reject_json_number(_raw: str) -> float:
     raise ValueError("non-integer JSON numbers are not allowed")
 
 
-def _timestamp(value: datetime | None) -> str | None:
-    if value is None:
-        return None
+def _required_timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("timestamp timezone is required")
+        raise ValueError("required timestamp timezone must be aware")
     return value.isoformat()
+
+
+def _optional_timestamp(value: datetime | None) -> str | None:
+    return None if value is None else _required_timestamp(value)
+
+
+_RECOVERY_METADATA_KEYS = {
+    "legacy_identity",
+    "source",
+    "recovered_at",
+    "recovery_status",
+    "source_snapshot_id",
+}
+
+
+def _recovery_metadata_document(value: object) -> dict[str, object]:
+    if type(value) is not dict or set(value) - _RECOVERY_METADATA_KEYS:
+        raise ValueError("invalid recovery metadata schema")
+    result = dict(value)
+    if "legacy_identity" in result and type(result["legacy_identity"]) is not bool:
+        raise ValueError("invalid recovery metadata legacy_identity")
+    for key in ("source", "recovery_status", "source_snapshot_id"):
+        item = result.get(key)
+        if item is not None and (type(item) is not str or not item or len(item) > 128):
+            raise ValueError(f"invalid recovery metadata {key}")
+    recovered_at = result.get("recovered_at")
+    if recovered_at is not None:
+        try:
+            _parse_datetime(recovered_at)
+        except (TypeError, ValueError):
+            raise ValueError("invalid recovery metadata recovered_at") from None
+    return result
 
 
 def _evidence_document(item: EvidenceItem) -> dict[str, Any]:
@@ -135,7 +220,7 @@ def _evidence_document(item: EvidenceItem) -> dict[str, Any]:
         "content_source": item.content_source,
         "collector_source": item.collector_source,
         "canonical_url": item.canonical_url,
-        "published_at": _timestamp(item.published_at),
+        "published_at": _optional_timestamp(item.published_at),
         "source_role": item.source_role.value,
         "origin_cluster": item.origin_cluster,
         "supports_claim": item.supports_claim,
@@ -183,7 +268,7 @@ def _transition_document(row: StatusTransition) -> dict[str, Any]:
     return {
         "from_status": row.from_status.value if row.from_status else None,
         "to_status": row.to_status.value,
-        "changed_at": _timestamp(row.changed_at),
+        "changed_at": _required_timestamp(row.changed_at),
         "reason": row.reason,
     }
 
@@ -195,12 +280,12 @@ def event_document(event: EvidenceEvent) -> dict[str, Any]:
         "summary": trusted_event_text(event, event.summary),
         "category": event.category,
         "related_tags": [{"id": key, "name": name} for key, name in event.related_tags],
-        "published_at": _timestamp(event.published_at),
+        "published_at": _optional_timestamp(event.published_at),
         "core_claim": trusted_event_text(event, event.core_claim),
         "verification_status": event.verification_status.value,
         "verification_reason": event.verification_reason,
-        "verified_at": _timestamp(event.verified_at),
-        "evidence_as_of": _timestamp(event.evidence_as_of),
+        "verified_at": _required_timestamp(event.verified_at),
+        "evidence_as_of": _required_timestamp(event.evidence_as_of),
         "key_fields": [field_document(row) for row in event.key_fields],
         "primary_evidence": [_evidence_document(row) for row in event.primary_evidence],
         "independent_evidence": [_evidence_document(row) for row in event.independent_evidence],
@@ -215,9 +300,9 @@ def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
     return {
         "event_id": event.event_id,
         "title": trusted_event_text(event, event.title),
-        "published_at": _timestamp(event.published_at),
-        "verified_at": _timestamp(event.verified_at),
-        "evidence_as_of": _timestamp(event.evidence_as_of),
+        "published_at": _optional_timestamp(event.published_at),
+        "verified_at": _required_timestamp(event.verified_at),
+        "evidence_as_of": _required_timestamp(event.evidence_as_of),
         "category": event.category,
         "related_tags": [{"id": key, "name": name} for key, name in event.related_tags],
         "core_claim": trusted_event_text(event, event.core_claim),
@@ -239,18 +324,17 @@ def event_summary_document(event: EvidenceEvent) -> dict[str, Any]:
 def snapshot_document(snapshot: EvidenceSnapshot) -> dict[str, Any]:
     if type(snapshot.snapshot_id) is not str or type(snapshot.raw_snapshot_id) is not str:
         raise ValueError("invalid evidence snapshot identity")
-    if type(snapshot.recovery_metadata) is not dict:
-        raise ValueError("invalid recovery metadata")
+    metadata = _recovery_metadata_document(snapshot.recovery_metadata)
     document = {
         "schema_version": 1,
         "snapshot_id": snapshot.snapshot_id,
-        "generated_at": _timestamp(snapshot.generated_at),
+        "generated_at": _required_timestamp(snapshot.generated_at),
         "events": [event_document(event) for event in snapshot.events],
     }
     if snapshot.raw_snapshot_id:
         document["raw_snapshot_id"] = snapshot.raw_snapshot_id
-    if snapshot.recovery_metadata:
-        document["recovery_metadata"] = dict(snapshot.recovery_metadata)
+    if metadata:
+        document["recovery_metadata"] = metadata
     _exact_builtin(document)
     return document
 
@@ -260,7 +344,7 @@ def _parse_datetime(value: Any) -> datetime:
         raise ValueError("invalid timestamp")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("timestamp timezone is required")
+        raise ValueError("timestamp timezone must be aware")
     return parsed
 
 
@@ -422,9 +506,7 @@ def evidence_snapshot_from_document(document: dict[str, Any]) -> EvidenceSnapsho
     snapshot_id = document["snapshot_id"]
     raw_snapshot_id = document.get("raw_snapshot_id")
     recovery_metadata = document.get("recovery_metadata")
-    if recovery_metadata is not None and type(recovery_metadata) is not dict:
-        raise ValueError("invalid recovery metadata")
-    metadata = dict(recovery_metadata) if recovery_metadata is not None else {}
+    metadata = _recovery_metadata_document(recovery_metadata if recovery_metadata is not None else {})
     if raw_snapshot_id is not None and type(raw_snapshot_id) is not str:
         raise ValueError("invalid raw snapshot identity")
     events = document["events"]
@@ -463,29 +545,58 @@ class EvidenceStorage:
         payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         if len(payload) > _MAX_EVIDENCE_DOCUMENT_BYTES:
             raise ValueError("evidence document is too large")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        temp_path = Path(raw_path)
-        opened = os.fstat(descriptor)
-        identity = (opened.st_dev, opened.st_ino)
+        descriptor: int | None = None
+        temp_path: Path | None = None
+        identity: tuple[int, int] | None = None
         try:
-            with os.fdopen(descriptor, "wb") as handle:
+            _ensure_directory(path.parent)
+            descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+            temp_path = Path(raw_path)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            handle = os.fdopen(descriptor, "wb")
+            descriptor = None
+            with handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             _replace_durable(temp_path, path)
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temp_path is not None and identity is not None:
+                _cleanup_owned_temp(temp_path, identity)
+            raise OSError("storage_error") from None
         except BaseException:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            _cleanup_owned_temp(temp_path, identity)
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temp_path is not None and identity is not None:
+                _cleanup_owned_temp(temp_path, identity)
             raise
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:
         try:
             with CACHE_IO_LOCK:
-                with path.open("rb") as handle:
+                before = path.stat(follow_symlinks=False)
+                if not stat.S_ISREG(before.st_mode) or getattr(before, "st_reparse_tag", 0):
+                    return None
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(path, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                    os.close(descriptor)
+                    return None
+                with os.fdopen(descriptor, "rb") as handle:
                     raw = handle.read(_MAX_EVIDENCE_DOCUMENT_BYTES + 1)
                 if len(raw) > _MAX_EVIDENCE_DOCUMENT_BYTES:
                     return None
@@ -533,9 +644,11 @@ class EvidenceStorage:
             handle.flush()
 
     def publish(self, snapshot: EvidenceSnapshot) -> None:
+        document = snapshot_document(snapshot)
+        generated_at = _required_timestamp(snapshot.generated_at)
         with CACHE_IO_LOCK:
             previous = self.load_current()
-            self._atomic_write(self.current_path, snapshot_document(snapshot))
+            self._atomic_write(self.current_path, document)
             history_status = "completed"
             history_error = None
             try:
@@ -545,8 +658,8 @@ class EvidenceStorage:
                 history_error = type(error).__name__
             self._atomic_write(self.last_refresh_path, {
                 "status": "completed",
-                "attempted_at": snapshot.generated_at.isoformat(),
-                "last_successful_refresh_at": snapshot.generated_at.isoformat(),
+                "attempted_at": generated_at,
+                "last_successful_refresh_at": generated_at,
                 "error": None,
                 "history_status": history_status,
                 "history_error": history_error,
