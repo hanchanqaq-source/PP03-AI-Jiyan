@@ -2059,3 +2059,302 @@ def test_archive_rejects_cyclic_evidence_id_url_aliases_without_losing_key_field
         ))
 
     assert archive.get("a" * 20) == before
+
+
+@pytest.mark.parametrize("second_failure", ("journal", "bucket", "index", "state"))
+def test_archive_recovers_committed_target_before_starting_another_transaction_after_repeated_crashes(
+    tmp_path,
+    monkeypatch,
+    second_failure,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    baseline_state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    real_replace = archive_module._replace_durable
+    first_update = snapshot(
+        event(
+            status=VerificationStatus.DISPROVED,
+            history=(
+                StatusTransition(None, VerificationStatus.VERIFIED, NOW, "reason-verified"),
+                StatusTransition(
+                    VerificationStatus.VERIFIED,
+                    VerificationStatus.DISPROVED,
+                    NOW,
+                    "reason-disproved",
+                ),
+            ),
+        ),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+    )
+
+    def fail_first_prepared_state(source: Path, destination: Path) -> None:
+        if destination == archive.state_path:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if payload["phase"] == "prepared":
+                raise OSError("simulated crash before prepared state")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_first_prepared_state)
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(first_update)
+
+    pending = json.loads(archive.journal_path.read_text(encoding="utf-8"))
+    assert json.loads(archive.state_path.read_text(encoding="utf-8")) == baseline_state
+    assert archive.get("a" * 20)["verification_status"] == "disproved"
+
+    second_snapshot = snapshot(
+        event("b" * 20),
+        snapshot_id="9" * 20,
+        raw_snapshot_id="8" * 20,
+    )
+
+    def fail_second_transaction(source: Path, destination: Path) -> None:
+        if second_failure == "journal" and destination == archive.journal_path:
+            raise OSError("simulated second journal crash")
+        if second_failure == "bucket" and destination.name.endswith(".jsonl"):
+            raise OSError("simulated second bucket crash")
+        if second_failure == "index" and destination == archive.index_path:
+            raise OSError("simulated second index crash")
+        if second_failure == "state" and destination == archive.state_path:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if payload["phase"] == "prepared" and payload["generation"] > pending["target_generation"]:
+                raise OSError("simulated second state crash")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_second_transaction)
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(second_snapshot)
+
+    recovered_state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert recovered_state["phase"] == "finalized"
+    assert recovered_state["generation"] == pending["target_generation"]
+
+    monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
+    archive.upsert(second_snapshot)
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+    assert archive.get("a" * 20)["verification_status"] == "disproved"
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "https://official.example.com/proof?payload=%7B%22apiKey%22%3A%22SECRET%22%7D",
+        "https://official.example.com/proof?payload=%255B%257B%2522authorizationToken%2522%253A%2522SECRET%2522%257D%255D",
+        "https://official.example.com/proof?payload=%7B%22meta%22%3A%5B%22token%3DSECRET%22%5D%7D",
+        "https://official.example.com/proof?payload=%7B%22meta%22%3A%22clientCredential%3A%20SECRET%22%7D",
+    ),
+)
+def test_archive_rejects_sensitive_names_nested_inside_bounded_json_query_payloads_before_storage(
+    tmp_path,
+    unsafe_url,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="URL"):
+        archive.upsert(snapshot(event(primary_evidence=(evidence_item(
+            "nested-secret",
+            canonical_url=unsafe_url,
+        ),))))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_nested_json_secret_detection_allows_monkey_and_turnkey_keys(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    public_url = (
+        "https://official.example.com/proof?payload="
+        "%7B%22monkey%22%3A%22capuchin%22%2C%22turnkey%22%3A%22ready%22%7D"
+    )
+
+    archive.upsert(snapshot(event(primary_evidence=(evidence_item(
+        "nested-benign",
+        canonical_url=public_url,
+    ),))))
+
+    assert archive.get("a" * 20)["primary_evidence"][0]["canonical_url"] == public_url
+
+
+def test_archive_reclassifies_one_global_evidence_identity_into_the_newer_snapshot_role(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    shared_url = "https://official.example.com/reclassified-proof"
+    archive.upsert(snapshot(event(
+        primary_evidence=(evidence_item("z-old-proof", canonical_url=shared_url),),
+        key_fields=(KeyField(
+            "amount",
+            "1",
+            "1",
+            FieldVerificationStatus.VERIFIED,
+            ("z-old-proof",),
+            "official",
+        ),),
+    )))
+
+    archive.upsert(snapshot(
+        event(
+            independent_evidence=(evidence_item("a-new-proof", canonical_url=shared_url),),
+            key_fields=(KeyField(
+                "amount",
+                "1",
+                "1",
+                FieldVerificationStatus.VERIFIED,
+                ("a-new-proof",),
+                "official",
+            ),),
+        ),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+    ))
+
+    row = archive.get("a" * 20)
+    assert row["primary_evidence"] == []
+    assert [item["evidence_id"] for item in row["independent_evidence"]] == ["a-new-proof"]
+    amount = next(field for field in row["key_fields"] if field["field_name"] == "amount")
+    assert amount["evidence_ids"] == ["a-new-proof"]
+
+
+def test_archive_rejects_cross_collection_id_url_swap_without_mutating_history(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    url_a = "https://official.example.com/cross-role-a"
+    url_b = "https://official.example.com/cross-role-b"
+    archive.upsert(snapshot(event(
+        primary_evidence=(evidence_item("proof-a", canonical_url=url_a),),
+        independent_evidence=(evidence_item("proof-b", canonical_url=url_b),),
+    )))
+    before = archive.get("a" * 20)
+
+    with pytest.raises(ValueError, match="evidence"):
+        archive.upsert(snapshot(
+            event(
+                independent_evidence=(evidence_item("proof-a", canonical_url=url_b),),
+                contradicting_evidence=(evidence_item("proof-b", canonical_url=url_a),),
+            ),
+            snapshot_id="f" * 20,
+            raw_snapshot_id="d" * 20,
+        ))
+
+    assert archive.get("a" * 20) == before
+
+
+def test_archive_v1_journal_rejects_historical_subset_instead_of_merging_it_as_no_change(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    verified = snapshot(event(primary_evidence=(evidence_item("first-proof"),)))
+    archive.upsert(verified)
+    historical = archive.get("a" * 20)
+    archive.upsert(snapshot(
+        event(
+            status=VerificationStatus.DISPROVED,
+            history=(
+                StatusTransition(None, VerificationStatus.VERIFIED, NOW, "reason-verified"),
+                StatusTransition(
+                    VerificationStatus.VERIFIED,
+                    VerificationStatus.DISPROVED,
+                    NOW,
+                    "reason-disproved",
+                ),
+            ),
+            primary_evidence=(evidence_item("first-proof"),),
+            contradicting_evidence=(evidence_item("later-disproof"),),
+        ),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+    ))
+    archive.journal_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "rows": [_legacy_v1_row(historical)]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_v1_exact_replay_is_validated_outside_the_requested_query_window(tmp_path):
+    archived_time = NOW - timedelta(days=30)
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(
+        _timed_event("o" * 20, archived_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=archived_time,
+    ))
+    persisted = archive.get("o" * 20)
+    archive.journal_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "rows": [_legacy_v1_row(persisted)]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    assert archive.query(days=1) == []
+
+
+@pytest.mark.parametrize("nonexact_case", ("absent", "newer", "conflicting"))
+def test_archive_v1_journal_rejects_every_nonexact_replay_without_mutating_persisted_rows(
+    tmp_path,
+    nonexact_case,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event(primary_evidence=(evidence_item("persisted-proof"),))))
+    persisted = archive.get("a" * 20)
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    before = bucket.read_bytes()
+    if nonexact_case == "absent":
+        selected = snapshot(
+            event("b" * 20, primary_evidence=(evidence_item("absent-proof"),)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        )
+        journal_row = archive_module._archive_document(
+            selected,
+            archive_module.event_document(selected.events[0]),
+            NOW,
+        )
+        legacy = _legacy_v1_row(journal_row)
+    elif nonexact_case == "newer":
+        selected = snapshot(
+            event(
+                status=VerificationStatus.DISPROVED,
+                history=(
+                    StatusTransition(None, VerificationStatus.VERIFIED, NOW, "reason-verified"),
+                    StatusTransition(
+                        VerificationStatus.VERIFIED,
+                        VerificationStatus.DISPROVED,
+                        NOW,
+                        "reason-disproved",
+                    ),
+                ),
+                primary_evidence=(evidence_item("persisted-proof"),),
+                contradicting_evidence=(evidence_item("newer-disproof"),),
+            ),
+            snapshot_id="f" * 20,
+            raw_snapshot_id="d" * 20,
+        )
+        journal_row = archive_module._archive_document(
+            selected,
+            archive_module.event_document(selected.events[0]),
+            NOW,
+        )
+        legacy = _legacy_v1_row(journal_row)
+    else:
+        legacy = _legacy_v1_row(persisted)
+        legacy["title"] = "conflicting historical title"
+
+    archive.journal_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "rows": [legacy]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert bucket.read_bytes() == before

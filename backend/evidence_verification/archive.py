@@ -138,6 +138,10 @@ _NESTED_SECRET = re.compile(
     r"credential(?:s)?|bearer|cookie|session|jwt|signature|sig|code)\s*=",
     re.IGNORECASE,
 )
+_QUERY_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9])([A-Za-z0-9_-]{1,128})\s*[:=]")
+_MAX_QUERY_DECODE_ROUNDS = 8
+_MAX_QUERY_JSON_NODES = 512
+_MAX_QUERY_JSON_DEPTH = 8
 _SPECIAL_HOST_SUFFIXES = (
     ".local",
     ".localhost",
@@ -331,6 +335,92 @@ def _query_name_is_sensitive(value: str) -> bool:
     return any(compact.endswith(suffix) for suffix in sensitive_suffixes)
 
 
+def _text_contains_sensitive_assignment(value: str) -> bool:
+    return any(_query_name_is_sensitive(match.group(1)) for match in _QUERY_ASSIGNMENT.finditer(value))
+
+
+def _json_value_contains_sensitive_name(
+    value: object,
+    *,
+    depth: int,
+    remaining: list[int],
+) -> bool:
+    if depth > _MAX_QUERY_JSON_DEPTH:
+        raise ValueError("invalid archive evidence URL")
+    remaining[0] -= 1
+    if remaining[0] < 0:
+        raise ValueError("invalid archive evidence URL")
+    if type(value) is dict:
+        for key, nested in value.items():
+            if type(key) is not str or _query_name_is_sensitive(key):
+                return True
+            if _json_value_contains_sensitive_name(nested, depth=depth + 1, remaining=remaining):
+                return True
+        return False
+    if type(value) is list:
+        return any(
+            _json_value_contains_sensitive_name(nested, depth=depth + 1, remaining=remaining)
+            for nested in value
+        )
+    if type(value) is str:
+        return _decoded_query_value_contains_sensitive_name(
+            value,
+            depth=depth + 1,
+            remaining=remaining,
+        )
+    if type(value) in {int, float, bool, type(None)}:
+        return False
+    raise ValueError("invalid archive evidence URL")
+
+
+def _decoded_query_value_contains_sensitive_name(
+    value: str,
+    *,
+    depth: int = 0,
+    remaining: list[int] | None = None,
+) -> bool:
+    if depth > _MAX_QUERY_JSON_DEPTH or len(value) > 8_192:
+        raise ValueError("invalid archive evidence URL")
+    node_budget = [_MAX_QUERY_JSON_NODES] if remaining is None else remaining
+    decoded = value
+    stabilized = False
+    for _ in range(_MAX_QUERY_DECODE_ROUNDS):
+        if _text_contains_sensitive_assignment(decoded):
+            return True
+        stripped = decoded.strip()
+        if stripped.startswith(("{", "[")):
+            encoded = stripped.encode("utf-8")
+            try:
+                _preflight_json_payload(
+                    encoded + b"\n",
+                    maximum_depth=_MAX_QUERY_JSON_DEPTH,
+                    maximum_tokens=min(_MAX_QUERY_JSON_NODES, max(1, node_budget[0])),
+                )
+                parsed = json.loads(
+                    encoded.decode("utf-8"),
+                    object_pairs_hook=_strict_json_object,
+                    parse_int=_strict_json_int,
+                    parse_float=_reject_json_number,
+                    parse_constant=_reject_json_number,
+                )
+            except (TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
+                raise ValueError("invalid archive evidence URL") from None
+            if _json_value_contains_sensitive_name(
+                parsed,
+                depth=depth + 1,
+                remaining=node_budget,
+            ):
+                return True
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            stabilized = True
+            break
+        decoded = next_value
+    if not stabilized:
+        raise ValueError("invalid archive evidence URL")
+    return False
+
+
 def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
     numeric_part = r"(?:0[xX][0-9A-Fa-f]+|[0-9]+)"
     if not re.fullmatch(rf"{numeric_part}(?:\.{numeric_part})*", host):
@@ -448,14 +538,18 @@ def _archive_public_url(value: object) -> str:
         raise ValueError("invalid archive evidence URL")
     decoded_query = parsed.query
     stabilized = False
-    for _ in range(8):
+    for _ in range(_MAX_QUERY_DECODE_ROUNDS):
         if _NESTED_SECRET.search(decoded_query):
             raise ValueError("invalid archive evidence URL")
         try:
             decoded_pairs = parse_qsl(decoded_query, keep_blank_values=True, strict_parsing=False)
         except ValueError:
             raise ValueError("invalid archive evidence URL") from None
-        if any(_query_name_is_sensitive(key) for key, _value in decoded_pairs):
+        if any(
+            _query_name_is_sensitive(key)
+            or _decoded_query_value_contains_sensitive_name(query_value)
+            for key, query_value in decoded_pairs
+        ):
             raise ValueError("invalid archive evidence URL")
         next_value = unquote(decoded_query)
         if next_value == decoded_query:
@@ -468,7 +562,11 @@ def _archive_public_url(value: object) -> str:
         pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
     except ValueError:
         raise ValueError("invalid archive evidence URL") from None
-    if any(_query_name_is_sensitive(key) for key, _value in pairs):
+    if any(
+        _query_name_is_sensitive(key)
+        or _decoded_query_value_contains_sensitive_name(query_value)
+        for key, query_value in pairs
+    ):
         raise ValueError("invalid archive evidence URL")
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("invalid archive evidence URL")
@@ -1061,6 +1159,23 @@ def _validate_archive_projection(
     return validated
 
 
+def _legacy_archive_projection(row: dict[str, Any]) -> dict[str, Any]:
+    projection = {
+        key: row[key]
+        for key in _LEGACY_ARCHIVE_KEYS
+        if key not in {"schema_version", "snapshot_history"}
+    }
+    projection["schema_version"] = _LEGACY_ARCHIVE_SCHEMA_VERSION
+    projection["snapshot_history"] = [
+        {
+            key: lineage[key]
+            for key in _LEGACY_LINEAGE_KEYS
+        }
+        for lineage in row["snapshot_history"]
+    ]
+    return projection
+
+
 def _lineage_order(row: dict[str, str]) -> tuple[datetime, str, str, str]:
     return (
         _parse_datetime(row["generated_at"]),
@@ -1136,9 +1251,13 @@ def _merge_evidence(
         if item["canonical_url"]
     }
     for loser_index, loser_item in enumerate(loser):
-        candidates = {
-            winner_by_id[loser_item["evidence_id"]]
-        } if loser_item["evidence_id"] in winner_by_id else set()
+        candidates: set[int] = set()
+        if loser_item["evidence_id"] in winner_by_id:
+            matched_index = winner_by_id[loser_item["evidence_id"]]
+            matched_url = winner[matched_index]["canonical_url"]
+            if loser_item["canonical_url"] and matched_url and loser_item["canonical_url"] != matched_url:
+                raise ValueError("ambiguous archive evidence identity")
+            candidates.add(matched_index)
         if loser_item["canonical_url"] in winner_by_url:
             candidates.add(winner_by_url[loser_item["canonical_url"]])
         if len(candidates) > 1:
@@ -1169,6 +1288,44 @@ def _merge_evidence(
             result.append(dict(item))
             aliases[item["evidence_id"]] = item["evidence_id"]
     return sorted(result, key=lambda item: (item["evidence_id"], item["canonical_url"])), aliases
+
+
+def _merge_evidence_collections(
+    loser: dict[str, Any],
+    winner: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+    loser_items = [
+        (collection_name, item)
+        for collection_name in _EVIDENCE_COLLECTION_KEYS
+        for item in loser[collection_name]
+    ]
+    winner_items = [
+        (collection_name, item)
+        for collection_name in _EVIDENCE_COLLECTION_KEYS
+        for item in winner[collection_name]
+    ]
+    merged, aliases = _merge_evidence(
+        [item for _collection_name, item in loser_items],
+        [item for _collection_name, item in winner_items],
+    )
+    loser_roles = {
+        aliases[item["evidence_id"]]: collection_name
+        for collection_name, item in loser_items
+    }
+    winner_roles = {
+        aliases[item["evidence_id"]]: collection_name
+        for collection_name, item in winner_items
+    }
+    collections: dict[str, list[dict[str, Any]]] = {
+        collection_name: [] for collection_name in _EVIDENCE_COLLECTION_KEYS
+    }
+    for item in merged:
+        evidence_id = item["evidence_id"]
+        collection_name = winner_roles.get(evidence_id, loser_roles.get(evidence_id))
+        if collection_name is None:
+            raise ValueError("ambiguous archive evidence identity")
+        collections[collection_name].append(item)
+    return collections, aliases
 
 
 def _transition_identity(row: dict[str, Any]) -> tuple[object, ...]:
@@ -1279,16 +1436,9 @@ def _merge_archive_rows(
         list(other["key_fields"]),
         list(current["key_fields"]),
     )
-    aliases: dict[str, str] = {}
-    for key in ("primary_evidence", "independent_evidence", "syndicated_copies", "contradicting_evidence"):
-        merged[key], collection_aliases = _merge_evidence(
-            list(other[key]),
-            list(current[key]),
-        )
-        for old_id, retained_id in collection_aliases.items():
-            previous_alias = aliases.setdefault(old_id, retained_id)
-            if previous_alias != retained_id:
-                raise ValueError("ambiguous archive evidence identity")
+    evidence_collections, aliases = _merge_evidence_collections(other, current)
+    for key, items in evidence_collections.items():
+        merged[key] = items
     available_evidence = {
         item["evidence_id"]
         for key in _EVIDENCE_COLLECTION_KEYS
@@ -2356,6 +2506,149 @@ class EvidenceArchive:
             if actual not in allowed:
                 raise OSError("storage_corrupt")
 
+    def _recover_native_journal_before_upsert(
+        self,
+        journal: dict[str, Any],
+        state: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        if journal["legacy"]:
+            return
+        diagnostics = self._diagnostics()
+        budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
+        cutoff = now - timedelta(days=90)
+        names = set(journal["base_bucket_digests"])
+        cursor = cutoff.date()
+        while cursor <= now.date():
+            names.add(f"{cursor.isoformat()}.jsonl")
+            cursor += timedelta(days=1)
+
+        bucket_rows: dict[str, list[dict[str, Any]]] = {}
+        existing: dict[str, dict[str, Any]] = {}
+        locations: dict[str, set[str]] = {}
+        observed: dict[str, str] = {}
+        for name in sorted(names):
+            rows = self._read_bucket(
+                name,
+                diagnostics,
+                budget=budget,
+                fail_on_budget=True,
+                validation_now=now,
+                observed_digests=observed,
+            )
+            bucket_rows[name] = rows
+            for row in rows:
+                event_id = row["event_id"]
+                locations.setdefault(event_id, set()).add(name)
+                previous = existing.get(event_id)
+                existing[event_id] = row if previous is None else _merge_archive_rows(previous, row)
+
+        self._validate_journal_bucket_state(journal, observed)
+        self._validate_persisted_bucket_state(state, journal, observed)
+        affected = set(journal["target_bucket_digests"])
+        journal_ids = {row["event_id"] for row in journal["rows"]}
+        if any(not locations.get(event_id, set()) <= affected for event_id in journal_ids):
+            raise OSError("storage_corrupt")
+        for row in journal["rows"]:
+            previous = existing.get(row["event_id"])
+            if previous is None:
+                continue
+            try:
+                if _merge_archive_rows(previous, row) != row:
+                    raise OSError("storage_corrupt")
+            except (KeyError, TypeError, ValueError):
+                raise OSError("storage_corrupt") from None
+
+        actual_index_digest = self._index_digest()
+        if (
+            actual_index_digest == journal["target_index_digest"]
+            and all(
+                observed[name] == target_digest
+                for name, target_digest in journal["target_bucket_digests"].items()
+            )
+        ):
+            self._write_state(
+                journal["target_generation"],
+                "prepared",
+                journal["transaction_id"],
+                journal["target_index_digest"],
+                journal["target_bucket_digests"],
+            )
+            self._remove_journal()
+            self._write_state(
+                journal["target_generation"],
+                "finalized",
+                journal["transaction_id"],
+                journal["target_index_digest"],
+                {},
+            )
+            return
+
+        removals = {name: set(journal_ids) for name in affected}
+        additions: dict[str, list[dict[str, Any]]] = {name: [] for name in affected}
+        for row in journal["rows"]:
+            target_name = _bucket_name(row)
+            if target_name not in affected:
+                raise OSError("storage_corrupt")
+            additions[target_name].append(row)
+        planned_rows = _apply_bucket_mutations(
+            {name: bucket_rows.get(name, []) for name in affected},
+            removals,
+            additions,
+        )
+        bucket_payloads = {
+            name: self._bucket_payload(name, rows)
+            for name, rows in planned_rows.items()
+        }
+        if {
+            name: self._payload_digest(payload)
+            for name, payload in bucket_payloads.items()
+        } != journal["target_bucket_digests"]:
+            raise OSError("storage_corrupt")
+
+        target_rows = dict(existing)
+        target_rows.update({row["event_id"]: row for row in journal["rows"]})
+        planned_index = {
+            event_id: _bucket_name(row)
+            for event_id, row in target_rows.items()
+            if cutoff <= _event_time(row) <= now
+        }
+        index_payload = self._index_payload(planned_index)
+        if self._payload_digest(index_payload) != journal["target_index_digest"]:
+            raise OSError("storage_corrupt")
+
+        prepared_state = self._state_payload(
+            journal["target_generation"],
+            "prepared",
+            journal["transaction_id"],
+            journal["target_index_digest"],
+            journal["target_bucket_digests"],
+        )
+        finalized_state = self._state_payload(
+            journal["target_generation"],
+            "finalized",
+            journal["transaction_id"],
+            journal["target_index_digest"],
+            {},
+        )
+        mutation_bytes = (
+            len(index_payload)
+            + len(prepared_state)
+            + len(finalized_state)
+            + sum(map(len, bucket_payloads.values()))
+        )
+        if mutation_bytes > _MAX_MUTATION_BYTES:
+            raise OSError("storage_corrupt")
+
+        for name in sorted(affected):
+            if observed[name] != journal["target_bucket_digests"][name]:
+                self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
+        if actual_index_digest != journal["target_index_digest"]:
+            self._atomic_write(self.index_path, index_payload, _MAX_INDEX_BYTES)
+        self._atomic_write(self.state_path, prepared_state, _MAX_STATE_BYTES)
+        self._remove_journal()
+        self._atomic_write(self.state_path, finalized_state, _MAX_STATE_BYTES)
+
     def _rebuild_index(self) -> dict[str, str]:
         diagnostics = self._diagnostics()
         budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
@@ -2401,6 +2694,12 @@ class EvidenceArchive:
             budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
             journal = self._read_journal(archived_at, diagnostics, budget=budget)
             state = self._read_state()
+            if journal is not None and not journal["legacy"]:
+                self._recover_native_journal_before_upsert(journal, state, archived_at)
+                diagnostics = self._diagnostics()
+                budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
+                journal = self._read_journal(archived_at, diagnostics, budget=budget)
+                state = self._read_state()
             if (
                 journal is None
                 and state["generation"] > 0
@@ -2458,13 +2757,19 @@ class EvidenceArchive:
                         if journal["legacy"]:
                             raise OSError("storage_corrupt")
                         continue
-                    try:
-                        merged = _merge_archive_rows(previous, row)
-                    except (KeyError, TypeError, ValueError):
-                        raise OSError("storage_corrupt") from None
-                    expected = previous if journal["legacy"] else row
-                    if merged != expected:
-                        raise OSError("storage_corrupt")
+                    if journal["legacy"]:
+                        if (
+                            locations.get(row["event_id"]) != {_bucket_name(row)}
+                            or _legacy_archive_projection(previous) != _legacy_archive_projection(row)
+                        ):
+                            raise OSError("storage_corrupt")
+                    else:
+                        try:
+                            merged = _merge_archive_rows(previous, row)
+                        except (KeyError, TypeError, ValueError):
+                            raise OSError("storage_corrupt") from None
+                        if merged != row:
+                            raise OSError("storage_corrupt")
 
             if state["phase"] == "prepared":
                 if journal is not None:
@@ -2605,7 +2910,7 @@ class EvidenceArchive:
         legacy_journal = journal is not None and journal["legacy"]
         journal_ids = {row["event_id"] for row in journal_rows}
         journal_by_id = {row["event_id"]: row for row in journal_rows}
-        matched_legacy_ids: set[str] = set()
+        matched_legacy_ids: dict[str, int] = {}
         if not legacy_journal:
             for row in journal_rows:
                 effective = _event_time(row)
@@ -2621,6 +2926,8 @@ class EvidenceArchive:
             cursor += timedelta(days=1)
         if journal is not None and not journal["legacy"]:
             names.update(journal["base_bucket_digests"])
+        elif legacy_journal:
+            names.update(_bucket_name(row) for row in journal_rows)
         names.update(state["bucket_digests"])
         observed_bucket_digests: dict[str, str] = {}
         for name in sorted(names):
@@ -2633,26 +2940,29 @@ class EvidenceArchive:
                 observed_digests=observed_bucket_digests,
             ):
                 effective = _event_time(row)
-                if effective < cutoff or effective > now:
-                    continue
                 if row["event_id"] in journal_ids:
                     self._increment(diagnostics, "duplicate_rows")
                     journal_row = journal_by_id[row["event_id"]]
-                    try:
-                        merged = _merge_archive_rows(row, journal_row)
-                    except (KeyError, TypeError, ValueError):
-                        self._last_diagnostics = diagnostics
-                        raise OSError("storage_corrupt") from None
                     if legacy_journal:
-                        if merged != row:
+                        if (
+                            name != _bucket_name(journal_row)
+                            or _legacy_archive_projection(row) != _legacy_archive_projection(journal_row)
+                        ):
                             self._last_diagnostics = diagnostics
                             raise OSError("storage_corrupt")
-                        matched_legacy_ids.add(row["event_id"])
+                        matched_legacy_ids[row["event_id"]] = matched_legacy_ids.get(row["event_id"], 0) + 1
                     else:
+                        try:
+                            merged = _merge_archive_rows(row, journal_row)
+                        except (KeyError, TypeError, ValueError):
+                            self._last_diagnostics = diagnostics
+                            raise OSError("storage_corrupt") from None
                         if merged != journal_row:
                             self._last_diagnostics = diagnostics
                             raise OSError("storage_corrupt")
                         continue
+                if effective < cutoff or effective > now:
+                    continue
                 existing = selected.get(row["event_id"])
                 if existing is None:
                     selected[row["event_id"]] = row
@@ -2661,7 +2971,7 @@ class EvidenceArchive:
                     selected[row["event_id"]] = _merge_archive_rows(existing, row)
         self._validate_journal_bucket_state(journal, observed_bucket_digests)
         self._validate_persisted_bucket_state(state, journal, observed_bucket_digests)
-        if legacy_journal and matched_legacy_ids != journal_ids:
+        if legacy_journal and matched_legacy_ids != {event_id: 1 for event_id in journal_ids}:
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt")
         self._last_diagnostics = diagnostics
