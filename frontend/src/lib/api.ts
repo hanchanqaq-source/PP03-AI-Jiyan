@@ -17,6 +17,8 @@ import type {
   MarketNewsResponse,
   MarketNewsSourceRetryResult,
   MarketNewsTranslationResponse,
+  NewsPipelineStarted,
+  NewsPipelineStatusData,
 } from "@/features/market-news/types";
 import type { LlmConfig } from "@/lib/llm";
 import type {
@@ -112,7 +114,12 @@ async function request<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
-  if (method !== "GET" && path.startsWith("/data-sources/")) {
+  if (method !== "GET" && (
+    path.startsWith("/data-sources/")
+    || path.startsWith("/market-news/refresh")
+    || path === "/evidence/refresh"
+    || path === "/radar/refresh"
+  )) {
     headers["X-PP03-Write-Intent"] = "1";
   }
   if (body !== undefined) {
@@ -522,7 +529,8 @@ export const api = {
   radar: () => get<RadarData>("/radar"),
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
   marketNewsEvents: (query: MarketNewsQuery) => get<MarketNewsResponse>(marketNewsPath("/market-news/events", query)),
-  marketNewsRefresh: (query: MarketNewsQuery) => request<MarketNewsResponse>(marketNewsPath("/market-news/refresh", query), "POST"),
+  marketNewsRefresh: (query?: MarketNewsQuery) => request<NewsPipelineStarted>(query ? marketNewsPath("/market-news/refresh", query) : "/market-news/refresh", "POST"),
+  newsPipelineStatus: (runId?: string) => get<NewsPipelineStatusData>(`/news/pipeline-status${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`),
   marketNewsRetrySource: (sourceId: string, query: MarketNewsQuery) => request<MarketNewsSourceRetryResult>(
     marketNewsPath(`/market-news/sources/${encodeURIComponent(sourceId)}/retry`, query),
     "POST",

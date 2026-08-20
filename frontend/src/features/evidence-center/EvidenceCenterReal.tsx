@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Database, Loader2, ShieldCheck } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
+import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { SourceHealthSummary } from "@/features/source-health/SourceHealthSummary";
 import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWorkspace";
 import { api } from "@/lib/api";
@@ -39,12 +41,16 @@ export function EvidenceCenter() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [pipelineStatus, setPipelineStatus] = useState<NewsPipelineStatusData | null>(null);
   const [explanationOpen, setExplanationOpen] = useState(false);
   const [detail, setDetail] = useState<EvidenceEventDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [focusHistory, setFocusHistory] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const requestRef = useRef(0);
+  const snapshotRequestRef = useRef(0);
+  const pipelineCycleRef = useRef(0);
+  const pipelineAbortRef = useRef<AbortController | null>(null);
 
   const loadList = useCallback(async (nextFilter: Filter) => {
     const requestId = ++requestRef.current;
@@ -53,16 +59,23 @@ export function EvidenceCenter() {
   }, []);
 
   const loadSnapshot = useCallback(async () => {
+    const requestId = ++snapshotRequestRef.current;
     setLoading(true); setError(null);
     try {
       const [nextSummary, nextEvents] = await Promise.all([api.evidenceSummary(), api.evidenceEvents({ days: 7 })]);
+      if (requestId !== snapshotRequestRef.current) return;
       setSummary(nextSummary); setEvents(nextEvents.events);
     } catch {
-      setError("证据快照加载失败，请确认本地后端可用后重试。");
-    } finally { setLoading(false); }
+      if (requestId === snapshotRequestRef.current) setError("证据快照加载失败，请确认本地后端可用后重试。");
+    } finally { if (requestId === snapshotRequestRef.current) setLoading(false); }
   }, []);
 
   useEffect(() => { void loadSnapshot(); }, [loadSnapshot]);
+  useEffect(() => () => {
+    snapshotRequestRef.current += 1;
+    pipelineCycleRef.current += 1;
+    pipelineAbortRef.current?.abort();
+  }, []);
   useEffect(() => {
     const eventId = new URLSearchParams(window.location.search).get("event_id");
     if (!eventId) return;
@@ -90,10 +103,38 @@ export function EvidenceCenter() {
     try { await loadList(next); } catch { setError("证据列表筛选失败，请稍后重试。" ); } finally { setLoading(false); }
   };
   const refresh = async () => {
-    if (refreshing) return; setRefreshing(true); setNotice(null);
-    try { await api.evidenceRefresh(); await loadSnapshot(); setNotice("核验刷新完成，已载入最新成功快照。"); }
-    catch { setNotice("核验刷新失败，继续保留并显示上次成功快照。" ); }
-    finally { setRefreshing(false); }
+    if (refreshing) return;
+    const pipelineCycle = ++pipelineCycleRef.current;
+    pipelineAbortRef.current?.abort();
+    const controller = new AbortController();
+    pipelineAbortRef.current = controller;
+    let evidenceReloaded = false;
+    setRefreshing(true); setNotice(null); setPipelineStatus(null);
+    try {
+      const terminal = await runNewsPipelineRefresh({
+        signal: controller.signal,
+        onStatus: async (next) => {
+          if (pipelineCycle !== pipelineCycleRef.current) return;
+          setPipelineStatus(next);
+          const evidenceDurable = next.phase === "evidence_saved" || next.phase === "trusted_published";
+          const terminalFailure = next.phase === "failed" || next.phase === "interrupted";
+          if (!evidenceReloaded && (evidenceDurable || terminalFailure)) {
+            evidenceReloaded = true;
+            await loadSnapshot();
+          }
+        },
+      });
+      if (!terminal || pipelineCycle !== pipelineCycleRef.current) return;
+      if (terminal.phase === "trusted_published") setNotice("核验刷新完成，已载入最新成功快照。");
+      else setNotice("核验刷新失败，继续保留并显示上次成功快照。");
+    }
+    catch { if (pipelineCycle === pipelineCycleRef.current) setNotice("核验刷新失败，继续保留并显示上次成功快照。" ); }
+    finally {
+      if (pipelineCycle === pipelineCycleRef.current) {
+        pipelineAbortRef.current = null;
+        setRefreshing(false);
+      }
+    }
   };
 
   return <div className="pb-8">
@@ -101,6 +142,7 @@ export function EvidenceCenter() {
     {explanationOpen && <section role="dialog" aria-label="数据说明" className="mb-4 rounded-xl border border-primary/25 bg-primary/5 p-4 text-xs text-muted-foreground"><p className="font-semibold text-foreground">真实性核验与数据源健康是两套独立机制。</p><p className="mt-2">仅明确官方证据或两个相互独立的来源链提供的一致证据可进入可信资讯流。</p><p className="mt-1">待核验金额、比例、数量和日期不会进入摘要、持仓影响或情绪判断。</p><p className="mt-1">AI 翻译、AI 摘要和来源数量不会自动提高核验等级。</p></section>}
     {notice && <p role="status" className="mb-4 rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary">{notice}</p>}
     {error && <p role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{error}</p>}
+    <NewsPipelineStatus status={pipelineStatus} />
 
     {loading && !summary ? <section className="rounded-xl border border-border/60 p-4 text-sm text-muted-foreground"><Loader2 className="mr-2 inline h-4 w-4 animate-spin" />正在载入核验快照…</section> : !summary?.loaded ? <section className="rounded-xl border border-border/60 bg-muted/10 p-4"><p className="font-semibold">尚无已完成的核验快照</p><p className="mt-1 text-xs text-muted-foreground">运行核验后才会显示真实计数；未加载状态不会显示为全部为 0。</p></section> : <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-label="真实核验概览"><Metric label="核验覆盖率" value={coverage} note="准入事件占当前核验事件比例，不代表资讯整体为真" /><Metric label="已核验" value={String(summary.counts?.verified ?? 0)} note="有明确官方或一手证据" /><Metric label="多源印证" value={String(summary.counts?.corroborated ?? 0)} note="至少两个相互独立的来源链" /><Metric label="待核验" value={String(summary.counts?.unverified ?? 0)} note="证据不足，不进入可信资讯流" /><Metric label="冲突 / 更正" value={String((summary.counts?.conflicting ?? 0) + (summary.counts?.corrected ?? 0) + (summary.counts?.disproved ?? 0))} note={`${snapshotLabel(summary.snapshot_id)} · ${summary.generated_at ? new Date(summary.generated_at).toLocaleString("zh-CN", { hour12: false }) : "时间未知"}`} /></section>}
 

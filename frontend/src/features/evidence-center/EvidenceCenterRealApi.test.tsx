@@ -1,25 +1,37 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
+import type { NewsPipelineStatusData } from "@/features/market-news/types";
+import type { EvidenceEventDetail, EvidenceEventList, EvidenceEventSummary, EvidenceSummaryData, EvidenceTransition } from "./types";
 import { EvidenceCenter } from "./EvidenceCenterReal";
 
 vi.mock("@/features/source-health/SourceHealthSummary", () => ({ SourceHealthSummary: ({ onOpenDetails }: { onOpenDetails: () => void }) => <button onClick={onOpenDetails}>A1 健康摘要</button> }));
 vi.mock("@/features/source-health/SourceHealthWorkspace", () => ({ SourceHealthWorkspace: () => <section aria-label="来源库直接清单">完整数据源清单</section> }));
 
-const transition = { from_status: "corroborated", to_status: "conflicting", changed_at: "2026-08-18T08:30:00+00:00", reason: "官方披露与转载金额不一致" };
-const row = {
+const transition: EvidenceTransition = { from_status: "corroborated", to_status: "conflicting", changed_at: "2026-08-18T08:30:00+00:00", reason: "官方披露与转载金额不一致" };
+const row: EvidenceEventSummary = {
   event_id: "0123456789abcdef0123", title: "交易所公告：星河科技建设存储算力中心", published_at: "2026-08-18T07:00:00+00:00", verified_at: "2026-08-18T08:30:00+00:00", evidence_as_of: "2026-08-18T08:30:00+00:00", category: "company", related_tags: [{ id: "semiconductor", name: "半导体" }], core_claim: "公司公告建设存储算力中心", verification_status: "verified", verification_reason: "已有明确官方证据", verified_key_fields: [], pending_key_field_count: 1, conflicting_key_field_count: 0, primary_evidence_count: 1, independent_evidence_count: 1, syndicated_copy_count: 2, contradicting_evidence_count: 0, holding_relevance: "none", status_change_count: 1, latest_transition: transition,
 };
-const detail = {
+const detail: EvidenceEventDetail = {
   ...row, summary: "交易所公告确认星河科技建设存储算力中心。", key_fields: [{ field_name: "money", raw_value: "12亿元", normalized_value: "CNY:1200000000", verification_status: "unverified", evidence_ids: [], reason: "金额尚待核验" }],
   primary_evidence: [{ evidence_id: "official-1", content_source: "交易所公告", collector_source: "现有资讯源", canonical_url: "https://www.sse.com.cn/disclosure/a", published_at: "2026-08-18T07:00:00+00:00", source_role: "primary", origin_cluster: "publisher:sse.com.cn", supports_claim: true, supports_fields: ["money"], contradicts_claim: false, is_official: true, title: "官方公告", excerpt: "公开证据摘要" }],
   independent_evidence: [{ evidence_id: "independent-1", content_source: "独立来源", collector_source: "现有资讯源二", canonical_url: "https://example.org/report", published_at: "2026-08-18T07:10:00+00:00", source_role: "independent", origin_cluster: "publisher:example.org", supports_claim: true, supports_fields: [], contradicts_claim: false, is_official: false, title: "独立报道", excerpt: "一致摘要" }],
   syndicated_copies: [{ evidence_id: "copy-1", content_source: "转载来源", collector_source: "现有资讯源三", canonical_url: "https://example.net/copy", published_at: "2026-08-18T07:20:00+00:00", source_role: "syndicated", origin_cluster: "syndication:abc", supports_claim: true, supports_fields: [], contradicts_claim: false, is_official: false, title: "转载", excerpt: "同稿" }],
   contradicting_evidence: [], status_history: [transition],
 };
-const summary = { loaded: true, snapshot_id: "acceptance-snapshot", generated_at: "2026-08-18T08:30:00+00:00", counts: { verified: 3, corroborated: 3, unverified: 1, conflicting: 1, corrected: 0, disproved: 0 }, field_counts: { verified: 2, corroborated: 0, unverified: 1, conflicting: 0 }, admitted_count: 6, isolated_count: 2, last_refresh: { status: "completed", attempted_at: "2026-08-18T08:30:00+00:00" } };
-const listing = { events: [row], snapshot_id: summary.snapshot_id, generated_at: summary.generated_at, total: 1, filters: { verification_status: null, tag_id: null, category: null, days: 7, holding_relevance: null } };
+const summary: EvidenceSummaryData = { loaded: true, snapshot_id: "acceptance-snapshot", generated_at: "2026-08-18T08:30:00+00:00", counts: { verified: 3, corroborated: 3, unverified: 1, conflicting: 1, corrected: 0, disproved: 0 }, field_counts: { verified: 2, corroborated: 0, unverified: 1, conflicting: 0 }, admitted_count: 6, isolated_count: 2, last_refresh: { status: "completed", attempted_at: "2026-08-18T08:30:00+00:00" } };
+const listing: EvidenceEventList = { events: [row], snapshot_id: summary.snapshot_id, generated_at: summary.generated_at, total: 1, filters: { verification_status: null, tag_id: null, category: null, days: 7, holding_relevance: null } };
+const pipelineStarted = { run_id: "run-evidence", raw_snapshot_id: "raw-evidence", phase: "queued" as const };
+const pipelineDone: NewsPipelineStatusData = {
+  loaded: true, run_id: pipelineStarted.run_id, raw_snapshot_id: pipelineStarted.raw_snapshot_id,
+  evidence_snapshot_id: "evidence-complete", trusted_snapshot_id: "trusted-complete", phase: "trusted_published",
+  counts: { raw_event_count: 8, verified_count: 3, corroborated_count: 3, pending_count: 1, conflicting_count: 1, corrected_count: 0, disproved_count: 0, failed_source_count: 2 },
+  admitted_count: 6, has_pending_evidence_message: false,
+  created_at: "2026-08-20T09:00:00+00:00", updated_at: "2026-08-20T09:00:01+00:00",
+  redacted_error: null, recovery_status: "ready", recovery_error: null, compatibility_error: null,
+  displayed_trusted_snapshot_id: "trusted-complete", displayed_trusted: { snapshot_id: "trusted-complete", published_at: "2026-08-20T09:00:01+00:00", event_count: 6 },
+};
 
 describe("EvidenceCenter real verification workspace", () => {
   beforeEach(() => {
@@ -28,6 +40,8 @@ describe("EvidenceCenter real verification workspace", () => {
     vi.spyOn(api as any, "evidenceSummary").mockResolvedValue(summary);
     vi.spyOn(api as any, "evidenceEvents").mockResolvedValue(listing);
     vi.spyOn(api as any, "evidenceEvent").mockResolvedValue(detail);
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(pipelineStarted);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(pipelineDone);
     vi.spyOn(api as any, "evidenceRefresh").mockResolvedValue(summary);
   });
 
@@ -70,11 +84,57 @@ describe("EvidenceCenter real verification workspace", () => {
     fireEvent.keyDown(document, { key: "Escape" }); expect(screen.queryByRole("dialog", { name: "证据详情" })).not.toBeInTheDocument(); expect(trigger).toHaveFocus();
   });
 
-  it("auto-opens query detail and runs a real refresh", async () => {
+  it("auto-opens query detail and runs verification through the shared pipeline", async () => {
     const user = userEvent.setup(); window.history.replaceState({}, "", "/evidence-center?event_id=0123456789abcdef0123"); render(<EvidenceCenter />);
     expect(await screen.findByRole("dialog", { name: "证据详情" })).toHaveTextContent("交易所公告：星河科技建设存储算力中心");
     await user.click(screen.getByRole("button", { name: "关闭证据详情" })); await user.click(screen.getByRole("button", { name: "运行核验" }));
     expect(await screen.findByText("核验刷新完成，已载入最新成功快照。")).toBeInTheDocument();
+    expect(api.marketNewsRefresh).toHaveBeenCalledTimes(1);
+    expect((api as any).evidenceRefresh).not.toHaveBeenCalled();
+    expect(api.newsPipelineStatus).toHaveBeenCalledWith(pipelineStarted.run_id);
+  });
+
+  it("reloads evidence only after the shared run reaches an evidence-durable phase", async () => {
+    const user = userEvent.setup();
+    let resolveStatus!: (value: NewsPipelineStatusData) => void;
+    vi.mocked(api.newsPipelineStatus).mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve; }));
+    render(<EvidenceCenter />);
+    await screen.findByText("交易所公告：星河科技建设存储算力中心");
+    const initialSummaryCalls = vi.mocked(api.evidenceSummary).mock.calls.length;
+    const initialListCalls = vi.mocked(api.evidenceEvents).mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+    expect(api.evidenceSummary).toHaveBeenCalledTimes(initialSummaryCalls);
+    expect(api.evidenceEvents).toHaveBeenCalledTimes(initialListCalls);
+
+    resolveStatus({ ...pipelineDone, phase: "evidence_saved", trusted_snapshot_id: null });
+    await waitFor(() => expect(api.evidenceSummary).toHaveBeenCalledTimes(initialSummaryCalls + 1));
+    expect(api.evidenceEvents).toHaveBeenCalledTimes(initialListCalls + 1);
+  });
+
+  it("does not let an older snapshot load overwrite the evidence-saved reload", async () => {
+    const user = userEvent.setup();
+    const freshRow = { ...row, event_id: "fedcba9876543210fedc", title: "新证据快照事件" };
+    let resolveOldSummary!: (value: typeof summary) => void;
+    let resolveOldList!: (value: EvidenceEventList) => void;
+    vi.mocked(api.evidenceSummary)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldSummary = resolve; }))
+      .mockResolvedValueOnce({ ...summary, snapshot_id: "fresh-evidence" });
+    vi.mocked(api.evidenceEvents)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldList = resolve; }))
+      .mockResolvedValueOnce({ ...listing, snapshot_id: "fresh-evidence", events: [freshRow] });
+
+    render(<EvidenceCenter />);
+    await waitFor(() => expect(api.evidenceSummary).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+    expect(await screen.findByText(freshRow.title)).toBeInTheDocument();
+
+    await act(async () => {
+      resolveOldSummary(summary);
+      resolveOldList(listing);
+    });
+    await waitFor(() => expect(screen.getByText(freshRow.title)).toBeInTheDocument());
+    expect(screen.queryByText(row.title)).not.toBeInTheDocument();
   });
 
   it("derives correction rows from real transition data", async () => {

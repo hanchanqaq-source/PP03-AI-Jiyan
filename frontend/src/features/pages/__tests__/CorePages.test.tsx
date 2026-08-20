@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
 import { directEvent, marketNewsResponse, translatedEnglishEvent } from "@/features/market-news/__tests__/fixtures";
-import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse, MarketNewsTranslationResponse } from "@/features/market-news/types";
+import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse, MarketNewsTranslationResponse, NewsPipelineStarted } from "@/features/market-news/types";
 import { cacheMarketNewsResponse, MarketNews, readMarketNewsCache } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
 
@@ -411,7 +411,7 @@ describe("PP03 core pages", () => {
         events: [filteredEvent],
         filters: queryFor("storage", "global_tech"),
       });
-    let resolveRefresh!: (value: typeof marketNewsResponse) => void;
+    let resolveRefresh!: (value: NewsPipelineStarted) => void;
     vi.spyOn(api, "marketNewsRefresh").mockImplementation(() => new Promise((resolve) => { resolveRefresh = resolve; }));
     render(<MarketNews />);
     await screen.findByRole("heading", { name: directEvent.title });
@@ -420,7 +420,7 @@ describe("PP03 core pages", () => {
     await user.click(screen.getByRole("button", { name: "全球科技" }));
     expect(await screen.findByRole("heading", { name: filteredEvent.title })).toBeInTheDocument();
 
-    resolveRefresh({ ...marketNewsResponse, events: [staleRefreshEvent] });
+    resolveRefresh({ run_id: "stale-run", raw_snapshot_id: "stale-raw", phase: "queued" });
     await waitFor(() => expect(screen.queryByRole("heading", { name: staleRefreshEvent.title })).not.toBeInTheDocument());
     expect(screen.getByRole("heading", { name: filteredEvent.title })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新资讯" })).not.toBeDisabled();
@@ -429,7 +429,7 @@ describe("PP03 core pages", () => {
   it("disables refresh while a filter GET is still loading", async () => {
     let resolveGet!: (value: typeof marketNewsResponse) => void;
     vi.spyOn(api, "marketNewsEvents").mockImplementation(() => new Promise((resolve) => { resolveGet = resolve; }));
-    const refresh = vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(marketNewsResponse);
+    const refresh = vi.spyOn(api, "marketNewsRefresh").mockResolvedValue({ run_id: "blocked-run", raw_snapshot_id: "blocked-raw", phase: "queued" });
     render(<MarketNews />);
 
     expect(screen.getByRole("button", { name: "刷新资讯" })).toBeDisabled();

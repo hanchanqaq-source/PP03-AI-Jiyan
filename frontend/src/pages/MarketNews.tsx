@@ -5,6 +5,7 @@ import { DataInfoDialog } from "@/features/market-news/DataInfoDialog";
 import { EventCard } from "@/features/market-news/EventCard";
 import { EventDetailDrawer } from "@/features/market-news/EventDetailDrawer";
 import { MarketNewsSidebar } from "@/features/market-news/MarketNewsSidebar";
+import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
 import { SourceFailureDialog } from "@/features/market-news/SourceFailureDialog";
 import { SourceHealthDrawer } from "@/features/source-health/SourceHealthDrawer";
 import type {
@@ -15,6 +16,7 @@ import type {
   MarketNewsResponse,
   MarketNewsSort,
   MarketNewsTranslation,
+  NewsPipelineStatusData,
 } from "@/features/market-news/types";
 import { SelectedTagBar } from "@/features/tags/SelectedTagBar";
 import { TagSelector } from "@/features/tags/TagSelector";
@@ -121,6 +123,10 @@ function needsTranslation(event: MarketNewsEvent): boolean {
   return !language.startsWith("zh") && !/[\u3400-\u9fff]/.test(`${event.title} ${event.summary}`);
 }
 
+function isTrustedEvent(event: MarketNewsEvent): boolean {
+  return event.verification_status === "verified" || event.verification_status === "corroborated";
+}
+
 function mergeTranslations(response: MarketNewsResponse, translations: MarketNewsTranslation[]): MarketNewsResponse {
   const byId = new Map(translations.map((translation) => [translation.event_id, translation]));
   const mergeEvent = (event: MarketNewsEvent): MarketNewsEvent => {
@@ -194,11 +200,14 @@ export function MarketNews() {
   const [view, setView] = useState<{ queryKey: string; response: MarketNewsResponse } | null>(null);
   const responseCacheRef = useRef<Map<string, MarketNewsResponse>>(new Map());
   const requestIdRef = useRef(0);
+  const pipelineCycleRef = useRef(0);
+  const pipelineAbortRef = useRef<AbortController | null>(null);
   const sourceRetryIdRef = useRef(0);
   const translationIdRef = useRef(0);
   const translationRequestedRef = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [pipelineStatus, setPipelineStatus] = useState<NewsPipelineStatusData | null>(null);
   const [queryError, setQueryError] = useState<{ queryKey: string; message: string } | null>(null);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
@@ -237,6 +246,18 @@ export function MarketNews() {
     setSourceDialogOpen(false);
     sourceRetryIdRef.current += 1;
   }, [queryKey]);
+
+  useEffect(() => {
+    pipelineCycleRef.current += 1;
+    pipelineAbortRef.current?.abort();
+    pipelineAbortRef.current = null;
+    setPipelineStatus(null);
+  }, [queryKey]);
+
+  useEffect(() => () => {
+    pipelineCycleRef.current += 1;
+    pipelineAbortRef.current?.abort();
+  }, []);
 
   useEffect(() => {
     const requestId = ++requestIdRef.current;
@@ -321,17 +342,35 @@ export function MarketNews() {
   const refresh = async () => {
     if (refreshing || loading || (mode === "my_focus" && query.tag_ids.length === 0)) return;
     const requestId = ++requestIdRef.current;
+    const pipelineCycle = ++pipelineCycleRef.current;
+    pipelineAbortRef.current?.abort();
+    const controller = new AbortController();
+    pipelineAbortRef.current = controller;
     setRefreshing(true);
     setQueryError(null);
+    setPipelineStatus(null);
     try {
-      const response = await api.marketNewsRefresh(query);
-      if (requestId !== requestIdRef.current) return;
+      const terminal = await runNewsPipelineRefresh({
+        query,
+        signal: controller.signal,
+        onStatus: (next) => {
+          if (pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
+          setPipelineStatus(next);
+        },
+      });
+      if (!terminal || requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
+      if (terminal.phase !== "trusted_published") {
+        setQueryError({ queryKey, message: "本轮资讯刷新未完成，继续显示上一份可信快照。" });
+        return;
+      }
+      const response = await api.marketNewsEvents(query);
+      if (requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       if (!responseMatchesQuery(response, query)) throw new Error("market-news refresh filters mismatch");
       const accepted = preserveSameSnapshotTranslations(response, responseCacheRef.current.get(queryKey));
       cacheMarketNewsResponse(responseCacheRef.current, queryKey, accepted);
       setView({ queryKey, response: accepted });
     } catch {
-      if (requestId !== requestIdRef.current) return;
+      if (requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
       setView(sameQueryCache ? { queryKey, response: sameQueryCache } : null);
       setQueryError({
@@ -341,7 +380,10 @@ export function MarketNews() {
           : "当前筛选加载失败，请稍后重试。",
       });
     } finally {
-      if (requestId === requestIdRef.current) setRefreshing(false);
+      if (pipelineCycle === pipelineCycleRef.current && activeQueryKeyRef.current === queryKey) {
+        pipelineAbortRef.current = null;
+        setRefreshing(false);
+      }
     }
   };
 
@@ -383,7 +425,8 @@ export function MarketNews() {
   const noTags = mode === "my_focus" && query.tag_ids.length === 0;
   const error = queryError?.queryKey === queryKey ? queryError.message : null;
   const queryFailedWithoutCache = Boolean(error && !data && !noTags);
-  const displayedEvents = data ? data.events.filter((event) => event.verification_status === "verified" || event.verification_status === "corroborated") : [];
+  const displayedEvents = data ? data.events.filter(isTrustedEvent) : [];
+  const displayedFocusEvents = data ? data.focus_events.filter(isTrustedEvent) : [];
   const backendEmptyReason = data?.empty_reason || (data && data.events.length === 0 ? "no_events" : null);
   const emptyReason = noTags ? "no_tags" : backendEmptyReason === "no_events" && displayedEvents.length > 0 ? null : backendEmptyReason;
   const status = STATUS_LABELS[data?.data_status || ""] || "等待公开数据";
@@ -417,6 +460,8 @@ export function MarketNews() {
         </div>
       </section>
 
+      <NewsPipelineStatus status={pipelineStatus} />
+
       <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-border/55 bg-muted/15 px-3 py-2 text-xs text-muted-foreground">
         <span>状态：{status}</span>
         {data && <span>{data.source_summary.total_sources} 个来源配置</span>}
@@ -433,7 +478,7 @@ export function MarketNews() {
           {loading && <p className="border-b border-border/45 py-2 text-xs text-muted-foreground">正在更新筛选结果…</p>}
           {displayedEvents.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id, event: selectedEvent })} onViewEvidence={(selectedEvent) => openEvidenceCenter(selectedEvent.event_id)} />)}
         </main>
-        <MarketNewsSidebar focus={data.focus_events} impact={data.impact_summary} days={data.filters.days} />
+        <MarketNewsSidebar focus={displayedFocusEvents} impact={data.impact_summary} days={data.filters.days} />
       </div>}
 
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} onCancel={() => setSelectorOpen(false)} onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />

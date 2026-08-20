@@ -6,6 +6,48 @@ export type MarketNewsMode = "my_focus" | "my_holdings" | "global_tech" | "domes
 export type MarketNewsSort = "importance" | "latest" | "holding_relevance";
 export type MarketNewsCategoryFilter = "all" | MarketNewsCategory;
 export type MarketNewsVerificationStatus = "verified" | "corroborated" | "unverified" | "conflicting" | "corrected" | "disproved";
+export type NewsPipelinePhase = "queued" | "fetching" | "raw_saved" | "verifying" | "evidence_saved" | "trusted_published" | "failed" | "interrupted";
+
+export interface NewsPipelineStarted {
+  run_id: string;
+  raw_snapshot_id: string;
+  phase: "queued";
+}
+
+export interface NewsPipelineCounts {
+  raw_event_count: number;
+  verified_count: number;
+  corroborated_count: number;
+  pending_count: number;
+  conflicting_count: number;
+  corrected_count: number;
+  disproved_count: number;
+  failed_source_count: number;
+}
+
+export interface NewsPipelineStatusData {
+  loaded: boolean;
+  run_id: string | null;
+  raw_snapshot_id: string | null;
+  evidence_snapshot_id: string | null;
+  trusted_snapshot_id: string | null;
+  phase: NewsPipelinePhase | null;
+  counts: NewsPipelineCounts | null;
+  admitted_count: number | null;
+  has_pending_evidence_message: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  redacted_error: string | null;
+  recovery_status: string;
+  recovery_error: string | null;
+  compatibility_error: string | null;
+  displayed_trusted_snapshot_id: string | null;
+  displayed_trusted: {
+    snapshot_id: string;
+    published_at: string;
+    event_count: number;
+  } | null;
+}
 
 export interface MarketNewsSource {
   source_name: string;
