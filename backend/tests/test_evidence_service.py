@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -237,3 +239,41 @@ def test_archive_failure_does_not_replace_previous_current_evidence_snapshot(tmp
 
     assert storage.current_path.read_bytes() == before
     assert storage.load_current() == previous
+
+
+def test_journal_delete_failure_keeps_prepared_archive_and_previous_current_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    archive = EvidenceArchive(storage.root, now=lambda: NOW)
+    previous_service = EvidenceVerificationService(
+        storage=storage,
+        archive=archive,
+        event_loader=lambda: [event("a" * 20, [official_source()])],
+        now=lambda: NOW,
+    )
+    previous = previous_service.refresh()
+    before = storage.current_path.read_bytes()
+    real_unlink = Path.unlink
+
+    def fail_transaction_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == archive.journal_path:
+            raise OSError("simulated journal delete failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_transaction_unlink)
+    failing = EvidenceVerificationService(
+        storage=storage,
+        archive=archive,
+        event_loader=lambda: [event("b" * 20, [official_source()])],
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(OSError, match="storage_error"):
+        failing.refresh()
+
+    assert storage.current_path.read_bytes() == before
+    assert storage.load_current() == previous
+    assert archive.journal_path.is_file()
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
