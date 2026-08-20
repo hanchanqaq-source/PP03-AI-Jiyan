@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
+import hashlib
 import io
 import ipaddress
 import json
 import os
 from pathlib import Path
-import posixpath
 import re
 import stat
 import tempfile
@@ -35,25 +37,27 @@ from .storage import (
     event_document,
     validated_snapshot_document,
 )
-_ARCHIVE_SCHEMA_VERSION = 1
+_ARCHIVE_SCHEMA_VERSION = 2
 _INDEX_SCHEMA_VERSION = 1
 _ALLOWED_DAYS = {1, 3, 7, 30, 90}
 _KNOWN_STATUSES = {status.value for status in VerificationStatus}
 _BUCKET_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
 _MAX_BUCKET_BYTES = 32 * 1_048_576
-_MAX_INDEX_BYTES = 8 * 1_048_576
+_MAX_INDEX_BYTES = 16 * 1_048_576
 _MAX_ROW_BYTES = 1_048_576
 _MAX_BUCKET_ROWS = 4_096
 _MAX_ARCHIVE_FILES = 512
-_MAX_INDEX_EVENTS = 20_000
-_MAX_SCAN_BYTES = 64 * 1_048_576
-_MAX_SCAN_ROWS = 20_000
-_MAX_SCAN_NODES = 200_000
+_MAX_INDEX_EVENTS = 65_536
+_MAX_ARCHIVE_SCAN_BYTES = 64 * 1_048_576
+_MAX_JOURNAL_BYTES = 32 * 1_048_576
 _MAX_SNAPSHOT_BYTES = 16 * 1_048_576
 _MAX_SNAPSHOT_NODES = 200_000
 _MAX_SNAPSHOT_RESOURCES = 50_000
+_MAX_SCAN_BYTES = _MAX_ARCHIVE_SCAN_BYTES + _MAX_JOURNAL_BYTES
+_MAX_SCAN_ROWS = _MAX_INDEX_EVENTS * 2
+_MAX_ARCHIVE_SCAN_NODES = _MAX_INDEX_EVENTS * 128
+_MAX_SCAN_NODES = _MAX_ARCHIVE_SCAN_NODES + _MAX_SNAPSHOT_NODES
 _MAX_MUTATION_BYTES = 64 * 1_048_576
-_MAX_JOURNAL_BYTES = 32 * 1_048_576
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _MAX_DIAGNOSTIC_COUNT = 1_000_000
 _JOURNAL_SCHEMA_VERSION = 1
@@ -65,8 +69,9 @@ _ARCHIVE_KEYS = _EVENT_KEYS | {
     "archived_at",
     "last_updated_at",
     "snapshot_history",
+    "content_digest",
 }
-_LINEAGE_KEYS = {"evidence_snapshot_id", "raw_snapshot_id", "generated_at"}
+_LINEAGE_KEYS = {"evidence_snapshot_id", "raw_snapshot_id", "generated_at", "content_digest"}
 _INDEX_KEYS = {"schema_version", "events"}
 _JOURNAL_KEYS = {"schema_version", "rows"}
 _EVIDENCE_COLLECTION_KEYS = (
@@ -129,6 +134,10 @@ _NAT64_NETWORKS = (
     ipaddress.IPv6Network("64:ff9b::/96"),
     ipaddress.IPv6Network("64:ff9b:1::/48"),
 )
+_IPV4_COMPATIBLE_NETWORK = ipaddress.IPv6Network("::/96")
+_UNRESERVED_PATH_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_PATH_SAFE_CHARACTERS = "/:@-._~!$&'()*+,;="
+_CONTENT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _STATUS_PRECEDENCE = {
     VerificationStatus.UNVERIFIED.value: 0,
     VerificationStatus.VERIFIED.value: 1,
@@ -174,11 +183,14 @@ def _valid_bucket_name(value: object) -> bool:
         return False
 
 
-def _lineage_document(snapshot: EvidenceSnapshot) -> dict[str, str]:
+def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[str, str]:
+    if _CONTENT_DIGEST.fullmatch(content_digest) is None:
+        raise ValueError("invalid archive lineage digest")
     return {
         "evidence_snapshot_id": _bounded_text(snapshot.snapshot_id, "evidence_snapshot_id"),
         "raw_snapshot_id": _bounded_text(snapshot.raw_snapshot_id, "raw_snapshot_id"),
         "generated_at": _timestamp(snapshot.generated_at, "snapshot generated_at"),
+        "content_digest": content_digest,
     }
 
 
@@ -189,8 +201,17 @@ def _lineage_from_document(value: object) -> dict[str, str]:
         "evidence_snapshot_id": _bounded_text(value["evidence_snapshot_id"], "evidence_snapshot_id"),
         "raw_snapshot_id": _bounded_text(value["raw_snapshot_id"], "raw_snapshot_id"),
         "generated_at": _metadata_time(value["generated_at"], "lineage generated_at").isoformat(),
+        "content_digest": _bounded_text(value["content_digest"], "lineage content_digest", maximum=64),
     }
+    if _CONTENT_DIGEST.fullmatch(lineage["content_digest"]) is None:
+        raise ValueError("invalid archive lineage digest")
     return lineage
+
+
+def _event_content_digest(row: dict[str, Any]) -> str:
+    event = {key: row[key] for key in sorted(_EVENT_KEYS)}
+    payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _event_time(row: dict[str, Any]) -> datetime:
@@ -267,6 +288,8 @@ def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
 
 def _public_host(host: str) -> tuple[str, bool]:
     candidate = host.rstrip(".")
+    if "%" in candidate:
+        raise ValueError("invalid archive evidence URL")
     try:
         address = ipaddress.ip_address(candidate)
     except ValueError:
@@ -299,11 +322,33 @@ def _public_host(host: str) -> tuple[str, bool]:
             or address.sixtofour is not None
             or address.teredo is not None
             or any(address in network for network in _NAT64_NETWORKS)
+            or address in _IPV4_COMPATIBLE_NETWORK
         ):
             raise ValueError("invalid archive evidence URL")
     if not address.is_global:
         raise ValueError("invalid archive evidence URL")
     return address.compressed.casefold(), isinstance(address, ipaddress.IPv6Address)
+
+
+def _canonical_public_path(value: str) -> str:
+    source = value or "/"
+    parts: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        character = source[cursor]
+        if character == "%":
+            if cursor + 2 >= len(source) or re.fullmatch(r"[0-9A-Fa-f]{2}", source[cursor + 1:cursor + 3]) is None:
+                raise ValueError("invalid archive evidence URL")
+            encoded = int(source[cursor + 1:cursor + 3], 16)
+            if encoded in _UNRESERVED_PATH_BYTES:
+                parts.append(chr(encoded))
+            else:
+                parts.append(f"%{encoded:02X}")
+            cursor += 3
+            continue
+        parts.append(quote(character, safe=_PATH_SAFE_CHARACTERS))
+        cursor += 1
+    return "".join(parts)
 
 
 def _archive_public_url(value: object) -> str:
@@ -354,11 +399,9 @@ def _archive_public_url(value: object) -> str:
     default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
     authority_host = f"[{host}]" if is_ipv6 else host
     authority = authority_host if port is None or default_port else f"{authority_host}:{port}"
-    raw_path = unquote(parsed.path or "/")
-    normalized_path = posixpath.normpath(raw_path)
+    normalized_path = _canonical_public_path(parsed.path)
     if not normalized_path.startswith("/"):
-        normalized_path = f"/{normalized_path}"
-    normalized_path = quote(normalized_path, safe="/:@-._~!$&'()*+,;=")
+        raise ValueError("invalid archive evidence URL")
     public_query = urlencode(sorted(
         (key, item) for key, item in pairs if key.casefold() not in _TRACKING_QUERY_KEYS
     ), doseq=True)
@@ -492,6 +535,190 @@ def _ensure_snapshot_budget(rows: list[dict[str, Any]]) -> None:
             raise ValueError("archive snapshot budget exceeded")
 
 
+def _input_metrics(
+    value: object,
+    *,
+    maximum_bytes: int,
+    maximum_nodes: int,
+    depth: int = 0,
+) -> tuple[int, int]:
+    """Bound the frozen input graph before snapshot_document allocates nested copies."""
+    if depth > 16:
+        raise ValueError("archive snapshot is too deep")
+    if isinstance(value, Enum):
+        value = value.value
+    elif type(value) is datetime:
+        value = _timestamp(value, "snapshot input time")
+
+    if value is None:
+        encoded_bytes = 4
+    elif type(value) is bool:
+        encoded_bytes = 4 if value else 5
+    elif type(value) is int:
+        if value < -1_000_000_000 or value > 1_000_000_000:
+            raise ValueError("archive snapshot integer is too large")
+        encoded_bytes = len(str(value))
+    elif type(value) is str:
+        if len(value.encode("utf-8")) > _MAX_ROW_BYTES:
+            raise ValueError("archive snapshot text is too large")
+        encoded_bytes = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    elif type(value) in {tuple, list}:
+        if len(value) > 5_000:
+            raise ValueError("archive snapshot list is too large")
+        encoded_bytes = 2 + max(0, len(value) - 1)
+        nodes = 1
+        for item in value:
+            item_bytes, item_nodes = _input_metrics(
+                item,
+                maximum_bytes=maximum_bytes - encoded_bytes,
+                maximum_nodes=maximum_nodes - nodes,
+                depth=depth + 1,
+            )
+            encoded_bytes += item_bytes
+            nodes += item_nodes
+            if encoded_bytes > maximum_bytes or nodes > maximum_nodes:
+                raise ValueError("archive snapshot budget exceeded")
+        return encoded_bytes, nodes
+    elif type(value) is dict:
+        if len(value) > 5_000:
+            raise ValueError("archive snapshot object is too large")
+        encoded_bytes = 2 + max(0, len(value) - 1)
+        nodes = 1
+        for key, item in value.items():
+            if type(key) is not str or len(key) > 128:
+                raise ValueError("archive snapshot object key is invalid")
+            key_bytes, key_nodes = _input_metrics(
+                key,
+                maximum_bytes=maximum_bytes - encoded_bytes,
+                maximum_nodes=maximum_nodes - nodes,
+                depth=depth + 1,
+            )
+            encoded_bytes += key_bytes + 1
+            nodes += key_nodes
+            item_bytes, item_nodes = _input_metrics(
+                item,
+                maximum_bytes=maximum_bytes - encoded_bytes,
+                maximum_nodes=maximum_nodes - nodes,
+                depth=depth + 1,
+            )
+            encoded_bytes += item_bytes
+            nodes += item_nodes
+            if encoded_bytes > maximum_bytes or nodes > maximum_nodes:
+                raise ValueError("archive snapshot budget exceeded")
+        return encoded_bytes, nodes
+    elif is_dataclass(value) and not isinstance(value, type):
+        encoded_bytes = 2
+        nodes = 1
+        dataclass_fields = fields(value)
+        if len(dataclass_fields) > 128:
+            raise ValueError("archive snapshot object is too large")
+        for index, field in enumerate(dataclass_fields):
+            if index:
+                encoded_bytes += 1
+            key_bytes, key_nodes = _input_metrics(
+                field.name,
+                maximum_bytes=maximum_bytes - encoded_bytes,
+                maximum_nodes=maximum_nodes - nodes,
+                depth=depth + 1,
+            )
+            encoded_bytes += key_bytes + 1
+            nodes += key_nodes
+            item_bytes, item_nodes = _input_metrics(
+                getattr(value, field.name),
+                maximum_bytes=maximum_bytes - encoded_bytes,
+                maximum_nodes=maximum_nodes - nodes,
+                depth=depth + 1,
+            )
+            encoded_bytes += item_bytes
+            nodes += item_nodes
+            if encoded_bytes > maximum_bytes or nodes > maximum_nodes:
+                raise ValueError("archive snapshot budget exceeded")
+        return encoded_bytes, nodes
+    else:
+        raise ValueError("archive snapshot input type is invalid")
+    if encoded_bytes > maximum_bytes or maximum_nodes < 1:
+        raise ValueError("archive snapshot budget exceeded")
+    return encoded_bytes, 1
+
+
+def _preflight_snapshot_input(snapshot: EvidenceSnapshot) -> None:
+    if type(snapshot) is not EvidenceSnapshot or type(snapshot.events) is not tuple:
+        raise ValueError("invalid archive snapshot input")
+    resources = 0
+    for selected in snapshot.events:
+        try:
+            resources += (
+                1
+                + len(selected.related_tags)
+                + len(selected.key_fields)
+                + len(selected.status_history)
+                + len(selected.primary_evidence)
+                + len(selected.independent_evidence)
+                + len(selected.syndicated_copies)
+                + len(selected.contradicting_evidence)
+            )
+        except (AttributeError, TypeError):
+            raise ValueError("invalid archive snapshot input") from None
+        if resources > _MAX_SNAPSHOT_RESOURCES:
+            raise ValueError("archive snapshot resource budget exceeded")
+    _input_metrics(
+        snapshot,
+        maximum_bytes=_MAX_SNAPSHOT_BYTES,
+        maximum_nodes=_MAX_SNAPSHOT_NODES,
+    )
+
+
+def _preflight_json_payload(raw: bytes, *, maximum_depth: int, maximum_tokens: int) -> None:
+    if not raw or raw[-1:] != b"\n" or raw.count(b"\n") != 1:
+        raise ValueError("invalid archive JSON framing")
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    tokens = 0
+    for value in raw[:-1]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == 0x5C:
+                escaped = True
+            elif value == 0x22:
+                in_string = False
+            elif value < 0x20:
+                raise ValueError("invalid archive JSON string")
+            continue
+        if value == 0x22:
+            in_string = True
+            tokens += 1
+        elif value in {0x7B, 0x5B}:
+            stack.append(value)
+            tokens += 1
+            if len(stack) > maximum_depth:
+                raise ValueError("archive JSON is too deep")
+        elif value in {0x7D, 0x5D}:
+            expected = 0x7B if value == 0x7D else 0x5B
+            if not stack or stack.pop() != expected:
+                raise ValueError("invalid archive JSON structure")
+            tokens += 1
+        elif value in {0x2C, 0x3A}:
+            tokens += 1
+        if tokens > maximum_tokens:
+            raise ValueError("archive JSON token budget exceeded")
+    if in_string or escaped or stack:
+        raise ValueError("invalid archive JSON structure")
+
+
+def _validate_evidence_references(row: dict[str, Any]) -> None:
+    available = {
+        item["evidence_id"]
+        for collection_name in _EVIDENCE_COLLECTION_KEYS
+        for item in row[collection_name]
+    }
+    for field in row["key_fields"]:
+        references = field["evidence_ids"]
+        if len(references) != len(set(references)) or any(reference not in available for reference in references):
+            raise ValueError("invalid archive key-field evidence reference")
+
+
 def _row_times(row: dict[str, Any]) -> Iterator[datetime]:
     for key in ("published_at", "verified_at", "evidence_as_of"):
         value = row[key]
@@ -510,7 +737,7 @@ def _validate_temporal_row(row: dict[str, Any], now: datetime) -> None:
     maximum = current + _MAX_CLOCK_SKEW
     generated_at = _metadata_time(row["snapshot_generated_at"], "snapshot_generated_at")
     archived_at = _metadata_time(row["archived_at"], "archived_at")
-    if generated_at > maximum or archived_at > maximum:
+    if generated_at > maximum or archived_at > maximum or generated_at > archived_at + _MAX_CLOCK_SKEW:
         raise ValueError("invalid archive time")
     snapshot_maximum = generated_at + _MAX_CLOCK_SKEW
     status_times = [
@@ -524,13 +751,33 @@ def _validate_temporal_row(row: dict[str, Any], now: datetime) -> None:
         raise ValueError("invalid archive status history")
     previous_status: str | None = None
     for index, transition in enumerate(history):
-        if transition["from_status"] != previous_status:
+        reason = transition["reason"]
+        if not reason.strip():
+            raise ValueError("invalid archive status reason")
+        if transition["from_status"] is None:
+            previous_status = transition["to_status"]
+            continue
+        if previous_status is None or transition["from_status"] != previous_status:
             raise ValueError("invalid archive status history continuity")
         if index > 0 and transition["from_status"] == transition["to_status"]:
             raise ValueError("invalid archive status history transition")
         previous_status = transition["to_status"]
     if previous_status != row["verification_status"]:
         raise ValueError("invalid archive status history final status")
+    if not row["verification_reason"].strip() or row["verification_reason"] != history[-1]["reason"]:
+        raise ValueError("invalid archive final status reason")
+    verified_at = _metadata_time(row["verified_at"], "verified_at")
+    evidence_as_of = _metadata_time(row["evidence_as_of"], "evidence_as_of")
+    if any(value > verified_at for value in status_times) or evidence_as_of > verified_at:
+        raise ValueError("invalid archive verification time")
+    if row["published_at"] is not None and _metadata_time(row["published_at"], "published_at") > verified_at:
+        raise ValueError("invalid archive publication time")
+    for collection_name in _EVIDENCE_COLLECTION_KEYS:
+        for item in row[collection_name]:
+            if item["published_at"] is not None and _metadata_time(
+                item["published_at"], "evidence published_at"
+            ) > evidence_as_of:
+                raise ValueError("invalid archive evidence time")
     for value in _row_times(row):
         if value > maximum or value > snapshot_maximum:
             raise ValueError("invalid archive time")
@@ -546,11 +793,13 @@ def _validate_temporal_row(row: dict[str, Any], now: datetime) -> None:
 
 
 def _archive_document(snapshot: EvidenceSnapshot, row: dict[str, Any], archived_at: datetime) -> dict[str, Any]:
-    lineage = _lineage_document(snapshot)
     archived_event = _sanitize_archive_urls(row)
     archived_event["title"] = archived_event["title"][:500]
     archived_event["summary"] = archived_event["summary"][:1_200]
     archived_event["core_claim"] = archived_event["core_claim"][:1_200]
+    _validate_evidence_references(archived_event)
+    content_digest = _event_content_digest(archived_event)
+    lineage = _lineage_document(snapshot, content_digest)
     document = {
         "schema_version": _ARCHIVE_SCHEMA_VERSION,
         **archived_event,
@@ -560,6 +809,7 @@ def _archive_document(snapshot: EvidenceSnapshot, row: dict[str, Any], archived_
         "archived_at": _timestamp(archived_at, "archived_at"),
         "last_updated_at": lineage["generated_at"],
         "snapshot_history": [lineage],
+        "content_digest": content_digest,
     }
     _exact_builtin(document)
     return document
@@ -573,6 +823,10 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     canonical_event = event_document(event)
     if canonical_event != {key: value[key] for key in _EVENT_KEYS}:
         raise ValueError("archive event is not canonical")
+    content_digest = _bounded_text(value["content_digest"], "archive content_digest", maximum=64)
+    if _CONTENT_DIGEST.fullmatch(content_digest) is None or _event_content_digest(canonical_event) != content_digest:
+        raise ValueError("archive content digest mismatch")
+    _validate_evidence_references(canonical_event)
     event_id = _bounded_text(value["event_id"], "event_id")
     evidence_snapshot_id = _bounded_text(value["evidence_snapshot_id"], "evidence_snapshot_id")
     raw_snapshot_id = _bounded_text(value["raw_snapshot_id"], "raw_snapshot_id")
@@ -583,10 +837,12 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     if type(history) is not list or not history:
         raise ValueError("invalid archive snapshot history")
     parsed_history = [_lineage_from_document(item) for item in history]
-    identities = {
-        (item["evidence_snapshot_id"], item["raw_snapshot_id"], item["generated_at"])
-        for item in parsed_history
-    }
+    identities: dict[tuple[str, str, str], str] = {}
+    for item in parsed_history:
+        identity = (item["evidence_snapshot_id"], item["raw_snapshot_id"], item["generated_at"])
+        previous_digest = identities.setdefault(identity, item["content_digest"])
+        if previous_digest != item["content_digest"]:
+            raise ValueError("archive lineage content mismatch")
     if len(identities) != len(parsed_history):
         raise ValueError("duplicate archive lineage")
     if parsed_history != sorted(parsed_history, key=_lineage_order):
@@ -607,6 +863,7 @@ def _archive_from_document(value: object) -> dict[str, Any]:
         "archived_at": archived_at.isoformat(),
         "last_updated_at": last_updated_at.isoformat(),
         "snapshot_history": parsed_history,
+        "content_digest": content_digest,
     }
     for collection_name in _EVIDENCE_COLLECTION_KEYS:
         for item in result[collection_name]:
@@ -615,11 +872,12 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     return result
 
 
-def _lineage_order(row: dict[str, str]) -> tuple[datetime, str, str]:
+def _lineage_order(row: dict[str, str]) -> tuple[datetime, str, str, str]:
     return (
         _parse_datetime(row["generated_at"]),
         row["evidence_snapshot_id"],
         row["raw_snapshot_id"],
+        row["content_digest"],
     )
 
 
@@ -662,26 +920,47 @@ def _merge_by_key(
 def _merge_evidence(
     loser: list[dict[str, Any]],
     winner: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any] | None] = []
-    positions: dict[tuple[str, str], int] = {}
-    for item in (*loser, *winner):
-        identities = {("id", item["evidence_id"])}
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    items = [*loser, *winner]
+    parents = list(range(len(items)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+
+    owners: dict[tuple[str, str], int] = {}
+    for index, item in enumerate(items):
+        identities = [("id", item["evidence_id"])]
         if item["canonical_url"]:
-            identities.add(("url", item["canonical_url"]))
-        matched = {positions[identity] for identity in identities if identity in positions}
-        if len(matched) > 1:
-            raise ValueError("ambiguous archive evidence identity")
-        if matched:
-            position = next(iter(matched))
-            merged[position] = item
-        else:
-            position = len(merged)
-            merged.append(item)
+            identities.append(("url", item["canonical_url"]))
         for identity in identities:
-            positions[identity] = position
-    result = [item for item in merged if item is not None]
-    return sorted(result, key=lambda item: (item["evidence_id"], item["canonical_url"]))
+            previous = owners.get(identity)
+            if previous is not None:
+                union(index, previous)
+            else:
+                owners[identity] = index
+
+    groups: dict[int, list[int]] = {}
+    for index in range(len(items)):
+        groups.setdefault(find(index), []).append(index)
+    aliases: dict[str, str] = {}
+    result: list[dict[str, Any]] = []
+    for indices in groups.values():
+        canonical_id = min(items[index]["evidence_id"] for index in indices)
+        selected = dict(items[max(indices)])
+        selected["evidence_id"] = canonical_id
+        result.append(selected)
+        for index in indices:
+            aliases[items[index]["evidence_id"]] = canonical_id
+    return sorted(result, key=lambda item: (item["evidence_id"], item["canonical_url"])), aliases
 
 
 def _transition_identity(row: dict[str, Any]) -> tuple[object, ...]:
@@ -698,6 +977,9 @@ def _status_history_is_continuous(history: list[dict[str, Any]], final_status: s
         return False
     previous: str | None = None
     for index, transition in enumerate(history):
+        if transition["from_status"] is None:
+            previous = transition["to_status"]
+            continue
         if transition["from_status"] != previous:
             return False
         if index > 0 and transition["from_status"] == transition["to_status"]:
@@ -749,14 +1031,17 @@ def _merge_archive_rows(
 
     histories = list(previous["snapshot_history"])
     seen_lineages = {
-        (row["evidence_snapshot_id"], row["raw_snapshot_id"], row["generated_at"])
+        (row["evidence_snapshot_id"], row["raw_snapshot_id"], row["generated_at"]): row["content_digest"]
         for row in histories
     }
     for row in incoming["snapshot_history"]:
         identity = (row["evidence_snapshot_id"], row["raw_snapshot_id"], row["generated_at"])
-        if identity not in seen_lineages:
+        previous_digest = seen_lineages.get(identity)
+        if previous_digest is not None and previous_digest != row["content_digest"]:
+            raise ValueError("archive lineage content mismatch")
+        if previous_digest is None:
             histories.append(row)
-            seen_lineages.add(identity)
+            seen_lineages[identity] = row["content_digest"]
     histories.sort(key=_lineage_order)
     if lineage_cutoff is not None:
         histories = [
@@ -783,11 +1068,30 @@ def _merge_archive_rows(
         list(current["key_fields"]),
         key=lambda row: (row["field_name"], row["verification_status"]),
     )
+    aliases: dict[str, str] = {}
     for key in ("primary_evidence", "independent_evidence", "syndicated_copies", "contradicting_evidence"):
-        merged[key] = _merge_evidence(
+        merged[key], collection_aliases = _merge_evidence(
             list(other[key]),
             list(current[key]),
         )
+        for old_id, retained_id in collection_aliases.items():
+            previous_alias = aliases.setdefault(old_id, retained_id)
+            if previous_alias != retained_id:
+                raise ValueError("ambiguous archive evidence identity")
+    available_evidence = {
+        item["evidence_id"]
+        for key in _EVIDENCE_COLLECTION_KEYS
+        for item in merged[key]
+    }
+    remapped_fields: list[dict[str, Any]] = []
+    for field in merged["key_fields"]:
+        updated = dict(field)
+        references = [aliases.get(evidence_id, evidence_id) for evidence_id in field["evidence_ids"]]
+        updated["evidence_ids"] = sorted(set(references))
+        if any(evidence_id not in available_evidence for evidence_id in updated["evidence_ids"]):
+            raise ValueError("invalid archive key-field evidence reference")
+        remapped_fields.append(updated)
+    merged["key_fields"] = remapped_fields
     merged["status_history"] = _merge_status_history(
         list(other["status_history"]),
         list(current["status_history"]),
@@ -799,6 +1103,7 @@ def _merge_archive_rows(
     merged["snapshot_generated_at"] = current["snapshot_generated_at"]
     merged["last_updated_at"] = current["snapshot_generated_at"]
     merged["archived_at"] = min(previous["archived_at"], incoming["archived_at"])
+    merged["content_digest"] = _event_content_digest(merged)
     return _archive_from_document(merged)
 
 
@@ -1008,6 +1313,65 @@ class EvidenceArchive:
             except OSError:
                 pass
 
+    def _open_existing_lock(self) -> io.FileIO | None:
+        before = self._safe_file(self.lock_path)
+        if before is None:
+            if self._entry_present(self.lock_path):
+                raise OSError("storage_error")
+            return None
+        self._verify_parent(self.lock_path)
+        descriptor: int | None = None
+        identity: tuple[int, int] | None = None
+        try:
+            flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.lock_path, flags)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                identity != (before.st_dev, before.st_ino)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+            ):
+                raise OSError("storage_error")
+            handle = io.FileIO(descriptor, mode="r+", closefd=True)
+            descriptor = None
+            return handle
+        except OSError:
+            if descriptor is not None:
+                if identity is None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    _close_owned_descriptor(descriptor, identity)
+            raise OSError("storage_error") from None
+
+    @contextmanager
+    def _reader_process_lock(self) -> Iterator[bool]:
+        if not _safe_directory(self.root) or not _safe_directory(self.archive_root):
+            yield False
+            return
+        handle = self._open_existing_lock()
+        if handle is None:
+            yield False
+            return
+        acquired = False
+        try:
+            deadline = time.monotonic() + self._lock_timeout
+            while not (acquired := self._try_lock(handle)):
+                if time.monotonic() >= deadline:
+                    raise OSError("storage_lock_unavailable")
+                time.sleep(0.01)
+            yield True
+        finally:
+            if acquired:
+                self._unlock(handle)
+            try:
+                handle.close()
+            except OSError:
+                pass
+
     def _safe_file(self, path: Path) -> os.stat_result | None:
         try:
             metadata = path.stat(follow_symlinks=False)
@@ -1151,6 +1515,9 @@ class EvidenceArchive:
         if not _valid_bucket_name(name) or len(rows) > _MAX_BUCKET_ROWS:
             raise ValueError("invalid archive bucket")
         canonical = sorted(rows, key=lambda row: row["event_id"])
+        event_ids = [row["event_id"] for row in canonical]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("archive bucket contains duplicate event identities")
         payload_parts: list[bytes] = []
         for row in canonical:
             validated = _archive_from_document(row)
@@ -1243,6 +1610,11 @@ class EvidenceArchive:
                 self._increment(diagnostics, "skipped_corrupt_rows")
                 continue
             rows.append(parsed)
+        event_ids = [row["event_id"] for row in rows]
+        if event_ids != sorted(event_ids) or len(event_ids) != len(set(event_ids)):
+            self._increment(diagnostics, "skipped_files")
+            self._last_diagnostics = diagnostics
+            raise OSError("storage_corrupt")
         return rows
 
     def _bucket_names(self) -> list[str]:
@@ -1324,6 +1696,11 @@ class EvidenceArchive:
         try:
             self._increment(diagnostics, "scanned_files")
             budget["bytes"] -= len(raw)
+            _preflight_json_payload(
+                raw,
+                maximum_depth=16,
+                maximum_tokens=_MAX_SNAPSHOT_NODES * 4 + 16,
+            )
             document = self._parse_json(raw)
             if type(document) is not dict or set(document) != _JOURNAL_KEYS:
                 raise ValueError("invalid archive journal")
@@ -1387,6 +1764,7 @@ class EvidenceArchive:
         return result
 
     def upsert(self, snapshot: EvidenceSnapshot) -> None:
+        _preflight_snapshot_input(snapshot)
         document = validated_snapshot_document(snapshot)
         archived_at = _utc(self._now(), "archive clock")
         incoming = [
@@ -1502,7 +1880,9 @@ class EvidenceArchive:
         diagnostics = self._diagnostics()
         budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
         selected: dict[str, dict[str, Any]] = {}
-        for row in self._read_journal(now, diagnostics, budget=budget):
+        journal_rows = self._read_journal(now, diagnostics, budget=budget)
+        journal_ids = {row["event_id"] for row in journal_rows}
+        for row in journal_rows:
             effective = _event_time(row)
             if effective < cutoff or effective > now:
                 continue
@@ -1512,9 +1892,18 @@ class EvidenceArchive:
         cursor = start_date
         while cursor <= current_date:
             name = f"{cursor.isoformat()}.jsonl"
-            for row in self._read_bucket(name, diagnostics, budget=budget, validation_now=now):
+            for row in self._read_bucket(
+                name,
+                diagnostics,
+                budget=budget,
+                fail_on_budget=True,
+                validation_now=now,
+            ):
                 effective = _event_time(row)
                 if effective < cutoff or effective > now:
+                    continue
+                if row["event_id"] in journal_ids:
+                    self._increment(diagnostics, "duplicate_rows")
                     continue
                 existing = selected.get(row["event_id"])
                 if existing is None:
@@ -1530,20 +1919,48 @@ class EvidenceArchive:
             reverse=True,
         )
 
+    def _query_without_lock(self, days: int, status: str | None) -> list[dict[str, Any]]:
+        del status
+        diagnostics = self._diagnostics()
+        if not _safe_directory(self.root) or not _safe_directory(self.archive_root):
+            self._last_diagnostics = diagnostics
+            return []
+        for authority in (self.journal_path, self.index_path):
+            if self._safe_file(authority) is not None or self._entry_present(authority):
+                self._last_diagnostics = diagnostics
+                raise OSError("storage_corrupt")
+        now = _utc(self._now(), "archive clock")
+        cursor = (now - timedelta(days=days)).date()
+        while cursor <= now.date():
+            path = self.archive_root / f"{cursor.isoformat()}.jsonl"
+            if self._safe_file(path) is not None:
+                self._last_diagnostics = diagnostics
+                raise OSError("storage_corrupt")
+            if self._entry_present(path):
+                self._increment(diagnostics, "skipped_files")
+            cursor += timedelta(days=1)
+        self._last_diagnostics = diagnostics
+        return []
+
     def query(self, days: int, status: str | None = None) -> list[dict[str, Any]]:
         if type(days) is not int or days not in _ALLOWED_DAYS:
             raise ValueError("days must be one of 1, 3, 7, 30, 90")
         if status is not None and (type(status) is not str or status not in _KNOWN_STATUSES):
             raise ValueError("invalid verification status")
         with CACHE_IO_LOCK:
-            return self._query_unlocked(days, status)
+            with self._reader_process_lock() as locked:
+                return self._query_unlocked(days, status) if locked else self._query_without_lock(days, status)
 
     def get(self, event_id: str) -> dict[str, Any] | None:
         if type(event_id) is not str or not event_id or len(event_id) > 128:
             return None
         with CACHE_IO_LOCK:
-            return next((row for row in self._query_unlocked(90, None) if row["event_id"] == event_id), None)
+            with self._reader_process_lock() as locked:
+                rows = self._query_unlocked(90, None) if locked else self._query_without_lock(90, None)
+                return next((row for row in rows if row["event_id"] == event_id), None)
 
     def count(self) -> int:
         with CACHE_IO_LOCK:
-            return len(self._query_unlocked(90, None))
+            with self._reader_process_lock() as locked:
+                rows = self._query_unlocked(90, None) if locked else self._query_without_lock(90, None)
+                return len(rows)

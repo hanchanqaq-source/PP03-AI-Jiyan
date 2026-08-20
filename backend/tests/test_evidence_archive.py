@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -71,7 +72,7 @@ def event(
         published_at=published_at,
         core_claim="星河科技建设算力中心",
         verification_status=status,
-        verification_reason=f"reason-{status.value}",
+        verification_reason=history[-1].reason,
         verified_at=NOW,
         evidence_as_of=NOW,
         key_fields=key_fields,
@@ -97,6 +98,13 @@ def snapshot(
 
 def _upsert_in_child(root: str, event_id: str) -> None:
     EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(event(event_id)))
+
+
+def _hold_archive_lock(root: str, ready, seconds: float) -> None:
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    with archive._process_lock():
+        ready.set()
+        time.sleep(seconds)
 
 
 def test_archive_deduplicates_by_event_id_and_preserves_disproof_history_and_lineage(tmp_path):
@@ -126,7 +134,10 @@ def test_archive_deduplicates_by_event_id_and_preserves_disproof_history_and_lin
     assert [row["to_status"] for row in rows[0]["status_history"]] == ["verified", "disproved"]
     assert rows[0]["evidence_snapshot_id"] == "3" * 20
     assert rows[0]["raw_snapshot_id"] == "4" * 20
-    assert rows[0]["snapshot_history"] == [
+    assert [
+        {key: value for key, value in lineage.items() if key != "content_digest"}
+        for lineage in rows[0]["snapshot_history"]
+    ] == [
         {
             "evidence_snapshot_id": "1" * 20,
             "raw_snapshot_id": "2" * 20,
@@ -138,6 +149,11 @@ def test_archive_deduplicates_by_event_id_and_preserves_disproof_history_and_lin
             "generated_at": NOW.isoformat(),
         },
     ]
+    assert all(
+        len(lineage["content_digest"]) == 64
+        and set(lineage["content_digest"]) <= set("0123456789abcdef")
+        for lineage in rows[0]["snapshot_history"]
+    )
 
 
 def test_archive_does_not_store_full_article_body(tmp_path):
@@ -249,9 +265,8 @@ def test_archive_query_stops_before_reading_past_the_global_scan_budget(tmp_path
     archive.upsert(snapshot(event()))
     monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", 32)
 
-    assert archive.query(days=90) == []
-    assert archive.last_diagnostics["skipped_files"] == 1
-    assert archive.last_diagnostics["scanned_rows"] == 0
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
 
 
 def test_archive_get_count_and_ninety_day_boundary_are_truthful(tmp_path):
@@ -543,16 +558,17 @@ def test_archive_preflights_index_capacity_before_any_bucket_mutation(tmp_path, 
     assert archive.get("2" * 20) is None
 
 
-def test_archive_index_supports_one_identity_per_source_day_for_ninety_days(tmp_path):
+def test_archive_index_supports_six_events_per_source_day_for_ninety_days(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     expected = {
         f"{number:020d}": f"{(NOW - timedelta(days=number % 90)).date().isoformat()}.jsonl"
-        for number in range(108 * 90)
+        for number in range(108 * 6 * 90)
     }
 
     archive._write_index(expected)
 
     assert archive._read_index() == expected
+    assert len(archive._index_payload(expected)) <= archive_module._MAX_INDEX_BYTES
 
 
 def test_archive_index_prunes_out_of_window_identities_before_capacity_check(tmp_path, monkeypatch):
@@ -651,6 +667,7 @@ def test_archive_preserves_more_than_256_lineages_within_the_window(tmp_path):
             "evidence_snapshot_id": f"{number:020x}",
             "raw_snapshot_id": f"{number + 1000:020x}",
             "generated_at": (initial_time + timedelta(minutes=number)).isoformat(),
+            "content_digest": f"{number:064x}",
         }
         for number in range(256)
     ]
@@ -749,8 +766,8 @@ def test_archive_scan_budget_uses_bytes_read_from_the_same_nofollow_descriptor(t
     monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", original_size + 1)
     monkeypatch.setattr(os, "open", racing_open)
 
-    assert archive.query(days=90) == []
-    assert archive.last_diagnostics["skipped_files"] == 1
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
 
 
 def test_archive_read_only_queries_do_not_create_storage_or_lock_files(tmp_path):
@@ -821,6 +838,7 @@ def test_archive_rejects_event_times_that_are_not_causal_to_snapshot_before_stor
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     selected = replace(
         event(primary_evidence=(evidence_item("future-of-snapshot"),)),
+        verification_reason="late",
         status_history=(StatusTransition(None, VerificationStatus.VERIFIED, NOW, "late"),),
     )
 
@@ -1019,14 +1037,35 @@ def test_archive_reads_authoritative_journal_first_with_shared_scan_budget_and_d
     )
     payload = archive._journal_payload([journal_row])
     archive.journal_path.write_bytes(payload)
-    monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", len(payload))
+    bucket_size = (archive.archive_root / "2026-08-20.jsonl").stat().st_size
+    monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", len(payload) + bucket_size)
 
     rows = archive.query(days=90)
 
     assert [row["verification_status"] for row in rows] == ["disproved"]
-    assert archive.last_diagnostics["scanned_files"] == 1
-    assert archive.last_diagnostics["scanned_rows"] == 1
-    assert archive.last_diagnostics["skipped_files"] == 1
+    assert archive.last_diagnostics["scanned_files"] == 2
+    assert archive.last_diagnostics["scanned_rows"] == 2
+    assert archive.last_diagnostics["skipped_files"] == 0
+    assert archive.last_diagnostics["duplicate_rows"] == 1
+
+
+def test_archive_authoritative_journal_suppresses_stale_bucket_row_outside_query_window(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(_timed_event("a" * 20, NOW)))
+    journal_snapshot = snapshot(
+        _timed_event("a" * 20, NOW - timedelta(days=91)),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    )
+    journal_row = archive_module._archive_document(
+        journal_snapshot,
+        archive_module.event_document(journal_snapshot.events[0]),
+        NOW,
+    )
+    archive.journal_path.write_bytes(archive._journal_payload([journal_row]))
+
+    assert archive.query(days=90) == []
+    assert archive.last_diagnostics["duplicate_rows"] == 1
 
 
 def test_archive_snapshot_budget_short_circuits_before_serializing_whole_rows(tmp_path, monkeypatch):
@@ -1086,5 +1125,296 @@ def test_archive_same_descriptor_read_detects_size_or_timestamp_change(tmp_path,
 
     monkeypatch.setattr(os, "fstat", racing_fstat)
 
-    assert archive.query(days=90) == []
-    assert archive.last_diagnostics["skipped_files"] == 1
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_reader_waits_for_the_cross_process_archive_transaction_lock(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(target=_hold_archive_lock, args=(str(tmp_path), ready, 0.5))
+    process.start()
+    assert ready.wait(10)
+
+    started = time.monotonic()
+    rows = archive.query(days=90)
+    elapsed = time.monotonic() - started
+    process.join(10)
+
+    assert process.exitcode == 0
+    assert [row["event_id"] for row in rows] == ["a" * 20]
+    assert elapsed >= 0.3
+
+
+def test_archive_scan_budget_fails_closed_instead_of_omitting_unrelated_bucket_rows(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    second_snapshot = snapshot(
+        event("b" * 20),
+        snapshot_id="2" * 20,
+        raw_snapshot_id="3" * 20,
+    )
+    journal_row = archive_module._archive_document(
+        second_snapshot,
+        archive_module.event_document(second_snapshot.events[0]),
+        NOW,
+    )
+    journal = archive._journal_payload([journal_row])
+    archive.journal_path.write_bytes(journal)
+    required = len(journal) + len(bucket.read_bytes())
+
+    monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", required - 1)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", required)
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+
+
+def test_archive_public_url_keeps_reserved_and_repeated_path_semantics_distinct():
+    values = (
+        "https://official.example.com/a%2fb",
+        "https://official.example.com/a/b",
+        "https://official.example.com/a//b",
+    )
+
+    canonical = [archive_module._archive_public_url(value) for value in values]
+
+    assert canonical == [
+        "https://official.example.com/a%2Fb",
+        "https://official.example.com/a/b",
+        "https://official.example.com/a//b",
+    ]
+    assert len(set(canonical)) == 3
+    assert [archive_module._archive_public_url(value) for value in canonical] == canonical
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "https://[2606:4700:4700::1111%25eth0]/proof",
+        "https://[::192.0.2.1]/proof",
+    ),
+)
+def test_archive_rejects_scoped_or_deprecated_embedded_ipv4_hosts(tmp_path, unsafe_url):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="URL"):
+        archive.upsert(snapshot(event(primary_evidence=(evidence_item("unsafe", canonical_url=unsafe_url),))))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_evidence_dedupe_remaps_key_field_references_to_retained_ids(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    shared_url = "https://official.example.com/shared-proof"
+    archive.upsert(snapshot(event(
+        primary_evidence=(evidence_item("old-proof", canonical_url=shared_url),),
+        key_fields=(KeyField(
+            "amount",
+            "old",
+            "old",
+            FieldVerificationStatus.VERIFIED,
+            ("old-proof",),
+            "official",
+        ),),
+    )))
+    archive.upsert(snapshot(
+        event(primary_evidence=(evidence_item("new-proof", canonical_url=shared_url),)),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+    ))
+
+    row = archive.get("a" * 20)
+    retained_ids = {
+        item["evidence_id"]
+        for collection in archive_module._EVIDENCE_COLLECTION_KEYS
+        for item in row[collection]
+    }
+    referenced_ids = {
+        evidence_id
+        for field in row["key_fields"]
+        for evidence_id in field["evidence_ids"]
+    }
+    assert referenced_ids
+    assert referenced_ids <= retained_ids
+
+
+def test_archive_rejects_key_field_references_without_retained_evidence(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    selected = event(key_fields=(KeyField(
+        "amount",
+        "12",
+        "12",
+        FieldVerificationStatus.VERIFIED,
+        ("missing-proof",),
+        "official",
+    ),))
+
+    with pytest.raises(ValueError, match="evidence"):
+        archive.upsert(snapshot(selected))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_rejects_different_content_for_an_existing_lineage_identity(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    first = snapshot(event(title="immutable title"))
+    conflicting = snapshot(event(title="different title"))
+    archive.upsert(first)
+
+    with pytest.raises(ValueError, match="lineage"):
+        archive.upsert(conflicting)
+
+    assert archive.get("a" * 20)["title"] == "immutable title"
+
+
+@pytest.mark.parametrize(
+    "selected",
+    (
+        replace(event(), verification_reason="does not match final transition"),
+        replace(
+            event(),
+            verified_at=NOW - timedelta(minutes=2),
+            status_history=(StatusTransition(
+                None,
+                VerificationStatus.VERIFIED,
+                NOW - timedelta(minutes=1),
+                "reason-verified",
+            ),),
+        ),
+        replace(
+            event(primary_evidence=(evidence_item("later-proof"),)),
+            evidence_as_of=NOW - timedelta(minutes=1),
+        ),
+        replace(
+            event(),
+            verification_reason="",
+            status_history=(StatusTransition(None, VerificationStatus.VERIFIED, NOW, ""),),
+        ),
+    ),
+)
+def test_archive_rejects_noncausal_status_reason_and_evidence_times(tmp_path, selected):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="archive"):
+        archive.upsert(snapshot(selected))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_accepts_reappearance_as_a_new_rooted_status_chain_and_replays_stably(tmp_path):
+    first_time = NOW - timedelta(days=2)
+    omitted_time = NOW - timedelta(days=1)
+    first = snapshot(
+        _timed_event("r" * 20, first_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=first_time,
+    )
+    omitted = EvidenceSnapshot(
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+        generated_at=omitted_time,
+        events=(),
+    )
+    reappeared_event = replace(
+        _timed_event("r" * 20, NOW, status=VerificationStatus.DISPROVED),
+        verification_reason="new official denial",
+        status_history=(StatusTransition(
+            None,
+            VerificationStatus.DISPROVED,
+            NOW,
+            "new official denial",
+        ),),
+    )
+    reappeared = snapshot(
+        reappeared_event,
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+    )
+    forward = EvidenceArchive(tmp_path / "forward", now=lambda: NOW)
+    replay = EvidenceArchive(tmp_path / "replay", now=lambda: NOW)
+
+    for selected in (first, omitted, reappeared, first):
+        forward.upsert(selected)
+    for selected in (reappeared, omitted, first, reappeared):
+        replay.upsert(selected)
+
+    forward_row = forward.get("r" * 20)
+    replay_row = replay.get("r" * 20)
+    assert forward_row == replay_row
+    assert forward_row["verification_status"] == "disproved"
+    assert [row["from_status"] for row in forward_row["status_history"]] == [None, None]
+    assert [row["to_status"] for row in forward_row["status_history"]] == ["verified", "disproved"]
+
+
+def test_archive_journal_rejects_excessive_structure_before_json_materialization(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    archive.journal_path.write_bytes(
+        b'{"schema_version":1,"rows":' + (b"[" * 20) + (b"]" * 20) + b"}\n"
+    )
+    parsed = False
+
+    def forbidden_parse(_raw):
+        nonlocal parsed
+        parsed = True
+        raise AssertionError("journal reached json.loads before structural preflight")
+
+    monkeypatch.setattr(archive, "_parse_json", forbidden_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+    assert parsed is False
+
+
+def test_archive_rejects_in_memory_resource_exhaustion_before_snapshot_document_copy(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    selected = snapshot(event(primary_evidence=(evidence_item("proof"),)))
+    materialized = False
+
+    def forbidden_materialization(_snapshot):
+        nonlocal materialized
+        materialized = True
+        raise AssertionError("validated_snapshot_document called before resource preflight")
+
+    monkeypatch.setattr(archive_module, "_MAX_SNAPSHOT_RESOURCES", 1)
+    monkeypatch.setattr(archive_module, "validated_snapshot_document", forbidden_materialization)
+
+    with pytest.raises(ValueError, match="snapshot"):
+        archive.upsert(selected)
+    assert materialized is False
+    assert not archive.archive_root.exists()
+
+
+@pytest.mark.parametrize("duplicate", (False, True))
+def test_archive_bucket_requires_exact_sorted_unique_event_ids(tmp_path, duplicate):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    second_snapshot = snapshot(
+        event("b" * 20),
+        snapshot_id="2" * 20,
+        raw_snapshot_id="3" * 20,
+    )
+    second = archive_module._archive_document(
+        second_snapshot,
+        archive_module.event_document(second_snapshot.events[0]),
+        NOW,
+    )
+    first = archive.get("a" * 20)
+    rows = [first, first] if duplicate else [second, first]
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    bucket.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
