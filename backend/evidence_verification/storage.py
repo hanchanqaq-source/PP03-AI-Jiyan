@@ -786,22 +786,46 @@ class EvidenceStorage:
         ):
             raise OSError("storage_error")
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags | (os.O_EXCL if before is None else 0), 0o600)
-        opened = os.fstat(descriptor)
-        identity = (opened.st_dev, opened.st_ino)
-        if before is not None and identity != (before.st_dev, before.st_ino):
-            _close_owned_descriptor(descriptor, identity)
-            raise OSError("storage_error")
+        descriptor: int | None = None
+        identity: tuple[int, int] | None = None
         try:
-            handle = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
+            descriptor = os.open(path, flags | (os.O_EXCL if before is None else 0), 0o600)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if before is not None and identity != (before.st_dev, before.st_ino):
+                raise OSError("storage_error")
+            try:
+                handle = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
+            except BaseException:
+                _close_owned_descriptor(descriptor, identity)
+                descriptor = None
+                raise
+            descriptor = None
+            with handle:
+                for row in rows:
+                    handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            if descriptor is not None:
+                if identity is None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    _close_owned_descriptor(descriptor, identity)
+            raise OSError("storage_error") from None
         except BaseException:
-            _close_owned_descriptor(descriptor, identity)
+            if descriptor is not None:
+                if identity is None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    _close_owned_descriptor(descriptor, identity)
             raise
-        with handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
 
     def publish(self, snapshot: EvidenceSnapshot) -> None:
         document = validated_snapshot_document(snapshot)

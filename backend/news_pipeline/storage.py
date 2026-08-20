@@ -363,8 +363,6 @@ def _trusted_document(snapshot: TrustedSnapshot, events: list[dict[str, object]]
 
 
 def _validate_trusted_admission(events: list[dict[str, object]], evidence: EvidenceSnapshot) -> None:
-    if not events:
-        raise ValueError("trusted events require same-snapshot evidence")
     evidence_by_id: dict[str, object] = {}
     for event in evidence.events:
         if type(event.event_id) is not str or not event.event_id or event.event_id in evidence_by_id:
@@ -373,6 +371,11 @@ def _validate_trusted_admission(events: list[dict[str, object]], evidence: Evide
     seen: set[str] = set()
     approved_event_statuses = {VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED}
     approved_field_statuses = {FieldVerificationStatus.VERIFIED, FieldVerificationStatus.CORROBORATED}
+    eligible = {
+        event_id
+        for event_id, event in evidence_by_id.items()
+        if event.verification_status in approved_event_statuses
+    }
     for trusted in events:
         event_id = trusted["event_id"]
         if event_id in seen:
@@ -400,6 +403,8 @@ def _validate_trusted_admission(events: list[dict[str, object]], evidence: Evide
             if field_name in seen_fields or trusted_field not in approved_fields:
                 raise ValueError("trusted key field requires approved same-snapshot evidence")
             seen_fields.add(field_name)
+    if seen != eligible:
+        raise ValueError("trusted event IDs must equal eligible evidence set")
 
 
 class NewsPipelineStorage:
@@ -643,7 +648,6 @@ class NewsPipelineStorage:
     @staticmethod
     def _replace_final_commit(source: Path, destination: Path) -> None:
         """Make the pointer replacement the final propagated publication operation."""
-        NewsPipelineStorage._sync_dir(destination.parent)
         if os.name == "nt":
             import ctypes
 
@@ -654,6 +658,15 @@ class NewsPipelineStorage:
                 raise ctypes.WinError()
             return
         os.replace(source, destination)
+        try:
+            NewsPipelineStorage._sync_dir(destination.parent)
+        except OSError:
+            # The namespace already names the new pointer. Propagating a
+            # post-rename fsync error would let the caller report a failed run
+            # while readers observe the new current snapshot. Treat this as an
+            # ambiguous-but-committed durability result; a later write must not
+            # attempt to roll the pointer back.
+            pass
 
     @staticmethod
     def _close_owned_descriptor(descriptor: int, identity: tuple[int, int]) -> None:
@@ -926,6 +939,14 @@ class NewsPipelineStorage:
         self._closed = True
         if writer is not None:
             if writer.creator_pid != os.getpid():
+                # A forked child owns only its inherited descriptor reference.
+                # LOCK_UN would release the parent's open-file-description
+                # lock, while returning without close would keep the parent
+                # lock alive after the parent closes its own reference.
+                try:
+                    writer.lock_handle.close()
+                except OSError:
+                    pass
                 return
             self._unlock(writer.lock_handle)
             try:
@@ -1013,13 +1034,13 @@ class NewsPipelineStorage:
             raise ValueError("published_at must be aware UTC")
         events = _validate_trusted_events(_bounded(list(snapshot.events)))
         with CACHE_IO_LOCK, self._process_lock():
-            self._require_writer()
             evidence = self._load_evidence(raw_id)
             if self._load_raw(raw_id) is None or evidence is None:
                 raise ValueError("raw and evidence artifacts must be durable before trusted publish")
             if evidence.recovery_metadata.get("legacy_identity") is True:
                 raise ValueError("legacy evidence must be deterministically reverified before trusted publish")
             _validate_trusted_admission(events, evidence)
+            self._require_writer()
             initial_document = _trusted_document(snapshot, events, 1)
             initial_intent = {
                 "raw_snapshot_id": raw_id,
@@ -1273,6 +1294,8 @@ class NewsPipelineStorage:
             raise ValueError("invalid pipeline run")
         if any(value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(None) for value in (run.created_at, run.updated_at)):
             raise ValueError("run timestamps must be aware UTC")
+        if run.updated_at < run.created_at:
+            raise ValueError("updated_at cannot precede created_at")
         if run.redacted_error is not None and type(run.redacted_error) is not str:
             raise ValueError("invalid redacted_error")
         return {"schema_version": 1, "run_id": _id(run.run_id, "run_id"), "raw_snapshot_id": _id(run.raw_snapshot_id, "raw_snapshot_id"), "evidence_snapshot_id": _optional_id(run.evidence_snapshot_id, "evidence_snapshot_id"), "trusted_snapshot_id": _optional_id(run.trusted_snapshot_id, "trusted_snapshot_id"), "phase": run.phase.value, "counts": asdict(_counts(asdict(run.counts))), "created_at": run.created_at.isoformat(), "updated_at": run.updated_at.isoformat(), "redacted_error": _safe_error(run.redacted_error) if run.redacted_error else None, "displayed_trusted_snapshot_id": _optional_id(run.displayed_trusted_snapshot_id, "displayed_trusted_snapshot_id")}
@@ -1322,6 +1345,15 @@ class NewsPipelineStorage:
                     raise ValueError("terminal run cannot be revived")
                 if run.raw_snapshot_id != current.raw_snapshot_id:
                     raise ValueError("immutable raw_snapshot_id")
+                if run.created_at != current.created_at:
+                    raise ValueError("created_at is immutable")
+                if run.updated_at < current.updated_at:
+                    raise ValueError("updated_at cannot decrease")
+                if any(
+                    getattr(run.counts, field) < getattr(current.counts, field)
+                    for field in PipelineCounts.__dataclass_fields__
+                ):
+                    raise ValueError("pipeline counts cannot decrease")
                 for field in ("evidence_snapshot_id", "trusted_snapshot_id", "displayed_trusted_snapshot_id"):
                     if getattr(current, field) is not None and getattr(current, field) != getattr(run, field):
                         raise ValueError(f"immutable {field}")
@@ -1359,7 +1391,12 @@ class NewsPipelineStorage:
                     continue
                 if run is None or run.phase not in _NONTERMINAL:
                     continue
-                recovered = replace(run, phase=PipelinePhase.INTERRUPTED, updated_at=now, redacted_error="pipeline_interrupted")
+                recovered = replace(
+                    run,
+                    phase=PipelinePhase.INTERRUPTED,
+                    updated_at=max(now, run.updated_at),
+                    redacted_error="pipeline_interrupted",
+                )
                 self._atomic_write(self._run_path(run.run_id), self._run_document(recovered))
                 interrupted += 1
         return interrupted

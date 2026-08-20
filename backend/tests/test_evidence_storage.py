@@ -575,3 +575,130 @@ def test_evidence_writer_fdopen_failure_never_closes_a_reused_descriptor(tmp_pat
     finally:
         if reused:
             os.close(reused[0])
+
+
+def test_transition_append_closes_descriptor_once_when_fstat_fails(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    snapshot = EvidenceSnapshot(
+        "snapshot",
+        NOW,
+        (evidence_event(status=VerificationStatus.UNVERIFIED, history_hours=(12,)),),
+    )
+    real_open, real_fstat, real_close = os.open, os.fstat, os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_owned_fstat(descriptor):
+        if descriptor in opened:
+            raise OSError("C:\\private\\history")
+        return real_fstat(descriptor)
+
+    def record_close(descriptor):
+        if descriptor in opened:
+            closed.append(descriptor)
+        return real_close(descriptor)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.open", record_open)
+        scoped.setattr("evidence_verification.storage.os.fstat", fail_owned_fstat)
+        scoped.setattr("evidence_verification.storage.os.close", record_close)
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage._append_transitions(snapshot, None)
+
+    assert opened and closed == [opened[0]]
+    with pytest.raises(OSError):
+        real_fstat(opened[0])
+
+
+def test_transition_append_fdopen_failure_does_not_close_reused_descriptor(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    snapshot = EvidenceSnapshot(
+        "snapshot",
+        NOW,
+        (evidence_event(status=VerificationStatus.UNVERIFIED, history_hours=(12,)),),
+    )
+    victim = tmp_path / "victim.txt"
+    victim.write_text("survive", encoding="utf-8")
+    reused: list[int] = []
+
+    def close_reuse_then_fail(descriptor: int, *_args, **_kwargs):
+        os.close(descriptor)
+        reused.append(os.open(victim, os.O_RDONLY))
+        assert reused[-1] == descriptor
+        raise OSError("D:\\private\\history-fdopen")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.fdopen", close_reuse_then_fail)
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage._append_transitions(snapshot, None)
+
+    try:
+        assert os.fstat(reused[0]).st_size == len("survive")
+    finally:
+        if reused:
+            os.close(reused[0])
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "fsync"])
+def test_transition_append_write_and_fsync_failures_close_once_and_redact(
+    failure_stage,
+    tmp_path,
+    monkeypatch,
+):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    snapshot = EvidenceSnapshot(
+        "snapshot",
+        NOW,
+        (evidence_event(status=VerificationStatus.UNVERIFIED, history_hours=(12,)),),
+    )
+    real_fdopen, real_fsync = os.fdopen, os.fsync
+    close_counts: list[int] = []
+    owned_descriptors: list[int] = []
+
+    class FailingHandle:
+        def __init__(self, descriptor, *args, **kwargs):
+            self.handle = real_fdopen(descriptor, *args, **kwargs)
+            owned_descriptors.append(descriptor)
+            self.close_count = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+        def write(self, value):
+            if failure_stage == "write":
+                raise OSError("C:\\private\\history-write")
+            return self.handle.write(value)
+
+        def flush(self):
+            return self.handle.flush()
+
+        def fileno(self):
+            return self.handle.fileno()
+
+        def close(self):
+            self.close_count += 1
+            close_counts.append(self.close_count)
+            self.handle.close()
+
+    def fail_owned_fsync(descriptor):
+        if failure_stage == "fsync" and descriptor in owned_descriptors:
+            raise OSError("D:\\private\\history-fsync")
+        return real_fsync(descriptor)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.fdopen", FailingHandle)
+        scoped.setattr("evidence_verification.storage.os.fsync", fail_owned_fsync)
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage._append_transitions(snapshot, None)
+
+    assert close_counts == [1]
+    with pytest.raises(OSError):
+        os.fstat(owned_descriptors[0])

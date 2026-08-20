@@ -896,6 +896,63 @@ def test_trusted_publish_rejects_empty_projection_before_any_publication_mutatio
     assert not storage.trusted_root.exists()
 
 
+def test_trusted_publish_accepts_empty_projection_only_when_evidence_has_no_eligible_events(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    raw_event = canonical_market_event()
+    storage.write_raw(RawSnapshot("raw-1", NOW, (raw_event,)))
+    source = evidence_snapshot("raw-1")
+    pending = replace(
+        source.events[0],
+        verification_status=VerificationStatus.UNVERIFIED,
+        verification_reason="证据不足",
+    )
+    storage.write_evidence(replace(source, events=(pending,)))
+    trusted = TrustedSnapshot("raw-1", NOW, ())
+
+    storage.publish_trusted(trusted)
+
+    assert storage.load_current_trusted() == trusted
+
+
+def test_trusted_event_ids_must_equal_the_complete_eligible_evidence_set(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    second = replace(
+        source.events[0],
+        event_id="b" * 20,
+        title="监管公告：远航公司披露整改进展",
+        summary="远航公司披露整改进展。",
+        verification_status=VerificationStatus.CORROBORATED,
+    )
+    storage.write_evidence(replace(source, events=(source.events[0], second)))
+
+    with pytest.raises(ValueError, match="eligible evidence"):
+        storage.publish_trusted(trusted_snapshot("raw-1"))
+
+    assert not storage._publication_intent_path.exists()
+    assert not storage.current_pointer_path.exists()
+
+
+def test_invalid_trusted_projection_does_not_claim_a_new_writer_generation(tmp_path):
+    writer = NewsPipelineStorage(tmp_path)
+    writer.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    second = replace(source.events[0], event_id="b" * 20)
+    writer.write_evidence(replace(source, events=(source.events[0], second)))
+    generation_path = tmp_path / ".news-pipeline-generation.json"
+    before = generation_path.read_bytes()
+    writer.close()
+    restarted = NewsPipelineStorage(tmp_path)
+
+    with pytest.raises(ValueError, match="eligible evidence"):
+        restarted.publish_trusted(trusted_snapshot("raw-1"))
+
+    assert generation_path.read_bytes() == before
+    assert not restarted._publication_intent_path.exists()
+    assert not restarted.current_pointer_path.exists()
+
+
 @pytest.mark.parametrize("evidence_status", [VerificationStatus.UNVERIFIED, VerificationStatus.CONFLICTING])
 def test_trusted_publish_binds_event_id_and_status_to_same_evidence_snapshot(tmp_path, evidence_status):
     storage = NewsPipelineStorage(tmp_path)
@@ -1103,29 +1160,48 @@ def test_trusted_publish_rejects_duplicate_verified_field_identity(tmp_path):
     assert not storage.current_pointer_path.exists()
 
 
-def test_pointer_directory_sync_failure_occurs_before_the_final_replace(tmp_path, monkeypatch):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
+def test_post_rename_pointer_directory_sync_failure_is_a_successful_final_commit(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    for raw_id in ("old", "new"):
+        storage.write_raw(raw_snapshot(raw_id))
+        storage.write_evidence(evidence_snapshot(raw_id))
+    storage.publish_trusted(trusted_snapshot("old"))
+    real_sync = storage._sync_dir
+    root_syncs = 0
+
+    def fail_only_after_pointer_replace(path):
+        nonlocal root_syncs
+        if path == storage.current_pointer_path.parent:
+            root_syncs += 1
+            if root_syncs == 3:
+                raise OSError("post-rename directory sync is ambiguous")
+        real_sync(path)
+
+    monkeypatch.setattr(NewsPipelineStorage, "_sync_dir", staticmethod(fail_only_after_pointer_replace))
+
+    storage.publish_trusted(trusted_snapshot("new"))
+
+    assert root_syncs == 3
+    assert storage.load_current_trusted() == trusted_snapshot("new")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX rename fault semantics")
+def test_final_pointer_rename_failure_preserves_the_previous_current_snapshot(tmp_path, monkeypatch):
     storage = NewsPipelineStorage(tmp_path)
     for raw_id in ("old", "new"):
         storage.write_raw(raw_snapshot(raw_id))
         storage.write_evidence(evidence_snapshot(raw_id))
     storage.publish_trusted(trusted_snapshot("old"))
     old_pointer = storage.current_pointer_path.read_bytes()
-    real_sync = storage._sync_dir
-    real_replace = storage._replace_final_commit
+    real_replace = os.replace
 
-    def fail_only_pointer_parent(path):
-        if path == storage.current_pointer_path.parent:
-            raise OSError("storage_error")
-        real_sync(path)
+    def fail_pointer_rename(source, destination):
+        if Path(destination) == storage.current_pointer_path:
+            raise OSError("rename failed")
+        real_replace(source, destination)
 
-    def final_replace_with_failed_precommit(source, destination):
-        monkeypatch.setattr(NewsPipelineStorage, "_sync_dir", staticmethod(fail_only_pointer_parent))
-        try:
-            real_replace(source, destination)
-        finally:
-            monkeypatch.setattr(NewsPipelineStorage, "_sync_dir", staticmethod(real_sync))
-
-    monkeypatch.setattr(storage, "_replace_final_commit", final_replace_with_failed_precommit)
+    monkeypatch.setattr("news_pipeline.storage.os.replace", fail_pointer_rename)
 
     with pytest.raises(OSError, match="storage_error"):
         storage.publish_trusted(trusted_snapshot("new"))
@@ -1235,6 +1311,121 @@ def test_forked_child_cannot_use_or_close_parent_writer_capability(tmp_path):
     assert os.waitstatus_to_exitcode(status) == 0
     storage.write_raw(raw_snapshot("parent-2"))
     assert storage.load_raw("parent-2") == raw_snapshot("parent-2")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_child_close_drops_only_its_inherited_handle(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("parent-1"))
+    child_ready_read, child_ready_write = os.pipe()
+    child_exit_read, child_exit_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(child_ready_read)
+            os.close(child_exit_write)
+            storage.close()
+            os.write(child_ready_write, b"1")
+            os.read(child_exit_read, 1)
+            os._exit(0)
+        except BaseException:
+            os._exit(3)
+
+    os.close(child_ready_write)
+    os.close(child_exit_read)
+    contender = NewsPipelineStorage(tmp_path)
+    try:
+        assert os.read(child_ready_read, 1) == b"1"
+        with pytest.raises(ValueError, match="writer is active"):
+            contender.write_raw(raw_snapshot("contender-before-parent-close"))
+
+        storage.close()
+        contender.write_raw(raw_snapshot("contender-after-parent-close"))
+        assert contender.load_raw("contender-after-parent-close") is not None
+    finally:
+        os.write(child_exit_write, b"1")
+        os.close(child_exit_write)
+        os.close(child_ready_read)
+        _, status = os.waitpid(child, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+
+
+@pytest.mark.parametrize("count_field", list(PipelineCounts.__dataclass_fields__))
+def test_run_audit_counts_never_decrease(count_field, tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    baseline_counts = PipelineCounts(**{
+        name: 2 for name in PipelineCounts.__dataclass_fields__
+    })
+    queued = replace(pipeline_run(phase=PipelinePhase.QUEUED), counts=baseline_counts)
+    storage.write_run(queued)
+    decreased = replace(
+        queued,
+        phase=PipelinePhase.FETCHING,
+        counts=replace(baseline_counts, **{count_field: 1}),
+        updated_at=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="counts cannot decrease"):
+        storage.write_run(decreased, expected_phase=PipelinePhase.QUEUED)
+
+    assert storage.load_run("run-1") == queued
+
+
+def test_run_audit_preserves_created_at_and_nondecreasing_updated_at(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    queued = replace(
+        pipeline_run(phase=PipelinePhase.QUEUED),
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    storage.write_run(queued)
+
+    with pytest.raises(ValueError, match="created_at is immutable"):
+        storage.write_run(
+            replace(
+                queued,
+                phase=PipelinePhase.FETCHING,
+                created_at=NOW + timedelta(seconds=2),
+                updated_at=NOW + timedelta(seconds=2),
+            ),
+            expected_phase=PipelinePhase.QUEUED,
+        )
+    with pytest.raises(ValueError, match="updated_at cannot decrease"):
+        storage.write_run(
+            replace(
+                queued,
+                phase=PipelinePhase.FETCHING,
+                updated_at=NOW,
+            ),
+            expected_phase=PipelinePhase.QUEUED,
+        )
+
+    assert storage.load_run("run-1") == queued
+
+
+def test_new_run_rejects_updated_at_before_created_at(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+
+    with pytest.raises(ValueError, match="updated_at cannot precede created_at"):
+        storage.write_run(replace(
+            pipeline_run(phase=PipelinePhase.QUEUED),
+            updated_at=NOW - timedelta(seconds=1),
+        ))
+
+
+def test_recovery_never_moves_updated_at_backwards_when_clock_is_earlier(tmp_path):
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    future = NOW + timedelta(seconds=10)
+    queued = replace(pipeline_run(phase=PipelinePhase.QUEUED), updated_at=future)
+    storage.write_run(queued)
+    storage.close()
+
+    restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    restarted.recover_incomplete_runs()
+
+    recovered = restarted.load_run("run-1")
+    assert recovered.phase is PipelinePhase.INTERRUPTED
+    assert recovered.created_at == queued.created_at
+    assert recovered.updated_at == future
 
 
 def test_abrupt_writer_exit_cleans_only_exact_owned_temp_residue(tmp_path):
