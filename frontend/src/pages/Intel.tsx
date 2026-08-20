@@ -1,13 +1,15 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
 import { TrendingUp, FileText, Newspaper, Rss, RefreshCw, Loader2, ExternalLink, AlertCircle, Sparkles, Lightbulb, Star } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
+import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
-import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
+import { api, ApiError, isAbortError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
 import { loadWatch } from "@/lib/watchlist";
 import { hasLlm, chatStream } from "@/lib/llm";
 import { cn } from "@/lib/utils";
@@ -26,18 +28,64 @@ function InvestmentNewsPanel() {
   const [err, setErr] = useState<string | null>(null);
   const [active, setActive] = useState("ai");
   const [refreshing, setRefreshing] = useState(false);
+  const [pipelineStatus, setPipelineStatus] = useState<NewsPipelineStatusData | null>(null);
+  const loadCycleRef = useRef(0);
+  const refreshCycleRef = useRef(0);
+  const refreshAbortRef = useRef<AbortController | null>(null);
   const [digests, setDigests] = useState<Record<string, Digest>>({});
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
 
   useEffect(() => {
-    api.radar().then(setData).catch((e) => setErr(e instanceof ApiError ? e.message : "加载失败"));
+    const cycle = ++loadCycleRef.current;
+    const controller = new AbortController();
+    api.radar(controller.signal).then((next) => {
+      if (cycle === loadCycleRef.current && !controller.signal.aborted) setData(next);
+    }).catch((e) => {
+      if (cycle === loadCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
+        setErr(e instanceof ApiError ? e.message : "加载失败");
+      }
+    });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => () => {
+    refreshCycleRef.current += 1;
+    refreshAbortRef.current?.abort();
   }, []);
 
   const refresh = async () => {
+    if (refreshing) return;
+    const cycle = ++refreshCycleRef.current;
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
     setRefreshing(true); setErr(null);
-    try { setData(await api.radarRefresh()); }
-    catch (e) { setErr(e instanceof ApiError ? e.message : "刷新失败"); }
-    finally { setRefreshing(false); }
+    setPipelineStatus(null);
+    try {
+      const terminal = await runNewsPipelineRefresh({
+        signal: controller.signal,
+        kickoff: (signal) => api.radarRefresh(signal),
+        onStatus: (next) => {
+          if (cycle === refreshCycleRef.current) setPipelineStatus(next);
+        },
+      });
+      if (!terminal || cycle !== refreshCycleRef.current || controller.signal.aborted) return;
+      if (terminal.phase !== "trusted_published") {
+        setErr(newsPipelineFailureMessage(terminal));
+        return;
+      }
+      const next = await api.radar(controller.signal);
+      if (cycle === refreshCycleRef.current && !controller.signal.aborted) setData(next);
+    } catch (e) {
+      if (cycle === refreshCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
+        setErr("资讯流水线状态连接失败；继续显示上一份可信快照。");
+      }
+    } finally {
+      if (cycle === refreshCycleRef.current) {
+        refreshAbortRef.current = null;
+        setRefreshing(false);
+      }
+    }
   };
 
   const industries: Industry[] = data?.industries || [];
@@ -102,6 +150,8 @@ function InvestmentNewsPanel() {
           <AlertCircle className="h-4 w-4 shrink-0" /> {err}
         </div>
       )}
+
+      <NewsPipelineStatus status={pipelineStatus} />
 
       {!hasData && !err ? (
         <div className="rounded-lg border border-dashed border-border/70 p-8 text-center text-sm text-muted-foreground/70">

@@ -1,8 +1,9 @@
-import { api } from "@/lib/api";
+import { api, isAbortError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
   MarketNewsQuery,
   NewsPipelinePhase,
+  NewsPipelineErrorCode,
   NewsPipelineStarted,
   NewsPipelineStatusData,
 } from "./types";
@@ -28,6 +29,25 @@ const TERMINAL_LABEL: Partial<Record<NewsPipelinePhase, string>> = {
   failed: "运行失败",
   interrupted: "运行中断",
 };
+
+const FAILURE_COPY: Record<NewsPipelineErrorCode, string> = {
+  collection_failed: "公开资讯抓取失败；继续显示上一份可信快照。",
+  verification_failed: "确定性核验失败；继续显示上一份可信快照。",
+  evidence_persistence_failed: "证据快照保存失败；继续显示上一份可信快照。",
+  evidence_compatibility_failed: "证据兼容发布未完成；继续显示上一份可信快照。",
+  publication_failed: "可信资讯发布失败；继续显示上一份可信快照。",
+  radar_compatibility_failed: "资讯雷达兼容更新未完成；可信资讯快照仍可使用。",
+  pipeline_interrupted: "本轮资讯刷新在完成前中断；继续显示上一份可信快照。",
+  storage_error: "资讯快照存储暂时不可用；继续显示上一份可信快照。",
+  pipeline_error: "资讯流水线未完成；继续显示上一份可信快照。",
+};
+
+export function newsPipelineFailureMessage(status: NewsPipelineStatusData): string {
+  if (status.redacted_error) return FAILURE_COPY[status.redacted_error];
+  return status.phase === "interrupted"
+    ? FAILURE_COPY.pipeline_interrupted
+    : FAILURE_COPY.pipeline_error;
+}
 
 export function isNewsPipelineActive(phase: NewsPipelineStatusData["phase"]): phase is NewsPipelinePhase {
   return phase !== null && ACTIVE_PHASES.has(phase);
@@ -57,6 +77,7 @@ export interface RunNewsPipelineOptions {
   pollIntervalMs?: number;
   onStarted?: (runId: string) => void;
   onStatus?: (status: NewsPipelineStatusData) => void | Promise<void>;
+  kickoff?: (signal?: AbortSignal) => Promise<NewsPipelineStarted>;
 }
 
 export async function runNewsPipelineRefresh({
@@ -65,31 +86,33 @@ export async function runNewsPipelineRefresh({
   pollIntervalMs = 800,
   onStarted,
   onStatus,
+  kickoff,
 }: RunNewsPipelineOptions = {}): Promise<NewsPipelineStatusData | null> {
-  if (signal?.aborted) return null;
+  const requestSignal = signal ?? new AbortController().signal;
+  if (requestSignal.aborted) return null;
   let started: NewsPipelineStarted;
   try {
-    started = await api.marketNewsRefresh(query);
+    started = await (kickoff ? kickoff(requestSignal) : api.marketNewsRefresh(query, requestSignal));
   } catch (error) {
-    if (signal?.aborted) return null;
+    if (requestSignal.aborted || isAbortError(error)) return null;
     throw error;
   }
-  if (signal?.aborted) return null;
+  if (requestSignal.aborted) return null;
   onStarted?.(started.run_id);
 
-  while (!signal?.aborted) {
+  while (!requestSignal.aborted) {
     let status: NewsPipelineStatusData;
     try {
-      status = await api.newsPipelineStatus(started.run_id);
+      status = await api.newsPipelineStatus(started.run_id, requestSignal);
     } catch (error) {
-      if (signal?.aborted) return null;
+      if (requestSignal.aborted || isAbortError(error)) return null;
       throw error;
     }
-    if (signal?.aborted) return null;
+    if (requestSignal.aborted) return null;
     await onStatus?.(status);
-    if (signal?.aborted) return null;
+    if (requestSignal.aborted) return null;
     if (!isNewsPipelineActive(status.phase)) return status;
-    if (!await nextPoll(signal, pollIntervalMs)) return null;
+    if (!await nextPoll(requestSignal, pollIntervalMs)) return null;
   }
   return null;
 }
@@ -156,6 +179,6 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
 
     {inVerification && <p className="border-t border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">新资讯已抓取，核验处理中；当前显示上一份可信快照。</p>}
     {pendingEvidence && <p className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">本次已抓取 {counts?.raw_event_count ?? 0} 条资讯，目前尚无完成核验的内容。待核验资讯可在证据中心查看。</p>}
-    {(status.phase === "failed" || status.phase === "interrupted") && <p className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">本轮资讯刷新未完成；继续显示上一份可信快照。</p>}
+    {(status.phase === "failed" || status.phase === "interrupted") && <p className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">{newsPipelineFailureMessage(status)}</p>}
   </section>;
 }

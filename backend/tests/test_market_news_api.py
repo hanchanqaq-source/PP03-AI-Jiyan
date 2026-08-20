@@ -283,7 +283,10 @@ def test_async_refresh_kickoff_keeps_cached_events_visible_until_pipeline_publis
         )),
     )
 
-    response = client.post("/api/market-news/refresh?mode=global_tech&days=7&sort=importance")
+    response = client.post(
+        "/api/market-news/refresh?mode=global_tech&days=7&sort=importance",
+        headers={"X-PP03-Write-Intent": "1", "Origin": "http://127.0.0.1:5899", "Host": "127.0.0.1:8900"},
+    )
     cached = client.get("/api/market-news/events?mode=global_tech&days=7&sort=importance")
 
     assert response.status_code == 202

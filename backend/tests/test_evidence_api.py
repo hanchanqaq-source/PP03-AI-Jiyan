@@ -193,7 +193,10 @@ def test_async_refresh_kickoff_preserves_previous_evidence_snapshot(monkeypatch,
         )),
     )
 
-    started = client.post("/api/evidence/refresh")
+    started = client.post(
+        "/api/evidence/refresh",
+        headers={"X-PP03-Write-Intent": "1", "Origin": "http://127.0.0.1:5899", "Host": "127.0.0.1:8900"},
+    )
     after = client.get("/api/evidence/summary")
 
     assert started.status_code == 202

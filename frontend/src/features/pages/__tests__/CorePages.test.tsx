@@ -86,7 +86,10 @@ describe("PP03 core pages", () => {
     await user.click(screen.getByRole("button", { name: "国内政策" }));
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
 
-    expect(load).toHaveBeenLastCalledWith({ mode: "domestic_policy", tag_ids: ["robotics"], category: "policy", days: 30, sort: "latest" });
+    expect(load).toHaveBeenLastCalledWith(
+      { mode: "domestic_policy", tag_ids: ["robotics"], category: "policy", days: 30, sort: "latest" },
+      expect.any(AbortSignal),
+    );
   });
 
   it("translates only visible English events and updates list plus open detail on the same snapshot", async () => {
@@ -282,7 +285,7 @@ describe("PP03 core pages", () => {
     expect(screen.getByText("刷新中")).toBeInTheDocument();
     rejectRefresh(new Error("offline"));
 
-    expect(await screen.findByText("当前筛选加载失败，继续显示该筛选上次成功结果。")).toBeInTheDocument();
+    expect(await screen.findByText("资讯流水线状态连接失败；继续显示上一份可信快照。")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: directEvent.title })).toBeInTheDocument();
   });
 

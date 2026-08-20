@@ -7,6 +7,8 @@ export type MarketNewsSort = "importance" | "latest" | "holding_relevance";
 export type MarketNewsCategoryFilter = "all" | MarketNewsCategory;
 export type MarketNewsVerificationStatus = "verified" | "corroborated" | "unverified" | "conflicting" | "corrected" | "disproved";
 export type NewsPipelinePhase = "queued" | "fetching" | "raw_saved" | "verifying" | "evidence_saved" | "trusted_published" | "failed" | "interrupted";
+export type NewsPipelineRecoveryStatus = "ready" | "pending" | "failed";
+export type NewsPipelineErrorCode = "collection_failed" | "evidence_compatibility_failed" | "evidence_persistence_failed" | "pipeline_error" | "pipeline_interrupted" | "publication_failed" | "radar_compatibility_failed" | "storage_error" | "verification_failed";
 
 export interface NewsPipelineStarted {
   run_id: string;
@@ -37,10 +39,10 @@ export interface NewsPipelineStatusData {
   has_pending_evidence_message: boolean;
   created_at: string | null;
   updated_at: string | null;
-  redacted_error: string | null;
-  recovery_status: string;
-  recovery_error: string | null;
-  compatibility_error: string | null;
+  redacted_error: NewsPipelineErrorCode | null;
+  recovery_status: NewsPipelineRecoveryStatus;
+  recovery_error: "storage_corrupt" | null;
+  compatibility_error: "evidence_compatibility_failed" | "radar_compatibility_failed" | null;
   displayed_trusted_snapshot_id: string | null;
   displayed_trusted: {
     snapshot_id: string;

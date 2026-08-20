@@ -5,7 +5,7 @@ import { DataInfoDialog } from "@/features/market-news/DataInfoDialog";
 import { EventCard } from "@/features/market-news/EventCard";
 import { EventDetailDrawer } from "@/features/market-news/EventDetailDrawer";
 import { MarketNewsSidebar } from "@/features/market-news/MarketNewsSidebar";
-import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
+import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
 import { SourceFailureDialog } from "@/features/market-news/SourceFailureDialog";
 import { SourceHealthDrawer } from "@/features/source-health/SourceHealthDrawer";
 import type {
@@ -21,7 +21,7 @@ import type {
 import { SelectedTagBar } from "@/features/tags/SelectedTagBar";
 import { TagSelector } from "@/features/tags/TagSelector";
 import { usePageTags } from "@/features/tags/usePageTags";
-import { api } from "@/lib/api";
+import { api, isAbortError } from "@/lib/api";
 import { loadLlm } from "@/lib/llm";
 import { cn } from "@/lib/utils";
 
@@ -255,31 +255,34 @@ export function MarketNews() {
   }, [queryKey]);
 
   useEffect(() => () => {
+    requestIdRef.current += 1;
     pipelineCycleRef.current += 1;
     pipelineAbortRef.current?.abort();
   }, []);
 
   useEffect(() => {
     const requestId = ++requestIdRef.current;
+    const controller = new AbortController();
     const cached = readMarketNewsCache(responseCacheRef.current, queryKey);
     setRefreshing(false);
     if (mode === "my_focus" && query.tag_ids.length === 0) {
       setView(null);
       setLoading(false);
       setQueryError(null);
-      return;
+      return () => controller.abort();
     }
 
     setView(cached ? { queryKey, response: cached } : null);
     setLoading(true);
     setQueryError(null);
-    api.marketNewsEvents(query).then((response) => {
+    api.marketNewsEvents(query, controller.signal).then((response) => {
       if (requestId !== requestIdRef.current) return;
       if (!responseMatchesQuery(response, query)) throw new Error("market-news response filters mismatch");
       const accepted = preserveSameSnapshotTranslations(response, responseCacheRef.current.get(queryKey));
       cacheMarketNewsResponse(responseCacheRef.current, queryKey, accepted);
       setView({ queryKey, response: accepted });
-    }).catch(() => {
+    }).catch((error) => {
+      if (controller.signal.aborted || isAbortError(error)) return;
       if (requestId !== requestIdRef.current) return;
       const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
       setView(sameQueryCache ? { queryKey, response: sameQueryCache } : null);
@@ -292,6 +295,7 @@ export function MarketNews() {
     }).finally(() => {
       if (requestId === requestIdRef.current) setLoading(false);
     });
+    return () => controller.abort();
   }, [mode, query, queryKey]);
 
   useEffect(() => {
@@ -349,6 +353,7 @@ export function MarketNews() {
     setRefreshing(true);
     setQueryError(null);
     setPipelineStatus(null);
+    let failureStage: "pipeline" | "filter" = "pipeline";
     try {
       const terminal = await runNewsPipelineRefresh({
         query,
@@ -360,24 +365,28 @@ export function MarketNews() {
       });
       if (!terminal || requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       if (terminal.phase !== "trusted_published") {
-        setQueryError({ queryKey, message: "本轮资讯刷新未完成，继续显示上一份可信快照。" });
+        setQueryError({ queryKey, message: newsPipelineFailureMessage(terminal) });
         return;
       }
-      const response = await api.marketNewsEvents(query);
+      failureStage = "filter";
+      const response = await api.marketNewsEvents(query, controller.signal);
       if (requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       if (!responseMatchesQuery(response, query)) throw new Error("market-news refresh filters mismatch");
       const accepted = preserveSameSnapshotTranslations(response, responseCacheRef.current.get(queryKey));
       cacheMarketNewsResponse(responseCacheRef.current, queryKey, accepted);
       setView({ queryKey, response: accepted });
-    } catch {
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) return;
       if (requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       const sameQueryCache = readMarketNewsCache(responseCacheRef.current, queryKey);
       setView(sameQueryCache ? { queryKey, response: sameQueryCache } : null);
       setQueryError({
         queryKey,
-        message: sameQueryCache
-          ? "当前筛选加载失败，继续显示该筛选上次成功结果。"
-          : "当前筛选加载失败，请稍后重试。",
+        message: failureStage === "pipeline"
+          ? "资讯流水线状态连接失败；继续显示上一份可信快照。"
+          : sameQueryCache
+            ? "最新可信快照已发布，但当前筛选加载失败；继续显示该筛选上次成功结果。"
+            : "最新可信快照已发布，但当前筛选加载失败，请稍后重试。",
       });
     } finally {
       if (pipelineCycle === pipelineCycleRef.current && activeQueryKeyRef.current === queryKey) {

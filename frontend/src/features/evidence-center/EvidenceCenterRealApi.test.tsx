@@ -65,7 +65,10 @@ describe("EvidenceCenter real verification workspace", () => {
   it("requests real status filters and supports sorting", async () => {
     const user = userEvent.setup(); render(<EvidenceCenter />); await screen.findByText("交易所公告：星河科技建设存储算力中心");
     await user.click(screen.getByRole("button", { name: "待核验" }));
-    await waitFor(() => expect((api as any).evidenceEvents).toHaveBeenLastCalledWith({ days: 7, verification_status: "unverified" }));
+    await waitFor(() => expect((api as any).evidenceEvents).toHaveBeenLastCalledWith(
+      { days: 7, verification_status: "unverified" },
+      expect.any(AbortSignal),
+    ));
     await user.selectOptions(screen.getByLabelText("排序方式"), "holding_relevance");
     expect(screen.getByLabelText("排序方式")).toHaveValue("holding_relevance");
   });
@@ -91,7 +94,47 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(await screen.findByText("核验刷新完成，已载入最新成功快照。")).toBeInTheDocument();
     expect(api.marketNewsRefresh).toHaveBeenCalledTimes(1);
     expect((api as any).evidenceRefresh).not.toHaveBeenCalled();
-    expect(api.newsPipelineStatus).toHaveBeenCalledWith(pipelineStarted.run_id);
+    expect(api.newsPipelineStatus).toHaveBeenCalledWith(pipelineStarted.run_id, expect.any(AbortSignal));
+  });
+
+  it("reloads the exact current status filter when evidence becomes durable", async () => {
+    const user = userEvent.setup();
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+
+    await user.click(screen.getByRole("button", { name: "待核验" }));
+    await waitFor(() => expect(api.evidenceEvents).toHaveBeenLastCalledWith(
+      { days: 7, verification_status: "unverified" },
+      expect.any(AbortSignal),
+    ));
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+
+    await waitFor(() => expect(api.evidenceEvents).toHaveBeenLastCalledWith(
+      { days: 7, verification_status: "unverified" },
+      expect.any(AbortSignal),
+    ));
+  });
+
+  it("uses one generation authority across delayed filter and durable snapshot loads", async () => {
+    const user = userEvent.setup();
+    const staleRow = { ...row, event_id: "aaaaaaaaaaaaaaaaaaab", title: "迟到的筛选结果" };
+    const freshRow = { ...row, event_id: "bbbbbbbbbbbbbbbbbbbc", title: "新证据快照筛选结果" };
+    let resolveStale!: (value: EvidenceEventList) => void;
+    vi.mocked(api.evidenceEvents)
+      .mockResolvedValueOnce(listing)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve; }))
+      .mockResolvedValueOnce({ ...listing, events: [freshRow] });
+
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+    await user.click(screen.getByRole("button", { name: "待核验" }));
+    await waitFor(() => expect(api.evidenceEvents).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+    expect(await screen.findByText(freshRow.title)).toBeInTheDocument();
+
+    await act(async () => resolveStale({ ...listing, events: [staleRow] }));
+    expect(screen.queryByText(staleRow.title)).not.toBeInTheDocument();
+    expect(screen.getByText(freshRow.title)).toBeInTheDocument();
   });
 
   it("reloads evidence only after the shared run reaches an evidence-durable phase", async () => {

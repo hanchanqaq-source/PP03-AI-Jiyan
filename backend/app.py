@@ -117,6 +117,11 @@ app.add_middleware(
 _API_KEY = os.environ.get("VR_API_KEY", "").strip()
 _DATA_SOURCE_WRITE_HEADER = "x-pp03-write-intent"
 _DATA_SOURCE_WRITE_METHODS = {"POST", "PUT", "DELETE"}
+_PIPELINE_REFRESH_PATHS = {
+    "/api/market-news/refresh",
+    "/api/evidence/refresh",
+    "/api/radar/refresh",
+}
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -176,8 +181,12 @@ def _local_browser_origin(value: str | None) -> bool:
     )
 
 
-def _data_source_write_request(request: Request) -> bool:
-    if not request.url.path.startswith("/api/data-sources/"):
+def _protected_local_write_request(request: Request) -> bool:
+    is_protected_path = (
+        request.url.path.startswith("/api/data-sources/")
+        or request.url.path in _PIPELINE_REFRESH_PATHS
+    )
+    if not is_protected_path:
         return False
     if request.method in _DATA_SOURCE_WRITE_METHODS:
         return True
@@ -202,7 +211,7 @@ async def _require_api_key(request: Request, call_next):
 
 @app.middleware("http")
 async def _protect_data_source_writes(request: Request, call_next):
-    if not _data_source_write_request(request):
+    if not _protected_local_write_request(request):
         return await call_next(request)
     host = _single_request_header(request, "host")
     origin = _single_request_header(request, "origin")

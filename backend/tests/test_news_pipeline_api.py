@@ -11,6 +11,11 @@ from news_pipeline.service import NewsPipelineActiveError
 
 client = TestClient(app_module.app)
 NOW = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+WRITE_HEADERS = {
+    "X-PP03-Write-Intent": "1",
+    "Origin": "http://127.0.0.1:5899",
+    "Host": "127.0.0.1:8900",
+}
 
 
 def run(phase: PipelinePhase = PipelinePhase.QUEUED) -> PipelineRun:
@@ -55,9 +60,9 @@ def test_all_refresh_compatibility_routes_start_the_same_async_pipeline(monkeypa
     monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
 
     responses = [
-        client.post("/api/market-news/refresh?mode=global_tech&days=7"),
-        client.post("/api/evidence/refresh"),
-        client.post("/api/radar/refresh"),
+        client.post("/api/market-news/refresh?mode=global_tech&days=7", headers=WRITE_HEADERS),
+        client.post("/api/evidence/refresh", headers=WRITE_HEADERS),
+        client.post("/api/radar/refresh", headers=WRITE_HEADERS),
     ]
 
     assert [response.status_code for response in responses] == [202, 202, 202]
@@ -74,7 +79,7 @@ def test_active_refresh_conflict_is_shared_by_all_compatibility_routes(monkeypat
 
     monkeypatch.setattr("news_pipeline.api.get_service", lambda: Active())
 
-    response = client.post("/api/evidence/refresh")
+    response = client.post("/api/evidence/refresh", headers=WRITE_HEADERS)
 
     assert response.status_code == 409
     assert response.json()["detail"] == "资讯刷新正在运行"
@@ -98,7 +103,7 @@ def test_pipeline_api_normalizes_runtime_failures_without_leaking_details(monkey
             raise OSError("C:\\Users\\private\\token.txt?api_key=secret")
 
     monkeypatch.setattr("news_pipeline.api.get_service", lambda: BrokenStart())
-    response = client.post("/api/market-news/refresh")
+    response = client.post("/api/market-news/refresh", headers=WRITE_HEADERS)
     assert response.status_code == 503
     assert response.json() == {"detail": "资讯刷新暂时不可用"}
     assert "secret" not in response.text
@@ -121,6 +126,97 @@ def test_pipeline_api_normalizes_runtime_failures_without_leaking_details(monkey
     response = client.get("/api/news/pipeline-status?run_id=run-corrupt")
     assert response.status_code == 503
     assert response.json() == {"detail": "资讯刷新状态暂时不可用"}
+
+
+def test_pipeline_refresh_routes_reject_browser_simple_post_without_write_intent(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+
+    responses = [
+        client.post(
+            path,
+            headers={"Origin": "http://127.0.0.1:5899", "Host": "127.0.0.1:8900"},
+        )
+        for path in (
+            "/api/market-news/refresh",
+            "/api/evidence/refresh",
+            "/api/radar/refresh",
+        )
+    ]
+
+    assert [response.status_code for response in responses] == [403, 403, 403]
+    assert fake.starts == 0
+
+
+def test_pipeline_refresh_routes_reject_foreign_origin_even_with_write_intent(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+
+    responses = [
+        client.post(
+            path,
+            headers={
+                "X-PP03-Write-Intent": "1",
+                "Origin": "https://foreign.example",
+                "Host": "127.0.0.1:8900",
+            },
+        )
+        for path in (
+            "/api/market-news/refresh",
+            "/api/evidence/refresh",
+            "/api/radar/refresh",
+        )
+    ]
+
+    assert [response.status_code for response in responses] == [403, 403, 403]
+    assert fake.starts == 0
+
+
+def test_pipeline_refresh_preflight_requires_local_origin_and_write_intent(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+    headers = {
+        "Origin": "http://127.0.0.1:5899",
+        "Host": "127.0.0.1:8900",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type, x-pp03-write-intent",
+    }
+
+    for path in (
+        "/api/market-news/refresh",
+        "/api/evidence/refresh",
+        "/api/radar/refresh",
+    ):
+        approved = client.options(path, headers=headers)
+        missing_intent = client.options(
+            path,
+            headers={**headers, "Access-Control-Request-Headers": "content-type"},
+        )
+        foreign = client.options(
+            path,
+            headers={**headers, "Origin": "https://foreign.example"},
+        )
+        assert approved.status_code == 200
+        assert approved.headers.get("access-control-allow-origin") == "http://127.0.0.1:5899"
+        assert missing_intent.status_code == 403
+        assert foreign.status_code == 403
+
+    assert fake.starts == 0
+
+
+def test_pipeline_read_routes_remain_readable_without_write_intent(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+
+    status_response = client.get(
+        "/api/news/pipeline-status",
+        headers={"Origin": "http://127.0.0.1:5899", "Host": "127.0.0.1:8900"},
+    )
+    health_response = client.get("/api/health", headers={"Origin": "https://foreign.example"})
+
+    assert status_response.status_code == 200
+    assert health_response.status_code == 200
+    assert fake.starts == 0
 
 
 def test_app_lifespan_closes_and_clears_pipeline_before_source_health(monkeypatch):

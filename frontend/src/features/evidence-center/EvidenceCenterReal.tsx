@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Database, Loader2, ShieldCheck } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
-import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
+import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
 import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { SourceHealthSummary } from "@/features/source-health/SourceHealthSummary";
 import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWorkspace";
-import { api } from "@/lib/api";
+import { api, isAbortError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { EvidenceDrawer, STATUS_LABEL, StatusBadge } from "./EvidenceDrawer";
-import type { EvidenceEventDetail, EvidenceEventSummary, EvidenceSummaryData, VerificationStatus } from "./types";
+import type { EvidenceEventDetail, EvidenceEventQuery, EvidenceEventSummary, EvidenceSummaryData, VerificationStatus } from "./types";
 
 type Tab = "verification" | "health" | "corrections";
 type Filter = "all" | VerificationStatus;
@@ -48,31 +48,64 @@ export function EvidenceCenter() {
   const [focusHistory, setFocusHistory] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const requestRef = useRef(0);
-  const snapshotRequestRef = useRef(0);
+  const evidenceLoadAbortRef = useRef<AbortController | null>(null);
+  const filterRef = useRef<Filter>("all");
   const pipelineCycleRef = useRef(0);
   const pipelineAbortRef = useRef<AbortController | null>(null);
 
-  const loadList = useCallback(async (nextFilter: Filter) => {
-    const requestId = ++requestRef.current;
-    const result = await api.evidenceEvents({ days: 7, ...(nextFilter === "all" ? {} : { verification_status: nextFilter }) });
-    if (requestId === requestRef.current) setEvents(result.events);
-  }, []);
+  const queryForFilter = useCallback((nextFilter: Filter): EvidenceEventQuery => ({
+    days: 7,
+    ...(nextFilter === "all" ? {} : { verification_status: nextFilter }),
+  }), []);
 
-  const loadSnapshot = useCallback(async () => {
-    const requestId = ++snapshotRequestRef.current;
+  const loadList = useCallback(async (nextFilter: Filter): Promise<boolean> => {
+    const requestId = ++requestRef.current;
+    evidenceLoadAbortRef.current?.abort();
+    const controller = new AbortController();
+    evidenceLoadAbortRef.current = controller;
+    try {
+      const result = await api.evidenceEvents(queryForFilter(nextFilter), controller.signal);
+      if (requestId !== requestRef.current || controller.signal.aborted) return false;
+      setEvents(result.events);
+      return true;
+    } finally {
+      if (requestId === requestRef.current) {
+        evidenceLoadAbortRef.current = null;
+        setLoading(false);
+      }
+    }
+  }, [queryForFilter]);
+
+  const loadSnapshot = useCallback(async (nextFilter: Filter): Promise<boolean> => {
+    const requestId = ++requestRef.current;
+    evidenceLoadAbortRef.current?.abort();
+    const controller = new AbortController();
+    evidenceLoadAbortRef.current = controller;
     setLoading(true); setError(null);
     try {
-      const [nextSummary, nextEvents] = await Promise.all([api.evidenceSummary(), api.evidenceEvents({ days: 7 })]);
-      if (requestId !== snapshotRequestRef.current) return;
+      const [nextSummary, nextEvents] = await Promise.all([
+        api.evidenceSummary(controller.signal),
+        api.evidenceEvents(queryForFilter(nextFilter), controller.signal),
+      ]);
+      if (requestId !== requestRef.current || controller.signal.aborted) return false;
       setSummary(nextSummary); setEvents(nextEvents.events);
-    } catch {
-      if (requestId === snapshotRequestRef.current) setError("证据快照加载失败，请确认本地后端可用后重试。");
-    } finally { if (requestId === snapshotRequestRef.current) setLoading(false); }
-  }, []);
+      return true;
+    } catch (error) {
+      if (requestId !== requestRef.current || controller.signal.aborted || isAbortError(error)) return false;
+      setError("证据快照加载失败，请确认本地后端可用后重试。");
+      return false;
+    } finally {
+      if (requestId === requestRef.current) {
+        evidenceLoadAbortRef.current = null;
+        setLoading(false);
+      }
+    }
+  }, [queryForFilter]);
 
-  useEffect(() => { void loadSnapshot(); }, [loadSnapshot]);
+  useEffect(() => { void loadSnapshot(filterRef.current); }, [loadSnapshot]);
   useEffect(() => () => {
-    snapshotRequestRef.current += 1;
+    requestRef.current += 1;
+    evidenceLoadAbortRef.current?.abort();
     pipelineCycleRef.current += 1;
     pipelineAbortRef.current?.abort();
   }, []);
@@ -99,8 +132,10 @@ export function EvidenceCenter() {
   };
   const closeEvent = () => { setDetail(null); setDetailLoading(false); setFocusHistory(false); triggerRef.current?.focus(); };
   const changeFilter = async (next: Filter) => {
+    filterRef.current = next;
     setFilter(next); setLoading(true); setError(null);
-    try { await loadList(next); } catch { setError("证据列表筛选失败，请稍后重试。" ); } finally { setLoading(false); }
+    try { await loadList(next); }
+    catch (error) { if (!isAbortError(error)) setError("证据列表筛选失败，请稍后重试。" ); }
   };
   const refresh = async () => {
     if (refreshing) return;
@@ -109,6 +144,7 @@ export function EvidenceCenter() {
     const controller = new AbortController();
     pipelineAbortRef.current = controller;
     let evidenceReloaded = false;
+    let evidenceReloadSucceeded = false;
     setRefreshing(true); setNotice(null); setPipelineStatus(null);
     try {
       const terminal = await runNewsPipelineRefresh({
@@ -120,15 +156,20 @@ export function EvidenceCenter() {
           const terminalFailure = next.phase === "failed" || next.phase === "interrupted";
           if (!evidenceReloaded && (evidenceDurable || terminalFailure)) {
             evidenceReloaded = true;
-            await loadSnapshot();
+            evidenceReloadSucceeded = await loadSnapshot(filterRef.current);
           }
         },
       });
       if (!terminal || pipelineCycle !== pipelineCycleRef.current) return;
-      if (terminal.phase === "trusted_published") setNotice("核验刷新完成，已载入最新成功快照。");
-      else setNotice("核验刷新失败，继续保留并显示上次成功快照。");
+      if (terminal.phase === "trusted_published") {
+        if (evidenceReloadSucceeded) setNotice("核验刷新完成，已载入最新成功快照。");
+      } else setNotice(newsPipelineFailureMessage(terminal));
     }
-    catch { if (pipelineCycle === pipelineCycleRef.current) setNotice("核验刷新失败，继续保留并显示上次成功快照。" ); }
+    catch (error) {
+      if (pipelineCycle === pipelineCycleRef.current && !controller.signal.aborted && !isAbortError(error)) {
+        setNotice("核验流水线状态连接失败；继续显示上次成功快照。");
+      }
+    }
     finally {
       if (pipelineCycle === pipelineCycleRef.current) {
         pipelineAbortRef.current = null;

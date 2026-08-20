@@ -112,8 +112,9 @@ describe("NewsPipelineStatus", () => {
 
     expect(api.marketNewsRefresh).toHaveBeenCalledTimes(1);
     expect(status).toHaveBeenCalledTimes(2);
-    expect(status).toHaveBeenNthCalledWith(1, started.run_id);
-    expect(status).toHaveBeenNthCalledWith(2, started.run_id);
+    expect(api.marketNewsRefresh).toHaveBeenCalledWith(undefined, expect.any(AbortSignal));
+    expect(status).toHaveBeenNthCalledWith(1, started.run_id, expect.any(AbortSignal));
+    expect(status).toHaveBeenNthCalledWith(2, started.run_id, expect.any(AbortSignal));
     expect(phases).toEqual(["raw_saved", "trusted_published"]);
     expect(terminal?.phase).toBe("trusted_published");
   });
@@ -148,18 +149,92 @@ describe("NewsPipelineStatus", () => {
   });
 
   it("adds the write-intent header to all three pipeline refresh clients", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: started }), {
-      status: 202,
-      headers: { "Content-Type": "application/json" },
-    }));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(
+      new Response(JSON.stringify({ data: started }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ));
 
     await api.marketNewsRefresh();
-    await (api as unknown as { evidenceRefresh: () => Promise<unknown> }).evidenceRefresh();
-    await (api as unknown as { radarRefresh: () => Promise<unknown> }).radarRefresh();
+    await api.evidenceRefresh();
+    await api.radarRefresh();
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
     for (const [, init] of fetchMock.mock.calls) {
       expect(init?.headers).toMatchObject({ "X-PP03-Write-Intent": "1" });
     }
+  });
+
+  it("threads the caller signal into kickoff and selected-run fetch", async () => {
+    const controller = new AbortController();
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(pipelineStatus("trusted_published"));
+
+    await runNewsPipelineRefresh({ signal: controller.signal, pollIntervalMs: 0 });
+
+    expect(api.marketNewsRefresh).toHaveBeenCalledWith(undefined, controller.signal);
+    expect(api.newsPipelineStatus).toHaveBeenCalledWith(started.run_id, controller.signal);
+  });
+
+  it("threads AbortSignal through the pipeline clients to actual fetch", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: started }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: pipelineStatus("trusted_published") }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+
+    await api.radarRefresh(controller.signal);
+    await api.newsPipelineStatus(started.run_id, controller.signal);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/radar/refresh", expect.objectContaining({ signal: controller.signal }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, `/api/news/pipeline-status?run_id=${started.run_id}`, expect.objectContaining({ signal: controller.signal }));
+  });
+
+  it("rejects malformed successful kickoff and status payloads instead of rendering impossible state", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: {
+      run_id: "",
+      raw_snapshot_id: "raw-stage-1",
+      phase: "queued",
+    } }), { status: 202, headers: { "Content-Type": "application/json" } }));
+
+    await expect(api.marketNewsRefresh()).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: {
+      ...pipelineStatus("failed"),
+      counts: { ...pipelineStatus("failed").counts, pending_count: -1 },
+      redacted_error: "C:\\Users\\private\\token.txt",
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: {
+      ...pipelineStatus("failed"),
+      redacted_error: "C:\\Users\\private\\token.txt",
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+  });
+
+  it("maps only closed safe failure codes to Chinese user copy", () => {
+    render(<NewsPipelineStatus status={pipelineStatus("failed", { redacted_error: "verification_failed" })} />);
+
+    expect(screen.getByText("确定性核验失败；继续显示上一份可信快照。")).toBeInTheDocument();
+    expect(screen.queryByText("verification_failed")).not.toBeInTheDocument();
   });
 });
