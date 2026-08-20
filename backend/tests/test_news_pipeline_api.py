@@ -113,6 +113,15 @@ def test_pipeline_api_normalizes_runtime_failures_without_leaking_details(monkey
     assert response.json() == {"detail": "资讯刷新状态暂时不可用"}
     assert "private" not in response.text
 
+    class CorruptSelectedStatus(FakePipeline):
+        def get_status(self, run_id=None):
+            raise OSError("storage_corrupt")
+
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: CorruptSelectedStatus())
+    response = client.get("/api/news/pipeline-status?run_id=run-corrupt")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "资讯刷新状态暂时不可用"}
+
 
 def test_app_lifespan_closes_and_clears_pipeline_before_source_health(monkeypatch):
     calls = []

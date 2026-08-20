@@ -702,7 +702,7 @@ def test_evidence_phase_is_durable_before_fallible_compatibility_publication(tmp
         pipeline.close()
 
 
-def test_radar_compatibility_publication_happens_only_after_trusted_commit(tmp_path):
+def test_radar_compatibility_result_is_recorded_on_the_terminal_run_before_final_write(tmp_path):
     root = tmp_path / "pipeline"
     storage = NewsPipelineStorage(root, now=lambda: NOW)
     ids = iter(("run-radar-order", "raw-radar-order"))
@@ -711,7 +711,7 @@ def test_radar_compatibility_publication_happens_only_after_trusted_commit(tmp_p
         current = storage.load_current_trusted()
         run = storage.load_run("run-radar-order")
         assert current is not None and current.raw_snapshot_id == "raw-radar-order"
-        assert run.phase is PipelinePhase.TRUSTED_PUBLISHED
+        assert run.phase is PipelinePhase.EVIDENCE_SAVED
         raise OSError("compatibility cache unavailable")
 
     pipeline = NewsPipelineService(
@@ -726,6 +726,7 @@ def test_radar_compatibility_publication_happens_only_after_trusted_commit(tmp_p
     try:
         completed = pipeline.wait(pipeline.start().run_id, timeout=5)
         assert completed.phase is PipelinePhase.TRUSTED_PUBLISHED
+        assert completed.redacted_error == "radar_compatibility_failed"
         assert pipeline.current_trusted().raw_snapshot_id == "raw-radar-order"
         assert pipeline.get_status(completed.run_id)["compatibility_error"] == "radar_compatibility_failed"
     finally:
@@ -749,11 +750,10 @@ def test_failed_startup_recovery_blocks_refresh_until_explicit_retry_succeeds(tm
             failed.result(timeout=5)
         with pytest.raises(RuntimeError, match="recovery"):
             pipeline.start()
-        status = pipeline.get_status()
-        assert status["recovery_status"] == "failed"
-        assert status["recovery_error"] == "storage_corrupt"
-        assert "private" not in str(status)
+        with pytest.raises(OSError, match="storage_corrupt"):
+            pipeline.get_status()
         assert pipeline.recover_startup().result(timeout=5) == 0
+        assert pipeline.get_status()["recovery_status"] == "ready"
         assert pipeline.wait(pipeline.start().run_id, timeout=5).phase is PipelinePhase.TRUSTED_PUBLISHED
     finally:
         pipeline.close()
@@ -798,5 +798,77 @@ def test_corrupt_latest_run_still_allows_bounded_recovery_retry_after_reconstruc
         assert pipeline.recover_startup().result(timeout=5) == 1
         completed = pipeline.wait(pipeline.start().run_id, timeout=5)
         assert completed.phase is PipelinePhase.TRUSTED_PUBLISHED
+    finally:
+        pipeline.close()
+
+
+def test_compatibility_error_is_durable_per_run_and_survives_restart(tmp_path):
+    root = tmp_path / "pipeline"
+    identifiers = iter(("run-compat-first", "raw-compat-first", "run-compat-second", "raw-compat-second"))
+    calls = 0
+
+    def radar_publisher(_collection):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("legacy radar cache unavailable")
+
+    pipeline = NewsPipelineService(
+        storage=NewsPipelineStorage(root, now=lambda: NOW),
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        radar_publisher=radar_publisher,
+        now=lambda: NOW,
+        id_factory=lambda: next(identifiers),
+    )
+    first_id = pipeline.start().run_id
+    first = pipeline.wait(first_id, timeout=5)
+    second_id = pipeline.start().run_id
+    second = pipeline.wait(second_id, timeout=5)
+
+    assert first.phase is PipelinePhase.TRUSTED_PUBLISHED
+    assert first.redacted_error == "radar_compatibility_failed"
+    assert second.phase is PipelinePhase.TRUSTED_PUBLISHED
+    assert second.redacted_error is None
+    assert pipeline.get_status(first_id)["compatibility_error"] == "radar_compatibility_failed"
+    assert pipeline.get_status(second_id)["compatibility_error"] is None
+    pipeline.close()
+
+    restarted = NewsPipelineService(
+        storage=NewsPipelineStorage(root, now=lambda: NOW),
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        now=lambda: NOW,
+    )
+    try:
+        assert restarted.get_status(first_id)["compatibility_error"] == "radar_compatibility_failed"
+        assert restarted.get_status(second_id)["compatibility_error"] is None
+    finally:
+        restarted.close()
+
+
+def test_selected_corrupt_run_is_a_storage_error_not_a_missing_run(tmp_path):
+    root = tmp_path / "pipeline"
+    corrupt = root / "runs" / "run-corrupt.json"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text('{"schema_version":999}', encoding="utf-8")
+    pipeline = NewsPipelineService(
+        storage=NewsPipelineStorage(root, now=lambda: NOW),
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        now=lambda: NOW,
+    )
+    try:
+        with pytest.raises(OSError, match="storage_corrupt"):
+            pipeline.get_status("run-corrupt")
+        with pytest.raises(OSError, match="storage_corrupt"):
+            pipeline.get_status("run-absent")
+        corrupt.unlink()
+        assert pipeline.recover_startup().result(timeout=5) == 0
+        with pytest.raises(KeyError):
+            pipeline.get_status("run-absent")
     finally:
         pipeline.close()

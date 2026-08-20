@@ -60,6 +60,7 @@ _SAFE_ERROR_CODES = {
     "pipeline_error",
     "pipeline_interrupted",
     "publication_failed",
+    "radar_compatibility_failed",
     "storage_error",
     "verification_failed",
 }
@@ -1411,17 +1412,67 @@ class NewsPipelineStorage:
             return None
 
     def _artifact_phase(self, run: PipelineRun) -> None:
-        raw, evidence = self._load_raw(run.raw_snapshot_id), self._load_evidence(run.raw_snapshot_id)
-        if run.phase is PipelinePhase.RAW_SAVED and raw is None:
-            raise ValueError("raw snapshot must be durable before raw_saved")
-        if run.phase is PipelinePhase.EVIDENCE_SAVED and (raw is None or evidence is None):
-            raise ValueError("raw and evidence artifacts must be durable before evidence_saved")
-        if run.phase is PipelinePhase.EVIDENCE_SAVED and (run.evidence_snapshot_id is None or evidence.snapshot_id != run.evidence_snapshot_id or evidence.recovery_metadata.get("legacy_identity") is True):
+        raw = self._load_raw(run.raw_snapshot_id)
+        raw_required = (
+            run.phase in {
+                PipelinePhase.RAW_SAVED,
+                PipelinePhase.VERIFYING,
+                PipelinePhase.EVIDENCE_SAVED,
+                PipelinePhase.TRUSTED_PUBLISHED,
+            }
+            or run.evidence_snapshot_id is not None
+            or run.trusted_snapshot_id is not None
+            or (
+                run.phase in {PipelinePhase.FAILED, PipelinePhase.INTERRUPTED}
+                and run.counts.raw_event_count > 0
+            )
+        )
+        if raw_required and raw is None:
+            raise ValueError("raw snapshot must be durable for the persisted phase")
+
+        evidence_required = (
+            run.phase in {PipelinePhase.EVIDENCE_SAVED, PipelinePhase.TRUSTED_PUBLISHED}
+            or run.evidence_snapshot_id is not None
+            or run.trusted_snapshot_id is not None
+        )
+        evidence = self._load_evidence(run.raw_snapshot_id) if evidence_required else None
+        if evidence_required and (
+            evidence is None
+            or run.evidence_snapshot_id is None
+            or evidence.snapshot_id != run.evidence_snapshot_id
+            or evidence.recovery_metadata.get("legacy_identity") is True
+        ):
             raise ValueError("snapshot IDs must match durable non-legacy evidence")
-        if run.phase is PipelinePhase.TRUSTED_PUBLISHED and (raw is None or evidence is None or self._load_trusted(run.raw_snapshot_id) is None or (current := self._load_current()) is None or current.raw_snapshot_id != run.raw_snapshot_id):
-            raise ValueError("raw, evidence, trusted, and current pointer must be durable before trusted_published")
-        if run.phase is PipelinePhase.TRUSTED_PUBLISHED and (run.evidence_snapshot_id is None or evidence.snapshot_id != run.evidence_snapshot_id or run.trusted_snapshot_id != run.raw_snapshot_id or evidence.recovery_metadata.get("legacy_identity") is True):
-            raise ValueError("snapshot IDs must match durable non-legacy artifacts")
+
+        if run.phase is not PipelinePhase.TRUSTED_PUBLISHED and run.trusted_snapshot_id is None:
+            return
+        record = self._load_trusted_record(run.raw_snapshot_id)
+        pointer = self._load_pointer_record()
+        if record is not None and evidence is not None:
+            _validate_trusted_admission(list(record.snapshot.events), evidence)
+        if (
+            run.phase is not PipelinePhase.TRUSTED_PUBLISHED
+            or run.trusted_snapshot_id != run.raw_snapshot_id
+            or record is None
+            or pointer is None
+            or record.pointer_generation > pointer.generation
+            or (
+                record.pointer_generation == pointer.generation
+                and pointer.raw_snapshot_id != run.raw_snapshot_id
+            )
+            or (
+                record.pointer_generation < pointer.generation
+                and pointer.raw_snapshot_id == run.raw_snapshot_id
+            )
+        ):
+            raise ValueError("trusted artifact and pointer generation are inconsistent")
+
+    def _validate_loaded_run(self, run: PipelineRun) -> PipelineRun:
+        try:
+            self._artifact_phase(run)
+        except (OSError, ValueError):
+            raise OSError("storage_corrupt") from None
+        return run
 
     def write_run(self, run: PipelineRun, *, expected_phase: PipelinePhase | None = None) -> None:
         document = self._run_document(run)
@@ -1430,6 +1481,8 @@ class NewsPipelineStorage:
             current = self._load_run(run.run_id)
             if current is None and self._run_path(run.run_id).exists():
                 raise OSError("storage_corrupt")
+            if current is not None:
+                self._validate_loaded_run(current)
             if current is None:
                 if run.phase is not PipelinePhase.QUEUED or expected_phase is not None:
                     raise ValueError("new runs must begin queued")
@@ -1459,7 +1512,13 @@ class NewsPipelineStorage:
 
     def load_run(self, run_id: str) -> PipelineRun | None:
         with CACHE_IO_LOCK, self._process_lock():
-            return self._load_run(_id(run_id, "run_id"))
+            safe_run_id = _id(run_id, "run_id")
+            run = self._load_run(safe_run_id)
+            if run is None:
+                if self._run_path(safe_run_id).exists():
+                    raise OSError("storage_corrupt")
+                return None
+            return self._validate_loaded_run(run)
 
     def load_latest_run(self) -> PipelineRun | None:
         """Load the newest durable run using updated time and run ID as a stable tie."""
@@ -1486,13 +1545,12 @@ class NewsPipelineStorage:
                 run = self._load_run(run_id)
                 if run is None:
                     raise OSError("storage_corrupt")
-                runs.append(run)
+                runs.append(self._validate_loaded_run(run))
             return max(runs, key=lambda run: (run.updated_at, run.run_id), default=None)
 
     def recover_incomplete_runs(self) -> int:
         interrupted = 0
         with CACHE_IO_LOCK, self._process_lock():
-            self._claim_writer_unlocked()
             if not self.runs_root.exists():
                 return 0
             now = self._clock()
@@ -1516,7 +1574,8 @@ class NewsPipelineStorage:
                 run = self._load_run(run_id)
                 if run is None:
                     raise OSError("storage_corrupt")
-                runs.append(run)
+                runs.append(self._validate_loaded_run(run))
+            self._claim_writer_unlocked()
             for run in runs:
                 if run.phase not in _NONTERMINAL:
                     continue

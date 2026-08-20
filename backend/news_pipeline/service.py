@@ -65,7 +65,6 @@ class NewsPipelineService:
         self._latest_run_id: str | None = latest.run_id if latest is not None else None
         self._futures: dict[str, Future[None]] = {}
         self._recovery_future: Future[int] | None = None
-        self._compatibility_error: str | None = None
         self._closed = False
 
     def _clock(self) -> datetime:
@@ -222,20 +221,21 @@ class NewsPipelineService:
             if type(trusted) is not TrustedSnapshot or trusted.raw_snapshot_id != durable_raw.raw_snapshot_id:
                 raise ValueError("trusted projector returned a different raw snapshot identity")
             self.storage.publish_trusted(trusted)
-            self._transition(
-                run_id,
-                PipelinePhase.TRUSTED_PUBLISHED,
-                trusted_snapshot_id=trusted.raw_snapshot_id,
-                displayed_trusted_snapshot_id=(
-                    run.displayed_trusted_snapshot_id or trusted.raw_snapshot_id
-                ),
-            )
+            compatibility_error = None
             if self._radar_publisher is not None:
                 try:
                     self._radar_publisher(collection)
                 except Exception:
-                    with self._lock:
-                        self._compatibility_error = "radar_compatibility_failed"
+                    compatibility_error = "radar_compatibility_failed"
+            self._transition(
+                run_id,
+                PipelinePhase.TRUSTED_PUBLISHED,
+                trusted_snapshot_id=trusted.raw_snapshot_id,
+                redacted_error=compatibility_error,
+                displayed_trusted_snapshot_id=(
+                    run.displayed_trusted_snapshot_id or trusted.raw_snapshot_id
+                ),
+            )
         except Exception:
             self._record_failure(run_id, error_code)
         finally:
@@ -259,7 +259,6 @@ class NewsPipelineService:
                 self._active_run_id = None
             run_id = self._id_factory()
             raw_snapshot_id = self._id_factory()
-            self._compatibility_error = None
             created_at = self._clock()
             displayed = self.storage.load_current_trusted()
             run = PipelineRun(
@@ -333,7 +332,8 @@ class NewsPipelineService:
     def get_status(self, run_id: str | None = None) -> dict[str, object]:
         with self._lock:
             recovery_status, recovery_error = self._recovery_state_unlocked()
-            compatibility_error = self._compatibility_error
+        if recovery_status == "failed":
+            raise OSError(recovery_error or "storage_corrupt")
         selected = self.storage.load_run(run_id) if run_id is not None else None
         if run_id is not None and selected is None:
             raise KeyError(run_id)
@@ -342,6 +342,14 @@ class NewsPipelineService:
             if selected is not None:
                 self._latest_run_id = selected.run_id
         displayed = self.storage.load_current_trusted()
+        compatibility_error = (
+            selected.redacted_error
+            if selected is not None and selected.redacted_error in {
+                "evidence_compatibility_failed",
+                "radar_compatibility_failed",
+            }
+            else None
+        )
         if selected is None:
             return {
                 "loaded": False,

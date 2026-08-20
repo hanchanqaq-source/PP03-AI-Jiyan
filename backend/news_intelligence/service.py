@@ -389,6 +389,13 @@ class MarketNewsService:
             if tag.get("provenance") == "article_text" and tag.get("id")
         }
 
+    @staticmethod
+    def _has_public_holding_relationship(event: Any) -> bool:
+        return (
+            event.relation_level in {"direct_holding", "industry_relation"}
+            or bool(event.related_funds)
+        )
+
     def _trusted_events(
         self,
         trusted: TrustedSnapshot,
@@ -402,7 +409,10 @@ class MarketNewsService:
         sort: str,
     ) -> dict[str, Any]:
         events = [_trusted_event(copy.deepcopy(document)) for document in trusted.events]
-        portfolio_status = "unavailable"
+        has_public_relationships = any(
+            self._has_public_holding_relationship(event) for event in events
+        )
+        portfolio_status = "public_relationships" if has_public_relationships else "unavailable"
         events = rank_events(events, "importance")
         apply_watch_relations(events, selected_tags)
         now = self.now()
@@ -422,8 +432,12 @@ class MarketNewsService:
                 selected = set(selected_tags)
                 filtered = [event for event in filtered if selected & {tag["id"] for tag in event.related_tags}]
         elif mode == "my_holdings":
-            filtered = []
-            empty_reason = "portfolio_unavailable"
+            filtered = [
+                event for event in filtered
+                if self._has_public_holding_relationship(event)
+            ]
+            if not has_public_relationships:
+                empty_reason = "portfolio_unavailable"
         elif mode == "global_tech":
             filtered = [
                 event for event in filtered
@@ -531,17 +545,26 @@ class MarketNewsService:
         selected_tags = list(dict.fromkeys(tag_ids or []))
         context = self._load_trusted_context()
         if context is not None:
-            trusted, raw, evidence = context
-            return self._trusted_events(
-                trusted,
-                raw,
-                evidence,
-                mode=mode,
-                selected_tags=selected_tags,
-                category=category,
-                days=days,
-                sort=sort,
-            )
+            for _attempt in range(3):
+                trusted, raw, evidence = context
+                payload = self._trusted_events(
+                    trusted,
+                    raw,
+                    evidence,
+                    mode=mode,
+                    selected_tags=selected_tags,
+                    category=category,
+                    days=days,
+                    sort=sort,
+                )
+                with self._snapshot_lock:
+                    current = self._load_trusted_context()
+                    if current is not None and current[0].raw_snapshot_id == trusted.raw_snapshot_id:
+                        return payload
+                if current is None:
+                    break
+                context = current
+            raise OSError("storage_error")
         if self.pipeline_state_loader is not None and self.pipeline_state_loader():
             return self._pipeline_pending_events(
                 mode=mode,
@@ -691,32 +714,42 @@ class MarketNewsService:
                 selected_snapshot_id = self._current_detail_snapshot_id
                 snapshot = self._detail_snapshots.get(selected_snapshot_id) if selected_snapshot_id else None
                 authority = self._detail_authorities.get(selected_snapshot_id) if selected_snapshot_id else None
-        if snapshot is not None:
-            if (
-                authority is None
-                and self.pipeline_state_loader is not None
-                and self.pipeline_state_loader()
-            ):
-                return None
-            if authority is not None:
-                context = self._load_trusted_context()
-                current_authority = context[0].raw_snapshot_id if context is not None else None
-                if current_authority is None and self.trusted_loader is not None:
-                    trusted = self.trusted_loader()
-                    current_authority = trusted.raw_snapshot_id if trusted is not None else None
-                if current_authority != authority:
+            if snapshot is not None:
+                if (
+                    authority is None
+                    and self.pipeline_state_loader is not None
+                    and self.pipeline_state_loader()
+                ):
                     return None
-            return snapshot.get(event_id)
+                if authority is not None:
+                    context = self._load_trusted_context()
+                    current_authority = context[0].raw_snapshot_id if context is not None else None
+                    if current_authority is None and self.trusted_loader is not None:
+                        trusted = self.trusted_loader()
+                        current_authority = trusted.raw_snapshot_id if trusted is not None else None
+                    if current_authority != authority:
+                        return None
+                row = snapshot.get(event_id)
+                return copy.deepcopy(row) if row is not None else None
         if snapshot_id is not None:
             return None
         self.get_events(mode="global_tech")
         with self._snapshot_lock:
             selected_snapshot_id = self._current_detail_snapshot_id
             snapshot = self._detail_snapshots.get(selected_snapshot_id) if selected_snapshot_id else None
-        return snapshot.get(event_id) if snapshot else None
+            authority = self._detail_authorities.get(selected_snapshot_id) if selected_snapshot_id else None
+            if snapshot is None or authority is None:
+                return None
+            context = self._load_trusted_context()
+            current_authority = context[0].raw_snapshot_id if context is not None else None
+            if current_authority != authority:
+                return None
+            row = snapshot.get(event_id)
+            return copy.deepcopy(row) if row is not None else None
 
 
 _service: MarketNewsService | None = None
+_service_lock = threading.Lock()
 
 
 def _default_trusted_context_loader() -> tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None:
@@ -733,14 +766,16 @@ def _default_pipeline_state_loader() -> bool:
 
 def get_service() -> MarketNewsService:
     global _service
-    if _service is None:
-        _service = MarketNewsService(
-            trusted_context_loader=_default_trusted_context_loader,
-            pipeline_state_loader=_default_pipeline_state_loader,
-        )
-    return _service
+    with _service_lock:
+        if _service is None:
+            _service = MarketNewsService(
+                trusted_context_loader=_default_trusted_context_loader,
+                pipeline_state_loader=_default_pipeline_state_loader,
+            )
+        return _service
 
 
 def reset_service() -> None:
     global _service
-    _service = None
+    with _service_lock:
+        _service = None

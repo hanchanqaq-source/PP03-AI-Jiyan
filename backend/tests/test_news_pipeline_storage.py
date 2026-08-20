@@ -123,6 +123,39 @@ def pipeline_run(*, phase: PipelinePhase) -> PipelineRun:
     )
 
 
+def write_trusted_run(storage: NewsPipelineStorage, *, run_id: str, raw_id: str) -> PipelineRun:
+    queued = replace(
+        pipeline_run(phase=PipelinePhase.QUEUED),
+        run_id=run_id,
+        raw_snapshot_id=raw_id,
+        displayed_trusted_snapshot_id=None,
+    )
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(raw_snapshot(raw_id))
+    raw_saved = replace(fetching, phase=PipelinePhase.RAW_SAVED)
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
+    storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
+    evidence = evidence_snapshot(raw_id)
+    storage.write_evidence(evidence)
+    evidence_saved = replace(
+        verifying,
+        phase=PipelinePhase.EVIDENCE_SAVED,
+        evidence_snapshot_id=evidence.snapshot_id,
+    )
+    storage.write_run(evidence_saved, expected_phase=PipelinePhase.VERIFYING)
+    storage.publish_trusted(trusted_snapshot(raw_id))
+    completed = replace(
+        evidence_saved,
+        phase=PipelinePhase.TRUSTED_PUBLISHED,
+        trusted_snapshot_id=raw_id,
+    )
+    storage.write_run(completed, expected_phase=PipelinePhase.EVIDENCE_SAVED)
+    return completed
+
+
 def test_all_pipeline_artifacts_share_raw_snapshot_id(tmp_path):
     storage = NewsPipelineStorage(tmp_path)
 
@@ -293,7 +326,11 @@ def test_second_storage_instance_cannot_overwrite_an_active_private_writer(tmp_p
 ])
 def test_explicit_recovery_interrupts_every_nonterminal_phase(tmp_path, phase):
     storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
-    run = replace(pipeline_run(phase=PipelinePhase.QUEUED), run_id=f"run-{phase.value}", evidence_snapshot_id="evidence-raw-1")
+    run = replace(
+        pipeline_run(phase=PipelinePhase.QUEUED),
+        run_id=f"run-{phase.value}",
+        evidence_snapshot_id=None,
+    )
     storage.write_run(run)
     if phase in {PipelinePhase.RAW_SAVED, PipelinePhase.VERIFYING, PipelinePhase.EVIDENCE_SAVED}:
         storage.write_raw(raw_snapshot(run.raw_snapshot_id))
@@ -307,7 +344,17 @@ def test_explicit_recovery_interrupts_every_nonterminal_phase(tmp_path, phase):
             PipelinePhase.VERIFYING,
             PipelinePhase.EVIDENCE_SAVED,
         ):
-            storage.write_run(replace(run, phase=next_phase), expected_phase=current)
+            storage.write_run(
+                replace(
+                    run,
+                    phase=next_phase,
+                    evidence_snapshot_id=(
+                        "evidence-raw-1"
+                        if next_phase is PipelinePhase.EVIDENCE_SAVED else None
+                    ),
+                ),
+                expected_phase=current,
+            )
             current = next_phase
             if next_phase is phase:
                 break
@@ -721,7 +768,8 @@ def test_loaded_run_rejects_non_allowlisted_redacted_error(tmp_path):
     document["redacted_error"] = "Authorization: Bearer secret C:\\private\\file"
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    assert storage.load_run("run-1") is None
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run("run-1")
 
 
 def test_raw_and_trusted_events_use_exact_canonical_schema(tmp_path):
@@ -1528,3 +1576,68 @@ def test_corrupt_recognized_run_blocks_recovery_instead_of_being_skipped(tmp_pat
         storage.recover_incomplete_runs()
 
     assert storage.load_run("run-1").phase is PipelinePhase.QUEUED
+
+
+def test_present_but_invalid_selected_run_is_storage_corrupt_not_absent(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    corrupt = storage.runs_root / "run-corrupt.json"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text(json.dumps({"schema_version": 999}), encoding="utf-8")
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run("run-corrupt")
+
+    assert storage.load_run("run-absent") is None
+
+
+def test_loaded_trusted_run_requires_its_complete_durable_artifact_chain(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    completed = write_trusted_run(storage, run_id="run-complete", raw_id="raw-complete")
+    (storage.evidence_root / "raw-complete.json").unlink()
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run(completed.run_id)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+
+
+def test_loaded_verifying_run_requires_its_durable_raw_snapshot(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(raw_snapshot(queued.raw_snapshot_id))
+    raw_saved = replace(fetching, phase=PipelinePhase.RAW_SAVED)
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
+    storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
+    (storage.raw_root / "raw-1.json").unlink()
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run(verifying.run_id)
+
+
+def test_historical_trusted_run_remains_valid_after_a_new_pointer_generation(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    first = write_trusted_run(storage, run_id="run-first", raw_id="raw-first")
+    write_trusted_run(storage, run_id="run-second", raw_id="raw-second")
+
+    assert storage.load_run(first.run_id) == first
+
+
+def test_failed_recovery_preflight_does_not_claim_a_new_writer_generation(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    completed = write_trusted_run(storage, run_id="run-complete", raw_id="raw-complete")
+    storage.close()
+    (tmp_path / "raw" / "raw-complete.json").unlink()
+    generation_path = tmp_path / ".news-pipeline-generation.json"
+    generation_before = generation_path.read_bytes()
+
+    restarted = NewsPipelineStorage(tmp_path)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        restarted.recover_incomplete_runs()
+
+    assert generation_path.read_bytes() == generation_before
+    with pytest.raises(OSError, match="storage_corrupt"):
+        restarted.load_run(completed.run_id)

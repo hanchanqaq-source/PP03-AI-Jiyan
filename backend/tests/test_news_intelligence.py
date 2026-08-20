@@ -435,6 +435,36 @@ def test_trusted_pipeline_read_never_loads_private_portfolio_fields():
     assert payload["empty_reason"] == "portfolio_unavailable"
 
 
+def test_trusted_my_holdings_uses_only_event_embedded_public_relationships():
+    from dataclasses import replace
+    from news_intelligence.service import MarketNewsService
+
+    trusted, raw, evidence = _pipeline_context_for_market_news()
+    public_event = dict(trusted.events[0])
+    public_event["relation_level"] = "direct_holding"
+    public_event["related_funds"] = [{"fund_code": "017811", "fund_name": "公开披露基金"}]
+    public_event["relation_evidence"] = []
+    trusted = replace(trusted, events=(public_event,))
+    private_accesses: list[str] = []
+
+    def portfolio_loader():
+        private_accesses.append("loader")
+        raise AssertionError("private portfolio loader must not run")
+
+    service = MarketNewsService(
+        trusted_context_loader=lambda: (trusted, raw, evidence),
+        portfolio_loader=portfolio_loader,
+        now=lambda: NOW,
+    )
+
+    payload = service.get_events(mode="my_holdings")
+
+    assert private_accesses == []
+    assert [event["event_id"] for event in payload["events"]] == [public_event["event_id"]]
+    assert payload["portfolio_status"] == "public_relationships"
+    assert payload["empty_reason"] is None
+
+
 def test_pipeline_state_without_trusted_pointer_never_falls_back_to_legacy_radar():
     from news_intelligence.service import MarketNewsService
 
@@ -529,3 +559,85 @@ def test_default_detail_uses_only_latest_response_and_explicit_old_pointer_is_re
     assert service.get_event(first_event_id, first_payload["snapshot_id"]) is None
     assert service.get_event(second_id) is not None
     assert second_payload["snapshot_id"] != first_payload["snapshot_id"]
+
+
+def test_trusted_response_retries_when_current_pointer_switches_before_return():
+    from dataclasses import replace
+    from news_intelligence.service import MarketNewsService
+
+    first_trusted, first_raw, first_evidence = _pipeline_context_for_market_news()
+    second_id = "b" * 20
+    second_document = dict(first_trusted.events[0])
+    second_document["event_id"] = second_id
+    second_raw_document = dict(first_raw.items[0])
+    second_raw_document["event_id"] = second_id
+    second_raw = replace(first_raw, raw_snapshot_id="raw-pointer-next", items=(second_raw_document,))
+    second_evidence = replace(
+        first_evidence,
+        snapshot_id="evidence-pointer-next",
+        raw_snapshot_id=second_raw.raw_snapshot_id,
+        events=(replace(first_evidence.events[0], event_id=second_id),),
+    )
+    second_trusted = replace(
+        first_trusted,
+        raw_snapshot_id=second_raw.raw_snapshot_id,
+        events=(second_document,),
+    )
+    calls = 0
+
+    def pointer_switching_loader():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return first_trusted, first_raw, first_evidence
+        return second_trusted, second_raw, second_evidence
+
+    service = MarketNewsService(
+        trusted_context_loader=pointer_switching_loader,
+        portfolio_loader=lambda: (_ for _ in ()).throw(AssertionError("private portfolio loaded")),
+        now=lambda: NOW,
+    )
+
+    payload = service.get_events(mode="my_focus", tag_ids=["storage"])
+
+    assert calls >= 3
+    assert payload["raw_snapshot_id"] == second_raw.raw_snapshot_id
+    assert [event["event_id"] for event in payload["events"]] == [second_id]
+    assert service.get_event(second_id) is not None
+    assert service.get_event(first_trusted.events[0]["event_id"]) is None
+
+
+def test_market_news_singleton_first_request_is_created_once_under_concurrency(monkeypatch):
+    import time
+    from threading import Barrier, Lock, Thread
+    import news_intelligence.service as service_module
+
+    service_module.reset_service()
+    ready = Barrier(8)
+    created: list[object] = []
+    created_lock = Lock()
+
+    def factory(**_kwargs):
+        instance = object()
+        with created_lock:
+            created.append(instance)
+        time.sleep(0.02)
+        return instance
+
+    monkeypatch.setattr(service_module, "MarketNewsService", factory)
+    results: list[object] = []
+
+    def first_request():
+        ready.wait()
+        results.append(service_module.get_service())
+
+    threads = [Thread(target=first_request) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(created) == 1
+    assert len({id(result) for result in results}) == 1
+    service_module.reset_service()
