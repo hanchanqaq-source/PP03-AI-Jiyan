@@ -59,9 +59,12 @@ _MAX_SCAN_ROWS = _MAX_INDEX_EVENTS * 2
 _MAX_ARCHIVE_SCAN_NODES = _MAX_INDEX_EVENTS * 128
 _MAX_SCAN_NODES = _MAX_ARCHIVE_SCAN_NODES + _MAX_SNAPSHOT_NODES
 _MAX_MUTATION_BYTES = 64 * 1_048_576
+_MAX_STATE_BYTES = 64 * 1_024
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _MAX_DIAGNOSTIC_COUNT = 1_000_000
-_JOURNAL_SCHEMA_VERSION = 1
+_JOURNAL_SCHEMA_VERSION = 2
+_LEGACY_JOURNAL_SCHEMA_VERSION = 1
+_STATE_SCHEMA_VERSION = 1
 _ARCHIVE_KEYS = _EVENT_KEYS | {
     "schema_version",
     "evidence_snapshot_id",
@@ -75,9 +78,30 @@ _ARCHIVE_KEYS = _EVENT_KEYS | {
 _LEGACY_ARCHIVE_KEYS = _ARCHIVE_KEYS - {"content_digest"}
 _LINEAGE_KEYS = {"evidence_snapshot_id", "raw_snapshot_id", "generated_at", "content_digest"}
 _LEGACY_LINEAGE_KEYS = _LINEAGE_KEYS - {"content_digest"}
-_MIGRATED_LINEAGE_KEYS = _LINEAGE_KEYS | {"legacy_v1"}
+_MIGRATED_LINEAGE_KEYS = _LINEAGE_KEYS | {"legacy_v1", "legacy_projection_digest"}
+_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS = _MIGRATED_LINEAGE_KEYS | {"legacy_unverifiable"}
 _INDEX_KEYS = {"schema_version", "events"}
-_JOURNAL_KEYS = {"schema_version", "rows"}
+_LEGACY_JOURNAL_KEYS = {"schema_version", "rows"}
+_JOURNAL_KEYS = {
+    "schema_version",
+    "transaction_id",
+    "base_generation",
+    "target_generation",
+    "base_index_digest",
+    "target_index_digest",
+    "base_bucket_digests",
+    "target_bucket_digests",
+    "rows",
+}
+_STATE_KEYS = {
+    "schema_version",
+    "generation",
+    "phase",
+    "transaction_id",
+    "index_digest",
+    "bucket_digests",
+}
+_MISSING_DIGEST = "0" * 64
 _EVIDENCE_COLLECTION_KEYS = (
     "primary_evidence",
     "independent_evidence",
@@ -85,6 +109,7 @@ _EVIDENCE_COLLECTION_KEYS = (
     "contradicting_evidence",
 )
 _SENSITIVE_QUERY_NAMES = {
+    "key",
     "apikey",
     "accesskey",
     "privatekey",
@@ -93,6 +118,9 @@ _SENSITIVE_QUERY_NAMES = {
     "refreshtoken",
     "clientsecret",
     "secret",
+    "credential",
+    "credentials",
+    "bearer",
     "password",
     "passwd",
     "authorization",
@@ -105,9 +133,9 @@ _SENSITIVE_QUERY_NAMES = {
     "code",
 }
 _NESTED_SECRET = re.compile(
-    r"(?:^|[?&;])\s*(?:api[_-]?key|access[_-]?key|private[_-]?key|access[_-]?token|"
+    r"(?:^|[?&;=/])\s*(?:key|api[_-]?key|access[_-]?key|private[_-]?key|access[_-]?token|"
     r"refresh[_-]?token|token|client[_-]?secret|secret|password|passwd|authorization|auth|"
-    r"cookie|session|jwt|signature|sig|code)\s*=",
+    r"credential(?:s)?|bearer|cookie|session|jwt|signature|sig|code)\s*=",
     re.IGNORECASE,
 )
 _SPECIAL_HOST_SUFFIXES = (
@@ -202,36 +230,56 @@ def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[s
     }
 
 
-def _legacy_lineage_digest(evidence_snapshot_id: str, raw_snapshot_id: str, generated_at: str) -> str:
-    payload = "\0".join(("pp03-archive-v1-lineage", evidence_snapshot_id, raw_snapshot_id, generated_at))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _lineage_from_document(value: object, *, legacy: bool = False) -> dict[str, Any]:
+def _lineage_from_document(
+    value: object,
+    *,
+    legacy: bool = False,
+    legacy_projection_digest: str | None = None,
+    legacy_unverifiable: bool = False,
+) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError("invalid archive lineage schema")
     keys = set(value)
-    migrated = not legacy and keys == _MIGRATED_LINEAGE_KEYS
+    migrated = not legacy and frozenset(keys) in {
+        frozenset(_MIGRATED_LINEAGE_KEYS),
+        frozenset(_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS),
+    }
     if (legacy and keys != _LEGACY_LINEAGE_KEYS) or (
-        not legacy and keys != _LINEAGE_KEYS and keys != _MIGRATED_LINEAGE_KEYS
+        not legacy
+        and keys != _LINEAGE_KEYS
+        and keys != _MIGRATED_LINEAGE_KEYS
+        and keys != _UNVERIFIABLE_MIGRATED_LINEAGE_KEYS
     ):
         raise ValueError("invalid archive lineage schema")
     evidence_snapshot_id = _bounded_text(value["evidence_snapshot_id"], "evidence_snapshot_id")
     raw_snapshot_id = _bounded_text(value["raw_snapshot_id"], "raw_snapshot_id")
     generated_at = _metadata_time(value["generated_at"], "lineage generated_at").isoformat()
-    legacy_digest = _legacy_lineage_digest(evidence_snapshot_id, raw_snapshot_id, generated_at)
+    if legacy:
+        if legacy_projection_digest is None or _CONTENT_DIGEST.fullmatch(legacy_projection_digest) is None:
+            raise ValueError("invalid legacy archive lineage projection")
+        lineage_digest = legacy_projection_digest
+    else:
+        lineage_digest = _bounded_text(value["content_digest"], "lineage content_digest", maximum=64)
     lineage = {
         "evidence_snapshot_id": evidence_snapshot_id,
         "raw_snapshot_id": raw_snapshot_id,
         "generated_at": generated_at,
-        "content_digest": legacy_digest
-        if legacy
-        else _bounded_text(value["content_digest"], "lineage content_digest", maximum=64),
+        "content_digest": lineage_digest,
     }
     if legacy or migrated:
-        if migrated and (value["legacy_v1"] is not True or lineage["content_digest"] != legacy_digest):
+        projection_digest = legacy_projection_digest if legacy else value["legacy_projection_digest"]
+        if (
+            projection_digest != lineage["content_digest"]
+            or value.get("legacy_v1", True) is not True
+        ):
             raise ValueError("invalid migrated archive lineage")
         lineage["legacy_v1"] = True
+        lineage["legacy_projection_digest"] = projection_digest
+        marked_unverifiable = legacy_unverifiable if legacy else value.get("legacy_unverifiable", False)
+        if marked_unverifiable:
+            if not legacy and value.get("legacy_unverifiable") is not True:
+                raise ValueError("invalid migrated archive lineage")
+            lineage["legacy_unverifiable"] = True
     if _CONTENT_DIGEST.fullmatch(lineage["content_digest"]) is None:
         raise ValueError("invalid archive lineage digest")
     return lineage
@@ -255,10 +303,14 @@ def _bucket_name(row: dict[str, Any]) -> str:
 
 
 def _query_name_is_sensitive(value: str) -> bool:
-    compact = re.sub(r"[^a-z0-9]", "", value.casefold())
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    tokens = re.findall(r"[a-z0-9]+", separated.casefold())
+    compact = "".join(tokens)
     if compact in _SENSITIVE_QUERY_NAMES:
         return True
-    sensitive_fragments = (
+    if any(token in _SENSITIVE_QUERY_NAMES for token in tokens):
+        return True
+    sensitive_suffixes = (
         "apikey",
         "accesskey",
         "privatekey",
@@ -272,8 +324,11 @@ def _query_name_is_sensitive(value: str) -> bool:
         "cookie",
         "session",
         "jwt",
+        "credential",
+        "credentials",
+        "bearer",
     )
-    return any(fragment in compact for fragment in sensitive_fragments)
+    return any(compact.endswith(suffix) for suffix in sensitive_suffixes)
 
 
 def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
@@ -949,7 +1004,15 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     history = value["snapshot_history"]
     if type(history) is not list or not history:
         raise ValueError("invalid archive snapshot history")
-    parsed_history = [_lineage_from_document(item, legacy=legacy) for item in history]
+    parsed_history = [
+        _lineage_from_document(
+            item,
+            legacy=legacy,
+            legacy_projection_digest=content_digest if legacy else None,
+            legacy_unverifiable=legacy and len(history) > 1,
+        )
+        for item in history
+    ]
     identities: dict[tuple[str, str, str], str] = {}
     for item in parsed_history:
         identity = (item["evidence_snapshot_id"], item["raw_snapshot_id"], item["generated_at"])
@@ -1064,45 +1127,47 @@ def _merge_evidence(
     loser: list[dict[str, Any]],
     winner: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    items = [*loser, *winner]
-    parents = list(range(len(items)))
+    loser_matches: dict[int, int] = {}
+    winner_matches: dict[int, int] = {}
+    winner_by_id = {item["evidence_id"]: index for index, item in enumerate(winner)}
+    winner_by_url = {
+        item["canonical_url"]: index
+        for index, item in enumerate(winner)
+        if item["canonical_url"]
+    }
+    for loser_index, loser_item in enumerate(loser):
+        candidates = {
+            winner_by_id[loser_item["evidence_id"]]
+        } if loser_item["evidence_id"] in winner_by_id else set()
+        if loser_item["canonical_url"] in winner_by_url:
+            candidates.add(winner_by_url[loser_item["canonical_url"]])
+        if len(candidates) > 1:
+            raise ValueError("ambiguous archive evidence identity")
+        if candidates:
+            winner_index = next(iter(candidates))
+            if winner_index in winner_matches:
+                raise ValueError("ambiguous archive evidence identity")
+            loser_matches[loser_index] = winner_index
+            winner_matches[winner_index] = loser_index
 
-    def find(index: int) -> int:
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parents[max(left_root, right_root)] = min(left_root, right_root)
-
-    owners: dict[tuple[str, str], int] = {}
-    for index, item in enumerate(items):
-        identities = [("id", item["evidence_id"])]
-        if item["canonical_url"]:
-            identities.append(("url", item["canonical_url"]))
-        for identity in identities:
-            previous = owners.get(identity)
-            if previous is not None:
-                union(index, previous)
-            else:
-                owners[identity] = index
-
-    groups: dict[int, list[int]] = {}
-    for index in range(len(items)):
-        groups.setdefault(find(index), []).append(index)
     aliases: dict[str, str] = {}
     result: list[dict[str, Any]] = []
-    for indices in groups.values():
-        canonical_id = min(items[index]["evidence_id"] for index in indices)
-        selected = dict(items[max(indices)])
+    for loser_index, winner_index in loser_matches.items():
+        pair = (loser[loser_index], winner[winner_index])
+        canonical_id = min(item["evidence_id"] for item in pair)
+        selected = dict(winner[winner_index])
         selected["evidence_id"] = canonical_id
         result.append(selected)
-        for index in indices:
-            aliases[items[index]["evidence_id"]] = canonical_id
+        for item in pair:
+            aliases[item["evidence_id"]] = canonical_id
+    for index, item in enumerate(loser):
+        if index not in loser_matches:
+            result.append(dict(item))
+            aliases[item["evidence_id"]] = item["evidence_id"]
+    for index, item in enumerate(winner):
+        if index not in winner_matches:
+            result.append(dict(item))
+            aliases[item["evidence_id"]] = item["evidence_id"]
     return sorted(result, key=lambda item: (item["evidence_id"], item["canonical_url"])), aliases
 
 
@@ -1182,16 +1247,11 @@ def _merge_archive_rows(
         if previous_lineage is None:
             histories_by_identity[identity] = row
             continue
+        if previous_lineage["content_digest"] != row["content_digest"]:
+            raise ValueError("archive lineage content mismatch")
         previous_legacy = previous_lineage.get("legacy_v1") is True
         incoming_legacy = row.get("legacy_v1") is True
-        if previous_lineage["content_digest"] != row["content_digest"]:
-            if previous_legacy and not incoming_legacy:
-                histories_by_identity[identity] = row
-            elif not previous_legacy and incoming_legacy:
-                continue
-            else:
-                raise ValueError("archive lineage content mismatch")
-        elif previous_legacy and not incoming_legacy:
+        if previous_legacy and not incoming_legacy:
             histories_by_identity[identity] = row
     histories = list(histories_by_identity.values())
     histories.sort(key=_lineage_order)
@@ -1329,6 +1389,7 @@ class EvidenceArchive:
         self.archive_root = self.root / "archive"
         self.index_path = self.archive_root / "index.json"
         self.journal_path = self.archive_root / "transaction.json"
+        self.state_path = self.archive_root / "state.json"
         self.lock_path = self.archive_root / ".archive.lock"
         self._now = now or (lambda: datetime.now(timezone.utc))
         if type(lock_timeout) not in {int, float} or isinstance(lock_timeout, bool) or lock_timeout <= 0 or lock_timeout > 30:
@@ -1752,6 +1813,7 @@ class EvidenceArchive:
         budget: dict[str, int] | None = None,
         fail_on_budget: bool = False,
         validation_now: datetime | None = None,
+        observed_digests: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         if not _valid_bucket_name(name):
             raise ValueError("invalid archive bucket name")
@@ -1765,7 +1827,11 @@ class EvidenceArchive:
                 if fail_on_budget:
                     raise OSError("storage_corrupt")
                 self._increment(diagnostics, "skipped_files")
+            elif observed_digests is not None:
+                observed_digests[name] = _MISSING_DIGEST
             return []
+        if observed_digests is not None:
+            observed_digests[name] = self._payload_digest(payload)
         if budget is not None:
             budget["bytes"] -= len(payload)
         self._increment(diagnostics, "scanned_files")
@@ -1839,9 +1905,158 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         return names
 
+    @staticmethod
+    def _payload_digest(payload: bytes | None) -> str:
+        return _MISSING_DIGEST if payload is None else hashlib.sha256(payload).hexdigest()
+
+    def _index_digest(self) -> str:
+        raw = self._read_bytes(self.index_path, _MAX_INDEX_BYTES)
+        if raw is None and self._entry_present(self.index_path):
+            raise OSError("storage_corrupt")
+        return self._payload_digest(raw)
+
+    def _read_state(self) -> dict[str, Any]:
+        raw = self._read_bytes(self.state_path, _MAX_STATE_BYTES)
+        if raw is None:
+            if self._entry_present(self.state_path):
+                raise OSError("storage_corrupt")
+            return {
+                "schema_version": _STATE_SCHEMA_VERSION,
+                "generation": 0,
+                "phase": "finalized",
+                "transaction_id": None,
+                "index_digest": None,
+                "bucket_digests": {},
+            }
+        try:
+            document = self._parse_json(raw)
+            if type(document) is not dict or set(document) != _STATE_KEYS:
+                raise ValueError("invalid archive state")
+            generation = document["generation"]
+            phase = document["phase"]
+            transaction_id = document["transaction_id"]
+            index_digest = document["index_digest"]
+            bucket_digests = self._bucket_digest_map(document["bucket_digests"])
+            if (
+                type(document["schema_version"]) is not int
+                or document["schema_version"] != _STATE_SCHEMA_VERSION
+                or type(generation) is not int
+                or generation < 1
+                or phase not in {"prepared", "finalized"}
+                or type(transaction_id) is not str
+                or _CONTENT_DIGEST.fullmatch(transaction_id) is None
+                or type(index_digest) is not str
+                or _CONTENT_DIGEST.fullmatch(index_digest) is None
+            ):
+                raise ValueError("invalid archive state")
+            result = dict(document)
+            result["bucket_digests"] = bucket_digests
+            return result
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
+            raise OSError("storage_corrupt") from None
+
+    def _state_payload(
+        self,
+        generation: int,
+        phase: str,
+        transaction_id: str,
+        index_digest: str,
+        bucket_digests: dict[str, str],
+    ) -> bytes:
+        if (
+            type(generation) is not int
+            or generation < 1
+            or phase not in {"prepared", "finalized"}
+            or type(transaction_id) is not str
+            or _CONTENT_DIGEST.fullmatch(transaction_id) is None
+            or type(index_digest) is not str
+            or _CONTENT_DIGEST.fullmatch(index_digest) is None
+        ):
+            raise ValueError("invalid archive state")
+        canonical_bucket_digests = self._bucket_digest_map(bucket_digests)
+        payload = (json.dumps(
+            {
+                "schema_version": _STATE_SCHEMA_VERSION,
+                "generation": generation,
+                "phase": phase,
+                "transaction_id": transaction_id,
+                "index_digest": index_digest,
+                "bucket_digests": canonical_bucket_digests,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n").encode("utf-8")
+        if len(payload) > _MAX_STATE_BYTES:
+            raise ValueError("archive state is too large")
+        return payload
+
+    def _write_state(
+        self,
+        generation: int,
+        phase: str,
+        transaction_id: str,
+        index_digest: str,
+        bucket_digests: dict[str, str],
+    ) -> None:
+        self._atomic_write(
+            self.state_path,
+            self._state_payload(
+                generation,
+                phase,
+                transaction_id,
+                index_digest,
+                bucket_digests,
+            ),
+            _MAX_STATE_BYTES,
+        )
+
+    @staticmethod
+    def _bucket_digest_map(value: object) -> dict[str, str]:
+        if type(value) is not dict or len(value) > _MAX_ARCHIVE_FILES:
+            raise ValueError("invalid archive transaction buckets")
+        result: dict[str, str] = {}
+        for name, digest in value.items():
+            if (
+                not _valid_bucket_name(name)
+                or type(digest) is not str
+                or _CONTENT_DIGEST.fullmatch(digest) is None
+            ):
+                raise ValueError("invalid archive transaction buckets")
+            result[name] = digest
+        return dict(sorted(result.items()))
+
+    @staticmethod
+    def _journal_transaction_id(
+        *,
+        base_generation: int,
+        target_generation: int,
+        base_index_digest: str,
+        target_index_digest: str,
+        base_bucket_digests: dict[str, str],
+        target_bucket_digests: dict[str, str],
+        rows: list[dict[str, Any]],
+    ) -> str:
+        material = json.dumps(
+            {
+                "base_generation": base_generation,
+                "target_generation": target_generation,
+                "base_index_digest": base_index_digest,
+                "target_index_digest": target_index_digest,
+                "base_bucket_digests": base_bucket_digests,
+                "target_bucket_digests": target_bucket_digests,
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
+
     def _read_index(self) -> dict[str, str] | None:
         raw = self._read_bytes(self.index_path, _MAX_INDEX_BYTES)
         if raw is None:
+            if self._entry_present(self.index_path):
+                raise OSError("storage_corrupt")
             return None
         try:
             document = self._parse_json(raw)
@@ -1862,7 +2077,7 @@ class EvidenceArchive:
                     raise ValueError("invalid archive index bucket")
             return result
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
-            return None
+            raise OSError("storage_corrupt") from None
 
     def _index_payload(self, events: dict[str, str]) -> bytes:
         if len(events) > _MAX_INDEX_EVENTS:
@@ -1881,7 +2096,17 @@ class EvidenceArchive:
     def _write_index(self, events: dict[str, str]) -> None:
         self._atomic_write(self.index_path, self._index_payload(events), _MAX_INDEX_BYTES)
 
-    def _journal_payload(self, rows: list[dict[str, Any]]) -> bytes:
+    def _journal_payload(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        base_generation: int | None = None,
+        target_generation: int | None = None,
+        base_index_digest: str | None = None,
+        target_index_digest: str | None = None,
+        base_bucket_digests: dict[str, str] | None = None,
+        target_bucket_digests: dict[str, str] | None = None,
+    ) -> bytes:
         if len(rows) > _MAX_INDEX_EVENTS:
             raise ValueError("archive snapshot journal is too large")
         validation_now = _utc(self._now(), "archive clock")
@@ -1889,8 +2114,69 @@ class EvidenceArchive:
             _validate_archive_projection(row, validation_now=validation_now)
             for row in sorted(rows, key=lambda row: row["event_id"])
         ]
+        state = self._read_state()
+        if base_generation is None:
+            base_generation = state["generation"]
+        if target_generation is None:
+            target_generation = base_generation + 1
+        if base_index_digest is None:
+            base_index_digest = self._index_digest()
+        if target_index_digest is None:
+            index = self._read_index() or {}
+            for row in canonical:
+                index[row["event_id"]] = _bucket_name(row)
+            target_index_digest = self._payload_digest(self._index_payload(index))
+        if base_bucket_digests is None:
+            current_index = self._read_index() or {}
+            names = {
+                _bucket_name(row)
+                for row in canonical
+            } | {
+                current_index[row["event_id"]]
+                for row in canonical
+                if row["event_id"] in current_index
+            }
+            base_bucket_digests = {}
+            for name in sorted(names):
+                raw = self._read_bytes(self.archive_root / name, _MAX_BUCKET_BYTES)
+                if raw is None and self._entry_present(self.archive_root / name):
+                    raise OSError("storage_corrupt")
+                base_bucket_digests[name] = self._payload_digest(raw)
+        base_bucket_digests = self._bucket_digest_map(base_bucket_digests)
+        if target_bucket_digests is None:
+            target_bucket_digests = dict(base_bucket_digests)
+        target_bucket_digests = self._bucket_digest_map(target_bucket_digests)
+        if (
+            type(base_generation) is not int
+            or type(target_generation) is not int
+            or base_generation < 0
+            or target_generation <= base_generation
+            or _CONTENT_DIGEST.fullmatch(base_index_digest) is None
+            or _CONTENT_DIGEST.fullmatch(target_index_digest) is None
+            or set(base_bucket_digests) != set(target_bucket_digests)
+        ):
+            raise ValueError("invalid archive transaction")
+        transaction_id = self._journal_transaction_id(
+            base_generation=base_generation,
+            target_generation=target_generation,
+            base_index_digest=base_index_digest,
+            target_index_digest=target_index_digest,
+            base_bucket_digests=base_bucket_digests,
+            target_bucket_digests=target_bucket_digests,
+            rows=canonical,
+        )
         payload = (json.dumps(
-            {"schema_version": _JOURNAL_SCHEMA_VERSION, "rows": canonical},
+            {
+                "schema_version": _JOURNAL_SCHEMA_VERSION,
+                "transaction_id": transaction_id,
+                "base_generation": base_generation,
+                "target_generation": target_generation,
+                "base_index_digest": base_index_digest,
+                "target_index_digest": target_index_digest,
+                "base_bucket_digests": base_bucket_digests,
+                "target_bucket_digests": target_bucket_digests,
+                "rows": canonical,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         ) + "\n").encode("utf-8")
@@ -1904,7 +2190,7 @@ class EvidenceArchive:
         diagnostics: dict[str, int],
         *,
         budget: dict[str, int],
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         maximum = min(_MAX_JOURNAL_BYTES, max(0, budget["bytes"]))
         raw = self._read_bytes(self.journal_path, maximum)
         if raw is None:
@@ -1912,7 +2198,7 @@ class EvidenceArchive:
                 self._increment(diagnostics, "skipped_files")
                 self._last_diagnostics = diagnostics
                 raise OSError("storage_corrupt")
-            return []
+            return None
         try:
             self._increment(diagnostics, "scanned_files")
             budget["bytes"] -= len(raw)
@@ -1922,13 +2208,21 @@ class EvidenceArchive:
                 maximum_tokens=_MAX_SNAPSHOT_NODES * 4 + 16,
             )
             document = self._parse_json(raw)
-            if type(document) is not dict or set(document) != _JOURNAL_KEYS:
+            if type(document) is not dict:
                 raise ValueError("invalid archive journal")
-            if (
-                type(document["schema_version"]) is not int
-                or document["schema_version"] != _JOURNAL_SCHEMA_VERSION
-                or type(document["rows"]) is not list
-            ):
+            schema_version = document.get("schema_version")
+            if type(schema_version) is not int:
+                raise ValueError("invalid archive journal")
+            legacy = schema_version == _LEGACY_JOURNAL_SCHEMA_VERSION
+            if legacy:
+                if set(document) != _LEGACY_JOURNAL_KEYS:
+                    raise ValueError("invalid archive journal")
+            elif schema_version == _JOURNAL_SCHEMA_VERSION:
+                if set(document) != _JOURNAL_KEYS:
+                    raise ValueError("invalid archive journal")
+            else:
+                raise ValueError("invalid archive journal")
+            if type(document["rows"]) is not list:
                 raise ValueError("invalid archive journal")
             if len(document["rows"]) > _MAX_INDEX_EVENTS:
                 raise ValueError("invalid archive journal")
@@ -1948,7 +2242,70 @@ class EvidenceArchive:
                 raise ValueError("invalid archive journal order")
             for row in rows:
                 _validate_temporal_row(row, now)
-            return rows
+            if legacy:
+                return {"legacy": True, "rows": rows}
+            transaction_id = document["transaction_id"]
+            base_generation = document["base_generation"]
+            target_generation = document["target_generation"]
+            base_index_digest = document["base_index_digest"]
+            target_index_digest = document["target_index_digest"]
+            base_bucket_digests = self._bucket_digest_map(document["base_bucket_digests"])
+            target_bucket_digests = self._bucket_digest_map(document["target_bucket_digests"])
+            if (
+                type(transaction_id) is not str
+                or _CONTENT_DIGEST.fullmatch(transaction_id) is None
+                or type(base_generation) is not int
+                or type(target_generation) is not int
+                or base_generation < 0
+                or target_generation <= base_generation
+                or type(base_index_digest) is not str
+                or _CONTENT_DIGEST.fullmatch(base_index_digest) is None
+                or type(target_index_digest) is not str
+                or _CONTENT_DIGEST.fullmatch(target_index_digest) is None
+                or set(base_bucket_digests) != set(target_bucket_digests)
+                or transaction_id != self._journal_transaction_id(
+                    base_generation=base_generation,
+                    target_generation=target_generation,
+                    base_index_digest=base_index_digest,
+                    target_index_digest=target_index_digest,
+                    base_bucket_digests=base_bucket_digests,
+                    target_bucket_digests=target_bucket_digests,
+                    rows=rows,
+                )
+            ):
+                raise ValueError("invalid archive journal")
+            state = self._read_state()
+            actual_index_digest = self._index_digest()
+            if state["phase"] == "prepared":
+                if (
+                    state["generation"] != target_generation
+                    or state["transaction_id"] != transaction_id
+                    or state["index_digest"] != target_index_digest
+                    or actual_index_digest != target_index_digest
+                ):
+                    raise ValueError("stale archive journal")
+            else:
+                if state["generation"] == target_generation:
+                    raise ValueError("stale archive journal")
+                if (
+                    state["generation"] != base_generation
+                    or state["generation"] > 0
+                    and state["index_digest"] != base_index_digest
+                    or actual_index_digest not in {base_index_digest, target_index_digest}
+                ):
+                    raise ValueError("stale archive journal")
+            return {
+                "legacy": False,
+                "rows": rows,
+                "transaction_id": transaction_id,
+                "base_generation": base_generation,
+                "target_generation": target_generation,
+                "base_index_digest": base_index_digest,
+                "target_index_digest": target_index_digest,
+                "base_bucket_digests": base_bucket_digests,
+                "target_bucket_digests": target_bucket_digests,
+                "state_phase": state["phase"],
+            }
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
             self._increment(diagnostics, "skipped_files")
             self._last_diagnostics = diagnostics
@@ -1960,6 +2317,44 @@ class EvidenceArchive:
             return
         _cleanup_owned_temp(self.journal_path, (metadata.st_dev, metadata.st_ino))
         _sync_directory(self.archive_root)
+
+    def _validate_journal_bucket_state(
+        self,
+        journal: dict[str, Any] | None,
+        observed: dict[str, str],
+    ) -> None:
+        if journal is None or journal["legacy"]:
+            return
+        base = journal["base_bucket_digests"]
+        target = journal["target_bucket_digests"]
+        if set(observed) & set(base) != set(base):
+            raise OSError("storage_corrupt")
+        for name in base:
+            actual = observed[name]
+            allowed = {target[name]} if journal["state_phase"] == "prepared" else {base[name], target[name]}
+            if actual not in allowed:
+                raise OSError("storage_corrupt")
+
+    def _validate_persisted_bucket_state(
+        self,
+        state: dict[str, Any],
+        journal: dict[str, Any] | None,
+        observed: dict[str, str],
+    ) -> None:
+        if state["generation"] == 0 or state["phase"] != "prepared":
+            return
+        for name, committed_digest in state["bucket_digests"].items():
+            if name not in observed:
+                raise OSError("storage_corrupt")
+            actual = observed[name]
+            if journal is not None and not journal["legacy"] and name in journal["target_bucket_digests"]:
+                if committed_digest != journal["target_bucket_digests"][name]:
+                    raise OSError("storage_corrupt")
+                allowed = {journal["target_bucket_digests"][name]}
+            else:
+                allowed = {committed_digest}
+            if actual not in allowed:
+                raise OSError("storage_corrupt")
 
     def _rebuild_index(self) -> dict[str, str]:
         diagnostics = self._diagnostics()
@@ -2004,7 +2399,18 @@ class EvidenceArchive:
         with CACHE_IO_LOCK, self._process_lock():
             diagnostics = self._diagnostics()
             budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
-            pending = self._read_journal(archived_at, diagnostics, budget=budget)
+            journal = self._read_journal(archived_at, diagnostics, budget=budget)
+            state = self._read_state()
+            if (
+                journal is None
+                and state["generation"] > 0
+                and self._index_digest() != state["index_digest"]
+            ):
+                raise OSError("storage_corrupt")
+            pending = [] if journal is None else journal["rows"]
+            if state["phase"] == "prepared":
+                if journal is not None and journal["legacy"]:
+                    raise OSError("storage_corrupt")
             index = self._read_index() or {}
             cutoff = archived_at - timedelta(days=90)
             names: set[str] = {
@@ -2018,10 +2424,14 @@ class EvidenceArchive:
                 previous_name = index.get(event_id)
                 if previous_name is not None:
                     names.add(previous_name)
+            if journal is not None and not journal["legacy"]:
+                names.update(journal["base_bucket_digests"])
+            names.update(state["bucket_digests"])
 
             bucket_rows: dict[str, list[dict[str, Any]]] = {}
             existing: dict[str, dict[str, Any]] = {}
             locations: dict[str, set[str]] = {}
+            observed_bucket_digests: dict[str, str] = {}
             for name in sorted(names):
                 rows = self._read_bucket(
                     name,
@@ -2029,6 +2439,7 @@ class EvidenceArchive:
                     budget=budget,
                     fail_on_budget=True,
                     validation_now=archived_at,
+                    observed_digests=observed_bucket_digests,
                 )
                 bucket_rows[name] = rows
                 for row in rows:
@@ -2036,6 +2447,39 @@ class EvidenceArchive:
                     locations.setdefault(event_id, set()).add(name)
                     previous = existing.get(event_id)
                     existing[event_id] = row if previous is None else _merge_archive_rows(previous, row)
+
+            self._validate_journal_bucket_state(journal, observed_bucket_digests)
+            self._validate_persisted_bucket_state(state, journal, observed_bucket_digests)
+
+            if journal is not None:
+                for row in pending:
+                    previous = existing.get(row["event_id"])
+                    if previous is None:
+                        if journal["legacy"]:
+                            raise OSError("storage_corrupt")
+                        continue
+                    try:
+                        merged = _merge_archive_rows(previous, row)
+                    except (KeyError, TypeError, ValueError):
+                        raise OSError("storage_corrupt") from None
+                    expected = previous if journal["legacy"] else row
+                    if merged != expected:
+                        raise OSError("storage_corrupt")
+
+            if state["phase"] == "prepared":
+                if journal is not None:
+                    self._remove_journal()
+                self._write_state(
+                    state["generation"],
+                    "finalized",
+                    state["transaction_id"],
+                    state["index_digest"],
+                    {},
+                )
+                state = self._read_state()
+                journal = None
+                pending = []
+            base_index_digest = self._index_digest()
 
             committed: dict[str, dict[str, Any]] = {}
             for row in (*pending, *incoming):
@@ -2086,8 +2530,50 @@ class EvidenceArchive:
                 name: self._bucket_payload(name, rows)
                 for name, rows in planned_rows.items()
             }
-            journal_payload = self._journal_payload(list(committed.values()))
-            mutation_bytes = len(index_payload) + len(journal_payload) + sum(map(len, bucket_payloads.values()))
+            pending_target = 0 if journal is None or journal["legacy"] else journal["target_generation"]
+            target_generation = max(state["generation"], pending_target) + 1
+            target_index_digest = self._payload_digest(index_payload)
+            base_bucket_digests = {
+                name: observed_bucket_digests.get(name, _MISSING_DIGEST)
+                for name in sorted(affected)
+            }
+            target_bucket_digests = {
+                name: self._payload_digest(bucket_payloads[name])
+                for name in sorted(affected)
+            }
+            target_state_bucket_digests = self._bucket_digest_map(target_bucket_digests)
+            journal_payload = self._journal_payload(
+                list(committed.values()),
+                base_generation=state["generation"],
+                target_generation=target_generation,
+                base_index_digest=base_index_digest,
+                target_index_digest=target_index_digest,
+                base_bucket_digests=base_bucket_digests,
+                target_bucket_digests=target_bucket_digests,
+            )
+            journal_document = self._parse_json(journal_payload)
+            transaction_id = journal_document["transaction_id"]
+            prepared_state_payload = self._state_payload(
+                target_generation,
+                "prepared",
+                transaction_id,
+                target_index_digest,
+                target_state_bucket_digests,
+            )
+            finalized_state_payload = self._state_payload(
+                target_generation,
+                "finalized",
+                transaction_id,
+                target_index_digest,
+                {},
+            )
+            mutation_bytes = (
+                len(index_payload)
+                + len(journal_payload)
+                + len(prepared_state_payload)
+                + len(finalized_state_payload)
+                + sum(map(len, bucket_payloads.values()))
+            )
             if mutation_bytes > _MAX_MUTATION_BYTES:
                 raise ValueError("archive snapshot mutation budget exceeded")
 
@@ -2096,7 +2582,9 @@ class EvidenceArchive:
             for name in write_order:
                 self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
             self._atomic_write(self.index_path, index_payload, _MAX_INDEX_BYTES)
+            self._atomic_write(self.state_path, prepared_state_payload, _MAX_STATE_BYTES)
             self._remove_journal()
+            self._atomic_write(self.state_path, finalized_state_payload, _MAX_STATE_BYTES)
 
     def _query_unlocked(self, days: int, status: str | None) -> list[dict[str, Any]]:
         now = _utc(self._now(), "archive clock")
@@ -2104,38 +2592,78 @@ class EvidenceArchive:
         diagnostics = self._diagnostics()
         budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
         selected: dict[str, dict[str, Any]] = {}
-        journal_rows = self._read_journal(now, diagnostics, budget=budget)
+        journal = self._read_journal(now, diagnostics, budget=budget)
+        state = self._read_state()
+        if (
+            journal is None
+            and state["generation"] > 0
+            and self._index_digest() != state["index_digest"]
+        ):
+            self._last_diagnostics = diagnostics
+            raise OSError("storage_corrupt")
+        journal_rows = [] if journal is None else journal["rows"]
+        legacy_journal = journal is not None and journal["legacy"]
         journal_ids = {row["event_id"] for row in journal_rows}
-        for row in journal_rows:
-            effective = _event_time(row)
-            if effective < cutoff or effective > now:
-                continue
-            selected[row["event_id"]] = row
+        journal_by_id = {row["event_id"]: row for row in journal_rows}
+        matched_legacy_ids: set[str] = set()
+        if not legacy_journal:
+            for row in journal_rows:
+                effective = _event_time(row)
+                if effective < cutoff or effective > now:
+                    continue
+                selected[row["event_id"]] = row
         start_date = cutoff.date()
         current_date = now.date()
         cursor = start_date
+        names: set[str] = set()
         while cursor <= current_date:
-            name = f"{cursor.isoformat()}.jsonl"
+            names.add(f"{cursor.isoformat()}.jsonl")
+            cursor += timedelta(days=1)
+        if journal is not None and not journal["legacy"]:
+            names.update(journal["base_bucket_digests"])
+        names.update(state["bucket_digests"])
+        observed_bucket_digests: dict[str, str] = {}
+        for name in sorted(names):
             for row in self._read_bucket(
                 name,
                 diagnostics,
                 budget=budget,
                 fail_on_budget=True,
                 validation_now=now,
+                observed_digests=observed_bucket_digests,
             ):
                 effective = _event_time(row)
                 if effective < cutoff or effective > now:
                     continue
                 if row["event_id"] in journal_ids:
                     self._increment(diagnostics, "duplicate_rows")
-                    continue
+                    journal_row = journal_by_id[row["event_id"]]
+                    try:
+                        merged = _merge_archive_rows(row, journal_row)
+                    except (KeyError, TypeError, ValueError):
+                        self._last_diagnostics = diagnostics
+                        raise OSError("storage_corrupt") from None
+                    if legacy_journal:
+                        if merged != row:
+                            self._last_diagnostics = diagnostics
+                            raise OSError("storage_corrupt")
+                        matched_legacy_ids.add(row["event_id"])
+                    else:
+                        if merged != journal_row:
+                            self._last_diagnostics = diagnostics
+                            raise OSError("storage_corrupt")
+                        continue
                 existing = selected.get(row["event_id"])
                 if existing is None:
                     selected[row["event_id"]] = row
                 else:
                     self._increment(diagnostics, "duplicate_rows")
                     selected[row["event_id"]] = _merge_archive_rows(existing, row)
-            cursor += timedelta(days=1)
+        self._validate_journal_bucket_state(journal, observed_bucket_digests)
+        self._validate_persisted_bucket_state(state, journal, observed_bucket_digests)
+        if legacy_journal and matched_legacy_ids != journal_ids:
+            self._last_diagnostics = diagnostics
+            raise OSError("storage_corrupt")
         self._last_diagnostics = diagnostics
         return sorted(
             (row for row in selected.values() if status is None or row["verification_status"] == status),
@@ -2152,7 +2680,7 @@ class EvidenceArchive:
         if not self._read_directory_present(self.archive_root):
             self._last_diagnostics = diagnostics
             return []
-        for authority in (self.journal_path, self.index_path):
+        for authority in (self.journal_path, self.index_path, self.state_path):
             if self._safe_file(authority) is not None or self._entry_present(authority):
                 self._last_diagnostics = diagnostics
                 raise OSError("storage_corrupt")
