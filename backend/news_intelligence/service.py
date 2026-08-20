@@ -11,10 +11,14 @@ from typing import Any, Callable
 import fund_portfolio
 import newsradar
 from fund_data import service as fund_service
+from evidence_verification.models import EvidenceSnapshot, FieldVerificationStatus, VerificationStatus
+from evidence_verification.storage import event_document, field_document
 from news_intelligence.clustering import cluster_items
+from news_intelligence.models import MarketNewsEvent, NewsSourceItem
 from news_intelligence.normalizer import normalize_radar
 from news_intelligence.ranking import rank_events
 from news_intelligence.relationships import apply_watch_relations, relate_events
+from news_pipeline.models import RawSnapshot, TrustedSnapshot
 
 
 TECH_TRACKS = {"ai", "semi", "robot", "auto", "energy", "bio", "space", "security", "tech", "consumer", "science"}
@@ -44,6 +48,129 @@ def _default_evidence_version() -> str:
     return snapshot.snapshot_id if snapshot else "unavailable"
 
 
+def project_trusted_snapshot(
+    evidence_snapshot: EvidenceSnapshot,
+    raw_snapshot: RawSnapshot,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> TrustedSnapshot:
+    """Project the complete evidence-approved event set from one raw snapshot."""
+    if type(evidence_snapshot) is not EvidenceSnapshot or type(raw_snapshot) is not RawSnapshot:
+        raise ValueError("invalid pipeline snapshot")
+    if evidence_snapshot.raw_snapshot_id != raw_snapshot.raw_snapshot_id:
+        raise ValueError("evidence and raw snapshot identities differ")
+    raw_by_id: dict[str, dict[str, Any]] = {}
+    for item in raw_snapshot.items:
+        if type(item) is not dict or type(item.get("event_id")) is not str:
+            raise ValueError("raw snapshot must contain normalized events")
+        event_id = item["event_id"]
+        if event_id in raw_by_id:
+            raise ValueError("raw event identity is ambiguous")
+        raw_by_id[event_id] = item
+    approved_statuses = {VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED}
+    approved_field_statuses = {FieldVerificationStatus.VERIFIED, FieldVerificationStatus.CORROBORATED}
+    rows: list[dict[str, Any]] = []
+    for evidence in evidence_snapshot.events:
+        if evidence.verification_status not in approved_statuses:
+            continue
+        raw = raw_by_id.get(evidence.event_id)
+        if raw is None:
+            raise ValueError("approved evidence event is absent from the raw snapshot")
+        row = copy.deepcopy(raw)
+        canonical = event_document(evidence)
+        untrusted_values = tuple(
+            field.raw_value for field in evidence.key_fields
+            if field.verification_status not in approved_field_statuses and field.raw_value
+        )
+        row["title"] = canonical["title"]
+        row["summary"] = canonical["summary"]
+        row["impact_basis"] = [
+            basis for basis in row.get("impact_basis") or []
+            if not any(value in basis for value in untrusted_values)
+        ]
+        row["verification_status"] = evidence.verification_status.value
+        row["verification_reason"] = evidence.verification_reason
+        row["verified_at"] = evidence.verified_at.isoformat()
+        row["verified_key_fields"] = [
+            field_document(field) for field in evidence.key_fields
+            if field.verification_status in approved_field_statuses
+        ]
+        rows.append(row)
+    published_at = now()
+    if not isinstance(published_at, datetime) or published_at.tzinfo is None or published_at.utcoffset() != timezone.utc.utcoffset(None):
+        raise ValueError("trusted projection clock must be aware UTC")
+    return TrustedSnapshot(raw_snapshot.raw_snapshot_id, published_at, tuple(rows))
+
+
+def _trusted_time(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("invalid trusted event timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("trusted event timestamp requires timezone")
+    return parsed
+
+
+def _trusted_event(document: dict[str, Any]) -> MarketNewsEvent:
+    tags = [(str(row.get("id") or ""), str(row.get("name") or "")) for row in document.get("related_tags") or []]
+    text_tags = {
+        (str(row.get("id") or ""), str(row.get("name") or ""))
+        for row in document.get("tag_evidence") or [] if row.get("provenance") == "article_text"
+    }
+    sources = []
+    for row in document.get("sources") or []:
+        region = str(row.get("region") or "unknown")
+        sources.append(NewsSourceItem(
+            source_name=str(row.get("source_name") or "未知公开来源"),
+            source_url=str(row.get("source_url") or ""),
+            original_url=str(row.get("original_url") or ""),
+            published_at=_trusted_time(row.get("published_at")),
+            fetched_at=_trusted_time(row.get("fetched_at")) or datetime.now(timezone.utc),
+            title=str(row.get("title") or ""),
+            summary=str(row.get("summary_or_excerpt") or ""),
+            language=str(row.get("language") or "unknown"),
+            region=region,
+            track_key="tech" if region.upper() in GLOBAL_REGIONS else (tags[0][0] if tags else ""),
+            track_name=tags[0][1] if tags else "",
+            category=str(document.get("category") or "industry"),
+            normalized_title=str(row.get("title") or "").casefold(),
+            tokens=frozenset(),
+            anchors=frozenset(),
+            related_tags=tuple(tags),
+            text_related_tags=tuple(tag for tag in tags if tag in text_tags),
+            source_domain="",
+            data_status=str(row.get("data_status") or document.get("data_status") or "cache"),
+        ))
+    return MarketNewsEvent(
+        event_id=str(document["event_id"]),
+        title=str(document.get("title") or ""),
+        summary=str(document.get("summary") or ""),
+        category=str(document.get("category") or "industry"),
+        published_at_first=_trusted_time(document.get("published_at_first")),
+        published_at_latest=_trusted_time(document.get("published_at_latest")),
+        sources=sources,
+        related_tags=[dict(row) for row in document.get("related_tags") or []],
+        original_links=list(document.get("original_links") or []),
+        data_status=str(document.get("data_status") or "cache"),
+        tag_evidence=[dict(row) for row in document.get("tag_evidence") or []],
+        related_companies=[dict(row) for row in document.get("related_companies") or []],
+        related_funds=[dict(row) for row in document.get("related_funds") or []],
+        relation_level=str(document.get("relation_level") or "none"),
+        relation_evidence=[dict(row) for row in document.get("relation_evidence") or []],
+        impact_tendency=str(document.get("impact_tendency") or "unclear"),
+        impact_basis=list(document.get("impact_basis") or []),
+        confidence=str(document.get("confidence") or "unavailable"),
+        missing_information=list(document.get("missing_information") or []),
+        importance_score=int(document.get("importance_score") or 0),
+        verification_status=document.get("verification_status"),
+        verification_reason=document.get("verification_reason"),
+        verified_at=document.get("verified_at"),
+        verified_key_fields=[dict(row) for row in document.get("verified_key_fields") or []],
+    )
+
+
 class MarketNewsService:
     def __init__(
         self,
@@ -53,6 +180,7 @@ class MarketNewsService:
         portfolio_loader: Callable[[], dict] = _default_portfolio_loader,
         evidence_admitter: Callable[[list[Any]], tuple[str, list[Any]]] = _default_evidence_admitter,
         evidence_version: Callable[[], str] = _default_evidence_version,
+        trusted_loader: Callable[[], TrustedSnapshot | None] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self.radar_loader = radar_loader
@@ -60,6 +188,7 @@ class MarketNewsService:
         self.portfolio_loader = portfolio_loader
         self.evidence_admitter = evidence_admitter
         self.evidence_version = evidence_version
+        self.trusted_loader = trusted_loader
         self.now = now
         self._snapshot_lock = threading.RLock()
         self._base_snapshots: OrderedDict[str, list[Any]] = OrderedDict()
@@ -176,6 +305,121 @@ class MarketNewsService:
             if tag.get("provenance") == "article_text" and tag.get("id")
         }
 
+    def _trusted_events(
+        self,
+        trusted: TrustedSnapshot,
+        *,
+        mode: str,
+        selected_tags: list[str],
+        category: str,
+        days: int,
+        sort: str,
+    ) -> dict[str, Any]:
+        events = [_trusted_event(copy.deepcopy(document)) for document in trusted.events]
+        portfolio, portfolio_status = self._load_portfolio()
+        relate_events(events, portfolio if portfolio_status == "ready" else None, [])
+        events = rank_events(events, "importance")
+        apply_watch_relations(events, selected_tags)
+        now = self.now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        cutoff = now - timedelta(days=days)
+        filtered = [event for event in events if event.published_at_latest is not None and event.published_at_latest >= cutoff]
+        if category != "all":
+            filtered = [event for event in filtered if event.category == category]
+
+        empty_reason = None
+        if mode == "my_focus":
+            if not selected_tags:
+                filtered = []
+                empty_reason = "no_tags"
+            else:
+                selected = set(selected_tags)
+                filtered = [event for event in filtered if selected & {tag["id"] for tag in event.related_tags}]
+        elif mode == "my_holdings":
+            if portfolio_status == "empty":
+                filtered = []
+                empty_reason = "no_holdings"
+            elif portfolio_status == "error":
+                filtered = []
+                empty_reason = "portfolio_error"
+            else:
+                filtered = [event for event in filtered if event.relation_level in {"direct_holding", "industry_relation"}]
+        elif mode == "global_tech":
+            filtered = [
+                event for event in filtered
+                if any(source.track_key in TECH_TRACKS and source.region.upper() in GLOBAL_REGIONS for source in event.sources)
+            ]
+        elif mode == "domestic_policy":
+            filtered = [
+                event for event in filtered
+                if event.category == "policy" and any(source.region.upper() == "CN" for source in event.sources)
+            ]
+        if selected_tags:
+            selected = set(selected_tags)
+            filtered = [event for event in filtered if selected & self._article_tag_ids(event)]
+
+        filtered = rank_events(filtered, sort)
+        if not filtered and empty_reason is None:
+            empty_reason = "no_events"
+        normalized_query = {
+            "mode": mode,
+            "tag_ids": sorted(selected_tags),
+            "category": category,
+            "days": days,
+            "sort": sort,
+        }
+        snapshot_id = hashlib.sha256(
+            f"{trusted.raw_snapshot_id}|{self._fingerprint(normalized_query)}|{self._fingerprint([event.event_id for event in filtered])}".encode("utf-8")
+        ).hexdigest()[:20]
+        self._remember_details(snapshot_id, filtered)
+        relation_counts = Counter(event.relation_level for event in filtered)
+        fund_counts: Counter[tuple[str, str]] = Counter()
+        for event in filtered:
+            for fund in event.related_funds:
+                fund_counts[(str(fund.get("fund_code") or ""), str(fund.get("fund_name") or ""))] += 1
+        source_ids = {
+            (source.source_name, source.source_url, source.original_url)
+            for event in events for source in event.sources
+        }
+        return {
+            "events": [event.to_dict() for event in filtered],
+            "focus_events": [event.to_dict() for event in filtered[:5]],
+            "impact_summary": None if portfolio_status == "error" else {
+                "holding_related_count": relation_counts["direct_holding"] + relation_counts["industry_relation"],
+                "direct_count": relation_counts["direct_holding"],
+                "industry_count": relation_counts["industry_relation"],
+                "watch_count": relation_counts["watch_tag"],
+                "funds": [
+                    {"fund_code": code, "fund_name": name, "event_count": count}
+                    for (code, name), count in sorted(fund_counts.items(), key=lambda item: (-item[1], item[0][0]))
+                ],
+            },
+            "generated_at": trusted.published_at.isoformat(),
+            "data_status": "trusted",
+            "source_summary": {
+                "total_sources": len(source_ids),
+                "failed_sources": 0,
+                "cache_status": "trusted",
+                "source_state": "trusted",
+                "refresh_failed": False,
+                "source_statuses": [],
+            },
+            "portfolio_status": portfolio_status,
+            "snapshot_id": snapshot_id,
+            "evidence_snapshot_id": trusted.raw_snapshot_id,
+            "ai_status": "unavailable",
+            "empty_reason": empty_reason,
+            "empty_message": (
+                "当前筛选暂无完成核验的资讯，可前往证据中心查看待核验内容。"
+                if empty_reason == "no_events" else None
+            ),
+            "filters": normalized_query,
+            "filter_options": {
+                "modes": sorted(MODES), "categories": sorted(CATEGORIES), "days": [1, 3, 7, 30], "sorts": sorted(SORTS),
+            },
+        }
+
     def get_events(
         self,
         *,
@@ -189,6 +433,17 @@ class MarketNewsService:
         if mode not in MODES or category not in CATEGORIES or days not in {1, 3, 7, 30} or sort not in SORTS:
             raise ValueError("invalid market-news filters")
         selected_tags = list(dict.fromkeys(tag_ids or []))
+        if self.trusted_loader is not None:
+            trusted = self.trusted_loader()
+            if trusted is not None:
+                return self._trusted_events(
+                    trusted,
+                    mode=mode,
+                    selected_tags=selected_tags,
+                    category=category,
+                    days=days,
+                    sort=sort,
+                )
         radar, refresh_failed = self._load_radar(refresh)
         portfolio, portfolio_status = self._load_portfolio()
         now = self.now()
@@ -327,10 +582,16 @@ class MarketNewsService:
 _service: MarketNewsService | None = None
 
 
+def _default_trusted_loader() -> TrustedSnapshot | None:
+    from news_pipeline.service import get_service as get_pipeline_service
+
+    return get_pipeline_service().current_trusted()
+
+
 def get_service() -> MarketNewsService:
     global _service
     if _service is None:
-        _service = MarketNewsService()
+        _service = MarketNewsService(trusted_loader=_default_trusted_loader)
     return _service
 
 

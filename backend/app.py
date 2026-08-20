@@ -37,6 +37,8 @@ from evidence_verification import service as evidence_service
 from evidence_verification.storage import event_document, event_summary_document
 from fund_data import service as fund_service
 from news_intelligence import service as market_news_service
+from news_pipeline.api import router as news_pipeline_router
+from news_pipeline import service as news_pipeline_service
 import market
 import myreports as mr
 import reflection as reflect_layer
@@ -59,6 +61,7 @@ def _run_startup_cache_cleanup():
 async def _lifespan(_app: FastAPI):
     _run_startup_cache_cleanup()
     health_service = None
+    pipeline_service = None
     try:
         try:
             health_service = source_health.get_service()
@@ -66,14 +69,22 @@ async def _lifespan(_app: FastAPI):
                 health_service.schedule_quick_if_due()
         except Exception:
             pass
+        try:
+            pipeline_service = news_pipeline_service.get_service()
+            pipeline_service.recover_startup()
+        except Exception:
+            pass
         yield
     finally:
+        if pipeline_service is not None:
+            pipeline_service.close()
         if health_service is not None:
             health_service.shutdown()
 
 
 app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
 app.include_router(data_sources_router)
+app.include_router(news_pipeline_router)
 
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)
@@ -665,15 +676,6 @@ def radar():
         raise HTTPException(502, f"资讯雷达异常：{e}") from e
 
 
-@app.post("/api/radar/refresh")
-def radar_refresh():
-    """强制重抓全部 RSS 源（耗时约 20-40s），更新缓存。"""
-    try:
-        return {"data": newsradar.fetch_radar()}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"资讯雷达刷新失败：{e}") from e
-
-
 MarketNewsMode = Literal["my_focus", "my_holdings", "global_tech", "domestic_policy"]
 MarketNewsCategory = Literal["all", "policy", "industry", "company", "fund_notice", "deep_content"]
 MarketNewsSort = Literal["importance", "latest", "holding_relevance"]
@@ -743,16 +745,6 @@ def evidence_event(event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$")):
     return {"data": event_document(row)}
 
 
-@app.post("/api/evidence/refresh")
-def evidence_refresh():
-    service = evidence_service.get_service()
-    try:
-        service.refresh()
-    except Exception as error:
-        raise HTTPException(502, f"证据核验刷新失败：{type(error).__name__}") from error
-    return {"data": service.get_summary()}
-
-
 def _market_news_payload(
     mode: MarketNewsMode,
     tag_id: list[str],
@@ -778,17 +770,6 @@ def market_news_events(
     sort: MarketNewsSort = "importance",
 ):
     return _market_news_payload(mode, tag_id, category, days, sort, False)
-
-
-@app.post("/api/market-news/refresh")
-def market_news_refresh(
-    mode: MarketNewsMode = "my_focus",
-    tag_id: list[str] = Query(default=[]),
-    category: MarketNewsCategory = "all",
-    days: MarketNewsDays = 7,
-    sort: MarketNewsSort = "importance",
-):
-    return _market_news_payload(mode, tag_id, category, days, sort, True)
 
 
 @app.post("/api/market-news/translations")

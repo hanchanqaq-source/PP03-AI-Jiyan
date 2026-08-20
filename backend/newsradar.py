@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
@@ -47,6 +48,17 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 BEIJING = timezone(timedelta(hours=8))
 SOURCE_ERROR_TYPES = {"timeout", "http_status", "tls", "dns", "connection", "rss_parse", "unknown"}
 _ORIGINAL_URLOPEN = urllib.request.urlopen
+
+
+@dataclass(frozen=True, slots=True)
+class RadarCollection:
+    """One non-persisting radar collection prepared for pipeline storage."""
+
+    raw_events: tuple[dict, ...]
+    source_statuses: tuple[dict, ...]
+    generated_at: datetime
+    failed_source_count: int
+    radar: dict
 
 
 class _RecordingRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -538,8 +550,8 @@ def _write_cache(data: dict) -> None:
                     pass
 
 
-def fetch_radar() -> dict:
-    """抓全部源，返回 12 赛道数据并落盘缓存。"""
+def _collect_radar_data() -> dict:
+    """抓全部源并返回兼容 radar 文档，不写缓存。"""
     cfg = _load_source_config()
     previous = load_cache()
     days = cfg.get("fetch", {}).get("recent_days", 7)
@@ -604,8 +616,39 @@ def fetch_radar() -> dict:
         "source_state": "partial_failure" if failed else "all_success",
         "source_statuses": source_statuses,
     }
-    _write_cache(data)
     return data
+
+
+def collect_radar() -> RadarCollection:
+    """Return normalized raw events without publishing the legacy radar cache."""
+    from news_intelligence.clustering import cluster_items
+    from news_intelligence.normalizer import normalize_radar
+
+    collected_at = datetime.now(timezone.utc)
+    radar = _collect_radar_data()
+    events = cluster_items(normalize_radar(radar, now=collected_at))
+    return RadarCollection(
+        raw_events=tuple(event.to_dict() for event in events),
+        source_statuses=tuple(dict(row) for row in radar.get("source_statuses") or []),
+        generated_at=collected_at,
+        failed_source_count=int((radar.get("stats") or {}).get("failed_sources") or 0),
+        radar=json.loads(json.dumps(radar, ensure_ascii=False)),
+    )
+
+
+def publish_radar_collection(collection: RadarCollection) -> dict:
+    """Publish a completed collection through the legacy cache adapter."""
+    if type(collection) is not RadarCollection:
+        raise TypeError("invalid radar collection")
+    radar = json.loads(json.dumps(collection.radar, ensure_ascii=False))
+    if str(radar.get("cache_status") or "") in {"realtime", "partial"}:
+        _write_cache(radar)
+    return radar
+
+
+def fetch_radar() -> dict:
+    """抓全部源，返回 12 赛道数据并落盘兼容缓存。"""
+    return publish_radar_collection(collect_radar())
 
 
 def load_cache():

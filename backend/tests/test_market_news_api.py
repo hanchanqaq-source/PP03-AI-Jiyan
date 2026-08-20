@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -266,18 +267,33 @@ def test_portfolio_failure_is_partial_success_and_ai_is_optional(monkeypatch):
     assert holdings.json()["data"]["empty_reason"] == "portfolio_error"
 
 
-def test_refresh_failure_keeps_cached_events(monkeypatch):
+def test_async_refresh_kickoff_keeps_cached_events_visible_until_pipeline_publishes(monkeypatch):
+    calls = 0
+
     def fail_refresh():
+        nonlocal calls
+        calls += 1
         raise OSError("all sources offline")
 
     monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: _service(radar_refresher=fail_refresh))
+    monkeypatch.setattr(
+        "news_pipeline.api.get_service",
+        lambda: SimpleNamespace(start=lambda: SimpleNamespace(
+            run_id="run-compat", raw_snapshot_id="raw-compat", phase=SimpleNamespace(value="queued"),
+        )),
+    )
 
     response = client.post("/api/market-news/refresh?mode=global_tech&days=7&sort=importance")
+    cached = client.get("/api/market-news/events?mode=global_tech&days=7&sort=importance")
 
-    assert response.status_code == 200
-    assert len(response.json()["data"]["events"]) == 2
-    assert response.json()["data"]["source_summary"]["refresh_failed"] is True
-    assert response.json()["data"]["data_status"] == "cache"
+    assert response.status_code == 202
+    assert response.json()["data"] == {
+        "run_id": "run-compat", "raw_snapshot_id": "raw-compat", "phase": "queued",
+    }
+    assert len(cached.json()["data"]["events"]) == 2
+    assert cached.json()["data"]["source_summary"]["refresh_failed"] is False
+    assert cached.json()["data"]["data_status"] == "cache"
+    assert calls == 0
 
 
 def test_event_detail_and_missing_event(monkeypatch):

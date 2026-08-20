@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -181,16 +182,24 @@ def test_no_snapshot_is_explicitly_unloaded_and_does_not_invent_zero_counts(monk
     assert data["field_counts"] is None
 
 
-def test_refresh_failure_returns_502_but_preserves_previous_api_snapshot(monkeypatch, tmp_path):
+def test_async_refresh_kickoff_preserves_previous_evidence_snapshot(monkeypatch, tmp_path):
     service = real_service(tmp_path)
     monkeypatch.setattr(service, "_event_loader", lambda: (_ for _ in ()).throw(RuntimeError("upstream unavailable")))
     monkeypatch.setattr(app_module.evidence_service, "get_service", lambda: service)
+    monkeypatch.setattr(
+        "news_pipeline.api.get_service",
+        lambda: SimpleNamespace(start=lambda: SimpleNamespace(
+            run_id="run-evidence", raw_snapshot_id="raw-evidence", phase=SimpleNamespace(value="queued"),
+        )),
+    )
 
-    failed = client.post("/api/evidence/refresh")
+    started = client.post("/api/evidence/refresh")
     after = client.get("/api/evidence/summary")
 
-    assert failed.status_code == 502
-    assert failed.json()["detail"] == "证据核验刷新失败：RuntimeError"
+    assert started.status_code == 202
+    assert started.json()["data"] == {
+        "run_id": "run-evidence", "raw_snapshot_id": "raw-evidence", "phase": "queued",
+    }
     assert after.json()["data"]["snapshot_id"] == "a" * 20
 
 

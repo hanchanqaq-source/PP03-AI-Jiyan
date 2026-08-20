@@ -11,13 +11,15 @@ import json
 import re
 import socket
 import threading
+from types import SimpleNamespace
 from typing import Callable
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import newsradar
 from news_intelligence.clustering import cluster_items
-from news_intelligence.normalizer import normalize_radar
+from news_intelligence.normalizer import normalize_radar, normalize_title
+from news_pipeline.models import RawSnapshot
 
 from .models import EvidenceItem, EvidenceSnapshot, FieldVerificationStatus, SourceRole, VerificationStatus
 from .source_identity import OFFICIAL_PUBLISHERS, canonicalize_public_url, identify_evidence, official_content_source
@@ -154,6 +156,52 @@ def _default_event_loader(now: datetime):
     return cluster_items(normalize_radar(radar, now=now))
 
 
+def _document_time(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("invalid raw event timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("raw event timestamp requires timezone")
+    return parsed
+
+
+def _raw_event_from_document(document: object) -> SimpleNamespace:
+    if type(document) is not dict or type(document.get("event_id")) is not str:
+        raise ValueError("raw snapshot must contain normalized event documents")
+    raw_sources = document.get("sources")
+    if type(raw_sources) is not list:
+        raise ValueError("raw event sources must be a list")
+    sources = []
+    for row in raw_sources:
+        if type(row) is not dict:
+            raise ValueError("invalid raw event source")
+        title = str(row.get("title") or "")
+        sources.append(SimpleNamespace(
+            source_name=str(row.get("source_name") or "未知公开来源"),
+            source_url=str(row.get("source_url") or ""),
+            original_url=str(row.get("original_url") or ""),
+            published_at=_document_time(row.get("published_at")),
+            title=title,
+            summary=str(row.get("summary_or_excerpt") or ""),
+            normalized_title=normalize_title(title),
+        ))
+    tags = document.get("related_tags")
+    if type(tags) is not list or any(type(row) is not dict for row in tags):
+        raise ValueError("invalid raw event tags")
+    return SimpleNamespace(
+        event_id=document["event_id"],
+        title=str(document.get("title") or ""),
+        summary=str(document.get("summary") or ""),
+        category=str(document.get("category") or "industry"),
+        published_at_first=_document_time(document.get("published_at_first")),
+        published_at_latest=_document_time(document.get("published_at_latest")),
+        related_tags=[{"id": str(row.get("id") or ""), "name": str(row.get("name") or "")} for row in tags],
+        sources=sources,
+    )
+
+
 class EvidenceVerificationService:
     def __init__(
         self,
@@ -198,36 +246,70 @@ class EvidenceVerificationService:
             published_at=document.published_at or item.published_at,
         )
 
-    def refresh(self) -> EvidenceSnapshot:
-        attempted_at = self._now()
+    def _verify_events(
+        self,
+        events: list,
+        *,
+        attempted_at: datetime,
+        raw_snapshot_id: str | None,
+        require_nonempty: bool,
+    ) -> EvidenceSnapshot:
         previous = self.storage.load_current()
         previous_by_id = {event.event_id: event for event in previous.events} if previous else {}
+        if require_nonempty and not events:
+            raise RuntimeError("no events available for evidence refresh")
+        verified = []
+        for event in events:
+            evidence = []
+            for source in event.sources:
+                item = identify_evidence(source)
+                if item.canonical_url:
+                    evidence.append(self._attest_existing_official_link(item))
+            verified.append(verify_event(
+                event,
+                evidence,
+                previous=previous_by_id.get(event.event_id),
+                now=attempted_at,
+            ))
+        fingerprint = json.dumps(
+            [(event.event_id, event.verification_status.value, event.verification_reason) for event in verified],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        snapshot_id = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:20]
+        return EvidenceSnapshot(
+            snapshot_id=snapshot_id,
+            raw_snapshot_id=raw_snapshot_id or snapshot_id,
+            generated_at=attempted_at,
+            events=tuple(verified),
+        )
+
+    def verify_raw_snapshot(self, raw_snapshot: RawSnapshot) -> EvidenceSnapshot:
+        if type(raw_snapshot) is not RawSnapshot or type(raw_snapshot.items) is not tuple:
+            raise ValueError("invalid raw snapshot")
+        attempted_at = self._now()
+        events = [_raw_event_from_document(document) for document in raw_snapshot.items]
+        event_ids = [event.event_id for event in events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("raw event identity is duplicated")
+        return self._verify_events(
+            events,
+            attempted_at=attempted_at,
+            raw_snapshot_id=raw_snapshot.raw_snapshot_id,
+            require_nonempty=False,
+        )
+
+    def publish_snapshot(self, snapshot: EvidenceSnapshot) -> None:
+        self.storage.publish(snapshot)
+
+    def refresh(self) -> EvidenceSnapshot:
+        attempted_at = self._now()
         try:
-            events = list(self._load_events())
-            if not events:
-                raise RuntimeError("no events available for evidence refresh")
-            verified = []
-            for event in events:
-                evidence = []
-                for source in event.sources:
-                    item = identify_evidence(source)
-                    if item.canonical_url:
-                        evidence.append(self._attest_existing_official_link(item))
-                verified.append(verify_event(
-                    event,
-                    evidence,
-                    previous=previous_by_id.get(event.event_id),
-                    now=attempted_at,
-                ))
-            fingerprint = json.dumps(
-                [(event.event_id, event.verification_status.value, event.verification_reason) for event in verified],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            snapshot = EvidenceSnapshot(
-                snapshot_id=hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:20],
-                generated_at=attempted_at,
-                events=tuple(verified),
+            snapshot = self._verify_events(
+                list(self._load_events()),
+                attempted_at=attempted_at,
+                raw_snapshot_id=None,
+                require_nonempty=True,
             )
             self.storage.publish(snapshot)
             return snapshot

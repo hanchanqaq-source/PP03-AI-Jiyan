@@ -221,3 +221,101 @@ def test_event_ids_and_order_are_stable_across_input_order():
 
     assert [event.event_id for event in first] == [event.event_id for event in second]
     assert [event.title for event in first] == [event.title for event in second]
+
+
+def test_trusted_projector_uses_same_raw_identity_and_excludes_pending_events():
+    from evidence_verification.models import EvidenceEvent, EvidenceSnapshot, VerificationStatus
+    from news_intelligence.service import project_trusted_snapshot
+    from news_pipeline.models import RawSnapshot
+
+    raw_events = cluster_items(normalize_radar(_radar(
+        _item("星河科技建设存储算力中心", "https://one.example.test/a", "2026-08-17T09:00:00+08:00", "来源一"),
+        _item("另一公司拟建设数据中心", "https://two.example.test/b", "2026-08-17T10:00:00+08:00", "来源二"),
+    ), now=NOW))
+    raw = RawSnapshot("raw-project", NOW, tuple(event.to_dict() for event in raw_events))
+    verified, pending = raw_events
+    evidence = EvidenceSnapshot(
+        snapshot_id="evidence-project",
+        raw_snapshot_id=raw.raw_snapshot_id,
+        generated_at=NOW,
+        events=(
+            EvidenceEvent(
+                event_id=verified.event_id,
+                title="确定性证据确认的可信标题",
+                summary="确定性证据确认的可信摘要。",
+                category=verified.category,
+                related_tags=tuple((tag["id"], tag["name"]) for tag in verified.related_tags),
+                published_at=verified.published_at_latest,
+                core_claim="可信核心主张",
+                verification_status=VerificationStatus.VERIFIED,
+                verification_reason="官方证据支持",
+                verified_at=NOW,
+                evidence_as_of=NOW,
+            ),
+            EvidenceEvent(
+                event_id=pending.event_id,
+                title=pending.title,
+                summary=pending.summary,
+                category=pending.category,
+                related_tags=tuple((tag["id"], tag["name"]) for tag in pending.related_tags),
+                published_at=pending.published_at_latest,
+                core_claim=pending.title,
+                verification_status=VerificationStatus.UNVERIFIED,
+                verification_reason="证据不足",
+                verified_at=NOW,
+                evidence_as_of=NOW,
+            ),
+        ),
+    )
+
+    trusted = project_trusted_snapshot(evidence, raw, now=lambda: NOW)
+
+    assert trusted.raw_snapshot_id == raw.raw_snapshot_id
+    assert [row["event_id"] for row in trusted.events] == [verified.event_id]
+    assert trusted.events[0]["title"] == "确定性证据确认的可信标题"
+    assert trusted.events[0]["summary"] == "确定性证据确认的可信摘要。"
+    assert trusted.events[0]["verification_status"] == "verified"
+
+
+def test_market_news_can_read_current_trusted_without_reloading_radar():
+    from evidence_verification.models import EvidenceEvent, EvidenceSnapshot, VerificationStatus
+    from news_intelligence.service import MarketNewsService, project_trusted_snapshot
+    from news_pipeline.models import RawSnapshot
+
+    event = cluster_items(normalize_radar(_radar(
+        _item("存储产品报价改善", "https://one.example.test/a", "2026-08-17T09:00:00+08:00", "来源一"),
+    ), now=NOW))[0]
+    raw = RawSnapshot("raw-current", NOW, (event.to_dict(),))
+    evidence = EvidenceSnapshot(
+        snapshot_id="evidence-current",
+        raw_snapshot_id=raw.raw_snapshot_id,
+        generated_at=NOW,
+        events=(EvidenceEvent(
+            event_id=event.event_id,
+            title=event.title,
+            summary=event.summary,
+            category=event.category,
+            related_tags=tuple((tag["id"], tag["name"]) for tag in event.related_tags),
+            published_at=event.published_at_latest,
+            core_claim=event.title,
+            verification_status=VerificationStatus.VERIFIED,
+            verification_reason="官方证据支持",
+            verified_at=NOW,
+            evidence_as_of=NOW,
+        ),),
+    )
+    trusted = project_trusted_snapshot(evidence, raw, now=lambda: NOW)
+    service = MarketNewsService(
+        radar_loader=lambda: (_ for _ in ()).throw(AssertionError("trusted read reloaded radar")),
+        portfolio_loader=lambda: {"overview": {"fund_count": 0}, "holdings": []},
+        evidence_admitter=lambda _events: (_ for _ in ()).throw(AssertionError("trusted read re-admitted evidence")),
+        evidence_version=lambda: "unavailable",
+        trusted_loader=lambda: trusted,
+        now=lambda: NOW,
+    )
+
+    payload = service.get_events(mode="my_focus", tag_ids=["storage"])
+
+    assert [row["event_id"] for row in payload["events"]] == [event.event_id]
+    assert payload["evidence_snapshot_id"] == trusted.raw_snapshot_id
+    assert payload["source_summary"]["refresh_failed"] is False

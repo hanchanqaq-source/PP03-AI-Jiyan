@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from fastapi.testclient import TestClient
+
+import app as app_module
+from news_pipeline.models import PipelineCounts, PipelinePhase, PipelineRun
+from news_pipeline.service import NewsPipelineActiveError
+
+
+client = TestClient(app_module.app)
+NOW = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+
+
+def run(phase: PipelinePhase = PipelinePhase.QUEUED) -> PipelineRun:
+    return PipelineRun(
+        run_id="run-api",
+        raw_snapshot_id="raw-api",
+        evidence_snapshot_id=None,
+        trusted_snapshot_id=None,
+        phase=phase,
+        counts=PipelineCounts(),
+        created_at=NOW,
+        updated_at=NOW,
+        redacted_error=None,
+        displayed_trusted_snapshot_id="trusted-old",
+    )
+
+
+class FakePipeline:
+    def __init__(self) -> None:
+        self.starts = 0
+        self.selected = []
+
+    def start(self):
+        self.starts += 1
+        return run()
+
+    def get_status(self, run_id=None):
+        self.selected.append(run_id)
+        return {
+            "run_id": run_id or "run-api",
+            "raw_snapshot_id": "raw-api",
+            "phase": "verifying",
+            "displayed_trusted_snapshot_id": "trusted-old",
+            "counts": PipelineCounts().__dict__ if hasattr(PipelineCounts(), "__dict__") else {
+                field: getattr(PipelineCounts(), field) for field in PipelineCounts.__dataclass_fields__
+            },
+        }
+
+
+def test_all_refresh_compatibility_routes_start_the_same_async_pipeline(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+
+    responses = [
+        client.post("/api/market-news/refresh?mode=global_tech&days=7"),
+        client.post("/api/evidence/refresh"),
+        client.post("/api/radar/refresh"),
+    ]
+
+    assert [response.status_code for response in responses] == [202, 202, 202]
+    assert [response.json()["data"] for response in responses] == [{
+        "run_id": "run-api", "raw_snapshot_id": "raw-api", "phase": "queued",
+    }] * 3
+    assert fake.starts == 3
+
+
+def test_active_refresh_conflict_is_shared_by_all_compatibility_routes(monkeypatch):
+    class Active(FakePipeline):
+        def start(self):
+            raise NewsPipelineActiveError("news pipeline refresh is active")
+
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: Active())
+
+    response = client.post("/api/evidence/refresh")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "资讯刷新正在运行"
+
+
+def test_pipeline_status_returns_selected_run_and_displayed_trusted(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+
+    response = client.get("/api/news/pipeline-status?run_id=run-selected")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["run_id"] == "run-selected"
+    assert response.json()["data"]["displayed_trusted_snapshot_id"] == "trusted-old"
+    assert fake.selected == ["run-selected"]
