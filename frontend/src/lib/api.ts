@@ -117,6 +117,48 @@ export function isAbortError(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
 }
 
+const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+async function readBoundedJsonResponse(resp: Response): Promise<any> {
+  const declaredLength = resp.headers.get("Content-Length");
+  if (declaredLength !== null) {
+    if (!/^\d+$/.test(declaredLength)) throw new ApiError("后端响应无效", 502);
+    const parsedLength = Number(declaredLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength > MAX_JSON_RESPONSE_BYTES) {
+      throw new ApiError("后端响应过大", 502);
+    }
+  }
+  if (resp.body === null) return null;
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > MAX_JSON_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new ApiError("后端响应过大", 502);
+    }
+    chunks.push(value);
+  }
+  if (received === 0) return null;
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return text.trim() ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function request<T>(
   path: string,
   method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
@@ -147,8 +189,9 @@ async function request<T>(
   }
   let payload: any = null;
   try {
-    payload = await resp.json();
-  } catch {
+    payload = await readBoundedJsonResponse(resp);
+  } catch (error) {
+    if (error instanceof ApiError || signal?.aborted || isAbortError(error)) throw error;
     /* 非 JSON 响应 */
   }
   if (!resp.ok) {
@@ -196,7 +239,8 @@ function pipelineRecord(value: unknown, allowed: Set<string>): Record<string, un
 }
 
 function pipelineString(value: unknown, maxLength: number): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > maxLength || value !== value.trim()) pipelineError();
+  if (typeof value !== "string" || value.length < 1 || value.length > maxLength || value !== value.trim()
+    || /[\u0000-\u001F\u007F]/.test(value)) pipelineError();
   return value;
 }
 
@@ -211,7 +255,17 @@ function nullablePipelineId(value: unknown): string | null {
 }
 
 function pipelineTimestamp(value: unknown): string {
-  return pipelineString(value, 64);
+  const timestamp = pipelineString(value, 64);
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|\+00:00)$/.exec(timestamp);
+  const parsed = new Date(timestamp.endsWith("+00:00") ? `${timestamp.slice(0, -6)}Z` : timestamp);
+  if (!match || Number.isNaN(parsed.getTime())
+    || parsed.getUTCFullYear() !== Number(match[1])
+    || parsed.getUTCMonth() + 1 !== Number(match[2])
+    || parsed.getUTCDate() !== Number(match[3])
+    || parsed.getUTCHours() !== Number(match[4])
+    || parsed.getUTCMinutes() !== Number(match[5])
+    || parsed.getUTCSeconds() !== Number(match[6])) pipelineError();
+  return timestamp;
 }
 
 function nullablePipelineTimestamp(value: unknown): string | null {
@@ -353,7 +407,7 @@ function shapeNewsPipelineStatus(value: unknown): NewsPipelineStatusData {
     };
   }
 
-  return validateNewsPipelineStatus({
+  const status = {
     loaded: row.loaded,
     run_id: nullablePipelineId(row.run_id),
     raw_snapshot_id: nullablePipelineId(row.raw_snapshot_id),
@@ -371,7 +425,10 @@ function shapeNewsPipelineStatus(value: unknown): NewsPipelineStatusData {
     compatibility_error: row.compatibility_error as NewsPipelineStatusData["compatibility_error"],
     displayed_trusted_snapshot_id: nullablePipelineId(row.displayed_trusted_snapshot_id),
     displayed_trusted: displayedTrusted,
-  });
+  } satisfies NewsPipelineStatusData;
+  if (status.created_at !== null && status.updated_at !== null
+    && Date.parse(status.updated_at) < Date.parse(status.created_at)) pipelineError();
+  return validateNewsPipelineStatus(status);
 }
 
 const MARKET_NEWS_RESPONSE_KEYS = new Set([
@@ -406,21 +463,59 @@ const MARKET_NEWS_SOURCE_KEYS = new Set([
   "source_name", "source_url", "original_url", "published_at", "fetched_at", "title",
   "summary_or_excerpt", "language", "region", "data_status",
 ]);
+const MARKET_NEWS_SOURCE_REQUIRED_KEYS = new Set(
+  [...MARKET_NEWS_SOURCE_KEYS].filter((key) => key !== "source_url" && key !== "original_url"),
+);
 const MARKET_NEWS_SOURCE_STATUS_KEYS = new Set([
   "source_id", "source_name", "source_url", "status", "error_type", "error_reason",
   "last_success_at", "used_cached_items", "item_count",
 ]);
+const MARKET_NEWS_SOURCE_STATUS_REQUIRED_KEYS = new Set(
+  [...MARKET_NEWS_SOURCE_STATUS_KEYS].filter((key) => key !== "source_url"),
+);
 const MARKET_NEWS_ERROR_TYPES = new Set(["timeout", "http_status", "tls", "dns", "connection", "rss_parse", "unknown"]);
 const MARKET_NEWS_RELATION_LEVELS = new Set(["direct_holding", "industry_relation", "watch_tag", "none"]);
 const MARKET_NEWS_IMPACTS = new Set(["positive", "negative", "neutral", "unclear"]);
 const MARKET_NEWS_CONFIDENCES = new Set(["high", "medium", "low", "unavailable"]);
-const MARKET_NEWS_MAX_EVENTS = 10_000;
-const MARKET_NEWS_MAX_FOCUS_EVENTS = 100;
-const MARKET_NEWS_MAX_SOURCE_STATUSES = 4_096;
-const MARKET_NEWS_MAX_NESTED_ROWS = 2_048;
+const MARKET_NEWS_MAX_EVENTS = 1_024;
+const MARKET_NEWS_MAX_FOCUS_EVENTS = 5;
+const MARKET_NEWS_MAX_SOURCE_STATUSES = 512;
+const MARKET_NEWS_MAX_NESTED_ROWS = 256;
+const MARKET_NEWS_MAX_DOCUMENT_NODES = 50_000;
+const MARKET_NEWS_MAX_DOCUMENT_CHARACTERS = 1_500_000;
+const MARKET_NEWS_MAX_DOCUMENT_DEPTH = 32;
 
 function marketNewsError(): never {
   throw new ApiError("市场资讯响应无效", 502);
+}
+
+function assertMarketNewsDocumentBudget(value: unknown): void {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  let characters = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    nodes += 1;
+    if (nodes > MARKET_NEWS_MAX_DOCUMENT_NODES || current.depth > MARKET_NEWS_MAX_DOCUMENT_DEPTH) marketNewsError();
+    if (typeof current.value === "string") {
+      characters += current.value.length;
+      if (characters > MARKET_NEWS_MAX_DOCUMENT_CHARACTERS) marketNewsError();
+      continue;
+    }
+    if (typeof current.value !== "object" || current.value === null) continue;
+    if (seen.has(current.value)) marketNewsError();
+    seen.add(current.value);
+    if (Array.isArray(current.value)) {
+      for (const item of current.value) pending.push({ value: item, depth: current.depth + 1 });
+      continue;
+    }
+    for (const [key, item] of Object.entries(current.value as Record<string, unknown>)) {
+      characters += key.length;
+      if (characters > MARKET_NEWS_MAX_DOCUMENT_CHARACTERS) marketNewsError();
+      pending.push({ value: item, depth: current.depth + 1 });
+    }
+  }
 }
 
 function marketNewsRecord(value: unknown, allowed: Set<string>): Record<string, unknown> {
@@ -438,7 +533,7 @@ function exactMarketNewsRecord(value: unknown, keys: Set<string>): Record<string
 
 function marketNewsString(value: unknown, maxLength = 512): string {
   if (typeof value !== "string" || value.length < 1 || value.length > maxLength || value !== value.trim()
-    || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value)) marketNewsError();
+    || /[\u0000-\u001F\u007F]/.test(value)) marketNewsError();
   return value;
 }
 
@@ -448,7 +543,7 @@ function marketNewsNullableString(value: unknown, maxLength = 512): string | nul
 
 function marketNewsBoundedText(value: unknown, maxLength: number): string {
   if (typeof value !== "string" || value.length > maxLength || value !== value.trim()
-    || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value)) marketNewsError();
+    || /[\u0000-\u001F\u007F]/.test(value)) marketNewsError();
   return value;
 }
 
@@ -481,6 +576,94 @@ function marketNewsCanonicalId(value: unknown, maxLength = 128): string {
   return id;
 }
 
+function marketNewsIpv4(hostname: string): number[] | null {
+  const parts = hostname.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return null;
+  const octets = parts.map(Number);
+  return octets.every((octet) => octet >= 0 && octet <= 255) ? octets : null;
+}
+
+function marketNewsIpv6(hostname: string): number[] | null {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!host.includes(":")) return null;
+  const halves = host.split("::");
+  if (halves.length > 2) return null;
+  const parseHalf = (half: string): number[] | null => {
+    if (!half) return [];
+    const words: number[] = [];
+    for (const part of half.split(":")) {
+      const ipv4 = marketNewsIpv4(part);
+      if (ipv4) {
+        words.push((ipv4[0] << 8) | ipv4[1], (ipv4[2] << 8) | ipv4[3]);
+      } else if (/^[0-9a-f]{1,4}$/.test(part)) words.push(Number.parseInt(part, 16));
+      else return null;
+    }
+    return words;
+  };
+  const left = parseHalf(halves[0]);
+  const right = parseHalf(halves[1] ?? "");
+  if (left === null || right === null) return null;
+  if (halves.length === 1) return left.length === 8 ? left : null;
+  const omitted = 8 - left.length - right.length;
+  return omitted >= 1 ? [...left, ...Array.from({ length: omitted }, () => 0), ...right] : null;
+}
+
+function marketNewsPrivateIpv4(octets: number[]): boolean {
+  const [a, b] = octets;
+  return a === 0 || a === 10 || a === 127 || a >= 224
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && (b === 0 || b === 168))
+    || (a === 198 && (b === 18 || b === 19));
+}
+
+function marketNewsNonPublicHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!host || host === "localhost" || (!host.includes(".") && !host.includes(":"))
+    || [".localhost", ".local", ".localdomain", ".lan", ".internal", ".home"].some((suffix) => host.endsWith(suffix))) return true;
+  const ipv4 = marketNewsIpv4(host);
+  if (ipv4) return marketNewsPrivateIpv4(ipv4);
+  if (!host.includes(":")) return false;
+  const words = marketNewsIpv6(host);
+  if (words === null) return true;
+  const allZero = words.every((word) => word === 0);
+  const loopback = words.slice(0, 7).every((word) => word === 0) && words[7] === 1;
+  const uniqueLocal = (words[0] & 0xfe00) === 0xfc00;
+  const linkLocal = (words[0] & 0xffc0) === 0xfe80;
+  const multicast = (words[0] & 0xff00) === 0xff00;
+  const mappedV4 = words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff;
+  const compatibleV4 = words.slice(0, 6).every((word) => word === 0);
+  const embeddedV4 = mappedV4 || compatibleV4
+    ? [(words[6] >> 8) & 0xff, words[6] & 0xff, (words[7] >> 8) & 0xff, words[7] & 0xff]
+    : null;
+  return allZero || loopback || uniqueLocal || linkLocal || multicast
+    || (embeddedV4 !== null && marketNewsPrivateIpv4(embeddedV4));
+}
+
+const MARKET_NEWS_SENSITIVE_QUERY_KEYS = new Set([
+  "key", "api_key", "apikey", "x-api-key", "token", "access_token", "refresh_token",
+  "auth", "authorization", "password", "passwd", "pwd", "code", "signature", "sig",
+  "secret", "client_secret", "credential", "cookie",
+]);
+const MARKET_NEWS_SENSITIVE_QUERY_VALUE = /(?:^|[?&#;])(?:key|api[_-]?key|x-api-key|token|access[_-]?token|refresh[_-]?token|auth|authorization|password|passwd|pwd|code|signature|sig|secret|client[_-]?secret|credential|cookie)=/i;
+
+function marketNewsSensitiveQueryValue(value: string): boolean {
+  let decoded = value;
+  for (let depth = 0; depth < 2; depth += 1) {
+    if (MARKET_NEWS_SENSITIVE_QUERY_VALUE.test(decoded)
+      || /(?:^|[\s,;])(?:bearer|basic)\s+\S+/i.test(decoded)) return true;
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) return false;
+      decoded = next;
+    } catch {
+      return false;
+    }
+  }
+  return MARKET_NEWS_SENSITIVE_QUERY_VALUE.test(decoded);
+}
+
 function marketNewsPublicUrl(value: unknown): string {
   const raw = marketNewsString(value, 2_048);
   let parsed: URL;
@@ -490,8 +673,37 @@ function marketNewsPublicUrl(value: unknown): string {
     marketNewsError();
   }
   if ((parsed.protocol !== "https:" && parsed.protocol !== "http:")
-    || !parsed.hostname || parsed.username || parsed.password) marketNewsError();
+    || !parsed.hostname || parsed.username || parsed.password || parsed.hash
+    || marketNewsNonPublicHost(parsed.hostname)
+    || [...parsed.searchParams].some(([key, queryValue]) => (
+      MARKET_NEWS_SENSITIVE_QUERY_KEYS.has(key.toLowerCase()) || marketNewsSensitiveQueryValue(queryValue)
+    ))) marketNewsError();
   return raw;
+}
+
+function marketNewsOptionalPublicUrl(value: unknown): string | null {
+  return value === undefined || value === null || value === "" ? null : marketNewsPublicUrl(value);
+}
+
+function marketNewsDeepEqual(left: unknown, right: unknown): boolean {
+  const pending: Array<[unknown, unknown]> = [[left, right]];
+  while (pending.length > 0) {
+    const [a, b] = pending.pop()!;
+    if (Object.is(a, b)) continue;
+    if (typeof a !== "object" || a === null || typeof b !== "object" || b === null || Array.isArray(a) !== Array.isArray(b)) return false;
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return false;
+      for (let index = 0; index < a.length; index += 1) pending.push([a[index], b[index]]);
+      continue;
+    }
+    const aRow = a as Record<string, unknown>;
+    const bRow = b as Record<string, unknown>;
+    const aKeys = Object.keys(aRow).sort();
+    const bKeys = Object.keys(bRow).sort();
+    if (aKeys.length !== bKeys.length || aKeys.some((key, index) => key !== bKeys[index])) return false;
+    for (const key of aKeys) pending.push([aRow[key], bRow[key]]);
+  }
+  return true;
 }
 
 function marketNewsArray<T>(value: unknown, maxLength: number, shape: (item: unknown) => T): T[] {
@@ -524,11 +736,12 @@ function shapeMarketNewsTagEvidence(value: unknown): { id: string; name: string;
 }
 
 function shapeMarketNewsSource(value: unknown): MarketNewsEvent["sources"][number] {
-  const row = exactMarketNewsRecord(value, MARKET_NEWS_SOURCE_KEYS);
+  const row = marketNewsRecord(value, MARKET_NEWS_SOURCE_KEYS);
+  if ([...MARKET_NEWS_SOURCE_REQUIRED_KEYS].some((key) => !(key in row))) marketNewsError();
   return {
     source_name: marketNewsString(row.source_name, 512),
-    source_url: marketNewsPublicUrl(row.source_url),
-    original_url: marketNewsPublicUrl(row.original_url),
+    source_url: marketNewsOptionalPublicUrl(row.source_url),
+    original_url: marketNewsOptionalPublicUrl(row.original_url),
     published_at: marketNewsNullableTimestamp(row.published_at),
     fetched_at: marketNewsTimestamp(row.fetched_at),
     title: marketNewsString(row.title, 1_000),
@@ -646,7 +859,10 @@ function shapeMarketNewsEvent(value: unknown): MarketNewsEvent {
   };
 }
 
-function shapeMarketNewsImpactSummary(value: unknown): MarketNewsResponse["impact_summary"] {
+function shapeMarketNewsImpactSummary(
+  value: unknown,
+  events: MarketNewsEvent[],
+): MarketNewsResponse["impact_summary"] {
   if (value === null) return null;
   const row = exactMarketNewsRecord(value, new Set([
     "holding_related_count", "direct_count", "industry_count", "watch_count", "funds",
@@ -664,6 +880,26 @@ function shapeMarketNewsImpactSummary(value: unknown): MarketNewsResponse["impac
     };
   });
   if (new Set(funds.map((fund) => fund.fund_code)).size !== funds.length) marketNewsError();
+  const relationCounts = { direct_holding: 0, industry_relation: 0, watch_tag: 0 };
+  const fundFacts = new Map<string, { name: string; count: number }>();
+  for (const event of events) {
+    if (event.relation_level in relationCounts) {
+      relationCounts[event.relation_level as keyof typeof relationCounts] += 1;
+    }
+    for (const fund of event.related_funds) {
+      const prior = fundFacts.get(fund.fund_code);
+      if (prior && prior.name !== fund.fund_name) marketNewsError();
+      fundFacts.set(fund.fund_code, { name: fund.fund_name, count: (prior?.count ?? 0) + 1 });
+    }
+  }
+  if (directCount !== relationCounts.direct_holding
+    || industryCount !== relationCounts.industry_relation
+    || pipelineCount(row.watch_count) !== relationCounts.watch_tag
+    || funds.length !== fundFacts.size
+    || funds.some((fund) => {
+      const fact = fundFacts.get(fund.fund_code);
+      return fact === undefined || fact.name !== fund.fund_name || fact.count !== fund.event_count;
+    })) marketNewsError();
   return {
     holding_related_count: holdingRelatedCount,
     direct_count: directCount,
@@ -673,8 +909,28 @@ function shapeMarketNewsImpactSummary(value: unknown): MarketNewsResponse["impac
   };
 }
 
+function validateMarketNewsSourceSummary(
+  totalSources: number,
+  failedSources: number,
+  cacheStatus: string,
+  sourceState: MarketNewsResponse["source_summary"]["source_state"],
+  sourceStatuses: MarketNewsResponse["source_summary"]["source_statuses"],
+): void {
+  const exactAttempt = sourceStatuses.length === totalSources;
+  if (sourceState === "all_success" && (!exactAttempt || totalSources === 0 || failedSources !== 0 || cacheStatus !== "realtime")) marketNewsError();
+  if (sourceState === "partial_failure" && (!exactAttempt || failedSources <= 0 || failedSources >= totalSources
+    || (cacheStatus !== "partial" && cacheStatus !== "cache"))) marketNewsError();
+  if (sourceState === "all_failed" && (!exactAttempt || totalSources === 0 || failedSources !== totalSources || cacheStatus !== "source_failure")) marketNewsError();
+  if (sourceState === "cached" && (failedSources !== 0 || cacheStatus !== "cache")) marketNewsError();
+  if (sourceState === "stale_cache" && cacheStatus !== "stale") marketNewsError();
+  if (sourceState === "empty" && (failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "empty")) marketNewsError();
+  if (sourceState === "pipeline_pending" && (totalSources !== 0 || failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "pipeline_pending")) marketNewsError();
+  if (sourceState === "trusted" && (failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "trusted")) marketNewsError();
+}
+
 function shapeMarketNewsSourceStatus(value: unknown): MarketNewsResponse["source_summary"]["source_statuses"][number] {
-  const row = exactMarketNewsRecord(value, MARKET_NEWS_SOURCE_STATUS_KEYS);
+  const row = marketNewsRecord(value, MARKET_NEWS_SOURCE_STATUS_KEYS);
+  if ([...MARKET_NEWS_SOURCE_STATUS_REQUIRED_KEYS].some((key) => !(key in row))) marketNewsError();
   const status = marketNewsEnum(row.status, new Set(["ok", "failed"])) as "ok" | "failed";
   const errorType = row.error_type === null
     ? null
@@ -685,7 +941,7 @@ function shapeMarketNewsSourceStatus(value: unknown): MarketNewsResponse["source
   return {
     source_id: marketNewsCanonicalId(row.source_id),
     source_name: marketNewsString(row.source_name, 512),
-    source_url: marketNewsPublicUrl(row.source_url),
+    source_url: marketNewsOptionalPublicUrl(row.source_url),
     status,
     error_type: errorType,
     error_reason: errorReason,
@@ -711,15 +967,25 @@ function shapeMarketNewsQuery(value: unknown): MarketNewsQuery {
 }
 
 function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
+  assertMarketNewsDocumentBudget(value);
   const row = exactMarketNewsRecord(value, MARKET_NEWS_RESPONSE_KEYS);
-  const events = marketNewsArray(row.events, MARKET_NEWS_MAX_EVENTS, shapeMarketNewsEvent);
-  const focusEvents = marketNewsArray(row.focus_events, MARKET_NEWS_MAX_FOCUS_EVENTS, shapeMarketNewsEvent);
+  if (!Array.isArray(row.events) || row.events.length > MARKET_NEWS_MAX_EVENTS
+    || !Array.isArray(row.focus_events) || row.focus_events.length > MARKET_NEWS_MAX_FOCUS_EVENTS) marketNewsError();
+  const rawEvents = row.events;
+  const events = rawEvents.map(shapeMarketNewsEvent);
+  const rawById = new Map<string, unknown>();
+  for (let index = 0; index < events.length; index += 1) rawById.set(events[index].event_id, rawEvents[index]);
+  const eventById = new Map(events.map((event) => [event.event_id, event]));
+  const focusEvents = row.focus_events.map((focusRow) => {
+    const focus = marketNewsRecord(focusRow, MARKET_NEWS_EVENT_KEYS);
+    const eventId = marketNewsCanonicalId(focus.event_id);
+    const rawEvent = rawById.get(eventId);
+    const event = eventById.get(eventId);
+    if (rawEvent === undefined || event === undefined || !marketNewsDeepEqual(rawEvent, focusRow)) marketNewsError();
+    return event;
+  });
   if (new Set(events.map((event) => event.event_id)).size !== events.length
-    || new Set(focusEvents.map((event) => event.event_id)).size !== focusEvents.length
-    || focusEvents.some((event) => {
-      const candidate = events.find((item) => item.event_id === event.event_id);
-      return candidate === undefined || JSON.stringify(candidate) !== JSON.stringify(event);
-    })) marketNewsError();
+    || new Set(focusEvents.map((event) => event.event_id)).size !== focusEvents.length) marketNewsError();
   const source = exactMarketNewsRecord(row.source_summary, MARKET_NEWS_SOURCE_SUMMARY_KEYS);
   const sourceStatuses = marketNewsArray(source.source_statuses, MARKET_NEWS_MAX_SOURCE_STATUSES, shapeMarketNewsSourceStatus);
   const totalSources = pipelineCount(source.total_sources);
@@ -757,11 +1023,14 @@ function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
     ? null
     : marketNewsEnum(row.empty_reason, MARKET_NEWS_EMPTY_REASONS) as MarketNewsResponse["empty_reason"];
   if (row.ai_status !== "available" && row.ai_status !== "unavailable") marketNewsError();
+  const cacheStatus = marketNewsEnum(source.cache_status, MARKET_NEWS_DATA_STATUSES);
+  const sourceState = marketNewsEnum(source.source_state, MARKET_NEWS_SOURCE_STATES) as MarketNewsResponse["source_summary"]["source_state"];
+  validateMarketNewsSourceSummary(totalSources, failedSources, cacheStatus, sourceState, sourceStatuses);
 
   return {
     events,
     focus_events: focusEvents,
-    impact_summary: shapeMarketNewsImpactSummary(row.impact_summary),
+    impact_summary: shapeMarketNewsImpactSummary(row.impact_summary, events),
     snapshot_id: snapshotId,
     raw_snapshot_id: rawSnapshotId,
     trusted_snapshot_id: trustedSnapshotId,
@@ -771,8 +1040,8 @@ function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
     source_summary: {
       total_sources: totalSources,
       failed_sources: failedSources,
-      cache_status: marketNewsEnum(source.cache_status, MARKET_NEWS_DATA_STATUSES),
-      source_state: marketNewsEnum(source.source_state, MARKET_NEWS_SOURCE_STATES) as MarketNewsResponse["source_summary"]["source_state"],
+      cache_status: cacheStatus,
+      source_state: sourceState,
       refresh_failed: marketNewsBoolean(source.refresh_failed),
       source_statuses: sourceStatuses,
     },
@@ -785,13 +1054,18 @@ function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
   };
 }
 
-function shapeMarketNewsRetryResult(value: unknown): MarketNewsSourceRetryResult {
+function shapeMarketNewsRetryResult(value: unknown, requestedSourceId: string): MarketNewsSourceRetryResult {
   if (typeof value !== "object" || value === null || Array.isArray(value)) marketNewsError();
-  if (!("retry_succeeded" in value)) return shapeMarketNewsResponse(value);
+  if (!("retry_succeeded" in value)) {
+    const response = shapeMarketNewsResponse(value);
+    if (response.source_summary.source_statuses.filter((status) => status.source_id === requestedSourceId).length !== 1) marketNewsError();
+    return response;
+  }
+  assertMarketNewsDocumentBudget(value);
   const row = exactMarketNewsRecord(value, new Set(["retry_succeeded", "source_status"]));
   if (row.retry_succeeded !== false) marketNewsError();
   const sourceStatus = shapeMarketNewsSourceStatus(row.source_status);
-  if (sourceStatus.status !== "failed") marketNewsError();
+  if (sourceStatus.status !== "failed" || sourceStatus.source_id !== requestedSourceId) marketNewsError();
   return { retry_succeeded: false, source_status: sourceStatus };
 }
 
@@ -1188,7 +1462,7 @@ export const api = {
   marketNewsRetrySource: (sourceId: string, query: MarketNewsQuery) => request<unknown>(
     marketNewsPath(`/market-news/sources/${encodeURIComponent(sourceId)}/retry`, query),
     "POST",
-  ).then(shapeMarketNewsRetryResult),
+  ).then((value) => shapeMarketNewsRetryResult(value, sourceId)),
   marketNewsTranslations: (payload: {
     items: Array<{ event_id: string; title: string; summary: string; source_language: string }>;
     llm: LlmConfig | null;

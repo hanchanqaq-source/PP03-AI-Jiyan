@@ -63,4 +63,16 @@ describe("MarketNews SourceFailureDialog", () => {
     rejectRetry(new Error("secret raw error"));
     expect(await screen.findByRole("alert")).toHaveTextContent("该来源重试失败，请稍后再试。");
   });
+
+  it("keeps a legacy failure row visible without rendering an empty source anchor", () => {
+    render(<SourceFailureDialog
+      open
+      statuses={[{ ...failures[0], source_url: null } as any]}
+      onClose={() => {}}
+      onRetry={async () => {}}
+    />);
+
+    expect(screen.getByText("全球科技公开源")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "查看来源 全球科技公开源" })).not.toBeInTheDocument();
+  });
 });

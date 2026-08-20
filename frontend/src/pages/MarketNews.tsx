@@ -5,7 +5,7 @@ import { DataInfoDialog } from "@/features/market-news/DataInfoDialog";
 import { EventCard } from "@/features/market-news/EventCard";
 import { EventDetailDrawer } from "@/features/market-news/EventDetailDrawer";
 import { MarketNewsSidebar } from "@/features/market-news/MarketNewsSidebar";
-import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
+import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
 import { SourceFailureDialog } from "@/features/market-news/SourceFailureDialog";
 import { SourceHealthDrawer } from "@/features/source-health/SourceHealthDrawer";
 import type {
@@ -387,7 +387,7 @@ export function MarketNews() {
       });
       if (!terminal || requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       if (terminal.phase !== "trusted_published") {
-        setQueryError({ queryKey, message: newsPipelineFailureMessage(terminal) });
+        setQueryError(null);
         return;
       }
       failureStage = "filter";
@@ -432,6 +432,8 @@ export function MarketNews() {
     const current = responseCacheRef.current.get(retryQueryKey);
     if (!current || current.snapshot_id !== retrySnapshotId) return;
     if (!("events" in result)) {
+      if (current.source_summary.source_statuses.filter((source) => source.source_id === sourceId).length !== 1
+        || result.source_status.source_id !== sourceId) throw new Error("market-news retry source mismatch");
       const sourceStatuses = current.source_summary.source_statuses.map((source) => (
         source.source_id === sourceId ? result.source_status : source
       ));

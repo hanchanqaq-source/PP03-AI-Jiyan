@@ -132,6 +132,67 @@ describe("NewsPipelineStatus", () => {
     expect(terminal?.phase).toBe("trusted_published");
   });
 
+  it("tolerates the normal pointer-ahead publication window without exposing it as terminal", async () => {
+    const pointerAhead = pipelineStatus("evidence_saved", {
+      displayed_trusted_snapshot_id: started.raw_snapshot_id,
+      displayed_trusted: {
+        snapshot_id: started.raw_snapshot_id,
+        published_at: "2026-08-20T09:00:02+00:00",
+        event_count: 5,
+      },
+      updated_at: "2026-08-20T09:00:02+00:00",
+    });
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus")
+      .mockResolvedValueOnce(pipelineStatus("verifying"))
+      .mockResolvedValueOnce(pointerAhead)
+      .mockResolvedValueOnce(pipelineStatus("trusted_published", {
+        displayed_trusted: pointerAhead.displayed_trusted,
+        updated_at: "2026-08-20T09:00:03+00:00",
+      }));
+    const phases: Array<NewsPipelineStatusData["phase"]> = [];
+
+    const terminal = await runNewsPipelineRefresh({
+      pollIntervalMs: 0,
+      onStatus: (next) => { phases.push(next.phase); },
+    });
+
+    expect(phases).toEqual(["verifying", "trusted_published"]);
+    expect(terminal?.phase).toBe("trusted_published");
+    expect(api.newsPipelineStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["evidence metadata does not match", pipelineStatus("evidence_saved", {
+      displayed_trusted_snapshot_id: started.raw_snapshot_id,
+      displayed_trusted: {
+        snapshot_id: started.raw_snapshot_id,
+        published_at: "2026-08-20T09:00:02+00:00",
+        event_count: 6,
+      },
+    })],
+    ["pointer advances before evidence durability", pipelineStatus("verifying", {
+      displayed_trusted_snapshot_id: started.raw_snapshot_id,
+      displayed_trusted: {
+        snapshot_id: started.raw_snapshot_id,
+        published_at: "2026-08-20T09:00:02+00:00",
+        event_count: 5,
+      },
+    })],
+  ])("rejects malformed first-frame pointer-ahead state: %s", async (_label, malformed) => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus")
+      .mockResolvedValueOnce(malformed)
+      .mockResolvedValueOnce(pipelineStatus("trusted_published"));
+    const onStatus = vi.fn();
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0, onStatus })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(onStatus).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["phase regression", pipelineStatus("raw_saved", { updated_at: "2026-08-20T09:00:02+00:00" })],
     ["count regression", pipelineStatus("evidence_saved", {
@@ -193,6 +254,28 @@ describe("NewsPipelineStatus", () => {
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus")
       .mockResolvedValueOnce(pipelineStatus("raw_saved"))
+      .mockResolvedValueOnce(invalidNext);
+    const onStatus = vi.fn();
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0, onStatus })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(onStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["created time changes", pipelineStatus("trusted_published", {
+      created_at: "2026-08-20T09:00:00.500000+00:00",
+      updated_at: "2026-08-20T09:00:02+00:00",
+    })],
+    ["updated time moves backwards", pipelineStatus("trusted_published", {
+      updated_at: "2026-08-20T09:00:00+00:00",
+    })],
+  ])("freezes exact run time lineage: %s", async (_label, invalidNext) => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus")
+      .mockResolvedValueOnce(pipelineStatus("evidence_saved"))
       .mockResolvedValueOnce(invalidNext);
     const onStatus = vi.fn();
 
@@ -374,6 +457,25 @@ describe("NewsPipelineStatus", () => {
     ["displayed identity mismatch", (value: Record<string, unknown>) => { value.displayed_trusted_snapshot_id = "trusted-other"; }],
     ["success with failure code", (value: Record<string, unknown>) => { value.redacted_error = "verification_failed"; }],
   ])("rejects impossible loaded status: %s", async (_label, mutate) => {
+    const base = pipelineStatus("trusted_published");
+    const payload: Record<string, unknown> = { ...base, ...base.counts };
+    mutate(payload);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+  });
+
+  it.each([
+    ["non-UTC timestamp", (value: Record<string, unknown>) => { value.created_at = "2026-08-20T17:00:00+08:00"; }],
+    ["timestamp with embedded tab", (value: Record<string, unknown>) => { value.updated_at = "2026-08-20T09:00:01+00:00\tforged"; }],
+    ["updated before created", (value: Record<string, unknown>) => { value.updated_at = "2026-08-20T08:59:59+00:00"; }],
+  ])("rejects noncanonical pipeline time: %s", async (_label, mutate) => {
     const base = pipelineStatus("trusted_published");
     const payload: Record<string, unknown> = { ...base, ...base.counts };
     mutate(payload);

@@ -97,6 +97,17 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(api.newsPipelineStatus).toHaveBeenCalledWith(pipelineStarted.run_id, expect.any(AbortSignal));
   });
 
+  it("announces a successful terminal Evidence refresh only once", async () => {
+    const user = userEvent.setup();
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+
+    await screen.findByText("核验刷新完成，已载入最新成功快照。");
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+  });
+
   it("rejects a list whose echoed filters do not match the requested filter", async () => {
     const user = userEvent.setup();
     render(<EvidenceCenter />);
@@ -202,7 +213,13 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(api.evidenceSummary).toHaveBeenCalledTimes(initialSummaryCalls);
     expect(api.evidenceEvents).toHaveBeenCalledTimes(initialListCalls);
 
-    resolveStatus({ ...pipelineDone, phase: "evidence_saved", trusted_snapshot_id: null });
+    resolveStatus({
+      ...pipelineDone,
+      phase: "evidence_saved",
+      trusted_snapshot_id: null,
+      displayed_trusted_snapshot_id: "trusted-old",
+      displayed_trusted: { ...pipelineDone.displayed_trusted!, snapshot_id: "trusted-old" },
+    });
     await waitFor(() => expect(api.evidenceSummary).toHaveBeenCalledTimes(initialSummaryCalls + 1));
     expect(api.evidenceEvents).toHaveBeenCalledTimes(initialListCalls + 1);
   });
@@ -308,6 +325,52 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(api.evidenceSummary).toHaveBeenCalledTimes(summaryCalls);
     expect(api.evidenceEvents).toHaveBeenCalledTimes(eventCalls);
     expect(screen.getByText(row.title)).toBeInTheDocument();
+  });
+
+  it("announces a terminal Evidence failure only once", async () => {
+    const user = userEvent.setup();
+    const failed: NewsPipelineStatusData = {
+      ...pipelineDone,
+      phase: "failed",
+      evidence_snapshot_id: null,
+      trusted_snapshot_id: null,
+      counts: { ...pipelineDone.counts!, verified_count: 0, corroborated_count: 0, pending_count: 0, conflicting_count: 0 },
+      admitted_count: 0,
+      redacted_error: "verification_failed",
+      compatibility_error: null,
+      displayed_trusted_snapshot_id: "trusted-old",
+      displayed_trusted: { ...pipelineDone.displayed_trusted!, snapshot_id: "trusted-old" },
+    };
+    vi.mocked(api.newsPipelineStatus).mockResolvedValue(failed);
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("uses the latest committed snapshot truth after an asynchronous status failure", async () => {
+    const user = userEvent.setup();
+    let resolveSummary!: (value: EvidenceSummaryData) => void;
+    let resolveListing!: (value: EvidenceEventList) => void;
+    let rejectStatus!: (reason: Error) => void;
+    vi.mocked(api.evidenceSummary).mockImplementationOnce(() => new Promise((resolve) => { resolveSummary = resolve; }));
+    vi.mocked(api.evidenceEvents).mockImplementationOnce(() => new Promise((resolve) => { resolveListing = resolve; }));
+    vi.mocked(api.newsPipelineStatus).mockImplementation(() => new Promise((_, reject) => { rejectStatus = reject; }));
+
+    render(<EvidenceCenter />);
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+    await act(async () => {
+      resolveSummary(summary);
+      resolveListing(listing);
+    });
+    await screen.findByText(row.title);
+    await act(async () => rejectStatus(new Error("status transport failed")));
+
+    expect(await screen.findByText("核验流水线状态连接失败；继续显示上次成功快照。")).toBeInTheDocument();
+    expect(screen.queryByText("核验流水线状态连接失败；当前尚无可显示的成功快照。")).not.toBeInTheDocument();
   });
 
   it("rejects a failed-run evidence reload that does not match its durable ID", async () => {

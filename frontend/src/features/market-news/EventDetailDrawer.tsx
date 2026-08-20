@@ -61,7 +61,7 @@ export function EventDetailDrawer({ open, event, onClose }: { open: boolean; eve
             <div className="space-y-2">{event.sources.map((source) => <div key={`${source.source_name}-${source.original_url}`} className="rounded-xl border border-border/50 p-3 text-xs">
               <div className="flex flex-wrap items-center gap-2 text-muted-foreground"><strong className="text-foreground">{source.source_name}</strong><span>{dateTime(source.published_at)}</span><span>{source.data_status === "stale" ? "过期缓存" : "公开来源"}</span></div>
               <p className="mt-2 font-medium">{source.title}</p><p className="mt-1 line-clamp-2 text-muted-foreground">{source.summary_or_excerpt || "来源未提供摘要"}</p>
-              <a href={source.original_url} target="_blank" rel="noreferrer" aria-label={`打开原始来源 ${source.source_name}`} className="mt-2 inline-flex items-center gap-1 text-primary hover:underline">打开原始来源<ExternalLink className="h-3 w-3" /></a>
+              {source.original_url && <a href={source.original_url} target="_blank" rel="noreferrer" aria-label={`打开原始来源 ${source.source_name}`} className="mt-2 inline-flex items-center gap-1 text-primary hover:underline">打开原始来源<ExternalLink className="h-3 w-3" /></a>}
             </div>)}</div>
           </Section>
 

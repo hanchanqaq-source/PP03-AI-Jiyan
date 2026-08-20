@@ -53,8 +53,8 @@ export interface NewsPipelineStatusData {
 
 export interface MarketNewsSource {
   source_name: string;
-  source_url: string;
-  original_url: string;
+  source_url: string | null;
+  original_url: string | null;
   published_at: string | null;
   fetched_at: string;
   title: string;
@@ -132,7 +132,7 @@ export type MarketNewsSourceState = "all_success" | "partial_failure" | "cached"
 export interface MarketNewsSourceStatus {
   source_id: string;
   source_name: string;
-  source_url: string;
+  source_url: string | null;
   status: "ok" | "failed";
   error_type: "timeout" | "http_status" | "tls" | "dns" | "connection" | "rss_parse" | "unknown" | null;
   error_reason: string | null;

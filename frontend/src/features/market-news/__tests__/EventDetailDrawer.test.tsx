@@ -57,4 +57,21 @@ describe("MarketNews EventDetailDrawer", () => {
     expect(screen.getByRole("dialog", { name: "Micron launches HBM3E事件详情" })).toBeInTheDocument();
     expect(screen.getAllByText("Shipments begin this quarter.").length).toBeGreaterThan(0);
   });
+
+  it("renders source facts without an anchor when the backend has no public URL", () => {
+    const event = {
+      ...directEvent,
+      original_links: [],
+      sources: directEvent.sources.map((source) => ({
+        ...source,
+        source_url: null,
+        original_url: null,
+      })),
+    } as any;
+
+    render(<EventDetailDrawer open event={event} onClose={() => {}} />);
+
+    expect(screen.getByText("来源一")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /打开原始来源/ })).not.toBeInTheDocument();
+  });
 });

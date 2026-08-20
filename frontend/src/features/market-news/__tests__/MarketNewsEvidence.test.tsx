@@ -171,6 +171,29 @@ describe("MarketNews trusted evidence admission", () => {
     await act(async () => resolveKickoff(started));
   });
 
+  it("announces one terminal pipeline failure instead of duplicating the page error alert", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({
+      ...marketNewsResponse,
+      events: [verified],
+      focus_events: [verified],
+      filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] },
+    });
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("failed", 6, 0) as NewsPipelineStatusData);
+    vi.mocked(api.newsPipelineStatus).mockResolvedValue({
+      ...status("failed", 6, 0),
+      redacted_error: "verification_failed",
+    });
+
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: verified.title });
+    await user.click(screen.getByRole("button", { name: "刷新资讯" }));
+
+    await screen.findByText("确定性核验失败；继续显示上一份可信快照。");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
   it("shapes exact market-news lineage while preserving the query snapshot hash", async () => {
     const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
     const payload = {
@@ -255,10 +278,109 @@ describe("MarketNews trusted evidence admission", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("accepts backend-compatible missing source links and returns null instead of an unsafe anchor", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    delete payload.events[0].sources[0].original_url;
+    payload.events[0].sources[0].source_url = "";
+    payload.events[0].original_links = [];
+    payload.focus_events = [structuredClone(payload.events[0])];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    const response = await api.marketNewsEvents(query);
+    expect(response.events[0].sources[0]).toMatchObject({ source_url: null, original_url: null });
+    expect(response.events[0].original_links).toEqual([]);
+  });
+
+  it.each([
+    "http://127.0.0.1/internal",
+    "http://10.2.3.4/internal",
+    "http://[::1]/internal",
+    "https://feed.local/private",
+    "https://public.example.org/feed?token=secret",
+    "https://public.example.org/feed?redirect=https%3A%2F%2Fpublic.example.org%2Fcallback%3Ftoken%3Dsecret",
+    "https://public.example.org/feed#credential",
+  ])("rejects a non-public or credential-bearing market-news URL: %s", async (unsafeUrl) => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.events[0].original_links[0] = unsafeUrl;
+    payload.focus_events = [structuredClone(payload.events[0])];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("binds a failed single-source retry to the exact requested source", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = {
+      retry_succeeded: false,
+      source_status: {
+        source_id: "fedcba9876543210",
+        source_name: "错误来源",
+        source_url: "https://public.example.org/feed",
+        status: "failed",
+        error_type: "timeout",
+        error_reason: "连接超时",
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 0,
+      },
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsRetrySource("0123456789abcdef", query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejects a successful single-source retry response that omits the requested source row", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: marketNewsResponse }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsRetrySource("0123456789abcdef", query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it.each([
+    ["source state", (payload: any) => {
+      payload.source_summary.source_state = "all_success";
+      payload.source_summary.cache_status = "realtime";
+    }],
+    ["impact facts", (payload: any) => {
+      payload.impact_summary = {
+        holding_related_count: 0,
+        direct_count: 0,
+        industry_count: 0,
+        watch_count: 0,
+        funds: [],
+      };
+    }],
+  ])("rejects a market-news summary that contradicts emitted %s", async (_label, mutate) => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    mutate(payload);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
   it.each([
     ["event extra key", (payload: any) => { payload.events[0].unexpected = "unsafe"; }],
     ["focus row mutation", (payload: any) => { payload.focus_events[0] = { ...payload.focus_events[0], title: "同 ID 的伪造焦点标题" }; }],
     ["event control text", (payload: any) => { payload.events[0].title = "\u0001伪造标题"; }],
+    ["event tab control text", (payload: any) => { payload.events[0].title = "伪\t造标题"; }],
     ["verified row missing timestamp", (payload: any) => { payload.events[0].verified_at = null; payload.focus_events[0] = payload.events[0]; }],
     ["non-canonical tag ID", (payload: any) => { payload.filters.tag_ids = ["../unsafe"]; }],
     ["event javascript link", (payload: any) => { payload.events[0].original_links[0] = "javascript:alert(1)"; }],
@@ -310,6 +432,83 @@ describe("MarketNews trusted evidence admission", () => {
     }));
 
     await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejects a response-level source capacity beyond the product catalog boundary", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const sourceStatuses = Array.from({ length: 513 }, (_, index) => ({
+      source_id: index.toString(16).padStart(16, "0"),
+      source_name: `来源 ${index}`,
+      source_url: `https://source-${index}.example.org/feed`,
+      status: "ok",
+      error_type: null,
+      error_reason: null,
+      last_success_at: null,
+      used_cached_items: false,
+      item_count: 0,
+    }));
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.source_summary = {
+      total_sources: 513,
+      failed_sources: 0,
+      cache_status: "realtime",
+      source_state: "all_success",
+      refresh_failed: false,
+      source_statuses: sourceStatuses,
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("bounds cumulative nested nodes across the whole market-news document", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.events = Array.from({ length: 60 }, (_, index) => ({
+      ...structuredClone(directEvent),
+      event_id: index.toString(16).padStart(20, "0"),
+      impact_basis: Array.from({ length: 1_000 }, () => "依据"),
+    }));
+    payload.focus_events = [];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("bounds cumulative text across the whole market-news document", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.events = Array.from({ length: 400 }, (_, index) => ({
+      ...structuredClone(directEvent),
+      event_id: index.toString(16).padStart(20, "0"),
+      summary: "x".repeat(4_096),
+    }));
+    payload.focus_events = [];
+    payload.impact_summary = null;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejects an oversized JSON response before consuming its body", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const response = new Response(JSON.stringify({ data: marketNewsResponse }), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Content-Length": "5000000" },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+    expect(response.bodyUsed).toBe(false);
   });
 
   it("labels a backend trusted snapshot accurately in Chinese", async () => {

@@ -54,6 +54,8 @@ export function EvidenceCenter() {
   const pipelineCycleRef = useRef(0);
   const pipelineAbortRef = useRef<AbortController | null>(null);
   const refreshInFlightRef = useRef(false);
+  const committedSummaryRef = useRef<EvidenceSummaryData | null>(summary);
+  committedSummaryRef.current = summary;
 
   const queryForFilter = useCallback((nextFilter: Filter): EvidenceEventQuery => ({
     days: 7,
@@ -199,7 +201,7 @@ export function EvidenceCenter() {
     }
     catch (error) {
       if (pipelineCycle === pipelineCycleRef.current && !controller.signal.aborted && !isAbortError(error)) {
-        setNotice(summary?.loaded
+        setNotice(committedSummaryRef.current?.loaded
           ? "核验流水线状态连接失败；继续显示上次成功快照。"
           : "核验流水线状态连接失败；当前尚无可显示的成功快照。");
       }
@@ -213,10 +215,16 @@ export function EvidenceCenter() {
     }
   };
 
+  const terminalPipelineNotice = Boolean(notice && pipelineStatus && (
+    (pipelineStatus.phase === "trusted_published" && notice === "核验刷新完成，已载入最新成功快照。")
+    || ((pipelineStatus.phase === "failed" || pipelineStatus.phase === "interrupted")
+      && notice === newsPipelineFailureMessage(pipelineStatus))
+  ));
+
   return <div className="pb-8">
     <PageHeader title="证据中心" subtitle="查看资讯的核验状态、一手证据、独立来源与更正记录" actions={<><button aria-label="数据说明" onClick={() => setExplanationOpen((value) => !value)} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:border-primary/45 hover:text-foreground"><Database className="h-4 w-4" />数据说明</button><button aria-label="运行核验" onClick={refresh} disabled={refreshing} className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground disabled:opacity-50">{refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}{refreshing ? "核验中" : "运行核验"}</button></>} />
     {explanationOpen && <section role="dialog" aria-label="数据说明" className="mb-4 rounded-xl border border-primary/25 bg-primary/5 p-4 text-xs text-muted-foreground"><p className="font-semibold text-foreground">真实性核验与数据源健康是两套独立机制。</p><p className="mt-2">仅明确官方证据或两个相互独立的来源链提供的一致证据可进入可信资讯流。</p><p className="mt-1">待核验金额、比例、数量和日期不会进入摘要、持仓影响或情绪判断。</p><p className="mt-1">AI 翻译、AI 摘要和来源数量不会自动提高核验等级。</p></section>}
-    {notice && <p role="status" className="mb-4 rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary">{notice}</p>}
+    {notice && <p role={terminalPipelineNotice ? undefined : "status"} className="mb-4 rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs text-primary">{notice}</p>}
     {error && <p role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{error}</p>}
     <NewsPipelineStatus status={pipelineStatus} />
 

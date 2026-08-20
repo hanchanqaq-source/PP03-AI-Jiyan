@@ -96,7 +96,7 @@ function validatePollSequence(
   previous: NewsPipelineStatusData | null,
   next: NewsPipelineStatusData,
   started: NewsPipelineStarted,
-): void {
+): boolean {
   if (!next.loaded || next.run_id !== started.run_id || next.raw_snapshot_id !== started.raw_snapshot_id) {
     throw new ApiError("资讯流水线响应无效", 502);
   }
@@ -108,7 +108,23 @@ function validatePollSequence(
   )) {
     throw new ApiError("资讯流水线响应无效", 502);
   }
-  if (!previous) return;
+  const pointerAhead = next.phase === "evidence_saved"
+    && next.evidence_snapshot_id !== null
+    && next.trusted_snapshot_id === null
+    && next.displayed_trusted_snapshot_id === started.raw_snapshot_id
+    && next.displayed_trusted?.snapshot_id === started.raw_snapshot_id
+    && next.displayed_trusted.event_count === next.admitted_count;
+  if (next.phase !== "trusted_published"
+    && next.displayed_trusted_snapshot_id === started.raw_snapshot_id
+    && !pointerAhead) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (!previous) return pointerAhead;
+  if (next.created_at !== previous.created_at
+    || next.updated_at === null || previous.updated_at === null
+    || Date.parse(next.updated_at) < Date.parse(previous.updated_at)) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
   const previousOrder = previous.phase ? PHASE_ORDER[previous.phase] : undefined;
   const nextOrder = next.phase ? PHASE_ORDER[next.phase] : undefined;
   if (previousOrder !== undefined && nextOrder !== undefined && nextOrder < previousOrder) {
@@ -140,7 +156,13 @@ function validatePollSequence(
     )) throw new ApiError("资讯流水线响应无效", 502);
   }
   if (next.phase !== "trusted_published"
-    && next.displayed_trusted_snapshot_id !== previous.displayed_trusted_snapshot_id) {
+    && next.displayed_trusted_snapshot_id !== previous.displayed_trusted_snapshot_id
+    && !pointerAhead) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  const previousPointerAhead = previous.phase === "evidence_saved"
+    && previous.displayed_trusted_snapshot_id === started.raw_snapshot_id;
+  if (previousPointerAhead && next.phase !== "trusted_published" && !pointerAhead) {
     throw new ApiError("资讯流水线响应无效", 502);
   }
   if (previous.displayed_trusted_snapshot_id !== null
@@ -149,6 +171,7 @@ function validatePollSequence(
       || next.displayed_trusted?.event_count !== previous.displayed_trusted?.event_count)) {
     throw new ApiError("资讯流水线响应无效", 502);
   }
+  return pointerAhead;
 }
 
 export async function runNewsPipelineRefresh({
@@ -181,8 +204,8 @@ export async function runNewsPipelineRefresh({
       throw error;
     }
     if (requestSignal.aborted) return null;
-    validatePollSequence(previousStatus, status, started);
-    await onStatus?.(status);
+    const pointerAhead = validatePollSequence(previousStatus, status, started);
+    if (!pointerAhead) await onStatus?.(status);
     previousStatus = status;
     if (requestSignal.aborted) return null;
     if (!isNewsPipelineActive(status.phase)) return status;
@@ -216,6 +239,16 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
   const ordinaryAnnouncement = status.phase
     ? `资讯流水线阶段：${STAGES.find((stage) => stage.phase === status.phase)?.label || TERMINAL_LABEL[status.phase] || "状态更新"}`
     : "资讯流水线状态未载入";
+  const terminalFailure = status.phase === "failed" || status.phase === "interrupted";
+  const liveStatusKind = terminalFailure
+    ? null
+    : inVerification
+      ? "verification"
+      : pendingEvidence
+        ? "pending"
+        : status.redacted_error === "radar_compatibility_failed"
+          ? "compatibility"
+          : "ordinary";
 
   return <section aria-label="资讯流水线状态" className="mb-4 overflow-hidden rounded-xl border border-border/65 bg-gradient-to-r from-slate-950/55 via-background/55 to-primary/5">
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/45 px-3 py-2.5">
@@ -259,12 +292,10 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
       <SnapshotId label="当前可信快照" value={currentTrustedId} />
     </div>
 
-    {inVerification && <p role="status" className="border-t border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">{inVerificationCopy}</p>}
-    {pendingEvidence && <p role="status" className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{pendingCopy}</p>}
-    {status.phase === "trusted_published" && status.redacted_error === "radar_compatibility_failed" && <p role="status" className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{FAILURE_COPY.radar_compatibility_failed}</p>}
-    {(status.phase === "failed" || status.phase === "interrupted") && <p role="alert" className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">{newsPipelineFailureMessage(status)}</p>}
-    {!inVerification && !pendingEvidence && status.redacted_error !== "radar_compatibility_failed"
-      && status.phase !== "failed" && status.phase !== "interrupted"
-      && <p role="status" className="sr-only">{ordinaryAnnouncement}</p>}
+    {inVerification && <p role={liveStatusKind === "verification" ? "status" : undefined} className="border-t border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">{inVerificationCopy}</p>}
+    {pendingEvidence && <p role={liveStatusKind === "pending" ? "status" : undefined} className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{pendingCopy}</p>}
+    {status.phase === "trusted_published" && status.redacted_error === "radar_compatibility_failed" && <p role={liveStatusKind === "compatibility" ? "status" : undefined} className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{FAILURE_COPY.radar_compatibility_failed}</p>}
+    {terminalFailure && <p role="alert" className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">{newsPipelineFailureMessage(status)}</p>}
+    {liveStatusKind === "ordinary" && <p role="status" className="sr-only">{ordinaryAnnouncement}</p>}
   </section>;
 }
