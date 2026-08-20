@@ -177,6 +177,7 @@ _MAX_QUERY_JSON_NODES = 512
 _MAX_QUERY_JSON_DEPTH = 8
 _MAX_QUERY_NAME_LENGTH = 128
 _MAX_QUERY_VERSION_SUFFIX_ROUNDS = 16
+_MAX_V2_CUTOFF_CANDIDATES = 4_096
 _SPECIAL_HOST_SUFFIXES = (
     ".local",
     ".localhost",
@@ -280,31 +281,16 @@ def _bucket_name_in_window(value: str, cutoff: datetime, upper: datetime) -> boo
     return cutoff.date() <= bucket_day <= upper.date()
 
 
-def _previous_journal_cutoff(rows: list[dict[str, Any]], now: datetime) -> datetime:
-    current = _utc(now, "archive clock")
-    if not rows:
-        return _shift_days(current, -90)
-    common_lineages: set[tuple[str, str, str]] | None = None
-    for row in rows:
-        row_lineages = {
-            (
-                lineage["evidence_snapshot_id"],
-                lineage["raw_snapshot_id"],
-                lineage["generated_at"],
-            )
-            for lineage in row["snapshot_history"]
-        }
-        common_lineages = row_lineages if common_lineages is None else common_lineages & row_lineages
-    if not common_lineages:
-        raise ValueError("invalid archive transaction lineage")
-    transaction_lineage = max(
-        common_lineages,
-        key=lambda item: (_metadata_time(item[2], "lineage generated_at"), item[0], item[1]),
-    )
-    transaction_upper = _metadata_time(transaction_lineage[2], "lineage generated_at")
-    if transaction_upper > _shift_datetime(current, _MAX_CLOCK_SKEW):
-        raise ValueError("invalid archive transaction time")
-    return _shift_days(transaction_upper, -90)
+def _file_mtime_utc(metadata: tuple[int, int, int, int, int, int]) -> datetime | None:
+    try:
+        mtime_ns = metadata[4]
+        if type(mtime_ns) is not int or mtime_ns < 0:
+            return None
+        return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(
+            microseconds=mtime_ns // 1_000,
+        )
+    except (IndexError, OverflowError, TypeError, ValueError):
+        return None
 
 
 def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[str, str]:
@@ -1913,6 +1899,23 @@ class EvidenceArchive:
                     _close_owned_descriptor(descriptor, identity)
             raise OSError("storage_error") from None
 
+    def _authority_present_without_lock(self) -> bool:
+        for path in (self.state_path, self.index_path):
+            if self._entry_present(path):
+                return True
+        entry_count = 0
+        try:
+            with os.scandir(self.archive_root) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                        raise OSError("storage_corrupt")
+                    if _valid_bucket_name(entry.name):
+                        return True
+        except OSError:
+            raise OSError("storage_corrupt") from None
+        return False
+
     @contextmanager
     def _reader_process_lock(self) -> Iterator[bool]:
         if not self._read_directory_present(self.root):
@@ -1921,10 +1924,18 @@ class EvidenceArchive:
         if not self._read_directory_present(self.archive_root):
             yield False
             return
-        handle = self._open_existing_lock()
+        handle: io.FileIO | None = None
+        for attempt in range(2):
+            handle = self._open_existing_lock()
+            if handle is not None:
+                break
+            if not self._authority_present_without_lock():
+                yield False
+                return
+            if attempt == 1:
+                raise OSError("storage_corrupt")
         if handle is None:
-            yield False
-            return
+            raise OSError("storage_corrupt")
         acquired = False
         try:
             deadline = time.monotonic() + self._lock_timeout
@@ -1972,6 +1983,7 @@ class EvidenceArchive:
         maximum: int,
         *,
         observed_identity: list[tuple[int, int]] | None = None,
+        observed_metadata: list[tuple[int, int, int, int, int, int]] | None = None,
     ) -> bytes | None:
         before = self._safe_file(path)
         if before is None:
@@ -2021,6 +2033,8 @@ class EvidenceArchive:
                 return None
             if observed_identity is not None:
                 observed_identity.append((after.st_dev, after.st_ino))
+            if observed_metadata is not None:
+                observed_metadata.append(after_signature)
             return payload
         except OSError:
             return None
@@ -2241,46 +2255,6 @@ class EvidenceArchive:
         if raw is None and self._entry_present(self.index_path):
             raise OSError("storage_corrupt")
         return self._payload_digest(raw)
-
-    def _read_state(self) -> dict[str, Any]:
-        raw = self._read_bytes(self.state_path, _MAX_STATE_BYTES)
-        if raw is None:
-            if self._entry_present(self.state_path):
-                raise OSError("storage_corrupt")
-            return {
-                "schema_version": 1,
-                "generation": 0,
-                "phase": "finalized",
-                "transaction_id": None,
-                "index_digest": None,
-                "bucket_digests": {},
-            }
-        try:
-            document = self._parse_json(raw)
-            if type(document) is not dict or set(document) != _LEGACY_STATE_KEYS:
-                raise ValueError("invalid archive state")
-            generation = document["generation"]
-            phase = document["phase"]
-            transaction_id = document["transaction_id"]
-            index_digest = document["index_digest"]
-            bucket_digests = self._bucket_digest_map(document["bucket_digests"])
-            if (
-                type(document["schema_version"]) is not int
-                or document["schema_version"] not in _LEGACY_STATE_SCHEMA_VERSIONS
-                or type(generation) is not int
-                or generation < 1
-                or phase not in {"prepared", "finalized"}
-                or type(transaction_id) is not str
-                or _CONTENT_DIGEST.fullmatch(transaction_id) is None
-                or type(index_digest) is not str
-                or _CONTENT_DIGEST.fullmatch(index_digest) is None
-            ):
-                raise ValueError("invalid archive state")
-            result = dict(document)
-            result["bucket_digests"] = bucket_digests
-            return result
-        except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
-            raise OSError("storage_corrupt") from None
 
     def _parse_authority_state(
         self,
@@ -2661,35 +2635,26 @@ class EvidenceArchive:
         except (KeyError, TypeError, ValueError):
             raise OSError("storage_corrupt") from None
 
-    def _logical_native_index(
+    def _v2_projection_at_upper(
         self,
         journal: dict[str, Any],
         physical_index: dict[str, str],
         *,
-        cutoff: datetime,
         upper: datetime,
-        physical_rows: dict[str, dict[str, Any]] | None = None,
-        locations: dict[str, set[str]] | None = None,
+        physical_rows: dict[str, dict[str, Any]],
+        locations: dict[str, set[str]],
+        physical_index_digest: str,
     ) -> dict[str, str]:
-        if journal["legacy"]:
+        if journal["legacy"] or journal["native_schema_version"] != _PREVIOUS_JOURNAL_SCHEMA_VERSION:
             raise OSError("storage_corrupt")
-        if journal["target_index"] is not None:
-            return dict(journal["target_index"])
-        if journal["native_schema_version"] != _PREVIOUS_JOURNAL_SCHEMA_VERSION:
+        if physical_index_digest not in {journal["base_index_digest"], journal["target_index_digest"]}:
             raise OSError("storage_corrupt")
-        actual_digest = self._index_digest()
-        if actual_digest == journal["target_index_digest"]:
-            return dict(physical_index)
-        if actual_digest != journal["base_index_digest"]:
-            raise OSError("storage_corrupt")
-        if physical_rows is None or locations is None:
-            raise OSError("storage_corrupt")
+        transaction_upper = _utc(upper, "archive transaction time")
+        cutoff = _shift_days(transaction_upper, -90)
         journal_ids = {row["event_id"] for row in journal["rows"]}
         target: dict[str, str] = {}
         for event_id, bucket_name in physical_index.items():
             if event_id in journal_ids:
-                continue
-            if _bucket_date(bucket_name) < cutoff.date():
                 continue
             row = physical_rows.get(event_id)
             if (
@@ -2709,6 +2674,86 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         return target
 
+    def _resolve_v2_transaction_projection(
+        self,
+        journal: dict[str, Any],
+        physical_index: dict[str, str],
+        *,
+        physical_rows: dict[str, dict[str, Any]],
+        locations: dict[str, set[str]],
+        physical_index_digest: str,
+        now: datetime,
+    ) -> tuple[datetime, dict[str, str]]:
+        if journal["legacy"] or journal["native_schema_version"] != _PREVIOUS_JOURNAL_SCHEMA_VERSION:
+            raise OSError("storage_corrupt")
+        current = _utc(now, "archive clock")
+        latest_allowed = _shift_datetime(current, _MAX_CLOCK_SKEW)
+        persisted_upper = journal.get("transaction_mtime")
+        if type(persisted_upper) is datetime and persisted_upper <= latest_allowed:
+            try:
+                target = self._v2_projection_at_upper(
+                    journal,
+                    physical_index,
+                    upper=persisted_upper,
+                    physical_rows=physical_rows,
+                    locations=locations,
+                    physical_index_digest=physical_index_digest,
+                )
+                return _shift_days(persisted_upper, -90), target
+            except OSError:
+                pass
+
+        journal_ids = {row["event_id"] for row in journal["rows"]}
+        event_times: set[datetime] = {_event_time(row) for row in journal["rows"]}
+        for event_id, bucket_name in physical_index.items():
+            if event_id in journal_ids:
+                continue
+            row = physical_rows.get(event_id)
+            if (
+                row is None
+                or locations.get(event_id) != {bucket_name}
+                or _bucket_name(row) != bucket_name
+            ):
+                raise OSError("storage_corrupt")
+            event_times.add(_event_time(row))
+        candidates: set[datetime] = set()
+        for observed in event_times:
+            for boundary in (observed, _shift_days(observed, 90)):
+                candidates.add(boundary)
+                try:
+                    candidates.add(_shift_datetime(boundary, -timedelta(microseconds=1)))
+                except OSError:
+                    pass
+                try:
+                    candidates.add(_shift_datetime(boundary, timedelta(microseconds=1)))
+                except OSError:
+                    pass
+                if len(candidates) > _MAX_V2_CUTOFF_CANDIDATES:
+                    raise OSError("storage_corrupt")
+        matched_target: dict[str, str] | None = None
+        matched_upper: datetime | None = None
+        for candidate in sorted(candidates):
+            if candidate > latest_allowed:
+                continue
+            try:
+                target = self._v2_projection_at_upper(
+                    journal,
+                    physical_index,
+                    upper=candidate,
+                    physical_rows=physical_rows,
+                    locations=locations,
+                    physical_index_digest=physical_index_digest,
+                )
+            except OSError:
+                continue
+            if matched_target is not None and target != matched_target:
+                raise OSError("storage_corrupt")
+            matched_target = target
+            matched_upper = candidate if matched_upper is None else min(matched_upper, candidate)
+        if matched_target is None or matched_upper is None:
+            raise OSError("storage_corrupt")
+        return _shift_days(matched_upper, -90), matched_target
+
     def _index_payload(self, events: dict[str, str]) -> bytes:
         if len(events) > _MAX_INDEX_EVENTS:
             raise ValueError("archive index is too large")
@@ -2727,61 +2772,23 @@ class EvidenceArchive:
         self._atomic_write(self.index_path, self._index_payload(events), _MAX_INDEX_BYTES)
 
 
-    def _recognized_legacy_journal_candidate(self) -> bool:
-        raw = self._read_bytes(self.journal_path, _MAX_JOURNAL_BYTES)
-        if raw is None:
-            return False
-        try:
-            _preflight_json_payload(
-                raw,
-                maximum_depth=16,
-                maximum_tokens=_MAX_SNAPSHOT_NODES * 4 + 16,
-            )
-            document = self._parse_json(raw)
-            if type(document) is not dict or type(document.get("schema_version")) is not int:
-                return False
-            expected_keys = {
-                _LEGACY_JOURNAL_SCHEMA_VERSION: _LEGACY_JOURNAL_KEYS,
-                _PREVIOUS_JOURNAL_SCHEMA_VERSION: _PREVIOUS_JOURNAL_KEYS,
-                _JOURNAL_SCHEMA_VERSION: _JOURNAL_KEYS,
-            }.get(document["schema_version"])
-            return expected_keys is not None and set(document) == expected_keys
-        except (TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
-            return False
-
-    def _explicit_foreign_journal_candidate(self) -> bool:
-        raw = self._read_bytes(self.journal_path, _MAX_JOURNAL_BYTES)
-        if raw is None:
-            return False
-        try:
-            _preflight_json_payload(raw, maximum_depth=4, maximum_tokens=8)
-            document = self._parse_json(raw)
-            return (
-                type(document) is dict
-                and set(document) == {"schema_version", "owner"}
-                and type(document["schema_version"]) is int
-                and type(document["owner"]) is str
-                and 0 < len(document["owner"]) <= 128
-            )
-        except (TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
-            return False
-
-
     def _read_journal(
         self,
         now: datetime,
         diagnostics: dict[str, int],
         *,
         budget: dict[str, int],
+        legacy_state: dict[str, Any] | None = None,
+        allow_unrecognized: bool = False,
     ) -> dict[str, Any] | None:
         if budget["files"] <= 0:
             raise OSError("storage_corrupt")
         maximum = min(_MAX_JOURNAL_BYTES, max(0, budget["bytes"]))
-        observed_identity: list[tuple[int, int]] = []
+        observed_metadata: list[tuple[int, int, int, int, int, int]] = []
         raw = self._read_bytes(
             self.journal_path,
             maximum,
-            observed_identity=observed_identity,
+            observed_metadata=observed_metadata,
         )
         if raw is None:
             if self._entry_present(self.journal_path):
@@ -2789,6 +2796,7 @@ class EvidenceArchive:
                 self._last_diagnostics = diagnostics
                 raise OSError("storage_corrupt")
             return None
+        owned_shape = False
         try:
             self._increment(diagnostics, "scanned_files")
             budget["files"] -= 1
@@ -2806,29 +2814,32 @@ class EvidenceArchive:
                 raise ValueError("invalid archive journal")
             legacy = schema_version == _LEGACY_JOURNAL_SCHEMA_VERSION
             previous_native = schema_version == _PREVIOUS_JOURNAL_SCHEMA_VERSION
-            if legacy:
-                if set(document) != _LEGACY_JOURNAL_KEYS:
-                    raise ValueError("invalid archive journal")
-            elif previous_native:
-                if set(document) != _PREVIOUS_JOURNAL_KEYS:
-                    raise ValueError("invalid archive journal")
-            elif schema_version == _JOURNAL_SCHEMA_VERSION:
-                if set(document) != _JOURNAL_KEYS:
-                    raise ValueError("invalid archive journal")
-            else:
+            expected_keys = {
+                _LEGACY_JOURNAL_SCHEMA_VERSION: _LEGACY_JOURNAL_KEYS,
+                _PREVIOUS_JOURNAL_SCHEMA_VERSION: _PREVIOUS_JOURNAL_KEYS,
+                _JOURNAL_SCHEMA_VERSION: _JOURNAL_KEYS,
+            }.get(schema_version)
+            if expected_keys is None or set(document) != expected_keys:
+                if (
+                    set(document) == {"schema_version", "owner"}
+                    and type(document.get("owner")) is str
+                    and 0 < len(document["owner"]) <= 128
+                ) or allow_unrecognized:
+                    return {"foreign": True}
                 raise ValueError("invalid archive journal")
-            if type(document["rows"]) is not list:
-                raise ValueError("invalid archive journal")
-            if len(document["rows"]) > _MAX_INDEX_EVENTS:
-                raise ValueError("invalid archive journal")
-            if len(document["rows"]) > budget["rows"]:
-                raise ValueError("invalid archive journal")
+            owned_shape = True
             _document_bytes, document_nodes = _json_metrics(
                 document,
                 maximum_bytes=_MAX_JOURNAL_BYTES,
                 maximum_nodes=budget["nodes"],
             )
             budget["nodes"] -= document_nodes
+            if type(document["rows"]) is not list:
+                raise ValueError("invalid archive journal")
+            if len(document["rows"]) > _MAX_INDEX_EVENTS:
+                raise ValueError("invalid archive journal")
+            if len(document["rows"]) > budget["rows"]:
+                raise ValueError("invalid archive journal")
             budget["rows"] -= len(document["rows"])
             self._increment(diagnostics, "scanned_rows", len(document["rows"]))
             rows = [_archive_from_document(row) for row in document["rows"]]
@@ -2837,14 +2848,17 @@ class EvidenceArchive:
                 raise ValueError("invalid archive journal order")
             for row in rows:
                 _validate_temporal_row(row, now)
-            if len(observed_identity) != 1:
+            if len(observed_metadata) != 1:
                 raise ValueError("invalid archive journal identity")
+            file_metadata = observed_metadata[0]
+            transaction_mtime = _file_mtime_utc(file_metadata)
             if legacy:
                 return {
                     "legacy": True,
                     "rows": rows,
-                    "file_identity": observed_identity[0],
+                    "file_identity": file_metadata[:2],
                     "file_digest": self._payload_digest(raw),
+                    "transaction_mtime": transaction_mtime,
                 }
             transaction_id = document["transaction_id"]
             base_generation = document["base_generation"]
@@ -2855,9 +2869,7 @@ class EvidenceArchive:
             target_bucket_digests = self._bucket_digest_map(document["target_bucket_digests"])
             cutoff_time: datetime | None = None
             target_index: dict[str, str] | None = None
-            if previous_native:
-                cutoff_time = _previous_journal_cutoff(rows, now)
-            else:
+            if not previous_native:
                 cutoff_time = _metadata_time(document["cutoff"], "archive transaction cutoff")
                 transaction_upper = _shift_days(cutoff_time, 90)
                 if transaction_upper > _shift_datetime(now, _MAX_CLOCK_SKEW):
@@ -2894,7 +2906,14 @@ class EvidenceArchive:
                 )
             ):
                 raise ValueError("invalid archive journal")
-            state = self._read_state()
+            state = legacy_state or {
+                "schema_version": 1,
+                "generation": 0,
+                "phase": "finalized",
+                "transaction_id": None,
+                "index_digest": None,
+                "bucket_digests": {},
+            }
             actual_index_digest = self._index_digest()
             completed = False
             if state["phase"] == "prepared":
@@ -2936,10 +2955,14 @@ class EvidenceArchive:
                 "native_schema_version": schema_version,
                 "cutoff": cutoff_time,
                 "target_index": target_index,
-                "file_identity": observed_identity[0],
+                "physical_index_digest": actual_index_digest,
+                "file_identity": file_metadata[:2],
                 "file_digest": self._payload_digest(raw),
+                "transaction_mtime": transaction_mtime,
             }
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
+            if allow_unrecognized and not owned_shape:
+                return {"foreign": True}
             self._increment(diagnostics, "skipped_files")
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt") from None
@@ -3265,7 +3288,11 @@ class EvidenceArchive:
             diagnostics=diagnostics,
             budget=budget,
         )
-        recovered = self._read_authority_state(now)
+        recovered = self._read_authority_state(
+            now,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
         if recovered is None or recovered["legacy"] or recovered["phase"] != "finalized":
             raise OSError("storage_corrupt")
         return recovered
@@ -3280,8 +3307,6 @@ class EvidenceArchive:
     ) -> dict[str, Any] | None:
         legacy_files = self._entry_present(self.index_path) or bool(self._bucket_names())
         journal_only = legacy_state is None and not legacy_files
-        if journal_only and not self._recognized_legacy_journal_candidate():
-            return None
         state_document = None if legacy_state is None else legacy_state["document"]
         if state_document is not None:
             try:
@@ -3298,15 +3323,17 @@ class EvidenceArchive:
                 state_document["bucket_digests"] = self._bucket_digest_map(state_document["bucket_digests"])
             except (KeyError, TypeError, ValueError):
                 raise OSError("storage_corrupt") from None
-        journal_candidate = self._recognized_legacy_journal_candidate()
-        if journal_candidate:
-            journal = self._read_journal(now, diagnostics, budget=budget)
-        elif self._explicit_foreign_journal_candidate():
+        journal = self._read_journal(
+            now,
+            diagnostics,
+            budget=budget,
+            legacy_state=state_document,
+            allow_unrecognized=journal_only,
+        )
+        if journal is not None and journal.get("foreign") is True:
             journal = None
-        elif self._entry_present(self.journal_path) and not journal_only:
-            raise OSError("storage_corrupt")
-        else:
-            journal = None
+        if journal_only and journal is None:
+            return None
         if journal_only and journal is not None and journal["legacy"]:
             return self._recover_first_legacy_journal(
                 journal,
@@ -3316,8 +3343,7 @@ class EvidenceArchive:
             )
         if state_document is not None and state_document["phase"] == "prepared" and journal is None:
             raise OSError("storage_corrupt")
-        if journal is not None and not journal["legacy"] and not journal["completed"]:
-            cutoff = journal["cutoff"] if journal["cutoff"] is not None else _shift_days(now, -90)
+        if journal is not None and not journal["legacy"]:
             physical_index = self._read_index() or {}
             (
                 _journal_bucket_rows,
@@ -3331,14 +3357,20 @@ class EvidenceArchive:
                 required_names=journal["target_bucket_digests"],
             )
             self._validate_journal_bucket_state(journal, journal_observed)
-            target_index = self._logical_native_index(
-                journal,
-                physical_index,
-                cutoff=cutoff,
-                upper=_shift_days(cutoff, 90),
-                physical_rows=journal_existing,
-                locations=journal_locations,
-            )
+            if journal["native_schema_version"] == _PREVIOUS_JOURNAL_SCHEMA_VERSION:
+                cutoff, target_index = self._resolve_v2_transaction_projection(
+                    journal,
+                    physical_index,
+                    physical_rows=journal_existing,
+                    locations=journal_locations,
+                    physical_index_digest=journal["physical_index_digest"],
+                    now=now,
+                )
+            else:
+                cutoff = journal["cutoff"]
+                target_index = journal["target_index"]
+                if type(cutoff) is not datetime or type(target_index) is not dict:
+                    raise OSError("storage_corrupt")
             prepared_payload = self._prepared_authority_payload(
                 base_generation=journal["base_generation"],
                 target_generation=journal["target_generation"],
@@ -3358,7 +3390,11 @@ class EvidenceArchive:
                 diagnostics=diagnostics,
                 budget=budget,
             )
-            return self._read_authority_state(now)
+            return self._read_authority_state(
+                now,
+                diagnostics=diagnostics,
+                budget=budget,
+            )
 
         physical_index = self._read_index() or {}
         physical_index_digest = self._index_digest()
@@ -3528,7 +3564,11 @@ class EvidenceArchive:
             diagnostics=diagnostics,
             budget=budget,
         )
-        return self._read_authority_state(now)
+        return self._read_authority_state(
+            now,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
 
 
     def upsert(self, snapshot: EvidenceSnapshot) -> None:
@@ -3767,31 +3807,8 @@ class EvidenceArchive:
         )
 
     def _query_without_lock(self, days: int, status: str | None) -> list[dict[str, Any]]:
-        del status
+        del days, status
         diagnostics = self._diagnostics()
-        if not self._read_directory_present(self.root):
-            self._last_diagnostics = diagnostics
-            return []
-        if not self._read_directory_present(self.archive_root):
-            self._last_diagnostics = diagnostics
-            return []
-        for authority in (self.index_path, self.state_path):
-            if self._safe_file(authority) is not None or self._entry_present(authority):
-                self._last_diagnostics = diagnostics
-                raise OSError("storage_corrupt")
-        now = _utc(self._now(), "archive clock")
-        cursor = _shift_days(now, -days).date()
-        final_day = now.date()
-        while cursor <= final_day:
-            path = self.archive_root / f"{cursor.isoformat()}.jsonl"
-            if self._safe_file(path) is not None:
-                self._last_diagnostics = diagnostics
-                raise OSError("storage_corrupt")
-            if self._entry_present(path):
-                self._increment(diagnostics, "skipped_files")
-            if cursor == final_day:
-                break
-            cursor += timedelta(days=1)
         self._last_diagnostics = diagnostics
         return []
 
