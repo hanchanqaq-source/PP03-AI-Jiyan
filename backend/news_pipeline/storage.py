@@ -55,6 +55,11 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _TEMP_NONCE = re.compile(r"^[a-z0-9_-]{8}$", re.IGNORECASE)
 _MAX_TEMP_SCAN = 1024
 _MAX_TEMP_CLEANUP = 128
+# Startup/recovery scans are fail-closed and bounded independently from the
+# JSON document limits. Invalid-name entries are outside the run namespace;
+# every recognized <run_id>.json entry must be a safe, single-link file.
+_MAX_RUN_SCAN_ENTRIES = 4096
+_MAX_RECOGNIZED_RUNS = 1024
 _SAFE_ERROR_CODES = {
     "collection_failed",
     "evidence_compatibility_failed",
@@ -390,6 +395,23 @@ def _validate_source_statuses(value: object) -> list[dict[str, object]]:
             raise ValueError("invalid source status item count")
         result.append(row)
     return result
+
+
+def _validate_raw_source_summary(
+    source_statuses: list[dict[str, object]],
+    total_source_count: object,
+    failed_source_count: object,
+) -> None:
+    if (
+        type(total_source_count) is not int
+        or type(failed_source_count) is not int
+        or not 0 <= failed_source_count <= total_source_count <= _MAX_INT
+        or len(source_statuses) > total_source_count
+    ):
+        raise ValueError("invalid raw source counts")
+    canonical_failed = sum(row["status"] == "failed" for row in source_statuses)
+    if failed_source_count != canonical_failed:
+        raise ValueError("failed source count does not match source statuses")
 
 
 def canonical_source_statuses(value: object) -> tuple[dict[str, object], ...]:
@@ -1075,24 +1097,23 @@ class NewsPipelineStorage:
         if not isinstance(snapshot.collected_at, datetime) or snapshot.collected_at.tzinfo is None or snapshot.collected_at.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError("collected_at must be aware UTC")
         items = _validate_raw_items(_bounded(list(snapshot.items)))
+        source_statuses = _validate_source_statuses(_bounded(list(snapshot.source_statuses)))
+        _validate_raw_source_summary(
+            source_statuses,
+            snapshot.total_source_count,
+            snapshot.failed_source_count,
+        )
         canonical = RawSnapshot(
             raw_snapshot_id=raw_id,
             collected_at=snapshot.collected_at,
             items=tuple(items),
-            source_statuses=snapshot.source_statuses,
+            source_statuses=tuple(source_statuses),
             total_source_count=snapshot.total_source_count,
             failed_source_count=snapshot.failed_source_count,
             cache_status=snapshot.cache_status,
             source_state=snapshot.source_state,
         )
         _raw_event_ids(canonical)
-        source_statuses = _validate_source_statuses(_bounded(list(snapshot.source_statuses)))
-        if (
-            type(snapshot.total_source_count) is not int
-            or type(snapshot.failed_source_count) is not int
-            or not 0 <= snapshot.failed_source_count <= snapshot.total_source_count <= _MAX_INT
-        ):
-            raise ValueError("invalid raw source counts")
         if snapshot.cache_status not in _CACHE_STATUSES or snapshot.source_state not in _SOURCE_STATES:
             raise ValueError("invalid raw source state")
         document: dict[str, object] = {
@@ -1144,19 +1165,19 @@ class NewsPipelineStorage:
             failed_source_count = document["failed_source_count"]
             cache_status = document["cache_status"]
             source_state = document["source_state"]
-            if (
-                type(total_source_count) is not int
-                or type(failed_source_count) is not int
-                or not 0 <= failed_source_count <= total_source_count <= _MAX_INT
-                or cache_status not in _CACHE_STATUSES
-                or source_state not in _SOURCE_STATES
-            ):
+            source_statuses = _validate_source_statuses(document["source_statuses"])
+            _validate_raw_source_summary(
+                source_statuses,
+                total_source_count,
+                failed_source_count,
+            )
+            if cache_status not in _CACHE_STATUSES or source_state not in _SOURCE_STATES:
                 return None
             snapshot = RawSnapshot(
                 identity,
                 _timestamp(document["collected_at"]),
                 tuple(_validate_raw_items(items)),
-                tuple(_validate_source_statuses(document["source_statuses"])),
+                tuple(source_statuses),
                 total_source_count,
                 failed_source_count,
                 cache_status,
@@ -1721,28 +1742,74 @@ class NewsPipelineStorage:
                 return None
             return self._validate_loaded_run(run)
 
+    def record_radar_compatibility_failure(self, run_id: str) -> PipelineRun:
+        """Durably attach the closed compatibility code before pointer commit.
+
+        This is the only supported same-phase run update. It is deliberately
+        limited to the evidence-saved checkpoint and cannot mutate a terminal
+        run or any snapshot identity/count.
+        """
+        safe_run_id = _id(run_id, "run_id")
+        with CACHE_IO_LOCK, self._process_lock():
+            self._require_writer()
+            current = self._load_run(safe_run_id)
+            if current is None:
+                raise OSError("storage_corrupt")
+            self._validate_loaded_run(current)
+            if (
+                current.phase is not PipelinePhase.EVIDENCE_SAVED
+                or current.durable_phase is not PipelinePhase.EVIDENCE_SAVED
+                or current.redacted_error not in {None, "radar_compatibility_failed"}
+            ):
+                raise ValueError("radar compatibility state is not recordable")
+            if current.redacted_error == "radar_compatibility_failed":
+                return current
+            updated = replace(
+                current,
+                updated_at=max(self._clock(), current.updated_at),
+                redacted_error="radar_compatibility_failed",
+            )
+            self._artifact_phase(updated)
+            self._atomic_write(self._run_path(safe_run_id), self._run_document(updated))
+            return updated
+
+    def _scan_run_ids(self) -> list[str]:
+        if not self.runs_root.exists():
+            return []
+        try:
+            self._verify_directory_chain(self.runs_root)
+            run_ids: list[str] = []
+            scanned = 0
+            with os.scandir(self.runs_root) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > _MAX_RUN_SCAN_ENTRIES:
+                        raise OSError("storage_corrupt")
+                    if not entry.name.endswith(".json"):
+                        continue
+                    try:
+                        run_id = _id(entry.name[:-5], "run_id")
+                    except ValueError:
+                        continue
+                    if len(run_ids) >= _MAX_RECOGNIZED_RUNS:
+                        raise OSError("storage_corrupt")
+                    info = entry.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or getattr(info, "st_reparse_tag", 0)
+                        or not _single_link(info)
+                    ):
+                        raise OSError("storage_corrupt")
+                    run_ids.append(run_id)
+            return sorted(run_ids)
+        except OSError:
+            raise OSError("storage_corrupt") from None
+
     def load_latest_run(self) -> PipelineRun | None:
         """Load the newest durable run using updated time and run ID as a stable tie."""
         with CACHE_IO_LOCK, self._process_lock():
-            if not self.runs_root.exists():
-                return None
-            try:
-                self._verify_directory_chain(self.runs_root)
-                paths = sorted(
-                    Path(entry.path)
-                    for entry in os.scandir(self.runs_root)
-                    if entry.name.endswith(".json")
-                    and entry.is_file(follow_symlinks=False)
-                    and _single_link(entry.stat(follow_symlinks=False))
-                )
-            except OSError:
-                raise OSError("storage_corrupt") from None
             runs: list[PipelineRun] = []
-            for path in paths:
-                try:
-                    run_id = _id(path.stem, "run_id")
-                except ValueError:
-                    continue
+            for run_id in self._scan_run_ids():
                 run = self._load_run(run_id)
                 if run is None:
                     raise OSError("storage_corrupt")
@@ -1755,30 +1822,34 @@ class NewsPipelineStorage:
             if not self.runs_root.exists():
                 return 0
             now = self._clock()
-            try:
-                self._verify_directory_chain(self.runs_root)
-                paths = sorted(
-                    Path(entry.path)
-                    for entry in os.scandir(self.runs_root)
-                    if entry.name.endswith(".json")
-                    and entry.is_file(follow_symlinks=False)
-                    and _single_link(entry.stat(follow_symlinks=False))
-                )
-            except OSError:
-                raise OSError("storage_corrupt") from None
             runs: list[PipelineRun] = []
-            for path in paths:
-                try:
-                    run_id = _id(path.stem, "run_id")
-                except ValueError:
-                    continue
+            for run_id in self._scan_run_ids():
                 run = self._load_run(run_id)
                 if run is None:
                     raise OSError("storage_corrupt")
                 runs.append(self._validate_loaded_run(run))
+            current = self._load_current() if os.path.lexists(self.current_pointer_path) else None
             self._claim_writer_unlocked()
             for run in runs:
                 if run.phase not in _NONTERMINAL:
+                    continue
+                if (
+                    run.phase is PipelinePhase.EVIDENCE_SAVED
+                    and run.durable_phase is PipelinePhase.EVIDENCE_SAVED
+                    and current is not None
+                    and current.raw_snapshot_id == run.raw_snapshot_id
+                ):
+                    recovered = replace(
+                        run,
+                        phase=PipelinePhase.TRUSTED_PUBLISHED,
+                        trusted_snapshot_id=run.raw_snapshot_id,
+                        durable_phase=PipelinePhase.TRUSTED_PUBLISHED,
+                        displayed_trusted_snapshot_id=run.raw_snapshot_id,
+                        updated_at=max(now, run.updated_at),
+                    )
+                    self._artifact_phase(recovered)
+                    self._atomic_write(self._run_path(run.run_id), self._run_document(recovered))
+                    interrupted += 1
                     continue
                 recovered = replace(
                     run,

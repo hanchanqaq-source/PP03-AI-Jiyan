@@ -138,8 +138,9 @@ class NewsPipelineService:
                     run_id,
                     PipelinePhase.TRUSTED_PUBLISHED,
                     trusted_snapshot_id=current.raw_snapshot_id,
-                    redacted_error=None,
+                    redacted_error=current.redacted_error,
                     durable_phase=PipelinePhase.TRUSTED_PUBLISHED,
+                    displayed_trusted_snapshot_id=current.raw_snapshot_id,
                 )
                 return True
             self._transition(run_id, PipelinePhase.FAILED, redacted_error=error_code)
@@ -234,13 +235,14 @@ class NewsPipelineService:
             trusted = self._trusted_projector(evidence)
             if type(trusted) is not TrustedSnapshot or trusted.raw_snapshot_id != durable_raw.raw_snapshot_id:
                 raise ValueError("trusted projector returned a different raw snapshot identity")
-            self.storage.publish_trusted(trusted)
             compatibility_error = None
             if self._radar_publisher is not None:
                 try:
                     self._radar_publisher(collection)
                 except Exception:
                     compatibility_error = "radar_compatibility_failed"
+                    run = self.storage.record_radar_compatibility_failure(run_id)
+            self.storage.publish_trusted(trusted)
             self._transition(
                 run_id,
                 PipelinePhase.TRUSTED_PUBLISHED,
@@ -325,7 +327,15 @@ class NewsPipelineService:
         return self.storage.load_current_trusted()
 
     def has_pipeline_state(self) -> bool:
-        return self.storage.load_latest_run() is not None or self.storage.load_current_trusted() is not None
+        if self._latest_run_id is not None:
+            cached = self.storage.load_run(self._latest_run_id)
+            if cached is not None:
+                return True
+        latest = self.storage.load_latest_run()
+        if latest is not None:
+            self._latest_run_id = latest.run_id
+            return True
+        return self.storage.load_current_trusted() is not None
 
     def current_trusted_context(
         self,
@@ -353,7 +363,10 @@ class NewsPipelineService:
         if run_id is not None and selected is None:
             raise KeyError(run_id)
         if selected is None:
-            selected = self.storage.load_latest_run()
+            if self._latest_run_id is not None:
+                selected = self.storage.load_run(self._latest_run_id)
+            if selected is None:
+                selected = self.storage.load_latest_run()
             if selected is not None:
                 self._latest_run_id = selected.run_id
         displayed = self.storage.load_current_trusted()

@@ -703,7 +703,7 @@ def test_evidence_phase_is_durable_before_fallible_compatibility_publication(tmp
         pipeline.close()
 
 
-def test_radar_compatibility_result_is_recorded_on_the_terminal_run_before_final_write(tmp_path):
+def test_radar_compatibility_result_is_durable_before_trusted_pointer_commit(tmp_path):
     root = tmp_path / "pipeline"
     storage = NewsPipelineStorage(root, now=lambda: NOW)
     ids = iter(("run-radar-order", "raw-radar-order"))
@@ -711,7 +711,7 @@ def test_radar_compatibility_result_is_recorded_on_the_terminal_run_before_final
     def radar_publisher(_collection):
         current = storage.load_current_trusted()
         run = storage.load_run("run-radar-order")
-        assert current is not None and current.raw_snapshot_id == "raw-radar-order"
+        assert current is None
         assert run.phase is PipelinePhase.EVIDENCE_SAVED
         raise OSError("compatibility cache unavailable")
 
@@ -730,6 +730,96 @@ def test_radar_compatibility_result_is_recorded_on_the_terminal_run_before_final
         assert completed.redacted_error == "radar_compatibility_failed"
         assert pipeline.current_trusted().raw_snapshot_id == "raw-radar-order"
         assert pipeline.get_status(completed.run_id)["compatibility_error"] == "radar_compatibility_failed"
+    finally:
+        pipeline.close()
+
+
+def test_recovery_reconciles_a_committed_zero_admission_publication_after_both_terminal_writes_fail(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "pipeline"
+    storage = NewsPipelineStorage(root, now=lambda: NOW)
+    original_write_run = storage.write_run
+    terminal_attempts = 0
+
+    def fail_both_terminal_writes(run, *, expected_phase=None):
+        nonlocal terminal_attempts
+        if run.phase is PipelinePhase.TRUSTED_PUBLISHED:
+            terminal_attempts += 1
+            raise OSError("terminal status unavailable")
+        return original_write_run(run, expected_phase=expected_phase)
+
+    monkeypatch.setattr(storage, "write_run", fail_both_terminal_writes)
+    identifiers = iter(("run-reconcile", "raw-reconcile"))
+
+    def broken_radar_publisher(_collection):
+        raise OSError("legacy radar cache unavailable")
+
+    pipeline = NewsPipelineService(
+        storage=storage,
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(
+            raw.raw_snapshot_id,
+            status=VerificationStatus.UNVERIFIED,
+        ),
+        trusted_projector=trusted,
+        radar_publisher=broken_radar_publisher,
+        now=lambda: NOW,
+        id_factory=lambda: next(identifiers),
+    )
+    started = pipeline.start()
+    stranded = pipeline.wait(started.run_id, timeout=5)
+
+    assert terminal_attempts == 2
+    assert stranded.phase is PipelinePhase.EVIDENCE_SAVED
+    assert stranded.redacted_error == "radar_compatibility_failed"
+    assert stranded.counts.raw_event_count == 1
+    assert stranded.counts.pending_count == 1
+    assert storage.load_current_trusted().raw_snapshot_id == started.raw_snapshot_id
+    pipeline.close()
+
+    restarted_storage = NewsPipelineStorage(root, now=lambda: NOW + timedelta(seconds=1))
+    assert restarted_storage.recover_incomplete_runs() == 1
+    recovered = restarted_storage.load_run(started.run_id)
+    assert recovered.phase is PipelinePhase.TRUSTED_PUBLISHED
+    assert recovered.durable_phase is PipelinePhase.TRUSTED_PUBLISHED
+    assert recovered.raw_snapshot_id == started.raw_snapshot_id
+    assert recovered.evidence_snapshot_id == f"evidence-{started.raw_snapshot_id}"
+    assert recovered.trusted_snapshot_id == started.raw_snapshot_id
+    assert recovered.counts.raw_event_count == 1
+    assert recovered.counts.pending_count == 1
+    assert recovered.counts.verified_count == 0
+    assert recovered.counts.corroborated_count == 0
+    assert recovered.redacted_error == "radar_compatibility_failed"
+
+    restarted = NewsPipelineService(
+        storage=restarted_storage,
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        now=lambda: NOW + timedelta(seconds=1),
+    )
+    try:
+        status = restarted.get_status(started.run_id)
+        assert status["has_pending_evidence_message"] is True
+        assert status["compatibility_error"] == "radar_compatibility_failed"
+    finally:
+        restarted.close()
+
+
+def test_default_status_uses_the_cached_latest_run_in_steady_state(tmp_path, monkeypatch):
+    pipeline = service(tmp_path)
+    run = pipeline.wait(pipeline.start().run_id, timeout=5)
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "load_latest_run",
+        lambda: (_ for _ in ()).throw(AssertionError("steady status rescanned the runs directory")),
+    )
+    try:
+        assert pipeline.get_status()["run_id"] == run.run_id
+        assert pipeline.has_pipeline_state() is True
     finally:
         pipeline.close()
 

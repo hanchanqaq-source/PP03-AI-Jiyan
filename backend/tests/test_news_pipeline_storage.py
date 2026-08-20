@@ -26,10 +26,25 @@ from news_pipeline.models import (
     RawSnapshot,
     TrustedSnapshot,
 )
+from news_pipeline import storage as pipeline_storage_module
 from news_pipeline.storage import NewsPipelineStorage
 
 
 NOW = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+
+
+def source_status_row(index: int, *, status: str = "failed") -> dict[str, object]:
+    return {
+        "source_id": f"source-{index}",
+        "source_name": f"公开源 {index}",
+        "source_url": f"https://source-{index}.example.test/feed",
+        "status": status,
+        "error_type": "timeout" if status == "failed" else None,
+        "error_reason": "连接超时" if status == "failed" else None,
+        "last_success_at": None if status == "failed" else NOW.isoformat(),
+        "used_cached_items": False,
+        "item_count": 0,
+    }
 
 
 def raw_snapshot(raw_snapshot_id: str) -> RawSnapshot:
@@ -957,7 +972,8 @@ def test_recovery_does_not_follow_symlinked_run_outside_storage_root(tmp_path):
         pytest.skip("symlink creation is unavailable")
 
     try:
-        assert storage.recover_incomplete_runs() == 0
+        with pytest.raises(OSError, match="storage_corrupt"):
+            storage.recover_incomplete_runs()
         assert link.is_symlink()
         assert json.loads(outside.read_text(encoding="utf-8"))["phase"] == "queued"
     finally:
@@ -1470,6 +1486,7 @@ def test_run_audit_counts_never_decrease(count_field, tmp_path):
         "raw-1",
         NOW,
         tuple(raw_rows),
+        source_statuses=(source_status_row(0), source_status_row(1)),
         total_source_count=2,
         failed_source_count=2,
     ))
@@ -1774,6 +1791,7 @@ def test_raw_checkpoint_run_counts_must_equal_the_durable_raw_artifact(tmp_path)
         "raw-counts",
         NOW,
         (canonical_market_event(),),
+        source_statuses=(source_status_row(0), source_status_row(1, status="ok")),
         total_source_count=2,
         failed_source_count=1,
     ))
@@ -1916,3 +1934,211 @@ def test_semantic_artifact_tamper_is_rejected_by_artifact_and_run_loads(tmp_path
         storage.load_current_trusted()
     with pytest.raises(OSError, match="storage_corrupt"):
         storage.load_run(completed.run_id)
+
+
+def test_raw_v2_rejects_failed_source_count_that_disagrees_with_canonical_status_rows(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    failed_status = ({
+        "source_id": "source-one",
+        "source_name": "公开源",
+        "source_url": "https://example.test/feed",
+        "status": "failed",
+        "error_type": "timeout",
+        "error_reason": "连接超时",
+        "last_success_at": None,
+        "used_cached_items": False,
+        "item_count": 0,
+    },)
+    mismatched = RawSnapshot(
+        raw_snapshot_id="raw-mismatched-source-count",
+        collected_at=NOW,
+        items=(),
+        source_statuses=failed_status,
+        total_source_count=108,
+        failed_source_count=0,
+        cache_status="partial",
+        source_state="partial_failure",
+    )
+
+    with pytest.raises(ValueError, match="failed source count"):
+        storage.write_raw(mismatched)
+
+    assert not (storage.raw_root / "raw-mismatched-source-count.json").exists()
+
+
+def test_tampered_raw_failed_source_count_blocks_run_load_and_recovery(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    failed_status = ({
+        "source_id": "source-one",
+        "source_name": "公开源",
+        "source_url": "https://example.test/feed",
+        "status": "failed",
+        "error_type": "timeout",
+        "error_reason": "连接超时",
+        "last_success_at": None,
+        "used_cached_items": False,
+        "item_count": 0,
+    },)
+    queued = replace(
+        pipeline_run(phase=PipelinePhase.QUEUED),
+        run_id="run-source-count",
+        raw_snapshot_id="raw-source-count",
+    )
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(RawSnapshot(
+        "raw-source-count",
+        NOW,
+        (),
+        source_statuses=failed_status,
+        total_source_count=108,
+        failed_source_count=1,
+        cache_status="partial",
+        source_state="partial_failure",
+    ))
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        durable_phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(failed_source_count=1),
+    )
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    raw_path = storage.raw_root / "raw-source-count.json"
+    document = json.loads(raw_path.read_text(encoding="utf-8"))
+    document["failed_source_count"] = 0
+    raw_path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert storage.load_raw("raw-source-count") is None
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run("run-source-count")
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+
+def test_recognized_run_directory_is_corruption_not_an_ignored_entry(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    unsafe = storage.runs_root / "run-directory.json"
+    unsafe.mkdir()
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+
+def test_recognized_hardlinked_run_is_corruption_when_link_counts_are_available(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    source = tmp_path / "hardlink-source.json"
+    source.write_text("{}", encoding="utf-8")
+    linked = storage.runs_root / "run-hardlink.json"
+    try:
+        os.link(source, linked)
+    except OSError:
+        pytest.skip("hardlink creation is unavailable")
+    if source.stat().st_nlink < 2:
+        pytest.skip("filesystem does not expose hardlink counts")
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+
+def test_run_scan_fails_closed_when_the_recognized_run_bound_is_exceeded(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    for index in range(3):
+        storage.write_run(PipelineRun(
+            run_id=f"run-{index}",
+            raw_snapshot_id=f"raw-{index}",
+            evidence_snapshot_id=None,
+            trusted_snapshot_id=None,
+            phase=PipelinePhase.QUEUED,
+            counts=PipelineCounts(),
+            created_at=NOW,
+            updated_at=NOW,
+            redacted_error=None,
+            displayed_trusted_snapshot_id=None,
+        ))
+    monkeypatch.setattr(pipeline_storage_module, "_MAX_RECOGNIZED_RUNS", 2)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+
+def test_run_scan_work_is_bounded_even_for_unknown_entry_names(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    for index in range(3):
+        (storage.runs_root / f"unknown-entry-{index}.tmp").write_text("ignored", encoding="utf-8")
+    monkeypatch.setattr(pipeline_storage_module, "_MAX_RUN_SCAN_ENTRIES", 2)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+
+def test_recovery_interrupts_evidence_saved_run_when_trusted_artifact_has_no_current_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    storage = NewsPipelineStorage(tmp_path, now=lambda: NOW)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(raw_snapshot(queued.raw_snapshot_id))
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(raw_event_count=1),
+        durable_phase=PipelinePhase.RAW_SAVED,
+    )
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
+    storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
+    evidence = evidence_snapshot(queued.raw_snapshot_id)
+    storage.write_evidence(evidence)
+    evidence_saved = replace(
+        verifying,
+        phase=PipelinePhase.EVIDENCE_SAVED,
+        evidence_snapshot_id=evidence.snapshot_id,
+        counts=PipelineCounts(raw_event_count=1, verified_count=1),
+        durable_phase=PipelinePhase.EVIDENCE_SAVED,
+    )
+    storage.write_run(evidence_saved, expected_phase=PipelinePhase.VERIFYING)
+    monkeypatch.setattr(
+        storage,
+        "_write_current_pointer",
+        lambda _intent: (_ for _ in ()).throw(OSError("pointer unavailable")),
+    )
+    with pytest.raises(OSError, match="pointer unavailable"):
+        storage.publish_trusted(trusted_snapshot(queued.raw_snapshot_id))
+    assert not storage.current_pointer_path.exists()
+    assert storage.load_trusted(queued.raw_snapshot_id) is not None
+    storage.close()
+
+    restarted = NewsPipelineStorage(tmp_path, now=lambda: NOW + timedelta(seconds=1))
+    assert restarted.recover_incomplete_runs() == 1
+    recovered = restarted.load_run(queued.run_id)
+    assert recovered.phase is PipelinePhase.INTERRUPTED
+    assert recovered.durable_phase is PipelinePhase.EVIDENCE_SAVED
+    assert recovered.trusted_snapshot_id is None
+    assert recovered.redacted_error == "pipeline_interrupted"
+
+
+def test_compatibility_checkpoint_cannot_mutate_a_terminal_run(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    completed = write_trusted_run(storage, run_id="run-terminal", raw_id="raw-terminal")
+    run_path = storage.runs_root / "run-terminal.json"
+    before = run_path.read_bytes()
+
+    with pytest.raises(ValueError, match="not recordable"):
+        storage.record_radar_compatibility_failure(completed.run_id)
+
+    assert run_path.read_bytes() == before
