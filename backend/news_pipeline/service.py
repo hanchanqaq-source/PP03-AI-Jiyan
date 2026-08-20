@@ -140,7 +140,9 @@ class NewsPipelineService:
                     trusted_snapshot_id=current.raw_snapshot_id,
                     redacted_error=current.redacted_error,
                     durable_phase=PipelinePhase.TRUSTED_PUBLISHED,
-                    displayed_trusted_snapshot_id=current.raw_snapshot_id,
+                    displayed_trusted_snapshot_id=(
+                        current.displayed_trusted_snapshot_id or current.raw_snapshot_id
+                    ),
                 )
                 return True
             self._transition(run_id, PipelinePhase.FAILED, redacted_error=error_code)

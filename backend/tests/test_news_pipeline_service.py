@@ -734,6 +734,54 @@ def test_radar_compatibility_result_is_durable_before_trusted_pointer_commit(tmp
         pipeline.close()
 
 
+def test_terminal_retry_preserves_the_run_displayed_trusted_identity(tmp_path, monkeypatch):
+    """Catches terminal compensation replacing the run's immutable prior display identity."""
+    root = tmp_path / "pipeline"
+    baseline = service(tmp_path)
+    previous = baseline.wait(baseline.start().run_id, timeout=5)
+    baseline.close()
+
+    storage = NewsPipelineStorage(root, now=lambda: NOW + timedelta(seconds=1))
+    original_write_run = storage.write_run
+    terminal_attempts = 0
+
+    def fail_first_terminal_write(run, *, expected_phase=None):
+        nonlocal terminal_attempts
+        if run.phase is PipelinePhase.TRUSTED_PUBLISHED:
+            terminal_attempts += 1
+            if terminal_attempts == 1:
+                raise OSError("terminal status unavailable")
+        return original_write_run(run, expected_phase=expected_phase)
+
+    def broken_radar_publisher(_collection):
+        raise OSError("legacy radar cache unavailable")
+
+    monkeypatch.setattr(storage, "write_run", fail_first_terminal_write)
+    identifiers = iter(("run-terminal-retry", "raw-terminal-retry"))
+    pipeline = NewsPipelineService(
+        storage=storage,
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        radar_publisher=broken_radar_publisher,
+        now=lambda: NOW + timedelta(seconds=1),
+        id_factory=lambda: next(identifiers),
+    )
+    try:
+        started = pipeline.start()
+        completed = pipeline.wait(started.run_id, timeout=5)
+
+        assert terminal_attempts == 2
+        assert completed.phase is PipelinePhase.TRUSTED_PUBLISHED
+        assert completed.durable_phase is PipelinePhase.TRUSTED_PUBLISHED
+        assert completed.displayed_trusted_snapshot_id == previous.raw_snapshot_id
+        assert completed.redacted_error == "radar_compatibility_failed"
+        assert pipeline.current_trusted().raw_snapshot_id == started.raw_snapshot_id
+        assert pipeline.get_status(started.run_id)["compatibility_error"] == "radar_compatibility_failed"
+    finally:
+        pipeline.close()
+
+
 def test_recovery_reconciles_a_committed_zero_admission_publication_after_both_terminal_writes_fail(
     tmp_path,
     monkeypatch,
@@ -792,6 +840,7 @@ def test_recovery_reconciles_a_committed_zero_admission_publication_after_both_t
     assert recovered.counts.verified_count == 0
     assert recovered.counts.corroborated_count == 0
     assert recovered.redacted_error == "radar_compatibility_failed"
+    assert recovered.displayed_trusted_snapshot_id == started.raw_snapshot_id
 
     restarted = NewsPipelineService(
         storage=restarted_storage,
