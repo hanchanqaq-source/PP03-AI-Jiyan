@@ -323,6 +323,12 @@ def _hold_archive_lock(root: str, ready, seconds: float) -> None:
         time.sleep(seconds)
 
 
+class _SplitlinesForbiddenBytes(bytes):
+    def splitlines(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("bucket payload allocated splitlines before row-budget rejection")
+
+
 def test_archive_deduplicates_by_event_id_and_preserves_disproof_history_and_lineage(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     verified = StatusTransition(None, VerificationStatus.VERIFIED, NOW - timedelta(hours=1), "official support")
@@ -1381,8 +1387,9 @@ def test_archive_scan_budget_fails_closed_instead_of_omitting_unrelated_bucket_r
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event("a" * 20)))
     state_size = archive.state_path.stat().st_size
+    index_size = archive.index_path.stat().st_size
     bucket_size = (archive.archive_root / "2026-08-20.jsonl").stat().st_size
-    required = state_size + bucket_size
+    required = state_size + index_size + bucket_size
 
     monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", required - 1)
     with pytest.raises(OSError, match="storage_corrupt"):
@@ -5231,6 +5238,7 @@ def test_archive_corrupt_row_cannot_turn_preflight_node_exhaustion_into_a_skip(t
         )
 
 
+@pytest.mark.parametrize("remaining_rows", (0, 8))
 @pytest.mark.parametrize(
     "payload",
     (
@@ -5239,10 +5247,11 @@ def test_archive_corrupt_row_cannot_turn_preflight_node_exhaustion_into_a_skip(t
         b'{"rows":[],"rows":[]}\n',
     ),
 )
-def test_archive_malformed_state_rows_shape_is_rejected_before_zero_row_parse(
+def test_archive_malformed_state_rows_shape_is_rejected_before_parse_for_any_row_budget(
     tmp_path,
     monkeypatch,
     payload,
+    remaining_rows,
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     with archive._process_lock():
@@ -5257,7 +5266,7 @@ def test_archive_malformed_state_rows_shape_is_rejected_before_zero_row_parse(
         return real_parse(raw)
 
     monkeypatch.setattr(archive, "_parse_json", count_parse)
-    budget = {"bytes": len(payload), "rows": 0, "nodes": 64, "files": 1}
+    budget = {"bytes": len(payload), "rows": remaining_rows, "nodes": 64, "files": 1}
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive._read_authority_state(NOW, budget=budget)
@@ -5265,6 +5274,7 @@ def test_archive_malformed_state_rows_shape_is_rejected_before_zero_row_parse(
     assert parse_calls == 0
 
 
+@pytest.mark.parametrize("remaining_rows", (0, 8))
 @pytest.mark.parametrize(
     "payload",
     (
@@ -5273,10 +5283,11 @@ def test_archive_malformed_state_rows_shape_is_rejected_before_zero_row_parse(
         b'{"schema_version":2,"rows":[],"rows":[]}\n',
     ),
 )
-def test_archive_malformed_journal_rows_shape_is_rejected_before_zero_row_parse(
+def test_archive_malformed_journal_rows_shape_is_rejected_before_parse_for_any_row_budget(
     tmp_path,
     monkeypatch,
     payload,
+    remaining_rows,
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     with archive._process_lock():
@@ -5291,7 +5302,7 @@ def test_archive_malformed_journal_rows_shape_is_rejected_before_zero_row_parse(
         return real_parse(raw)
 
     monkeypatch.setattr(archive, "_parse_json", count_parse)
-    budget = {"bytes": len(payload), "rows": 0, "nodes": 64, "files": 1}
+    budget = {"bytes": len(payload), "rows": remaining_rows, "nodes": 64, "files": 1}
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive._read_journal(
@@ -5301,3 +5312,322 @@ def test_archive_malformed_journal_rows_shape_is_rejected_before_zero_row_parse(
         )
 
     assert parse_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("physical_rows", "remaining_rows"),
+    (
+        (archive_module._MAX_BUCKET_ROWS + 1, archive_module._MAX_SCAN_ROWS),
+        (2, 1),
+    ),
+)
+def test_archive_bucket_rejects_row_budget_without_splitlines_allocation(
+    tmp_path,
+    monkeypatch,
+    physical_rows,
+    remaining_rows,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    payload = _SplitlinesForbiddenBytes(b"{}\n" * physical_rows)
+    monkeypatch.setattr(archive, "_read_bytes", lambda *_args, **_kwargs: payload)
+    budget = {
+        "bytes": len(payload),
+        "rows": remaining_rows,
+        "nodes": archive_module._MAX_SCAN_NODES,
+        "files": 1,
+    }
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive._read_bucket(
+            "2026-08-20.jsonl",
+            archive._diagnostics(),
+            budget=budget,
+            fail_on_budget=True,
+        )
+
+
+@pytest.mark.parametrize("authority_kind", ("state", "journal"))
+def test_archive_authority_preparse_bounds_top_level_key_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+    authority_kind,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    payload = b'{"' + (b"x" * 129) + b'":0,"rows":[]}\n'
+    path = archive.state_path if authority_kind == "state" else archive.journal_path
+    path.write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == payload:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+    budget = {"bytes": len(payload), "rows": 8, "nodes": 256, "files": 1}
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        if authority_kind == "state":
+            archive._read_authority_state(NOW, budget=budget)
+        else:
+            archive._read_journal(NOW, archive._diagnostics(), budget=budget)
+
+    assert parse_calls == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'[{"events":{}}]\n',
+        b'{"schema_version":1,"events":[]}\n',
+        b'{"schema_version":1,"events":{},"events":{}}\n',
+    ),
+)
+def test_archive_index_shape_is_rejected_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+    payload,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    archive.index_path.write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == payload:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+def test_archive_index_entry_capacity_is_rejected_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "events": {
+                    "a" * 20: "2026-08-20.jsonl",
+                    "b" * 20: "2026-08-20.jsonl",
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    archive.index_path.write_bytes(payload)
+    monkeypatch.setattr(archive_module, "_MAX_INDEX_EVENTS", 1)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == payload:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+@pytest.mark.parametrize("dimension", ("files", "bytes", "nodes", "rows"))
+def test_archive_index_budget_exhaustion_fails_before_payload_io(
+    tmp_path,
+    monkeypatch,
+    dimension,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    real_read_state = archive._read_authority_state
+
+    def exhaust_after_state(*args, **kwargs):
+        state = real_read_state(*args, **kwargs)
+        kwargs["budget"][dimension] = 0
+        return state
+
+    index_reads: list[Path] = []
+    real_read_bytes = archive._read_bytes
+
+    def record_index_read(path: Path, maximum: int, **kwargs):
+        if path == archive.index_path:
+            index_reads.append(path)
+        return real_read_bytes(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_read_authority_state", exhaust_after_state)
+    monkeypatch.setattr(archive, "_read_bytes", record_index_read)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert index_reads == []
+
+
+def test_archive_index_token_budget_is_rejected_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    payload = archive.index_path.read_bytes()
+    real_read_state = archive._read_authority_state
+
+    def leave_two_nodes_after_state(*args, **kwargs):
+        state = real_read_state(*args, **kwargs)
+        kwargs["budget"]["nodes"] = 2
+        return state
+
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == payload:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_read_authority_state", leave_two_nodes_after_state)
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+def test_archive_index_entries_consume_the_shared_row_budget(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    real_read_state = archive._read_authority_state
+
+    def leave_one_row_after_state(*args, **kwargs):
+        state = real_read_state(*args, **kwargs)
+        kwargs["budget"]["rows"] = 1
+        return state
+
+    monkeypatch.setattr(archive, "_read_authority_state", leave_one_row_after_state)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_legacy_migration_reads_physical_index_once(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive)
+    diagnostics = archive._diagnostics()
+    budget = archive_module._new_scan_budget()
+    legacy_state = archive._read_authority_state(
+        NOW,
+        diagnostics=diagnostics,
+        budget=budget,
+    )
+    index_reads = 0
+    real_read_bytes = archive._read_bytes
+
+    def count_index_reads(path: Path, maximum: int, **kwargs):
+        nonlocal index_reads
+        if path == archive.index_path:
+            index_reads += 1
+        return real_read_bytes(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_read_bytes", count_index_reads)
+
+    with archive._process_lock():
+        migrated = archive._migrate_legacy_authority(
+            legacy_state,
+            now=NOW,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
+
+    assert migrated is not None and migrated["phase"] == "finalized"
+    assert index_reads == 1
+
+
+def test_archive_prepared_recovery_reads_physical_index_once(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    diagnostics = archive._diagnostics()
+    budget = archive_module._new_scan_budget()
+    prepared = archive._read_authority_state(NOW, diagnostics=diagnostics, budget=budget)
+    index_reads = 0
+    real_read_bytes = archive._read_bytes
+
+    def count_index_reads(path: Path, maximum: int, **kwargs):
+        nonlocal index_reads
+        if path == archive.index_path:
+            index_reads += 1
+        return real_read_bytes(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_read_bytes", count_index_reads)
+
+    with archive._process_lock():
+        archive._recover_prepared_authority(
+            prepared,
+            now=NOW,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
+
+    assert index_reads == 1
+
+
+def test_archive_prepared_recovery_rejects_same_bytes_index_identity_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    diagnostics = archive._diagnostics()
+    budget = archive_module._new_scan_budget()
+    prepared = archive._read_authority_state(NOW, diagnostics=diagnostics, budget=budget)
+    real_plan = archive._plan_prepared_authority
+
+    def replace_index_after_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        replacement = archive.archive_root / "replacement-index.json"
+        replacement.write_bytes(archive.index_path.read_bytes())
+        os.replace(replacement, archive.index_path)
+        return plan
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", replace_index_after_plan)
+
+    with archive._process_lock(), pytest.raises(OSError, match="storage_corrupt"):
+        archive._recover_prepared_authority(
+            prepared,
+            now=NOW,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
+
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
