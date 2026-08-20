@@ -240,6 +240,61 @@ function nullablePipelineError(value: unknown): NewsPipelineErrorCode | null {
   return value as NewsPipelineErrorCode;
 }
 
+function evidenceCountTotal(counts: NewsPipelineCounts): number {
+  return counts.verified_count + counts.corroborated_count + counts.pending_count
+    + counts.conflicting_count + counts.corrected_count + counts.disproved_count;
+}
+
+function hasOnlyRawCounts(counts: NewsPipelineCounts): boolean {
+  return evidenceCountTotal(counts) === 0;
+}
+
+export function validateNewsPipelineStatus(status: NewsPipelineStatusData): NewsPipelineStatusData {
+  const displayedId = status.displayed_trusted_snapshot_id;
+  const displayed = status.displayed_trusted;
+  if ((displayedId === null) !== (displayed === null) || (displayed && displayed.snapshot_id !== displayedId)) pipelineError();
+
+  if (!status.loaded) {
+    if (status.has_pending_evidence_message || status.compatibility_error !== null) pipelineError();
+    return status;
+  }
+  const phase = status.phase;
+  const counts = status.counts;
+  if (phase === null || counts === null || status.raw_snapshot_id === null || status.run_id === null) pipelineError();
+  const hasEvidence = status.evidence_snapshot_id !== null;
+  const hasTrusted = status.trusted_snapshot_id !== null;
+  const evidenceTotal = evidenceCountTotal(counts);
+  const compatibilityFromError = status.redacted_error === "evidence_compatibility_failed"
+    || status.redacted_error === "radar_compatibility_failed"
+    ? status.redacted_error
+    : null;
+  if (status.compatibility_error !== compatibilityFromError) pipelineError();
+
+  if (phase === "queued" || phase === "fetching") {
+    if (hasEvidence || hasTrusted || Object.values(counts).some((value) => value !== 0)
+      || status.redacted_error !== null || status.has_pending_evidence_message) pipelineError();
+  } else if (phase === "raw_saved" || phase === "verifying") {
+    if (hasEvidence || hasTrusted || !hasOnlyRawCounts(counts)
+      || status.redacted_error !== null || status.has_pending_evidence_message) pipelineError();
+  } else if (phase === "evidence_saved") {
+    if (!hasEvidence || hasTrusted || evidenceTotal !== counts.raw_event_count
+      || (status.redacted_error !== null && status.redacted_error !== "radar_compatibility_failed")
+      || status.has_pending_evidence_message) pipelineError();
+  } else if (phase === "trusted_published") {
+    const pendingExpected = counts.raw_event_count > 0 && status.admitted_count === 0;
+    if (!hasEvidence || !hasTrusted || status.trusted_snapshot_id !== status.raw_snapshot_id
+      || evidenceTotal !== counts.raw_event_count || displayedId === null
+      || (status.redacted_error !== null && status.redacted_error !== "radar_compatibility_failed")
+      || status.has_pending_evidence_message !== pendingExpected) pipelineError();
+  } else if (phase === "failed" || phase === "interrupted") {
+    if (hasTrusted || status.redacted_error === null || status.has_pending_evidence_message
+      || (hasEvidence ? evidenceTotal !== counts.raw_event_count : evidenceTotal !== 0)
+      || (phase === "interrupted" && status.redacted_error !== "pipeline_interrupted")
+      || (phase === "failed" && status.redacted_error === "pipeline_interrupted")) pipelineError();
+  }
+  return status;
+}
+
 function shapeNewsPipelineStarted(value: unknown): NewsPipelineStarted {
   const row = pipelineRecord(value, new Set(["run_id", "raw_snapshot_id", "phase"]));
   if (Object.keys(row).length !== 3 || row.phase !== "queued") pipelineError();
@@ -274,6 +329,8 @@ function shapeNewsPipelineStatus(value: unknown): NewsPipelineStatusData {
     row.run_id === null || row.raw_snapshot_id === null || row.phase === null || counts === null
     || admitted === null || row.created_at === null || row.updated_at === null
   )) pipelineError();
+  if (row.loaded && PIPELINE_COUNT_KEYS.some((key) => !(key in row))) pipelineError();
+  if (!row.loaded && PIPELINE_COUNT_KEYS.some((key) => key in row)) pipelineError();
 
   let displayedTrusted: NewsPipelineStatusData["displayed_trusted"] = null;
   if (row.displayed_trusted !== null) {
@@ -286,7 +343,7 @@ function shapeNewsPipelineStatus(value: unknown): NewsPipelineStatusData {
     };
   }
 
-  return {
+  return validateNewsPipelineStatus({
     loaded: row.loaded,
     run_id: nullablePipelineId(row.run_id),
     raw_snapshot_id: nullablePipelineId(row.raw_snapshot_id),
@@ -304,7 +361,7 @@ function shapeNewsPipelineStatus(value: unknown): NewsPipelineStatusData {
     compatibility_error: row.compatibility_error as NewsPipelineStatusData["compatibility_error"],
     displayed_trusted_snapshot_id: nullablePipelineId(row.displayed_trusted_snapshot_id),
     displayed_trusted: displayedTrusted,
-  };
+  });
 }
 
 function dataSourceRecord(value: unknown): Record<string, unknown> {

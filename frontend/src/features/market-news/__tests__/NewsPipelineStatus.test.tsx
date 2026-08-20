@@ -20,24 +20,27 @@ function pipelineStatus(
   phase: NewsPipelineStatusData["phase"],
   overrides: Partial<NewsPipelineStatusData> = {},
 ): NewsPipelineStatusData {
+  const hasRaw = phase !== "queued" && phase !== "fetching";
+  const hasEvidence = phase === "evidence_saved" || phase === "trusted_published";
+  const published = phase === "trusted_published";
   return {
     loaded: true,
     run_id: started.run_id,
     raw_snapshot_id: started.raw_snapshot_id,
-    evidence_snapshot_id: phase === "queued" || phase === "fetching" || phase === "raw_saved" || phase === "verifying" ? null : "evidence-stage-1",
-    trusted_snapshot_id: phase === "trusted_published" ? "trusted-stage-1" : null,
+    evidence_snapshot_id: hasEvidence ? "evidence-stage-1" : null,
+    trusted_snapshot_id: published ? started.raw_snapshot_id : null,
     phase,
     counts: {
-      raw_event_count: 8,
-      verified_count: 3,
-      corroborated_count: 2,
-      pending_count: 1,
-      conflicting_count: 1,
+      raw_event_count: hasRaw ? 8 : 0,
+      verified_count: hasEvidence ? 3 : 0,
+      corroborated_count: hasEvidence ? 2 : 0,
+      pending_count: hasEvidence ? 1 : 0,
+      conflicting_count: hasEvidence ? 1 : 0,
       corrected_count: 0,
-      disproved_count: 1,
-      failed_source_count: 4,
+      disproved_count: hasEvidence ? 1 : 0,
+      failed_source_count: hasRaw ? 4 : 0,
     },
-    admitted_count: 5,
+    admitted_count: hasEvidence ? 5 : 0,
     has_pending_evidence_message: false,
     created_at: "2026-08-20T09:00:00+00:00",
     updated_at: "2026-08-20T09:00:01+00:00",
@@ -45,11 +48,11 @@ function pipelineStatus(
     recovery_status: "ready",
     recovery_error: null,
     compatibility_error: null,
-    displayed_trusted_snapshot_id: "trusted-old",
+    displayed_trusted_snapshot_id: published ? started.raw_snapshot_id : "trusted-old",
     displayed_trusted: {
-      snapshot_id: "trusted-old",
+      snapshot_id: published ? started.raw_snapshot_id : "trusted-old",
       published_at: "2026-08-19T09:00:00+00:00",
-      event_count: 6,
+      event_count: published ? 5 : 6,
     },
     ...overrides,
   };
@@ -119,6 +122,49 @@ describe("NewsPipelineStatus", () => {
     expect(terminal?.phase).toBe("trusted_published");
   });
 
+  it("rejects a selected status from another run before notifying consumers", async () => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(pipelineStatus("trusted_published", {
+      run_id: "run-other",
+      raw_snapshot_id: "raw-other",
+      trusted_snapshot_id: "raw-other",
+      displayed_trusted_snapshot_id: "raw-other",
+      displayed_trusted: {
+        snapshot_id: "raw-other",
+        published_at: "2026-08-20T09:00:01+00:00",
+        event_count: 5,
+      },
+    }));
+    const onStatus = vi.fn();
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0, onStatus })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(onStatus).not.toHaveBeenCalled();
+    expect(api.newsPipelineStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a selected status that changes the kickoff raw snapshot", async () => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(pipelineStatus("trusted_published", {
+      raw_snapshot_id: "raw-other",
+      trusted_snapshot_id: "raw-other",
+      displayed_trusted_snapshot_id: "raw-other",
+      displayed_trusted: {
+        snapshot_id: "raw-other",
+        published_at: "2026-08-20T09:00:01+00:00",
+        event_count: 5,
+      },
+    }));
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0 })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(api.newsPipelineStatus).toHaveBeenCalledTimes(1);
+  });
+
   it("stops polling when the owning view aborts", async () => {
     const controller = new AbortController();
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
@@ -179,12 +225,13 @@ describe("NewsPipelineStatus", () => {
 
   it("threads AbortSignal through the pipeline clients to actual fetch", async () => {
     const controller = new AbortController();
+    const terminal = pipelineStatus("trusted_published");
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ data: started }), {
         status: 202,
         headers: { "Content-Type": "application/json" },
       }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: pipelineStatus("trusted_published") }), {
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: { ...terminal, ...terminal.counts } }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }));
@@ -209,9 +256,11 @@ describe("NewsPipelineStatus", () => {
       status: 502,
     });
 
+    const failed = pipelineStatus("failed", { redacted_error: "verification_failed" });
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: {
-      ...pipelineStatus("failed"),
-      counts: { ...pipelineStatus("failed").counts, pending_count: -1 },
+      ...failed,
+      ...failed.counts,
+      counts: { ...failed.counts, pending_count: -1 },
       redacted_error: "C:\\Users\\private\\token.txt",
     } }), { status: 200, headers: { "Content-Type": "application/json" } }));
 
@@ -221,7 +270,8 @@ describe("NewsPipelineStatus", () => {
     });
 
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: {
-      ...pipelineStatus("failed"),
+      ...failed,
+      ...failed.counts,
       redacted_error: "C:\\Users\\private\\token.txt",
     } }), { status: 200, headers: { "Content-Type": "application/json" } }));
 
@@ -229,6 +279,72 @@ describe("NewsPipelineStatus", () => {
       message: "资讯流水线响应无效",
       status: 502,
     });
+  });
+
+  it.each([
+    ["missing flat count", (value: Record<string, unknown>) => { delete value.pending_count; }],
+    ["queued with evidence", (value: Record<string, unknown>) => {
+      value.phase = "queued";
+      value.trusted_snapshot_id = null;
+      value.displayed_trusted_snapshot_id = "trusted-old";
+      value.displayed_trusted = { snapshot_id: "trusted-old", published_at: "2026-08-19T09:00:00+00:00", event_count: 6 };
+    }],
+    ["published without trusted lineage", (value: Record<string, unknown>) => { value.trusted_snapshot_id = "trusted-other"; }],
+    ["displayed identity mismatch", (value: Record<string, unknown>) => { value.displayed_trusted_snapshot_id = "trusted-other"; }],
+    ["success with failure code", (value: Record<string, unknown>) => { value.redacted_error = "verification_failed"; }],
+  ])("rejects impossible loaded status: %s", async (_label, mutate) => {
+    const base = pipelineStatus("trusted_published");
+    const payload: Record<string, unknown> = { ...base, ...base.counts };
+    mutate(payload);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+  });
+
+  it("accepts an older selected terminal run whose displayed snapshot is the newer current pointer", async () => {
+    const selected = pipelineStatus("trusted_published", {
+      displayed_trusted_snapshot_id: "raw-current-newer",
+      displayed_trusted: {
+        snapshot_id: "raw-current-newer",
+        published_at: "2026-08-20T10:00:00+00:00",
+        event_count: 9,
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: {
+      ...selected,
+      ...selected.counts,
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).resolves.toMatchObject({
+      run_id: started.run_id,
+      raw_snapshot_id: started.raw_snapshot_id,
+      displayed_trusted_snapshot_id: "raw-current-newer",
+    });
+  });
+
+  it("rejects a kickoff terminal poll unless that run became the displayed trusted snapshot", async () => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(pipelineStatus("trusted_published", {
+      displayed_trusted_snapshot_id: "trusted-old",
+      displayed_trusted: {
+        snapshot_id: "trusted-old",
+        published_at: "2026-08-19T09:00:00+00:00",
+        event_count: 6,
+      },
+    }));
+    const onStatus = vi.fn();
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0, onStatus })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(onStatus).not.toHaveBeenCalled();
   });
 
   it("maps only closed safe failure codes to Chinese user copy", () => {

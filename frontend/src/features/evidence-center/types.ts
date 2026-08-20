@@ -82,7 +82,13 @@ export interface EvidenceEventList {
   snapshot_id: string | null;
   generated_at: string | null;
   total: number;
-  filters: Record<string, unknown>;
+  filters: {
+    verification_status: VerificationStatus | null;
+    tag_id: string | null;
+    category: string | null;
+    days: number;
+    holding_relevance: string | null;
+  };
 }
 
 export interface EvidenceEventQuery {

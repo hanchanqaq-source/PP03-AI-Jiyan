@@ -11,18 +11,21 @@ const unverified = { ...directEvent, event_id: "22222222222222222222", title: "�
 const started = { run_id: "run-market-news", raw_snapshot_id: "raw-market-news", phase: "queued" as const };
 
 function status(phase: NewsPipelineStatusData["phase"], raw = 6, admitted = 2): NewsPipelineStatusData {
+  const hasRaw = phase !== "queued" && phase !== "fetching";
+  const hasEvidence = phase === "evidence_saved" || phase === "trusted_published";
+  const published = phase === "trusted_published";
   return {
     loaded: true, run_id: started.run_id, raw_snapshot_id: started.raw_snapshot_id,
-    evidence_snapshot_id: phase === "queued" || phase === "fetching" || phase === "raw_saved" || phase === "verifying" ? null : "evidence-market-news",
-    trusted_snapshot_id: phase === "trusted_published" ? "trusted-market-news" : null,
+    evidence_snapshot_id: hasEvidence ? "evidence-market-news" : null,
+    trusted_snapshot_id: published ? started.raw_snapshot_id : null,
     phase,
-    counts: { raw_event_count: raw, verified_count: admitted, corroborated_count: 0, pending_count: raw - admitted, conflicting_count: 0, corrected_count: 0, disproved_count: 0, failed_source_count: 1 },
-    admitted_count: admitted,
-    has_pending_evidence_message: phase === "trusted_published" && raw > 0 && admitted === 0,
+    counts: { raw_event_count: hasRaw ? raw : 0, verified_count: hasEvidence ? admitted : 0, corroborated_count: 0, pending_count: hasEvidence ? raw - admitted : 0, conflicting_count: 0, corrected_count: 0, disproved_count: 0, failed_source_count: hasRaw ? 1 : 0 },
+    admitted_count: hasEvidence ? admitted : 0,
+    has_pending_evidence_message: published && raw > 0 && admitted === 0,
     created_at: "2026-08-20T09:00:00+00:00", updated_at: "2026-08-20T09:00:01+00:00",
     redacted_error: null, recovery_status: "ready", recovery_error: null, compatibility_error: null,
-    displayed_trusted_snapshot_id: phase === "trusted_published" ? "trusted-market-news" : marketNewsResponse.snapshot_id,
-    displayed_trusted: { snapshot_id: phase === "trusted_published" ? "trusted-market-news" : marketNewsResponse.snapshot_id, published_at: "2026-08-20T09:00:01+00:00", event_count: admitted },
+    displayed_trusted_snapshot_id: published ? started.raw_snapshot_id : marketNewsResponse.snapshot_id,
+    displayed_trusted: { snapshot_id: published ? started.raw_snapshot_id : marketNewsResponse.snapshot_id, published_at: "2026-08-20T09:00:01+00:00", event_count: published ? admitted : 1 },
   };
 }
 
@@ -66,7 +69,7 @@ describe("MarketNews trusted evidence admission", () => {
     const next = { ...verified, event_id: "33333333333333333333", title: "新可信快照事件" };
     const events = vi.spyOn(api, "marketNewsEvents")
       .mockResolvedValueOnce({ ...marketNewsResponse, events: [verified], focus_events: [verified], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } })
-      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: "trusted-market-news", events: [next], focus_events: [next], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
+      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: started.raw_snapshot_id, events: [next], focus_events: [next], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("trusted_published"));
 
@@ -83,7 +86,7 @@ describe("MarketNews trusted evidence admission", () => {
     const user = userEvent.setup();
     vi.spyOn(api, "marketNewsEvents")
       .mockResolvedValueOnce({ ...marketNewsResponse, events: [verified], focus_events: [verified], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } })
-      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: "trusted-empty", events: [], focus_events: [], empty_reason: "no_events", empty_message: null, filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
+      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: started.raw_snapshot_id, events: [], focus_events: [], empty_reason: "no_events", empty_message: null, filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("trusted_published", 6, 0));
 

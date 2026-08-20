@@ -1,4 +1,4 @@
-import { api, isAbortError } from "@/lib/api";
+import { api, ApiError, isAbortError, validateNewsPipelineStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
   MarketNewsQuery,
@@ -103,12 +103,21 @@ export async function runNewsPipelineRefresh({
   while (!requestSignal.aborted) {
     let status: NewsPipelineStatusData;
     try {
-      status = await api.newsPipelineStatus(started.run_id, requestSignal);
+      status = validateNewsPipelineStatus(await api.newsPipelineStatus(started.run_id, requestSignal));
     } catch (error) {
       if (requestSignal.aborted || isAbortError(error)) return null;
       throw error;
     }
     if (requestSignal.aborted) return null;
+    const terminalDisplayMismatch = status.phase === "trusted_published" && (
+      status.displayed_trusted_snapshot_id !== started.raw_snapshot_id
+      || status.displayed_trusted?.snapshot_id !== started.raw_snapshot_id
+      || status.displayed_trusted.event_count !== status.admitted_count
+    );
+    if (!status.loaded || status.run_id !== started.run_id || status.raw_snapshot_id !== started.raw_snapshot_id
+      || terminalDisplayMismatch) {
+      throw new ApiError("资讯流水线响应无效", 502);
+    }
     await onStatus?.(status);
     if (requestSignal.aborted) return null;
     if (!isNewsPipelineActive(status.phase)) return status;

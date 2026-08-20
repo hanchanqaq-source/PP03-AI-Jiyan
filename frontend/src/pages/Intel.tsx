@@ -29,33 +29,45 @@ function InvestmentNewsPanel() {
   const [active, setActive] = useState("ai");
   const [refreshing, setRefreshing] = useState(false);
   const [pipelineStatus, setPipelineStatus] = useState<NewsPipelineStatusData | null>(null);
-  const loadCycleRef = useRef(0);
+  const dataCycleRef = useRef(0);
+  const dataAbortRef = useRef<AbortController | null>(null);
   const refreshCycleRef = useRef(0);
   const refreshAbortRef = useRef<AbortController | null>(null);
+  const refreshInFlightRef = useRef(false);
   const [digests, setDigests] = useState<Record<string, Digest>>({});
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
 
   useEffect(() => {
-    const cycle = ++loadCycleRef.current;
+    const cycle = ++dataCycleRef.current;
     const controller = new AbortController();
+    dataAbortRef.current = controller;
     api.radar(controller.signal).then((next) => {
-      if (cycle === loadCycleRef.current && !controller.signal.aborted) setData(next);
+      if (cycle === dataCycleRef.current && !controller.signal.aborted) setData(next);
     }).catch((e) => {
-      if (cycle === loadCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
+      if (cycle === dataCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
         setErr(e instanceof ApiError ? e.message : "加载失败");
       }
     });
-    return () => controller.abort();
+    return () => {
+      if (dataAbortRef.current === controller) dataAbortRef.current = null;
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => () => {
+    dataCycleRef.current += 1;
+    dataAbortRef.current?.abort();
     refreshCycleRef.current += 1;
     refreshAbortRef.current?.abort();
   }, []);
 
   const refresh = async () => {
-    if (refreshing) return;
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
     const cycle = ++refreshCycleRef.current;
+    const dataCycle = ++dataCycleRef.current;
+    dataAbortRef.current?.abort();
+    dataAbortRef.current = null;
     refreshAbortRef.current?.abort();
     const controller = new AbortController();
     refreshAbortRef.current = controller;
@@ -74,8 +86,14 @@ function InvestmentNewsPanel() {
         setErr(newsPipelineFailureMessage(terminal));
         return;
       }
-      const next = await api.radar(controller.signal);
-      if (cycle === refreshCycleRef.current && !controller.signal.aborted) setData(next);
+      try {
+        const next = await api.radar(controller.signal);
+        if (cycle === refreshCycleRef.current && dataCycle === dataCycleRef.current && !controller.signal.aborted) setData(next);
+      } catch (e) {
+        if (cycle === refreshCycleRef.current && dataCycle === dataCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
+          setErr("可信资讯已发布，但最新资讯读取失败；继续显示上一份可信快照。");
+        }
+      }
     } catch (e) {
       if (cycle === refreshCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
         setErr("资讯流水线状态连接失败；继续显示上一份可信快照。");
@@ -83,6 +101,7 @@ function InvestmentNewsPanel() {
     } finally {
       if (cycle === refreshCycleRef.current) {
         refreshAbortRef.current = null;
+        refreshInFlightRef.current = false;
         setRefreshing(false);
       }
     }
@@ -146,7 +165,7 @@ function InvestmentNewsPanel() {
       </div>
 
       {err && (
-        <div className="mb-3 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+        <div role="alert" aria-live="assertive" className="mb-3 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
           <AlertCircle className="h-4 w-4 shrink-0" /> {err}
         </div>
       )}

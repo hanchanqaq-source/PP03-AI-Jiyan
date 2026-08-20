@@ -172,6 +172,25 @@ def test_pipeline_refresh_routes_reject_foreign_origin_even_with_write_intent(mo
     assert fake.starts == 0
 
 
+def test_pipeline_refresh_allows_originless_loopback_nonbrowser_client_with_write_intent(monkeypatch):
+    fake = FakePipeline()
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)
+
+    response = client.post(
+        "/api/market-news/refresh",
+        headers={
+            "X-PP03-Write-Intent": "1",
+            "Host": "127.0.0.1:8900",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["data"] == {
+        "run_id": "run-api", "raw_snapshot_id": "raw-api", "phase": "queued",
+    }
+    assert fake.starts == 1
+
+
 def test_pipeline_refresh_preflight_requires_local_origin_and_write_intent(monkeypatch):
     fake = FakePipeline()
     monkeypatch.setattr("news_pipeline.api.get_service", lambda: fake)

@@ -25,12 +25,12 @@ const listing: EvidenceEventList = { events: [row], snapshot_id: summary.snapsho
 const pipelineStarted = { run_id: "run-evidence", raw_snapshot_id: "raw-evidence", phase: "queued" as const };
 const pipelineDone: NewsPipelineStatusData = {
   loaded: true, run_id: pipelineStarted.run_id, raw_snapshot_id: pipelineStarted.raw_snapshot_id,
-  evidence_snapshot_id: "evidence-complete", trusted_snapshot_id: "trusted-complete", phase: "trusted_published",
+  evidence_snapshot_id: "acceptance-snapshot", trusted_snapshot_id: pipelineStarted.raw_snapshot_id, phase: "trusted_published",
   counts: { raw_event_count: 8, verified_count: 3, corroborated_count: 3, pending_count: 1, conflicting_count: 1, corrected_count: 0, disproved_count: 0, failed_source_count: 2 },
   admitted_count: 6, has_pending_evidence_message: false,
   created_at: "2026-08-20T09:00:00+00:00", updated_at: "2026-08-20T09:00:01+00:00",
   redacted_error: null, recovery_status: "ready", recovery_error: null, compatibility_error: null,
-  displayed_trusted_snapshot_id: "trusted-complete", displayed_trusted: { snapshot_id: "trusted-complete", published_at: "2026-08-20T09:00:01+00:00", event_count: 6 },
+  displayed_trusted_snapshot_id: pipelineStarted.raw_snapshot_id, displayed_trusted: { snapshot_id: pipelineStarted.raw_snapshot_id, published_at: "2026-08-20T09:00:01+00:00", event_count: 6 },
 };
 
 describe("EvidenceCenter real verification workspace", () => {
@@ -97,6 +97,31 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(api.newsPipelineStatus).toHaveBeenCalledWith(pipelineStarted.run_id, expect.any(AbortSignal));
   });
 
+  it("rejects a list whose echoed filters do not match the requested filter", async () => {
+    const user = userEvent.setup();
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+    vi.mocked(api.evidenceEvents).mockResolvedValueOnce({
+      ...listing,
+      filters: { ...listing.filters, verification_status: null },
+    });
+
+    await user.click(screen.getByRole("button", { name: "待核验" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("证据列表筛选失败");
+    expect(screen.getByText(row.title)).toBeInTheDocument();
+  });
+
+  it("rejects summary and list from different evidence snapshots atomically", async () => {
+    vi.mocked(api.evidenceSummary).mockResolvedValueOnce({ ...summary, snapshot_id: "summary-snapshot" });
+    vi.mocked(api.evidenceEvents).mockResolvedValueOnce({ ...listing, snapshot_id: "list-snapshot" });
+
+    render(<EvidenceCenter />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("证据快照加载失败");
+    expect(screen.queryByText(row.title)).not.toBeInTheDocument();
+  });
+
   it("reloads the exact current status filter when evidence becomes durable", async () => {
     const user = userEvent.setup();
     render(<EvidenceCenter />);
@@ -123,7 +148,7 @@ describe("EvidenceCenter real verification workspace", () => {
     vi.mocked(api.evidenceEvents)
       .mockResolvedValueOnce(listing)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve; }))
-      .mockResolvedValueOnce({ ...listing, events: [freshRow] });
+      .mockResolvedValueOnce({ ...listing, events: [freshRow], filters: { ...listing.filters, verification_status: "unverified" } });
 
     render(<EvidenceCenter />);
     await screen.findByText(row.title);
@@ -132,7 +157,7 @@ describe("EvidenceCenter real verification workspace", () => {
     await user.click(screen.getByRole("button", { name: "运行核验" }));
     expect(await screen.findByText(freshRow.title)).toBeInTheDocument();
 
-    await act(async () => resolveStale({ ...listing, events: [staleRow] }));
+    await act(async () => resolveStale({ ...listing, events: [staleRow], filters: { ...listing.filters, verification_status: "unverified" } }));
     expect(screen.queryByText(staleRow.title)).not.toBeInTheDocument();
     expect(screen.getByText(freshRow.title)).toBeInTheDocument();
   });
@@ -166,6 +191,10 @@ describe("EvidenceCenter real verification workspace", () => {
     vi.mocked(api.evidenceEvents)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveOldList = resolve; }))
       .mockResolvedValueOnce({ ...listing, snapshot_id: "fresh-evidence", events: [freshRow] });
+    vi.mocked(api.newsPipelineStatus).mockResolvedValueOnce({
+      ...pipelineDone,
+      evidence_snapshot_id: "fresh-evidence",
+    });
 
     render(<EvidenceCenter />);
     await waitFor(() => expect(api.evidenceSummary).toHaveBeenCalledTimes(1));
@@ -178,6 +207,52 @@ describe("EvidenceCenter real verification workspace", () => {
     });
     await waitFor(() => expect(screen.getByText(freshRow.title)).toBeInTheDocument());
     expect(screen.queryByText(row.title)).not.toBeInTheDocument();
+  });
+
+  it("retries an aborted durable reload and never commits a new list with an old summary", async () => {
+    const user = userEvent.setup();
+    const freshSummary = {
+      ...summary,
+      snapshot_id: "evidence-complete",
+      admitted_count: 4,
+      isolated_count: 2,
+      counts: { verified: 4, corroborated: 0, unverified: 1, conflicting: 1, corrected: 0, disproved: 0 },
+    };
+    const freshRow = { ...row, event_id: "cccccccccccccccccccc", title: "同快照筛选结果" };
+    const freshListing: EvidenceEventList = {
+      ...listing,
+      snapshot_id: "evidence-complete",
+      events: [freshRow],
+      filters: { ...listing.filters, verification_status: "unverified" },
+    };
+    let durableSummarySignal: AbortSignal | undefined;
+    vi.mocked(api.newsPipelineStatus)
+      .mockResolvedValueOnce({ ...pipelineDone, phase: "evidence_saved", evidence_snapshot_id: "evidence-complete", trusted_snapshot_id: null, displayed_trusted_snapshot_id: "trusted-old", displayed_trusted: { ...pipelineDone.displayed_trusted!, snapshot_id: "trusted-old" } })
+      .mockResolvedValueOnce({ ...pipelineDone, evidence_snapshot_id: "evidence-complete" });
+    vi.mocked(api.evidenceSummary)
+      .mockResolvedValueOnce(summary)
+      .mockImplementationOnce((signal) => new Promise((_, reject) => {
+        durableSummarySignal = signal;
+        signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      }))
+      .mockResolvedValue(freshSummary);
+    vi.mocked(api.evidenceEvents)
+      .mockResolvedValueOnce(listing)
+      .mockImplementationOnce((_query, signal) => new Promise((_, reject) => {
+        signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      }))
+      .mockResolvedValue(freshListing);
+
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+    await waitFor(() => expect(durableSummarySignal).toBeInstanceOf(AbortSignal));
+    await user.click(screen.getByRole("button", { name: "待核验" }));
+
+    expect(await screen.findByText(freshRow.title)).toBeInTheDocument();
+    expect(await screen.findByText("核验刷新完成，已载入最新成功快照。")).toBeInTheDocument();
+    expect(screen.getByText("67%")).toBeInTheDocument();
+    expect(api.evidenceSummary).toHaveBeenCalledTimes(4);
   });
 
   it("derives correction rows from real transition data", async () => {

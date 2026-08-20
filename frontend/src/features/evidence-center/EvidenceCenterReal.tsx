@@ -8,7 +8,7 @@ import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWork
 import { api, isAbortError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { EvidenceDrawer, STATUS_LABEL, StatusBadge } from "./EvidenceDrawer";
-import type { EvidenceEventDetail, EvidenceEventQuery, EvidenceEventSummary, EvidenceSummaryData, VerificationStatus } from "./types";
+import type { EvidenceEventDetail, EvidenceEventList, EvidenceEventQuery, EvidenceEventSummary, EvidenceSummaryData, VerificationStatus } from "./types";
 
 type Tab = "verification" | "health" | "corrections";
 type Filter = "all" | VerificationStatus;
@@ -58,41 +58,49 @@ export function EvidenceCenter() {
     ...(nextFilter === "all" ? {} : { verification_status: nextFilter }),
   }), []);
 
-  const loadList = useCallback(async (nextFilter: Filter): Promise<boolean> => {
-    const requestId = ++requestRef.current;
-    evidenceLoadAbortRef.current?.abort();
-    const controller = new AbortController();
-    evidenceLoadAbortRef.current = controller;
-    try {
-      const result = await api.evidenceEvents(queryForFilter(nextFilter), controller.signal);
-      if (requestId !== requestRef.current || controller.signal.aborted) return false;
-      setEvents(result.events);
-      return true;
-    } finally {
-      if (requestId === requestRef.current) {
-        evidenceLoadAbortRef.current = null;
-        setLoading(false);
-      }
-    }
-  }, [queryForFilter]);
+  const responseMatchesQuery = useCallback((result: EvidenceEventList, query: EvidenceEventQuery): boolean => {
+    const expected = {
+      verification_status: query.verification_status ?? null,
+      tag_id: query.tag_id ?? null,
+      category: query.category ?? null,
+      days: query.days ?? 7,
+      holding_relevance: query.holding_relevance ?? null,
+    };
+    const actual = result.filters;
+    return actual.verification_status === expected.verification_status
+      && actual.tag_id === expected.tag_id
+      && actual.category === expected.category
+      && actual.days === expected.days
+      && actual.holding_relevance === expected.holding_relevance;
+  }, []);
 
-  const loadSnapshot = useCallback(async (nextFilter: Filter): Promise<boolean> => {
+  const loadSnapshot = useCallback(async (
+    nextFilter: Filter,
+    expectedSnapshotId: string | null = null,
+    failureMessage = "证据快照加载失败，请确认本地后端可用后重试。",
+  ): Promise<boolean> => {
     const requestId = ++requestRef.current;
     evidenceLoadAbortRef.current?.abort();
     const controller = new AbortController();
     evidenceLoadAbortRef.current = controller;
+    const query = queryForFilter(nextFilter);
     setLoading(true); setError(null);
     try {
       const [nextSummary, nextEvents] = await Promise.all([
         api.evidenceSummary(controller.signal),
-        api.evidenceEvents(queryForFilter(nextFilter), controller.signal),
+        api.evidenceEvents(query, controller.signal),
       ]);
       if (requestId !== requestRef.current || controller.signal.aborted) return false;
+      if (!responseMatchesQuery(nextEvents, query)
+        || nextSummary.snapshot_id !== nextEvents.snapshot_id
+        || (expectedSnapshotId !== null && nextSummary.snapshot_id !== expectedSnapshotId)) {
+        throw new Error("evidence snapshot response mismatch");
+      }
       setSummary(nextSummary); setEvents(nextEvents.events);
       return true;
     } catch (error) {
       if (requestId !== requestRef.current || controller.signal.aborted || isAbortError(error)) return false;
-      setError("证据快照加载失败，请确认本地后端可用后重试。");
+      setError(failureMessage);
       return false;
     } finally {
       if (requestId === requestRef.current) {
@@ -100,7 +108,7 @@ export function EvidenceCenter() {
         setLoading(false);
       }
     }
-  }, [queryForFilter]);
+  }, [queryForFilter, responseMatchesQuery]);
 
   useEffect(() => { void loadSnapshot(filterRef.current); }, [loadSnapshot]);
   useEffect(() => () => {
@@ -134,8 +142,7 @@ export function EvidenceCenter() {
   const changeFilter = async (next: Filter) => {
     filterRef.current = next;
     setFilter(next); setLoading(true); setError(null);
-    try { await loadList(next); }
-    catch (error) { if (!isAbortError(error)) setError("证据列表筛选失败，请稍后重试。" ); }
+    await loadSnapshot(next, null, "证据列表筛选失败，请稍后重试。" );
   };
   const refresh = async () => {
     if (refreshing) return;
@@ -143,7 +150,6 @@ export function EvidenceCenter() {
     pipelineAbortRef.current?.abort();
     const controller = new AbortController();
     pipelineAbortRef.current = controller;
-    let evidenceReloaded = false;
     let evidenceReloadSucceeded = false;
     setRefreshing(true); setNotice(null); setPipelineStatus(null);
     try {
@@ -154,13 +160,21 @@ export function EvidenceCenter() {
           setPipelineStatus(next);
           const evidenceDurable = next.phase === "evidence_saved" || next.phase === "trusted_published";
           const terminalFailure = next.phase === "failed" || next.phase === "interrupted";
-          if (!evidenceReloaded && (evidenceDurable || terminalFailure)) {
-            evidenceReloaded = true;
-            evidenceReloadSucceeded = await loadSnapshot(filterRef.current);
+          if (!evidenceReloadSucceeded && (evidenceDurable || terminalFailure)) {
+            evidenceReloadSucceeded = await loadSnapshot(
+              filterRef.current,
+              evidenceDurable ? next.evidence_snapshot_id : null,
+            );
           }
         },
       });
       if (!terminal || pipelineCycle !== pipelineCycleRef.current) return;
+      if (!evidenceReloadSucceeded) {
+        evidenceReloadSucceeded = await loadSnapshot(
+          filterRef.current,
+          terminal.evidence_snapshot_id,
+        );
+      }
       if (terminal.phase === "trusted_published") {
         if (evidenceReloadSucceeded) setNotice("核验刷新完成，已载入最新成功快照。");
       } else setNotice(newsPipelineFailureMessage(terminal));
