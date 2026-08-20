@@ -221,6 +221,8 @@ export function MarketNews() {
   const pipelineAbortRef = useRef<AbortController | null>(null);
   const refreshInFlightRef = useRef(false);
   const sourceRetryIdRef = useRef(0);
+  const sourceRetryAbortRef = useRef<AbortController | null>(null);
+  const sourceRetryInFlightRef = useRef(false);
   const translationIdRef = useRef(0);
   const translationRequestedRef = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -263,6 +265,9 @@ export function MarketNews() {
     setDetailSelection(null);
     setSourceDialogOpen(false);
     sourceRetryIdRef.current += 1;
+    sourceRetryAbortRef.current?.abort();
+    sourceRetryAbortRef.current = null;
+    sourceRetryInFlightRef.current = false;
   }, [queryKey]);
 
   useEffect(() => {
@@ -277,6 +282,8 @@ export function MarketNews() {
     requestIdRef.current += 1;
     pipelineCycleRef.current += 1;
     pipelineAbortRef.current?.abort();
+    sourceRetryIdRef.current += 1;
+    sourceRetryAbortRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -423,38 +430,54 @@ export function MarketNews() {
   };
 
   const retrySource = async (sourceId: string) => {
+    if (sourceRetryInFlightRef.current) return;
     if (!data) throw new Error("missing current market-news snapshot");
+    sourceRetryInFlightRef.current = true;
     const retryId = ++sourceRetryIdRef.current;
     const retryQueryKey = queryKey;
     const retrySnapshotId = data.snapshot_id;
-    const result = await api.marketNewsRetrySource(sourceId, query);
-    if (retryId !== sourceRetryIdRef.current || activeQueryKeyRef.current !== retryQueryKey) return;
-    const current = responseCacheRef.current.get(retryQueryKey);
-    if (!current || current.snapshot_id !== retrySnapshotId) return;
-    if (!("events" in result)) {
-      const previousSources = current.source_summary.source_statuses.filter((source) => source.source_id === sourceId);
-      if (previousSources.length !== 1 || previousSources[0].status !== "failed"
-        || result.source_status.source_id !== sourceId) throw new Error("market-news retry source mismatch");
-      const sourceStatuses = current.source_summary.source_statuses.map((source) => (
-        source.source_id === sourceId ? result.source_status : source
-      ));
-      const updated: MarketNewsResponse = {
-        ...current,
-        source_summary: {
-          ...current.source_summary,
-          source_statuses: sourceStatuses,
-        },
-      };
-      cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, updated);
-      setView({ queryKey: retryQueryKey, response: updated });
-      throw new Error("configured source retry failed");
+    const controller = new AbortController();
+    sourceRetryAbortRef.current = controller;
+    try {
+      const result = await api.marketNewsRetrySource(sourceId, query, controller.signal);
+      if (controller.signal.aborted || retryId !== sourceRetryIdRef.current || activeQueryKeyRef.current !== retryQueryKey) return;
+      const current = responseCacheRef.current.get(retryQueryKey);
+      if (!current || current.snapshot_id !== retrySnapshotId) return;
+      if (!("events" in result)) {
+        const previousSources = current.source_summary.source_statuses.filter((source) => source.source_id === sourceId);
+        if (previousSources.length !== 1 || previousSources[0].status !== "failed"
+          || result.source_status.source_id !== sourceId) throw new Error("market-news retry source mismatch");
+        const sourceStatuses = current.source_summary.source_statuses.map((source) => (
+          source.source_id === sourceId ? result.source_status : source
+        ));
+        const updated: MarketNewsResponse = {
+          ...current,
+          source_summary: {
+            ...current.source_summary,
+            source_statuses: sourceStatuses,
+          },
+        };
+        cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, updated);
+        setView({ queryKey: retryQueryKey, response: updated });
+        throw new Error("configured source retry failed");
+      }
+      const requestedRows = result.source_summary.source_statuses.filter((source) => source.source_id === sourceId);
+      if (requestedRows.length !== 1 || requestedRows[0].status !== "ok") throw new Error("market-news retry source mismatch");
+      if (!responseMatchesQuery(result, query)) throw new Error("market-news retry filters mismatch");
+      const accepted = preserveSameSnapshotTranslations(result, current);
+      cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, accepted);
+      setView({ queryKey: retryQueryKey, response: accepted });
+      setQueryError(null);
+      if (result.source_summary.failed_sources === 0) setSourceDialogOpen(false);
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) return;
+      throw error;
+    } finally {
+      if (retryId === sourceRetryIdRef.current && sourceRetryAbortRef.current === controller) {
+        sourceRetryAbortRef.current = null;
+        sourceRetryInFlightRef.current = false;
+      }
     }
-    if (!responseMatchesQuery(result, query)) throw new Error("market-news retry filters mismatch");
-    const accepted = preserveSameSnapshotTranslations(result, current);
-    cacheMarketNewsResponse(responseCacheRef.current, retryQueryKey, accepted);
-    setView({ queryKey: retryQueryKey, response: accepted });
-    setQueryError(null);
-    if (result.source_summary.failed_sources === 0) setSourceDialogOpen(false);
   };
 
   const noTags = mode === "my_focus" && query.tag_ids.length === 0;

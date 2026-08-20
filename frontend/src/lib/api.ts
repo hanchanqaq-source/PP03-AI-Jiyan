@@ -649,13 +649,16 @@ function marketNewsNonPublicHost(hostname: string): boolean {
   const ietfSpecial = words[0] === 0x2001 && words[1] <= 0x01ff;
   const documentation = words[0] === 0x2001 && words[1] === 0x0db8;
   const sixToFour = words[0] === 0x2002;
+  const nat64WellKnown = words[0] === 0x0064 && words[1] === 0xff9b
+    && words.slice(2, 6).every((word) => word === 0);
+  const nat64LocalUse = words[0] === 0x0064 && words[1] === 0xff9b && words[2] === 0x0001;
   const mappedV4 = words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff;
   const compatibleV4 = words.slice(0, 6).every((word) => word === 0);
   const embeddedV4 = mappedV4 || compatibleV4
     ? [(words[6] >> 8) & 0xff, words[6] & 0xff, (words[7] >> 8) & 0xff, words[7] & 0xff]
     : null;
   return allZero || loopback || uniqueLocal || linkLocal || siteLocal || multicast
-    || discardOnly || ietfSpecial || documentation || sixToFour
+    || discardOnly || ietfSpecial || documentation || sixToFour || nat64WellKnown || nat64LocalUse
     || (embeddedV4 !== null && marketNewsPrivateIpv4(embeddedV4));
 }
 
@@ -665,40 +668,105 @@ const MARKET_NEWS_SENSITIVE_QUERY_KEY_PARTS = new Set([
   "secret", "clientsecret", "credential", "cookie", "session", "sessionid", "accesskey",
 ]);
 
-function marketNewsSensitiveQueryKey(key: string): boolean {
-  const parts = key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const MARKET_NEWS_SENSITIVE_QUERY_SUFFIXES = [
+  "apikey", "xapikey", "accesstoken", "refreshtoken", "authtoken", "idtoken",
+  "authorization", "password", "passwd", "signature", "clientsecret", "credential",
+  "sessionid", "accesskey",
+];
+const MARKET_NEWS_MAX_QUERY_DECODE_LAYERS = 4;
+
+function marketNewsDecodedQueryLayers(value: string): string[] {
+  const layers = [value];
+  let current = value;
+  for (let depth = 0; depth < MARKET_NEWS_MAX_QUERY_DECODE_LAYERS; depth += 1) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      marketNewsError();
+    }
+    if (decoded === current) return layers;
+    if (decoded.length > 4_096) marketNewsError();
+    layers.push(decoded);
+    current = decoded;
+  }
+  if (/%[0-9a-f]{2}/i.test(current)) marketNewsError();
+  return layers;
+}
+
+function marketNewsSensitiveDecodedQueryKey(key: string): boolean {
+  const camelSeparated = key.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+  const parts = camelSeparated.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   for (let start = 0; start < parts.length; start += 1) {
     let candidate = "";
-    for (let end = start; end < parts.length && end < start + 3; end += 1) {
+    for (let end = start; end < parts.length && end < start + 4; end += 1) {
       candidate += parts[end];
       if (MARKET_NEWS_SENSITIVE_QUERY_KEY_PARTS.has(candidate)) return true;
     }
   }
-  return false;
+  const compact = parts.join("");
+  return MARKET_NEWS_SENSITIVE_QUERY_SUFFIXES.some((suffix) => compact.endsWith(suffix));
+}
+
+function marketNewsSensitiveQueryKey(key: string): boolean {
+  return marketNewsDecodedQueryLayers(key).some(marketNewsSensitiveDecodedQueryKey);
 }
 
 function marketNewsSensitiveAssignment(value: string): boolean {
-  const assignments = value.matchAll(/([A-Za-z0-9_.\-\[\]]{1,128})\s*=/g);
+  const assignments = value.matchAll(/(?:^|[?&#;,{}\[])[\s"']*([A-Za-z0-9_%\.\-\[\]]{1,128})[\s"']*(?:=|:)/g);
   for (const match of assignments) {
     if (marketNewsSensitiveQueryKey(match[1])) return true;
   }
   return false;
 }
 
-function marketNewsSensitiveQueryValue(value: string): boolean {
-  let decoded = value;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (marketNewsSensitiveAssignment(decoded)
-      || /(?:^|[\s,;])(?:bearer|basic)\s+\S+/i.test(decoded)) return true;
-    try {
-      const next = decodeURIComponent(decoded);
-      if (next === decoded) return false;
-      decoded = next;
-    } catch {
-      return true;
+function marketNewsStructuredQuerySecret(value: string): boolean {
+  const trimmed = value.trim();
+  if ((!trimmed.startsWith("{") || !trimmed.endsWith("}"))
+    && (!trimmed.startsWith("[") || !trimmed.endsWith("]"))) return false;
+  let root: unknown;
+  try {
+    root = JSON.parse(trimmed);
+  } catch {
+    return false;
+  }
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: root, depth: 0 }];
+  let nodes = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    nodes += 1;
+    if (nodes > 256 || current.depth > 8) return true;
+    if (typeof current.value === "string") {
+      if (current.value.length > 4_096 || marketNewsSensitiveAssignment(current.value)) return true;
+      const nested = current.value.trim();
+      if ((nested.startsWith("{") && nested.endsWith("}")) || (nested.startsWith("[") && nested.endsWith("]"))) {
+        try {
+          pending.push({ value: JSON.parse(nested), depth: current.depth + 1 });
+        } catch {
+          // A non-JSON public string is not a structured secret by itself.
+        }
+      }
+      continue;
+    }
+    if (typeof current.value !== "object" || current.value === null) continue;
+    if (Array.isArray(current.value)) {
+      for (const item of current.value) pending.push({ value: item, depth: current.depth + 1 });
+      continue;
+    }
+    for (const [key, item] of Object.entries(current.value as Record<string, unknown>)) {
+      if (marketNewsSensitiveQueryKey(key)) return true;
+      pending.push({ value: item, depth: current.depth + 1 });
     }
   }
-  return marketNewsSensitiveAssignment(decoded);
+  return false;
+}
+
+function marketNewsSensitiveQueryValue(value: string): boolean {
+  return marketNewsDecodedQueryLayers(value).some((decoded) => (
+    marketNewsSensitiveAssignment(decoded)
+    || marketNewsStructuredQuerySecret(decoded)
+    || /(?:^|[\s,;])(?:bearer|basic)\s+\S+/i.test(decoded)
+  ));
 }
 
 function marketNewsPublicUrl(value: unknown): string {
@@ -1111,7 +1179,8 @@ function shapeMarketNewsRetryResult(value: unknown, requestedSourceId: string): 
   if (typeof value !== "object" || value === null || Array.isArray(value)) marketNewsError();
   if (!("retry_succeeded" in value)) {
     const response = shapeMarketNewsResponse(value);
-    if (response.source_summary.source_statuses.filter((status) => status.source_id === requestedSourceId).length !== 1) marketNewsError();
+    const requestedRows = response.source_summary.source_statuses.filter((status) => status.source_id === requestedSourceId);
+    if (requestedRows.length !== 1 || requestedRows[0].status !== "ok") marketNewsError();
     return response;
   }
   validateMarketNewsDocumentBudget(value);
@@ -1512,9 +1581,11 @@ export const api = {
     `/news/pipeline-status${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`,
     signal,
   ).then(shapeNewsPipelineStatus),
-  marketNewsRetrySource: (sourceId: string, query: MarketNewsQuery) => request<unknown>(
+  marketNewsRetrySource: (sourceId: string, query: MarketNewsQuery, signal?: AbortSignal) => request<unknown>(
     marketNewsPath(`/market-news/sources/${encodeURIComponent(sourceId)}/retry`, query),
     "POST",
+    undefined,
+    signal,
   ).then((value) => shapeMarketNewsRetryResult(value, sourceId)),
   marketNewsTranslations: (payload: {
     items: Array<{ event_id: string; title: string; summary: string; source_language: string }>;

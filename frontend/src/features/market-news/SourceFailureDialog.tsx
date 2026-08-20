@@ -32,6 +32,8 @@ export function SourceFailureDialog({
   const previousRef = useRef<HTMLElement | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
   const [retryError, setRetryError] = useState(false);
+  const retryInFlightRef = useRef(false);
+  const retryRequestRef = useRef(0);
   const failures = statuses.filter((source) => source.status === "failed");
 
   useEffect(() => {
@@ -44,14 +46,20 @@ export function SourceFailureDialog({
   }, [onClose, open]);
 
   const retry = async (sourceId: string) => {
+    if (retryInFlightRef.current) return;
+    retryInFlightRef.current = true;
+    const requestId = ++retryRequestRef.current;
     setRetryingId(sourceId);
     setRetryError(false);
     try {
       await onRetry(sourceId);
     } catch {
-      setRetryError(true);
+      if (requestId === retryRequestRef.current) setRetryError(true);
     } finally {
-      setRetryingId(null);
+      if (requestId === retryRequestRef.current) {
+        retryInFlightRef.current = false;
+        setRetryingId(null);
+      }
     }
   };
 
@@ -63,7 +71,7 @@ export function SourceFailureDialog({
       <div className="mt-4 space-y-3">{failures.map((source) => {
         const sourceUrl = safeMarketNewsPublicUrl(source.source_url);
         return <article key={source.source_id} className="rounded-xl border border-border/60 bg-muted/10 p-4 text-xs">
-          <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="text-sm font-semibold text-foreground">{source.source_name}</h3><p className="mt-1 text-warning">{ERROR_LABELS[source.error_type || "unknown"] || ERROR_LABELS.unknown}</p></div><button onClick={() => retry(source.source_id)} disabled={retryingId === source.source_id} aria-label={`重试来源 ${source.source_name}`} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 font-medium text-foreground hover:border-primary/45 disabled:cursor-not-allowed disabled:opacity-50">{retryingId === source.source_id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重试</button></div>
+          <div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="text-sm font-semibold text-foreground">{source.source_name}</h3><p className="mt-1 text-warning">{ERROR_LABELS[source.error_type || "unknown"] || ERROR_LABELS.unknown}</p></div><button onClick={() => retry(source.source_id)} disabled={retryingId !== null} aria-label={`重试来源 ${source.source_name}`} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 font-medium text-foreground hover:border-primary/45 disabled:cursor-not-allowed disabled:opacity-50">{retryingId === source.source_id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重试</button></div>
           <p className="mt-2 leading-5 text-muted-foreground">{source.error_reason || "未提供可公开的错误原因"}</p>
           <div className="mt-3 grid gap-1 text-muted-foreground sm:grid-cols-2"><p>最后成功：{formatTime(source.last_success_at)}</p><p>使用旧缓存：{source.used_cached_items ? "是" : "否"}</p><p>本次返回：{source.item_count} 条</p>{sourceUrl && <a href={sourceUrl} target="_blank" rel="noreferrer" aria-label={`查看来源 ${source.source_name}`} className="inline-flex items-center gap-1 text-primary hover:underline">查看公开来源<ExternalLink className="h-3 w-3" /></a>}</div>
         </article>;

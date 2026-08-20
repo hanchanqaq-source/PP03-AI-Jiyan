@@ -74,4 +74,16 @@ describe("MarketNews EventDetailDrawer", () => {
     expect(screen.getByText("来源一")).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /打开原始来源/ })).not.toBeInTheDocument();
   });
+
+  it("suppresses nested JSON credentials when an unsafe event bypasses the API shaper", () => {
+    const unsafeUrl = `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ token: "secret" }))}`;
+    render(<EventDetailDrawer open event={{
+      ...directEvent,
+      original_links: [unsafeUrl],
+      sources: directEvent.sources.map((source) => ({ ...source, source_url: unsafeUrl, original_url: unsafeUrl })),
+    }} onClose={() => {}} />);
+
+    expect(screen.queryByRole("link", { name: /打开原始来源/ })).not.toBeInTheDocument();
+    expect(document.querySelector(`a[href="${unsafeUrl}"]`)).not.toBeInTheDocument();
+  });
 });

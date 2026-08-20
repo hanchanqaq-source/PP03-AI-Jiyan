@@ -543,6 +543,20 @@ describe("PP03 core pages", () => {
       }],
     };
     const retried = responseFor(queryFor("storage"), retriedEvent, "source-new-snapshot", 2);
+    retried.source_summary = {
+      ...retried.source_summary,
+      source_statuses: [{
+        source_id: sourceId,
+        source_name: "存储公开源",
+        source_url: "https://feed.example.test/storage.xml",
+        status: "ok",
+        error_type: null,
+        error_reason: null,
+        last_success_at: "2026-08-20T10:35:00+08:00",
+        used_cached_items: false,
+        item_count: 2,
+      }],
+    };
     vi.spyOn(api, "marketNewsEvents").mockResolvedValue(initial);
     const retry = vi.spyOn(api, "marketNewsRetrySource").mockResolvedValue(retried);
 
@@ -551,7 +565,7 @@ describe("PP03 core pages", () => {
     await user.click(screen.getByRole("button", { name: "1 个来源失败，查看详情" }));
     await user.click(screen.getByRole("button", { name: "重试来源 存储公开源" }));
 
-    expect(retry).toHaveBeenCalledWith(sourceId, queryFor("storage"));
+    expect(retry).toHaveBeenCalledWith(sourceId, queryFor("storage"), expect.any(AbortSignal));
     expect(await screen.findByRole("heading", { name: retriedEvent.title })).toBeInTheDocument();
     expect(screen.getAllByText(retriedEvent.title)).toHaveLength(2);
     expect(screen.getByText("过去 7 天有 2 个事件与你的持仓相关")).toBeInTheDocument();

@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
@@ -318,12 +318,19 @@ describe("MarketNews trusted evidence admission", () => {
     "http://[ff02::1]/internal",
     "http://[::ffff:10.2.3.4]/internal",
     "http://[::ffff:198.51.100.42]/internal",
+    "http://[64:ff9b::a00:1]/internal",
+    "http://[64:ff9b:1::a00:1]/internal",
     "https://localhost/private",
     "https://feed.local/private",
     "https://user:password@public.example.org/feed",
     "https://public.example.org/feed?token=secret",
     "https://public.example.org/feed?access-key=secret",
     "https://public.example.org/feed?accessToken=secret",
+    "https://public.example.org/feed?myApiKey=secret",
+    "https://public.example.org/feed?myAccessToken=secret",
+    "https://public.example.org/feed?myClientSecret=secret",
+    "https://public.example.org/feed?%2574oken=secret",
+    "https://public.example.org/feed?%2525252574oken=secret",
     "https://public.example.org/feed?auth_token=secret",
     "https://public.example.org/feed?id_token=secret",
     "https://public.example.org/feed?api-key=secret",
@@ -332,6 +339,8 @@ describe("MarketNews trusted evidence admission", () => {
     "https://public.example.org/feed?user%5Baccess_key%5D=secret",
     "https://public.example.org/feed?redirect=https%3A%2F%2Fpublic.example.org%2Fcallback%3Ftoken%3Dsecret",
     "https://public.example.org/feed?redirect=https%253A%252F%252Fpublic.example.org%252Fcallback%253Faccess-key%253Dsecret",
+    `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ nested: { token: "secret" } }))}`,
+    `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ nested: JSON.stringify({ clientSecret: "secret" }) }))}`,
     "https://public.example.org/feed#credential",
   ])("rejects a non-public or credential-bearing market-news URL through GET and retry: %s", async (unsafeUrl) => {
     const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
@@ -473,6 +482,36 @@ describe("MarketNews trusted evidence admission", () => {
   it("rejects a successful single-source retry response that omits the requested source row", async () => {
     const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: marketNewsResponse }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsRetrySource("0123456789abcdef", query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejects a successful single-source retry whose requested source row is still failed", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.data_status = "partial";
+    payload.source_summary = {
+      total_sources: 2,
+      failed_sources: 1,
+      cache_status: "partial",
+      source_state: "partial_failure",
+      refresh_failed: false,
+      source_statuses: [{
+        source_id: "0123456789abcdef",
+        source_name: "仍失败的来源",
+        source_url: "https://public.example.org/feed",
+        status: "failed",
+        error_type: "timeout",
+        error_reason: "重试仍然超时",
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 0,
+      }],
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     }));
@@ -723,6 +762,103 @@ describe("MarketNews trusted evidence admission", () => {
     await user.click(screen.getByRole("button", { name: "重试来源 失败来源" }));
     expect(await screen.findByText("该来源重试失败，请稍后再试。")).toBeInTheDocument();
     expect(screen.getByText("来源：使用过期缓存")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "1 个来源失败，查看详情" })).toBeInTheDocument();
+  });
+
+  it("allows only one source retry globally and aborts it when the active filter changes", async () => {
+    const user = userEvent.setup();
+    const failedStatuses = ["0123456789abcdef", "fedcba9876543210"].map((sourceId, index) => ({
+      source_id: sourceId,
+      source_name: `失败来源 ${index + 1}`,
+      source_url: `https://public-${index + 1}.example.org/feed`,
+      status: "failed" as const,
+      error_type: "timeout" as const,
+      error_reason: "连接超时",
+      last_success_at: null,
+      used_cached_items: true,
+      item_count: 0,
+    }));
+    vi.spyOn(api, "marketNewsEvents").mockImplementation(async (requestQuery) => ({
+      ...marketNewsResponse,
+      filters: requestQuery,
+      source_summary: {
+        total_sources: 108,
+        failed_sources: 2,
+        cache_status: "stale",
+        source_state: "stale_cache",
+        refresh_failed: true,
+        source_statuses: failedStatuses,
+      },
+    }));
+    let resolveRetry!: (value: MarketNewsResponse) => void;
+    const retry = vi.spyOn(api, "marketNewsRetrySource").mockReturnValue(new Promise((resolve) => {
+      resolveRetry = resolve;
+    }));
+    render(<MarketNews />);
+
+    await screen.findByRole("heading", { name: directEvent.title });
+    await user.click(screen.getByRole("button", { name: "2 个来源失败，查看详情" }));
+    const first = screen.getByRole("button", { name: "重试来源 失败来源 1" });
+    const second = screen.getByRole("button", { name: "重试来源 失败来源 2" });
+    fireEvent.click(first);
+    fireEvent.click(second);
+
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(first).toBeDisabled();
+    expect(second).toBeDisabled();
+    const retrySignal = (retry.mock.calls[0] as unknown[])[2] as AbortSignal | undefined;
+    expect(retrySignal).toBeInstanceOf(AbortSignal);
+    expect(retrySignal?.aborted).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "政策" }));
+    await waitFor(() => expect(retrySignal?.aborted).toBe(true));
+    resolveRetry({
+      ...marketNewsResponse,
+      filters: { ...marketNewsResponse.filters, category: "all", tag_ids: ["semiconductor"] },
+      source_summary: {
+        ...marketNewsResponse.source_summary,
+        source_statuses: [{ ...failedStatuses[0], status: "ok", error_type: null, error_reason: null }],
+      },
+    });
+    await act(async () => {});
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", { name: "失败来源详情" })).not.toBeInTheDocument();
+  });
+
+  it("does not commit a mocked successful retry while the requested source row remains failed", async () => {
+    const user = userEvent.setup();
+    const failedStatus = {
+      source_id: "0123456789abcdef",
+      source_name: "仍失败的来源",
+      source_url: "https://public.example.org/feed",
+      status: "failed" as const,
+      error_type: "timeout" as const,
+      error_reason: "连接超时",
+      last_success_at: null,
+      used_cached_items: false,
+      item_count: 0,
+    };
+    const initial = {
+      ...marketNewsResponse,
+      filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] },
+      source_summary: {
+        total_sources: 2,
+        failed_sources: 1,
+        cache_status: "partial",
+        source_state: "partial_failure" as const,
+        refresh_failed: false,
+        source_statuses: [failedStatus],
+      },
+    };
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue(initial);
+    vi.spyOn(api, "marketNewsRetrySource").mockResolvedValue({ ...initial });
+    render(<MarketNews />);
+
+    await screen.findByRole("heading", { name: directEvent.title });
+    await user.click(screen.getByRole("button", { name: "1 个来源失败，查看详情" }));
+    await user.click(screen.getByRole("button", { name: "重试来源 仍失败的来源" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("该来源重试失败，请稍后再试。");
     expect(screen.getByRole("button", { name: "1 个来源失败，查看详情" })).toBeInTheDocument();
   });
 });

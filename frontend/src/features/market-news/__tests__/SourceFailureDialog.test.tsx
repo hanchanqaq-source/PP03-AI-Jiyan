@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { SourceFailureDialog } from "@/features/market-news/SourceFailureDialog";
@@ -59,9 +59,25 @@ describe("MarketNews SourceFailureDialog", () => {
 
     expect(retry).toHaveBeenCalledWith("0123456789abcdef");
     expect(first).toBeDisabled();
-    expect(second).not.toBeDisabled();
+    expect(second).toBeDisabled();
     rejectRetry(new Error("secret raw error"));
     expect(await screen.findByRole("alert")).toHaveTextContent("该来源重试失败，请稍后再试。");
+  });
+
+  it("disables every retry synchronously while one source request is in flight", async () => {
+    let resolveRetry!: () => void;
+    const retry = vi.fn(() => new Promise<void>((resolve) => { resolveRetry = resolve; }));
+    render(<SourceFailureDialog open statuses={failures} onClose={() => {}} onRetry={retry} />);
+
+    const first = screen.getByRole("button", { name: "重试来源 全球科技公开源" });
+    const second = screen.getByRole("button", { name: "重试来源 政策公开源" });
+    fireEvent.click(first);
+    fireEvent.click(second);
+
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(first).toBeDisabled();
+    expect(second).toBeDisabled();
+    await act(async () => resolveRetry());
   });
 
   it("keeps a legacy failure row visible without rendering an empty source anchor", () => {
@@ -74,5 +90,18 @@ describe("MarketNews SourceFailureDialog", () => {
 
     expect(screen.getByText("全球科技公开源")).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "查看来源 全球科技公开源" })).not.toBeInTheDocument();
+  });
+
+  it("does not render a NAT64 source anchor when a row bypasses response shaping", () => {
+    const unsafeUrl = "http://[64:ff9b::a00:1]/internal";
+    render(<SourceFailureDialog
+      open
+      statuses={[{ ...failures[0], source_url: unsafeUrl }]}
+      onClose={() => {}}
+      onRetry={async () => {}}
+    />);
+
+    expect(screen.queryByRole("link", { name: "查看来源 全球科技公开源" })).not.toBeInTheDocument();
+    expect(document.querySelector(`a[href="${unsafeUrl}"]`)).not.toBeInTheDocument();
   });
 });
