@@ -130,14 +130,13 @@ _MARKET_NEWS_SOURCE_RETRY_PATH = re.compile(
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
-def _single_request_header(request: Request, name: str) -> str | None:
+def _request_header_values(request: Request, name: str) -> tuple[str, ...]:
     encoded_name = name.lower().encode("ascii")
-    values = [
+    return tuple(
         value.decode("latin-1")
         for key, value in request.scope.get("headers", ())
         if key.lower() == encoded_name
-    ]
-    return values[0] if len(values) == 1 else None
+    )
 
 
 def _loopback_authority(value: str | None) -> bool:
@@ -187,10 +186,11 @@ def _local_browser_origin(value: str | None) -> bool:
 
 
 def _protected_local_write_request(request: Request) -> bool:
+    is_source_retry = _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
     is_protected_path = (
         request.url.path.startswith("/api/data-sources/")
         or request.url.path in _PIPELINE_REFRESH_PATHS
-        or _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
+        or is_source_retry
     )
     if not is_protected_path:
         return False
@@ -198,8 +198,10 @@ def _protected_local_write_request(request: Request) -> bool:
         return True
     if request.method != "OPTIONS":
         return False
-    requested_method = _single_request_header(request, "access-control-request-method")
-    return requested_method is not None and requested_method.upper() in _DATA_SOURCE_WRITE_METHODS
+    if is_source_retry:
+        return True
+    requested_methods = _request_header_values(request, "access-control-request-method")
+    return len(requested_methods) == 1 and requested_methods[0].upper() in _DATA_SOURCE_WRITE_METHODS
 
 
 @app.middleware("http")
@@ -219,21 +221,36 @@ async def _require_api_key(request: Request, call_next):
 async def _protect_data_source_writes(request: Request, call_next):
     if not _protected_local_write_request(request):
         return await call_next(request)
-    host = _single_request_header(request, "host")
-    origin = _single_request_header(request, "origin")
+    host_values = _request_header_values(request, "host")
+    origin_values = _request_header_values(request, "origin")
+    if len(host_values) != 1 or len(origin_values) > 1:
+        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+    host = host_values[0]
+    origin = origin_values[0] if origin_values else None
     if not _loopback_authority(host):
         return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
     if request.method == "OPTIONS":
-        requested_headers = _single_request_header(request, "access-control-request-headers")
+        requested_methods = _request_header_values(request, "access-control-request-method")
+        requested_header_values = _request_header_values(request, "access-control-request-headers")
+        if len(requested_methods) != 1 or len(requested_header_values) != 1:
+            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+        is_source_retry = _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
+        requested_method = requested_methods[0].upper()
+        if (
+            (is_source_retry and requested_method != "POST")
+            or (not is_source_retry and requested_method not in _DATA_SOURCE_WRITE_METHODS)
+        ):
+            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
         header_names = {
             item.strip().lower()
-            for item in (requested_headers or "").split(",")
+            for item in requested_header_values[0].split(",")
             if item.strip()
         }
         if not _local_browser_origin(origin) or _DATA_SOURCE_WRITE_HEADER not in header_names:
             return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
         return await call_next(request)
-    if _single_request_header(request, _DATA_SOURCE_WRITE_HEADER) != "1":
+    write_intent_values = _request_header_values(request, _DATA_SOURCE_WRITE_HEADER)
+    if len(write_intent_values) != 1 or write_intent_values[0] != "1":
         return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
     # Browsers send Origin; an originless caller is accepted only under the
     # already-verified loopback Host plus the non-simple custom-header gate.

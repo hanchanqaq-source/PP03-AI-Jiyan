@@ -279,6 +279,47 @@ def test_single_source_retry_rejects_untrusted_posts_before_handler(monkeypatch)
     assert calls == []
 
 
+def test_single_source_retry_rejects_ambiguous_duplicate_post_headers_before_handler(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        app_module.newsradar,
+        "retry_source",
+        lambda source_id: calls.append(source_id) or {"ok": False, "source_status": None},
+    )
+    path = "/api/market-news/sources/0123456789abcdef/retry"
+    base = [
+        ("Host", "127.0.0.1:8900"),
+        ("X-PP03-Write-Intent", "1"),
+    ]
+    duplicate_header_sets = [
+        [
+            *base,
+            ("Origin", "http://127.0.0.1:5899"),
+            ("Origin", "https://foreign.example"),
+        ],
+        [
+            *base,
+            ("Origin", "http://127.0.0.1:5899"),
+            ("Origin", "http://localhost:5899"),
+        ],
+        [
+            ("Host", "127.0.0.1:8900"),
+            ("X-PP03-Write-Intent", "1"),
+            ("X-PP03-Write-Intent", "1"),
+        ],
+        [
+            ("Host", "127.0.0.1:8900"),
+            ("Host", "localhost:8900"),
+            ("X-PP03-Write-Intent", "1"),
+        ],
+    ]
+
+    responses = [client.post(path, headers=headers) for headers in duplicate_header_sets]
+
+    assert [response.status_code for response in responses] == [403, 403, 403, 403]
+    assert calls == []
+
+
 def test_single_source_retry_preflight_requires_exact_local_write_authorization(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
@@ -305,6 +346,88 @@ def test_single_source_retry_preflight_requires_exact_local_write_authorization(
     assert approved.status_code == 200
     assert approved.headers.get("access-control-allow-origin") == "http://127.0.0.1:5899"
     assert [missing_intent.status_code, foreign.status_code, malicious_host.status_code] == [403, 403, 403]
+    assert calls == []
+
+
+def test_single_source_retry_preflight_rejects_missing_duplicate_or_non_post_method(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        app_module.newsradar,
+        "retry_source",
+        lambda source_id: calls.append(source_id) or {"ok": False, "source_status": None},
+    )
+    path = "/api/market-news/sources/0123456789abcdef/retry"
+    base = [
+        ("Origin", "http://127.0.0.1:5899"),
+        ("Host", "127.0.0.1:8900"),
+        ("Access-Control-Request-Headers", "content-type, x-pp03-write-intent"),
+    ]
+    rejected_header_sets = [
+        base,
+        [
+            *base,
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Method", "POST"),
+        ],
+        [*base, ("Access-Control-Request-Method", "GET")],
+        [*base, ("Access-Control-Request-Method", "PUT")],
+    ]
+
+    responses = [client.options(path, headers=headers) for headers in rejected_header_sets]
+
+    assert [response.status_code for response in responses] == [403, 403, 403, 403]
+    assert calls == []
+
+
+def test_single_source_retry_preflight_rejects_ambiguous_or_incomplete_headers_before_cors(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        app_module.newsradar,
+        "retry_source",
+        lambda source_id: calls.append(source_id) or {"ok": False, "source_status": None},
+    )
+    path = "/api/market-news/sources/0123456789abcdef/retry"
+    base = [
+        ("Origin", "http://127.0.0.1:5899"),
+        ("Host", "127.0.0.1:8900"),
+        ("Access-Control-Request-Method", "POST"),
+        ("Access-Control-Request-Headers", "content-type, x-pp03-write-intent"),
+    ]
+    rejected_header_sets = [
+        [
+            *base,
+            ("Origin", "https://foreign.example"),
+        ],
+        [
+            ("Origin", "http://127.0.0.1:5899"),
+            ("Host", "127.0.0.1:8900"),
+            ("Host", "public.example:8900"),
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Headers", "content-type, x-pp03-write-intent"),
+        ],
+        [
+            ("Origin", "http://127.0.0.1:5899"),
+            ("Host", "public.example:8900"),
+            ("Access-Control-Request-Method", "POST"),
+        ],
+        [
+            ("Origin", "http://127.0.0.1:5899"),
+            ("Host", "127.0.0.1:8900"),
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+        [
+            ("Origin", "http://127.0.0.1:5899"),
+            ("Host", "127.0.0.1:8900"),
+            ("Access-Control-Request-Method", "POST"),
+            ("Access-Control-Request-Headers", "content-type"),
+            ("Access-Control-Request-Headers", "x-pp03-write-intent"),
+        ],
+    ]
+
+    responses = [client.options(path, headers=headers) for headers in rejected_header_sets]
+
+    assert [response.status_code for response in responses] == [403, 403, 403, 403, 403]
     assert calls == []
 
 
