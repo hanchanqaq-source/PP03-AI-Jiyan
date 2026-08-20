@@ -275,17 +275,17 @@ def test_journal_finalization_never_depends_on_path_unlink(
 
     assert storage.current_path.read_bytes() != before
     assert storage.load_current() == refreshed
-    assert archive.journal_path.is_file()
+    assert not archive.journal_path.exists()
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
 
 
-def test_racing_foreign_journal_at_final_binding_keeps_previous_current_snapshot(
+def test_racing_foreign_transaction_does_not_block_finalized_archive_or_current_snapshot(
     tmp_path,
     monkeypatch,
 ):
     storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
     archive = EvidenceArchive(storage.root, now=lambda: NOW)
-    previous = EvidenceVerificationService(
+    EvidenceVerificationService(
         storage=storage,
         archive=archive,
         event_loader=lambda: [event("a" * 20, [official_source()])],
@@ -293,39 +293,28 @@ def test_racing_foreign_journal_at_final_binding_keeps_previous_current_snapshot
     ).refresh()
     before = storage.current_path.read_bytes()
     real_atomic_write = archive._atomic_write
-    real_read_bytes = archive._read_bytes
-    armed = False
+    archive.journal_path.write_bytes(b'{"owner":"foreign-before"}\n')
     foreign_payload = b'{"owner":"foreign","must_survive":true}\n'
 
-    def arm_after_prepared(path: Path, payload: bytes, maximum: int):
-        nonlocal armed
+    def replace_after_prepared(path: Path, payload: bytes, maximum: int):
         identity = real_atomic_write(path, payload, maximum)
         if path == archive.state_path and json.loads(payload)["phase"] == "prepared":
-            armed = True
-        return identity
-
-    def replace_before_final_binding(path: Path, maximum: int, **kwargs):
-        nonlocal armed
-        if armed and path == archive.journal_path:
-            armed = False
             replacement = archive.archive_root / "foreign-transaction.json"
             replacement.write_bytes(foreign_payload)
             os.replace(replacement, archive.journal_path)
-        return real_read_bytes(path, maximum, **kwargs)
+        return identity
 
-    monkeypatch.setattr(archive, "_atomic_write", arm_after_prepared)
-    monkeypatch.setattr(archive, "_read_bytes", replace_before_final_binding)
-    failing = EvidenceVerificationService(
+    monkeypatch.setattr(archive, "_atomic_write", replace_after_prepared)
+    service = EvidenceVerificationService(
         storage=storage,
         archive=archive,
         event_loader=lambda: [event("b" * 20, [official_source()])],
         now=lambda: NOW,
     )
 
-    with pytest.raises(OSError, match="storage_error"):
-        failing.refresh()
+    refreshed = service.refresh()
 
     assert archive.journal_path.read_bytes() == foreign_payload
-    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
-    assert storage.current_path.read_bytes() == before
-    assert storage.load_current() == previous
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
+    assert storage.current_path.read_bytes() != before
+    assert storage.load_current() == refreshed

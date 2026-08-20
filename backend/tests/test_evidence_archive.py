@@ -113,11 +113,47 @@ def _legacy_v1_row(row: dict[str, object]) -> dict[str, object]:
     return legacy
 
 
+def _downgrade_authority_to_legacy_state(archive: EvidenceArchive, schema_version: int = 1) -> None:
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    legacy = {
+        "schema_version": schema_version,
+        "generation": state["generation"],
+        "phase": state["phase"],
+        "transaction_id": state["transaction_id"],
+        "index_digest": state["target_index_digest"],
+        "bucket_digests": {},
+    }
+    archive.state_path.write_text(
+        json.dumps(legacy, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _refresh_finalized_bucket_manifest(archive: EvidenceArchive) -> None:
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    state["target_bucket_digests"] = {
+        path.name: archive._payload_digest(path.read_bytes())
+        for path in sorted(archive.archive_root.glob("*.jsonl"))
+    }
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _rewrite_pending_journal_as_v2(archive: EvidenceArchive) -> dict[str, object]:
-    document = json.loads(archive.journal_path.read_text(encoding="utf-8"))
-    document.pop("cutoff")
-    document.pop("target_index")
-    document["schema_version"] = 2
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    document = {
+        "schema_version": 2,
+        "transaction_id": "",
+        "base_generation": prepared["base_generation"],
+        "target_generation": prepared["target_generation"],
+        "base_index_digest": prepared["base_index_digest"],
+        "target_index_digest": prepared["target_index_digest"],
+        "base_bucket_digests": prepared["base_bucket_digests"],
+        "target_bucket_digests": prepared["target_bucket_digests"],
+        "rows": prepared["rows"],
+    }
     document["transaction_id"] = archive._journal_transaction_id(
         base_generation=document["base_generation"],
         target_generation=document["target_generation"],
@@ -129,6 +165,21 @@ def _rewrite_pending_journal_as_v2(archive: EvidenceArchive) -> dict[str, object
     )
     archive.journal_path.write_text(
         json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    archive.state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "generation": prepared["base_generation"],
+                "phase": "finalized",
+                "transaction_id": "0" * 64,
+                "index_digest": prepared["base_index_digest"],
+                "bucket_digests": {},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n",
         encoding="utf-8",
     )
     return document
@@ -280,7 +331,7 @@ def test_archive_query_accepts_exact_windows_and_known_statuses_and_sorts_descen
             archive.query(days=90, status=invalid_status)
 
 
-def test_archive_skips_bounded_malformed_rows_with_bounded_diagnostics(tmp_path):
+def test_archive_finalized_manifest_fails_closed_on_bounded_malformed_row_append(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
     bucket = tmp_path / "archive" / "2026-08-20.jsonl"
@@ -291,9 +342,8 @@ def test_archive_skips_bounded_malformed_rows_with_bounded_diagnostics(tmp_path)
             json.dumps(malformed, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         )
 
-    rows = archive.query(days=90)
-
-    assert [row["event_id"] for row in rows] == ["a" * 20]
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
     assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
     assert 0 <= archive.last_diagnostics["scanned_files"] <= 90
     assert set(archive.last_diagnostics) == {
@@ -396,12 +446,12 @@ def test_archive_index_io_failure_leaves_merged_journal_queryable_and_retryable(
     with pytest.raises(OSError, match="storage_error"):
         archive.upsert(updated)
 
-    assert archive.journal_path.is_file()
-    assert archive.get("a" * 20)["verification_status"] == "disproved"
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
 
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
+    assert archive.get("a" * 20)["verification_status"] == "disproved"
     archive.upsert(updated)
-    assert archive.journal_path.is_file()
+    assert not archive.journal_path.exists()
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
     assert archive.get("a" * 20)["verification_status"] == "disproved"
 
@@ -539,19 +589,19 @@ def test_archive_cross_bucket_target_failure_keeps_previous_history_queryable(tm
         archive.upsert(updated)
 
     assert previous_bucket.read_bytes() == previous_bytes
+    monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     retained = archive.get("c" * 20)
     assert retained is not None
     assert retained["verification_status"] == "disproved"
     assert [row["to_status"] for row in retained["status_history"]] == ["verified", "disproved"]
 
-    monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     archive.upsert(updated)
-    assert archive.journal_path.is_file()
+    assert not archive.journal_path.exists()
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
     assert archive.get("c" * 20)["snapshot_history"][-1]["evidence_snapshot_id"] == "f" * 20
 
 
-def test_archive_query_merges_cross_bucket_remnants_before_status_filtering(tmp_path):
+def test_archive_finalized_manifest_rejects_cross_bucket_remnant_injection(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     previous_time = NOW - timedelta(days=1)
     archive.upsert(snapshot(
@@ -579,8 +629,8 @@ def test_archive_query_merges_cross_bucket_remnants_before_status_filtering(tmp_
     ))
     old_bucket.write_bytes(old_bytes)
 
-    assert archive.query(days=90, status="verified") == []
-    assert [row["verification_status"] for row in archive.query(days=90, status="disproved")] == ["disproved"]
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90, status="verified")
 
 
 def test_archive_preflights_index_capacity_before_any_bucket_mutation(tmp_path, monkeypatch):
@@ -721,6 +771,7 @@ def test_archive_preserves_more_than_256_lineages_within_the_window(tmp_path):
     row["snapshot_generated_at"] = latest["generated_at"]
     row["last_updated_at"] = latest["generated_at"]
     bucket.write_text(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+    _refresh_finalized_bucket_manifest(archive)
 
     corrected = replace(
         _timed_event("e" * 20, NOW, status=VerificationStatus.CORRECTED),
@@ -766,7 +817,7 @@ def test_archive_rejects_future_and_noncausal_times_before_mutation(tmp_path):
     assert not (tmp_path / "archive").exists()
 
 
-def test_archive_skips_future_row_before_it_can_suppress_current_status(tmp_path):
+def test_archive_finalized_manifest_rejects_future_row_injection(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event(status=VerificationStatus.VERIFIED)))
     bucket = tmp_path / "archive" / "2026-08-20.jsonl"
@@ -784,10 +835,8 @@ def test_archive_skips_future_row_before_it_can_suppress_current_status(tmp_path
     with bucket.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(future_row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-    rows = archive.query(days=90)
-
-    assert [row["verification_status"] for row in rows] == ["verified"]
-    assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
 
 
 def test_archive_scan_budget_uses_bytes_read_from_the_same_nofollow_descriptor(tmp_path, monkeypatch):
@@ -1004,6 +1053,7 @@ def test_archive_corrupt_or_unknown_journal_fails_closed_instead_of_serving_old_
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_bytes(journal_payload)
 
     with pytest.raises(OSError, match="storage_corrupt"):
@@ -1017,6 +1067,7 @@ def test_archive_corrupt_or_unknown_journal_fails_closed_instead_of_serving_old_
 def test_archive_oversized_journal_fails_closed(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_bytes(b"x" * 65)
     monkeypatch.setattr(archive_module, "_MAX_JOURNAL_BYTES", 64)
 
@@ -1028,6 +1079,7 @@ def test_archive_future_journal_fails_closed(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
     row = archive.get("a" * 20)
+    _downgrade_authority_to_legacy_state(archive)
     future = (NOW + timedelta(minutes=6)).isoformat()
     row["snapshot_generated_at"] = future
     row["last_updated_at"] = future
@@ -1046,6 +1098,7 @@ def test_archive_journal_requires_unique_event_ids_and_canonical_order(tmp_path,
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event("b" * 20)))
     first = archive.get("b" * 20)
+    _downgrade_authority_to_legacy_state(archive)
     second_snapshot = snapshot(
         event("a" * 20),
         snapshot_id="2" * 20,
@@ -1066,47 +1119,50 @@ def test_archive_journal_requires_unique_event_ids_and_canonical_order(tmp_path,
         archive.query(days=90)
 
 
-def test_archive_reads_authoritative_journal_first_with_shared_scan_budget_and_diagnostics(
+def test_archive_recovers_authoritative_inline_prepared_state_before_query(
     tmp_path,
     monkeypatch,
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     verified, disproved = _same_time_competing_snapshots()
     archive.upsert(verified)
-    journal_row = archive_module._archive_document(
-        disproved,
-        archive_module.event_document(disproved.events[0]),
-        NOW,
-    )
-    committed = archive_module._merge_archive_rows(archive.get("a" * 20), journal_row)
-    payload = archive._journal_payload([committed])
-    archive.journal_path.write_bytes(payload)
-    bucket_size = (archive.archive_root / "2026-08-20.jsonl").stat().st_size
-    monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", len(payload) + bucket_size)
+    real_replace = archive_module._replace_durable
 
+    def fail_bucket(source: Path, destination: Path) -> None:
+        if destination.name.endswith(".jsonl"):
+            raise OSError("simulated bucket crash")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_bucket)
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(disproved)
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert prepared["phase"] == "prepared"
+    assert prepared["rows"][0]["verification_status"] == "disproved"
+
+    monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     rows = archive.query(days=90)
 
     assert [row["verification_status"] for row in rows] == ["disproved"]
-    assert archive.last_diagnostics["scanned_files"] == 2
-    assert archive.last_diagnostics["scanned_rows"] == 2
-    assert archive.last_diagnostics["skipped_files"] == 0
-    assert archive.last_diagnostics["duplicate_rows"] == 1
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
 
 
-def test_archive_rejects_journal_that_would_regress_a_bucket_row_outside_query_window(tmp_path):
+def test_archive_rejects_tampered_prepared_state_that_would_regress_a_bucket_row(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(_timed_event("a" * 20, NOW)))
-    journal_snapshot = snapshot(
-        _timed_event("a" * 20, NOW - timedelta(days=91)),
-        snapshot_id="1" * 20,
-        raw_snapshot_id="2" * 20,
-    )
-    journal_row = archive_module._archive_document(
-        journal_snapshot,
-        archive_module.event_document(journal_snapshot.events[0]),
-        NOW,
-    )
-    archive.journal_path.write_bytes(archive._journal_payload([journal_row]))
+    real_replace = archive_module._replace_durable
+
+    def fail_bucket(source: Path, destination: Path) -> None:
+        if destination.name.endswith(".jsonl"):
+            raise OSError("simulated bucket crash")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_bucket)
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20))
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    prepared["rows"][0]["published_at"] = (NOW - timedelta(days=91)).isoformat()
+    archive.state_path.write_text(json.dumps(prepared, separators=(",", ":")) + "\n", encoding="utf-8")
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
@@ -1198,27 +1254,16 @@ def test_archive_scan_budget_fails_closed_instead_of_omitting_unrelated_bucket_r
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event("a" * 20)))
-    bucket = archive.archive_root / "2026-08-20.jsonl"
-    second_snapshot = snapshot(
-        event("b" * 20),
-        snapshot_id="2" * 20,
-        raw_snapshot_id="3" * 20,
-    )
-    journal_row = archive_module._archive_document(
-        second_snapshot,
-        archive_module.event_document(second_snapshot.events[0]),
-        NOW,
-    )
-    journal = archive._journal_payload([journal_row])
-    archive.journal_path.write_bytes(journal)
-    required = len(journal) + len(bucket.read_bytes())
+    state_size = archive.state_path.stat().st_size
+    bucket_size = (archive.archive_root / "2026-08-20.jsonl").stat().st_size
+    required = state_size + bucket_size
 
     monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", required - 1)
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
 
     monkeypatch.setattr(archive_module, "_MAX_SCAN_BYTES", required)
-    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20}
 
 
 def test_archive_public_url_keeps_reserved_and_repeated_path_semantics_distinct():
@@ -1402,15 +1447,19 @@ def test_archive_accepts_reappearance_as_a_new_rooted_status_chain_and_replays_s
 def test_archive_journal_rejects_excessive_structure_before_json_materialization(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_bytes(
         b'{"schema_version":1,"rows":' + (b"[" * 20) + (b"]" * 20) + b"}\n"
     )
     parsed = False
+    real_parse = archive._parse_json
 
-    def forbidden_parse(_raw):
+    def forbidden_parse(raw):
         nonlocal parsed
-        parsed = True
-        raise AssertionError("journal reached json.loads before structural preflight")
+        if raw.startswith(b'{"schema_version":1,"rows":'):
+            parsed = True
+            raise AssertionError("journal reached json.loads before structural preflight")
+        return real_parse(raw)
 
     monkeypatch.setattr(archive, "_parse_json", forbidden_parse)
 
@@ -1677,6 +1726,7 @@ def test_archive_reads_v1_bucket_and_rewrites_it_as_strict_v2_on_next_upsert(tmp
         json.dumps(_legacy_v1_row(row), ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    _downgrade_authority_to_legacy_state(archive)
 
     recovered = archive.query(days=90)
     assert len(recovered) == 1
@@ -1708,6 +1758,7 @@ def test_archive_v1_compatibility_requires_an_exact_integer_schema_version(tmp_p
         ) + "\n",
         encoding="utf-8",
     )
+    _downgrade_authority_to_legacy_state(archive)
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
 
@@ -1716,6 +1767,7 @@ def test_archive_reads_strict_v1_rows_from_committed_journal(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event(primary_evidence=(evidence_item("legacy-journal-proof"),))))
     row = archive.get("a" * 20)
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_text(
         json.dumps(
             {"schema_version": 1, "rows": [_legacy_v1_row(row)]},
@@ -1755,6 +1807,7 @@ def test_archive_v1_multi_lineage_migration_rejects_unprovable_historical_replay
         json.dumps(_legacy_v1_row(row), ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    _downgrade_authority_to_legacy_state(archive)
 
     with pytest.raises(ValueError, match="lineage"):
         archive.upsert(first_snapshot)
@@ -1929,7 +1982,7 @@ def test_archive_bucket_structural_corruption_fails_closed_for_every_reader(
             archive.count()
 
 
-def test_archive_rejects_replayed_completed_transaction_journal(tmp_path, monkeypatch):
+def test_archive_rejects_replayed_stale_inline_prepared_state(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
     disproved = snapshot(
@@ -1958,24 +2011,23 @@ def test_archive_rejects_replayed_completed_transaction_journal(tmp_path, monkey
     monkeypatch.setattr(archive_module, "_replace_durable", fail_first_bucket)
     with pytest.raises(OSError, match="storage_error"):
         archive.upsert(disproved)
-    completed_transaction = archive.journal_path.read_bytes()
+    stale_prepared = archive.state_path.read_bytes()
 
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
-    archive.upsert(disproved)
     assert archive.get("a" * 20)["verification_status"] == "disproved"
-    assert archive.journal_path.is_file()
+    archive.upsert(snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20))
+    assert archive.get("a" * 20)["verification_status"] == "disproved"
 
-    archive.journal_path.write_bytes(completed_transaction)
+    archive.state_path.write_bytes(stale_prepared)
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
 
 
-def test_archive_keeps_one_manifest_bound_finalized_journal_across_transactions(tmp_path):
+def test_archive_keeps_one_manifest_bound_finalized_state_across_transactions(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
 
     archive.upsert(snapshot(event()))
-    first = json.loads(archive.journal_path.read_text(encoding="utf-8"))
-    first_identity = archive.journal_path.stat(follow_symlinks=False).st_ino
+    first = json.loads(archive.state_path.read_text(encoding="utf-8"))
 
     archive.upsert(snapshot(
         event("b" * 20),
@@ -1983,14 +2035,12 @@ def test_archive_keeps_one_manifest_bound_finalized_journal_across_transactions(
         raw_snapshot_id="2" * 20,
     ))
 
-    second = json.loads(archive.journal_path.read_text(encoding="utf-8"))
-    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    second = json.loads(archive.state_path.read_text(encoding="utf-8"))
     assert first["transaction_id"] != second["transaction_id"]
-    assert archive.journal_path.stat(follow_symlinks=False).st_ino != first_identity
-    assert state["phase"] == "finalized"
-    assert state["generation"] == second["target_generation"]
-    assert state["transaction_id"] == second["transaction_id"]
-    assert {path.name for path in archive.archive_root.glob("transaction*.json")} == {"transaction.json"}
+    assert second["phase"] == "finalized"
+    assert second["generation"] == first["generation"] + 1
+    assert second["target_bucket_digests"]
+    assert not archive.journal_path.exists()
     assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
 
 
@@ -2108,7 +2158,7 @@ def test_archive_rejects_cyclic_evidence_id_url_aliases_without_losing_key_field
     assert archive.get("a" * 20) == before
 
 
-@pytest.mark.parametrize("second_failure", ("journal", "bucket", "index", "state"))
+@pytest.mark.parametrize("second_failure", ("prepared", "bucket", "index", "finalized"))
 def test_archive_recovers_committed_target_before_starting_another_transaction_after_repeated_crashes(
     tmp_path,
     monkeypatch,
@@ -2116,7 +2166,6 @@ def test_archive_recovers_committed_target_before_starting_another_transaction_a
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
-    baseline_state = json.loads(archive.state_path.read_text(encoding="utf-8"))
     real_replace = archive_module._replace_durable
     first_update = snapshot(
         event(
@@ -2135,20 +2184,20 @@ def test_archive_recovers_committed_target_before_starting_another_transaction_a
         raw_snapshot_id="d" * 20,
     )
 
-    def fail_first_prepared_state(source: Path, destination: Path) -> None:
+    def fail_first_finalized_state(source: Path, destination: Path) -> None:
         if destination == archive.state_path:
             payload = json.loads(source.read_text(encoding="utf-8"))
-            if payload["phase"] == "prepared":
-                raise OSError("simulated crash before prepared state")
+            if payload["phase"] == "finalized" and payload["generation"] == 2:
+                raise OSError("simulated crash before finalized state")
         real_replace(source, destination)
 
-    monkeypatch.setattr(archive_module, "_replace_durable", fail_first_prepared_state)
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_first_finalized_state)
     with pytest.raises(OSError, match="storage_error"):
         archive.upsert(first_update)
 
-    pending = json.loads(archive.journal_path.read_text(encoding="utf-8"))
-    assert json.loads(archive.state_path.read_text(encoding="utf-8")) == baseline_state
-    assert archive.get("a" * 20)["verification_status"] == "disproved"
+    pending = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert pending["phase"] == "prepared"
+    assert pending["generation"] == 2
 
     second_snapshot = snapshot(
         event("b" * 20),
@@ -2157,25 +2206,23 @@ def test_archive_recovers_committed_target_before_starting_another_transaction_a
     )
 
     def fail_second_transaction(source: Path, destination: Path) -> None:
-        if second_failure == "journal" and destination == archive.journal_path:
-            raise OSError("simulated second journal crash")
+        if second_failure == "prepared" and destination == archive.state_path:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if payload["phase"] == "prepared" and payload["generation"] == 3:
+                raise OSError("simulated second prepared-state crash")
         if second_failure == "bucket" and destination.name.endswith(".jsonl"):
             raise OSError("simulated second bucket crash")
         if second_failure == "index" and destination == archive.index_path:
             raise OSError("simulated second index crash")
-        if second_failure == "state" and destination == archive.state_path:
+        if second_failure == "finalized" and destination == archive.state_path:
             payload = json.loads(source.read_text(encoding="utf-8"))
-            if payload["phase"] == "prepared" and payload["generation"] > pending["target_generation"]:
-                raise OSError("simulated second state crash")
+            if payload["phase"] == "finalized" and payload["generation"] == 3:
+                raise OSError("simulated second finalized-state crash")
         real_replace(source, destination)
 
     monkeypatch.setattr(archive_module, "_replace_durable", fail_second_transaction)
     with pytest.raises(OSError, match="storage_error"):
         archive.upsert(second_snapshot)
-
-    recovered_state = json.loads(archive.state_path.read_text(encoding="utf-8"))
-    assert recovered_state["phase"] == "finalized"
-    assert recovered_state["generation"] == pending["target_generation"]
 
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     archive.upsert(second_snapshot)
@@ -2306,6 +2353,7 @@ def test_archive_v1_journal_rejects_historical_subset_instead_of_merging_it_as_n
         snapshot_id="f" * 20,
         raw_snapshot_id="d" * 20,
     ))
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_text(
         json.dumps(
             {"schema_version": 1, "rows": [_legacy_v1_row(historical)]},
@@ -2329,6 +2377,7 @@ def test_archive_v1_exact_replay_is_validated_outside_the_requested_query_window
         generated_at=archived_time,
     ))
     persisted = archive.get("o" * 20)
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_text(
         json.dumps(
             {"schema_version": 1, "rows": [_legacy_v1_row(persisted)]},
@@ -2351,6 +2400,7 @@ def test_archive_v1_journal_rejects_every_nonexact_replay_without_mutating_persi
     persisted = archive.get("a" * 20)
     bucket = archive.archive_root / "2026-08-20.jsonl"
     before = bucket.read_bytes()
+    _downgrade_authority_to_legacy_state(archive)
     if nonexact_case == "absent":
         selected = snapshot(
             event("b" * 20, primary_evidence=(evidence_item("absent-proof"),)),
@@ -2408,14 +2458,13 @@ def test_archive_v1_journal_rejects_every_nonexact_replay_without_mutating_persi
 
 
 def _rewrite_finalized_index(archive: EvidenceArchive, events: dict[str, str]) -> None:
-    state = archive._read_state()
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
     archive._write_index(events)
-    archive._write_state(
-        state["generation"],
-        "finalized",
-        state["transaction_id"],
-        archive._index_digest(),
-        {},
+    state["target_index"] = dict(sorted(events.items()))
+    state["target_index_digest"] = archive._index_digest()
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -2453,7 +2502,7 @@ def test_archive_cross_validates_finalized_index_bucket_and_event_before_every_o
             ))
 
 
-def _leave_native_journal_before_bucket(
+def _leave_inline_state_before_bucket(
     archive: EvidenceArchive,
     monkeypatch,
     selected: EvidenceSnapshot,
@@ -2471,7 +2520,7 @@ def _leave_native_journal_before_bucket(
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
 
 
-def test_archive_native_journal_binds_original_cutoff_and_complete_target_index(tmp_path, monkeypatch):
+def test_archive_inline_prepared_state_binds_original_cutoff_and_complete_target_index(tmp_path, monkeypatch):
     old_time = NOW - timedelta(days=89, hours=23)
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(
@@ -2480,16 +2529,16 @@ def test_archive_native_journal_binds_original_cutoff_and_complete_target_index(
         raw_snapshot_id="2" * 20,
         generated_at=old_time,
     ))
-    _leave_native_journal_before_bucket(
+    _leave_inline_state_before_bucket(
         archive,
         monkeypatch,
         snapshot(event("n" * 20), snapshot_id="3" * 20, raw_snapshot_id="4" * 20),
     )
 
-    journal = json.loads(archive.journal_path.read_text(encoding="utf-8"))
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
 
-    assert journal["cutoff"] == (NOW - timedelta(days=90)).isoformat()
-    assert journal["target_index"] == {
+    assert prepared["cutoff"] == (NOW - timedelta(days=90)).isoformat()
+    assert prepared["target_index"] == {
         "n" * 20: "2026-08-20.jsonl",
         "o" * 20: old_time.date().isoformat() + ".jsonl",
     }
@@ -2498,7 +2547,7 @@ def test_archive_native_journal_binds_original_cutoff_and_complete_target_index(
 def test_archive_v2_native_journal_rejects_unindexed_canonical_bucket_row(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
-    _leave_native_journal_before_bucket(
+    _leave_inline_state_before_bucket(
         archive,
         monkeypatch,
         snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
@@ -2523,28 +2572,27 @@ def test_archive_v2_native_journal_rejects_unindexed_canonical_bucket_row(tmp_pa
 
 
 @pytest.mark.parametrize("budget_dimension", ("bytes", "rows", "nodes", "files"))
-def test_archive_native_recovery_shares_journal_scan_budget_without_reset(
+def test_archive_inline_recovery_shares_state_scan_budget_without_reset(
     tmp_path,
     monkeypatch,
     budget_dimension,
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
-    _leave_native_journal_before_bucket(
+    _leave_inline_state_before_bucket(
         archive,
         monkeypatch,
         snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
     )
-    journal_before = archive.journal_path.read_bytes()
     state_before = archive.state_path.read_bytes()
     bucket_path = next(archive.archive_root.glob("*.jsonl"))
-    journal_document = archive._parse_json(journal_before)
+    state_document = archive._parse_json(state_before)
     bucket_document = archive_module._archive_from_document(
         archive._parse_json(bucket_path.read_bytes().splitlines()[0])
     )
-    _journal_bytes, journal_nodes = archive_module._json_metrics(
-        journal_document,
-        maximum_bytes=archive_module._MAX_JOURNAL_BYTES,
+    _state_bytes, state_nodes = archive_module._json_metrics(
+        state_document,
+        maximum_bytes=archive_module._MAX_STATE_BYTES,
         maximum_nodes=archive_module._MAX_SCAN_NODES,
     )
     _bucket_bytes, bucket_nodes = archive_module._json_metrics(
@@ -2553,9 +2601,9 @@ def test_archive_native_recovery_shares_journal_scan_budget_without_reset(
         maximum_nodes=archive_module._MAX_SCAN_NODES,
     )
     limits = {
-        "bytes": len(journal_before) + bucket_path.stat().st_size - 1,
-        "rows": len(journal_document["rows"]) + 1 - 1,
-        "nodes": journal_nodes + bucket_nodes - 1,
+        "bytes": len(state_before) + bucket_path.stat().st_size - 1,
+        "rows": len(state_document["rows"]) + 1 - 1,
+        "nodes": state_nodes + bucket_nodes - 1,
         "files": 1,
     }
     constants = {
@@ -2573,7 +2621,6 @@ def test_archive_native_recovery_shares_journal_scan_budget_without_reset(
             raw_snapshot_id="4" * 20,
         ))
 
-    assert archive.journal_path.read_bytes() == journal_before
     assert archive.state_path.read_bytes() == state_before
 
 
@@ -2590,7 +2637,7 @@ def test_archive_recovers_with_transaction_cutoff_then_next_transaction_prunes_n
         raw_snapshot_id="2" * 20,
         generated_at=old_time,
     ))
-    _leave_native_journal_before_bucket(
+    _leave_inline_state_before_bucket(
         archive,
         monkeypatch,
         snapshot(event("n" * 20), snapshot_id="3" * 20, raw_snapshot_id="4" * 20),
@@ -2608,13 +2655,14 @@ def test_archive_recovers_with_transaction_cutoff_then_next_transaction_prunes_n
         "n" * 20: NOW.date().isoformat() + ".jsonl",
     }
     assert {row["event_id"] for row in archive.query(days=90)} == {"f" * 20, "n" * 20}
-    assert archive.journal_path.is_file()
+    assert not archive.journal_path.exists()
 
 
 def test_archive_consumes_exact_v1_journal_before_starting_native_transaction(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
     persisted = archive.get("a" * 20)
+    _downgrade_authority_to_legacy_state(archive)
     archive.journal_path.write_text(
         json.dumps(
             {"schema_version": 1, "rows": [_legacy_v1_row(persisted)]},
@@ -2638,85 +2686,69 @@ def test_archive_consumes_exact_v1_journal_before_starting_native_transaction(tm
         raw_snapshot_id="2" * 20,
     ))
 
-    assert observed_existing_journal == [True]
-    assert json.loads(archive.journal_path.read_text(encoding="utf-8"))["schema_version"] == 3
+    assert observed_existing_journal == []
+    assert json.loads(archive.journal_path.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["schema_version"] == 4
     assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
 
 
-def test_archive_refuses_to_delete_a_replaced_transaction_journal_identity(tmp_path, monkeypatch):
+def test_archive_preserves_foreign_transaction_replaced_after_prepared_state(tmp_path, monkeypatch):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
+    archive.journal_path.write_bytes(b'{"owner":"foreign-before"}\n')
     real_atomic_write = archive._atomic_write
-    replacement_identities: list[tuple[int, int]] = []
+    foreign_after = b'{"owner":"foreign-after-prepared"}\n'
 
     def replace_journal_after_prepared_state(path: Path, payload: bytes, maximum: int):
         identity = real_atomic_write(path, payload, maximum)
         if path == archive.state_path and json.loads(payload)["phase"] == "prepared":
             replacement = archive.archive_root / "replacement-transaction.json"
-            replacement.write_bytes(archive.journal_path.read_bytes())
+            replacement.write_bytes(foreign_after)
             os.replace(replacement, archive.journal_path)
-            metadata = archive.journal_path.stat(follow_symlinks=False)
-            replacement_identities.append((metadata.st_dev, metadata.st_ino))
         return identity
 
     monkeypatch.setattr(archive, "_atomic_write", replace_journal_after_prepared_state)
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
 
-    with pytest.raises(OSError, match="storage_error"):
-        archive.upsert(snapshot(
-            event("b" * 20),
-            snapshot_id="1" * 20,
-            raw_snapshot_id="2" * 20,
-        ))
-
-    metadata = archive.journal_path.stat(follow_symlinks=False)
-    assert replacement_identities == [(metadata.st_dev, metadata.st_ino)]
-    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+    assert archive.journal_path.read_bytes() == foreign_after
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
 
 
-def test_archive_finalization_rechecks_binding_without_deleting_a_racing_foreign_journal(
+def test_archive_preserves_foreign_transaction_replaced_after_finalized_state(
     tmp_path,
     monkeypatch,
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
+    archive.journal_path.write_bytes(b'{"owner":"foreign-before"}\n')
     real_atomic_write = archive._atomic_write
-    real_read_bytes = archive._read_bytes
-    armed = False
-    replacement_identities: list[tuple[int, int]] = []
     foreign_payload = b'{"owner":"foreign","must_survive":true}\n'
 
-    def arm_after_prepared(path: Path, payload: bytes, maximum: int):
-        nonlocal armed
+    def replace_after_finalized(path: Path, payload: bytes, maximum: int):
         identity = real_atomic_write(path, payload, maximum)
-        if path == archive.state_path and json.loads(payload)["phase"] == "prepared":
-            armed = True
-        return identity
-
-    def replace_before_final_binding(path: Path, maximum: int, **kwargs):
-        nonlocal armed
-        if armed and path == archive.journal_path:
-            armed = False
+        if (
+            path == archive.state_path
+            and json.loads(payload)["phase"] == "finalized"
+            and json.loads(payload)["generation"] == 2
+        ):
             replacement = archive.archive_root / "foreign-transaction.json"
             replacement.write_bytes(foreign_payload)
             os.replace(replacement, archive.journal_path)
-            metadata = archive.journal_path.stat(follow_symlinks=False)
-            replacement_identities.append((metadata.st_dev, metadata.st_ino))
-        return real_read_bytes(path, maximum, **kwargs)
+        return identity
 
-    monkeypatch.setattr(archive, "_atomic_write", arm_after_prepared)
-    monkeypatch.setattr(archive, "_read_bytes", replace_before_final_binding)
+    monkeypatch.setattr(archive, "_atomic_write", replace_after_finalized)
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
 
-    with pytest.raises(OSError, match="storage_error"):
-        archive.upsert(snapshot(
-            event("b" * 20),
-            snapshot_id="1" * 20,
-            raw_snapshot_id="2" * 20,
-        ))
-
-    metadata = archive.journal_path.stat(follow_symlinks=False)
-    assert replacement_identities == [(metadata.st_dev, metadata.st_ino)]
     assert archive.journal_path.read_bytes() == foreign_payload
-    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
 
 
 @pytest.mark.parametrize(
@@ -2879,6 +2911,7 @@ def test_archive_rejects_legacy_journal_bucket_candidates_before_any_bucket_path
 ):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive)
     start = NOW - timedelta(days=archive_module._MAX_ARCHIVE_FILES)
     rows: list[dict[str, object]] = []
     for number in range(archive_module._MAX_ARCHIVE_FILES + 1):
@@ -2909,3 +2942,330 @@ def test_archive_rejects_legacy_journal_bucket_candidates_before_any_bucket_path
     monkeypatch.setattr(archive, "_read_bucket", forbid_bucket_read)
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
+
+
+def test_archive_native_transactions_never_replace_or_require_foreign_transaction_path(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.archive_root.mkdir(parents=True)
+    foreign = b'{"owner":"foreign","must_survive":true}\n'
+    archive.journal_path.write_bytes(foreign)
+
+    archive.upsert(snapshot(event()))
+
+    assert archive.journal_path.read_bytes() == foreign
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 4
+    assert state["phase"] == "finalized"
+    assert archive.get("a" * 20)["event_id"] == "a" * 20
+
+
+def test_archive_foreign_transaction_replacement_during_finalization_is_irrelevant_and_preserved(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    first_foreign = b'{"owner":"foreign-one"}\n'
+    second_foreign = b'{"owner":"foreign-two"}\n'
+    archive.journal_path.write_bytes(first_foreign)
+    real_atomic_write = archive._atomic_write
+    replaced = False
+
+    def replace_foreign_after_prepared(path: Path, payload: bytes, maximum: int):
+        nonlocal replaced
+        identity = real_atomic_write(path, payload, maximum)
+        if path == archive.state_path and json.loads(payload)["phase"] == "prepared":
+            archive.journal_path.write_bytes(second_foreign)
+            replaced = True
+        return identity
+
+    monkeypatch.setattr(archive, "_atomic_write", replace_foreign_after_prepared)
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+
+    assert replaced is True
+    assert archive.journal_path.read_bytes() == second_foreign
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+
+
+def test_archive_finalized_state_is_authoritative_after_transaction_path_is_deleted(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    if archive.journal_path.exists():
+        archive.journal_path.unlink()
+
+    assert archive.get("a" * 20)["verification_status"] == "verified"
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["phase"] == "finalized"
+    assert state["target_bucket_digests"]
+
+
+def test_archive_recovers_inline_prepared_state_without_transaction_path(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    real_replace = archive_module._replace_durable
+
+    def fail_finalized_state(source: Path, destination: Path) -> None:
+        if destination == archive.state_path:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if payload["phase"] == "finalized" and payload["generation"] == 2:
+                raise OSError("simulated crash before finalized state")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_finalized_state)
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert prepared["phase"] == "prepared"
+    assert prepared["rows"]
+    if archive.journal_path.exists():
+        archive.journal_path.unlink()
+
+    monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
+    archive.upsert(snapshot(
+        event("c" * 20),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+    ))
+
+    assert {row["event_id"] for row in archive.query(days=90)} == {
+        "a" * 20,
+        "b" * 20,
+        "c" * 20,
+    }
+
+
+@pytest.mark.parametrize("field", ("target_bucket_digests", "target_index"))
+def test_archive_finalized_state_requires_complete_authoritative_target_manifests(tmp_path, field):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    state.pop(field)
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_rejects_partial_provenance_tuple_instead_of_constructing_mixed_origin(tmp_path):
+    clock = [NOW]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    stable = replace(
+        evidence_item("stable-proof"),
+        content_source="publisher-one.example",
+        collector_source="collector-one.example",
+        published_at=NOW - timedelta(hours=1),
+        origin_cluster="publisher:one",
+    )
+    archive.upsert(snapshot(event(primary_evidence=(stable,))))
+    partial = replace(
+        stable,
+        content_source="publisher-two.example",
+        collector_source="",
+        published_at=NOW,
+        origin_cluster="publisher:two",
+        title="new title",
+    )
+    clock[0] = NOW + timedelta(minutes=1)
+
+    with pytest.raises(ValueError, match="provenance"):
+        archive.upsert(snapshot(
+            replace(_timed_event("a" * 20, clock[0]), primary_evidence=(partial,)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+            generated_at=clock[0],
+        ))
+
+    retained = archive.get("a" * 20)["primary_evidence"][0]
+    assert (
+        retained["canonical_url"],
+        retained["published_at"],
+        retained["content_source"],
+        retained["collector_source"],
+        retained["origin_cluster"],
+    ) == (
+        stable.canonical_url,
+        stable.published_at.isoformat(),
+        stable.content_source,
+        stable.collector_source,
+        stable.origin_cluster,
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "https://official.example.com/proof?apiKey2=SECRET",
+        "https://official.example.com/proof?token2=SECRET",
+        "https://official.example.com/proof?subscriptionKey2026=SECRET",
+        "https://official.example.com/proof?payload=%257B%2522apiKey2%2522%253A%2522SECRET%2522%257D",
+    ),
+)
+def test_archive_rejects_version_suffixed_secret_names_at_all_nested_decode_layers(tmp_path, unsafe_url):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="URL"):
+        archive.upsert(snapshot(event(primary_evidence=(evidence_item(
+            "versioned-secret",
+            canonical_url=unsafe_url,
+        ),))))
+
+    assert not archive.archive_root.exists()
+
+
+@pytest.mark.parametrize("legacy_schema", (1, 2, 3))
+def test_archive_migrates_legacy_state_versions_without_losing_completed_rows(tmp_path, legacy_schema):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive, legacy_schema)
+
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 4
+    assert state["phase"] == "finalized"
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+
+
+@pytest.mark.parametrize("journal_schema", (2, 3))
+def test_archive_migrates_pending_legacy_native_journals_once_into_inline_state(
+    tmp_path,
+    monkeypatch,
+    journal_schema,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    if journal_schema == 2:
+        legacy_journal = _rewrite_pending_journal_as_v2(archive)
+    else:
+        prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+        legacy_journal = {
+            "schema_version": 3,
+            "transaction_id": prepared["transaction_id"],
+            "base_generation": prepared["base_generation"],
+            "target_generation": prepared["target_generation"],
+            "base_index_digest": prepared["base_index_digest"],
+            "target_index_digest": prepared["target_index_digest"],
+            "base_bucket_digests": prepared["base_bucket_digests"],
+            "target_bucket_digests": prepared["target_bucket_digests"],
+            "cutoff": prepared["cutoff"],
+            "target_index": prepared["target_index"],
+            "rows": prepared["rows"],
+        }
+        archive.journal_path.write_text(
+            json.dumps(legacy_journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        archive.state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "generation": prepared["base_generation"],
+                    "phase": "finalized",
+                    "transaction_id": "0" * 64,
+                    "index_digest": prepared["base_index_digest"],
+                    "bucket_digests": {},
+                },
+                separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+    legacy_bytes = archive.journal_path.read_bytes()
+
+    rows = archive.query(days=90)
+
+    assert {row["event_id"] for row in rows} == {"a" * 20, "b" * 20}
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["schema_version"] == 4
+    assert archive.journal_path.read_bytes() == legacy_bytes
+    assert legacy_journal["schema_version"] == journal_schema
+
+
+def test_archive_unknown_future_state_schema_fails_closed_without_touching_transaction_path(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    state["schema_version"] = 999
+    archive.state_path.write_text(json.dumps(state, separators=(",", ":")) + "\n", encoding="utf-8")
+    foreign = b'{"owner":"foreign"}\n'
+    archive.journal_path.write_bytes(foreign)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert archive.journal_path.read_bytes() == foreign
+
+
+def test_archive_complete_new_provenance_tuple_wins_as_one_source_identity(tmp_path):
+    clock = [NOW]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    first = replace(
+        evidence_item("stable-proof", canonical_url="https://one.example.com/proof"),
+        content_source="one.example.com",
+        collector_source="collector-one",
+        published_at=NOW - timedelta(hours=1),
+        origin_cluster="publisher:one",
+    )
+    archive.upsert(snapshot(event(primary_evidence=(first,))))
+    clock[0] = NOW + timedelta(minutes=1)
+    second = replace(
+        first,
+        content_source="two.example",
+        collector_source="collector-two",
+        published_at=clock[0],
+        origin_cluster="publisher:two",
+        title="new public title",
+    )
+    archive.upsert(snapshot(
+        replace(_timed_event("a" * 20, clock[0]), primary_evidence=(second,)),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=clock[0],
+    ))
+
+    retained = archive.get("a" * 20)["primary_evidence"][0]
+    assert (
+        retained["canonical_url"],
+        retained["published_at"],
+        retained["content_source"],
+        retained["collector_source"],
+        retained["origin_cluster"],
+    ) == (
+        "https://one.example.com/proof",
+        clock[0].isoformat(),
+        "two.example",
+        "collector-two",
+        "publisher:two",
+    )
+
+
+@pytest.mark.parametrize("name", ("monkey2", "turnkey2026"))
+def test_archive_versioned_benign_query_names_remain_public(tmp_path, name):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    public_url = f"https://official.example.com/proof?{name}=allowed"
+
+    archive.upsert(snapshot(event(primary_evidence=(evidence_item(
+        "benign-versioned-name",
+        canonical_url=public_url,
+    ),))))
+
+    assert archive.get("a" * 20)["primary_evidence"][0]["canonical_url"] == public_url
