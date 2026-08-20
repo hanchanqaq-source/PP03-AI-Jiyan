@@ -63,6 +63,7 @@ _MAX_SCAN_NODES = _MAX_ARCHIVE_SCAN_NODES + _MAX_SNAPSHOT_NODES * 2
 _MAX_MUTATION_BYTES = 128 * 1_048_576
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _MAX_DIAGNOSTIC_COUNT = 1_000_000
+_MAX_TOLERATED_CORRUPT_ROWS = 1
 _JOURNAL_SCHEMA_VERSION = 3
 _PREVIOUS_JOURNAL_SCHEMA_VERSION = 2
 _LEGACY_JOURNAL_SCHEMA_VERSION = 1
@@ -1045,11 +1046,17 @@ def _preflight_top_level_array_rows(raw: bytes, *, key: str, maximum_rows: int) 
     if type(maximum_rows) is not int or maximum_rows < 0:
         raise ValueError("invalid archive row budget")
     data = raw[:-1]
+    stripped = data.strip()
+    if not stripped or stripped[:1] != b"{" or stripped[-1:] != b"}":
+        if maximum_rows == 0:
+            raise ValueError("invalid archive JSON root")
+        return
     depth = 0
     in_string = False
     escaped = False
     string_start = 0
     row_count = 0
+    matched_key = False
     index = 0
     while index < len(data):
         value = data[index]
@@ -1070,9 +1077,18 @@ def _preflight_top_level_array_rows(raw: bytes, *, key: str, maximum_rows: int) 
                         except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
                             raise ValueError("invalid archive JSON key") from None
                         if decoded_key == key:
+                            if matched_key:
+                                if maximum_rows == 0:
+                                    raise ValueError("duplicate archive rows")
+                                return
+                            matched_key = True
                             cursor += 1
                             while cursor < len(data) and data[cursor] in b" \t\r\n":
                                 cursor += 1
+                            if cursor >= len(data) or data[cursor] != 0x5B:
+                                if maximum_rows == 0:
+                                    raise ValueError("invalid archive rows")
+                                return
                             if cursor < len(data) and data[cursor] == 0x5B:
                                 array_depth = 1
                                 array_string = False
@@ -2267,6 +2283,7 @@ class EvidenceArchive:
         strict_rows: bool = True,
         validation_now: datetime | None = None,
         observed_digests: dict[str, str] | None = None,
+        expected_digests: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not _valid_bucket_name(name):
             raise ValueError("invalid archive bucket name")
@@ -2285,76 +2302,148 @@ class EvidenceArchive:
             elif observed_digests is not None:
                 observed_digests[name] = _MISSING_DIGEST
             return []
-        if observed_digests is not None:
-            observed_digests[name] = self._payload_digest(payload)
+        raw_digest = self._payload_digest(payload)
+        tolerant = not strict_rows or (
+            expected_digests is not None and raw_digest not in expected_digests
+        )
         if budget is not None:
             budget["files"] -= 1
             budget["bytes"] -= len(payload)
         self._increment(diagnostics, "scanned_files")
-        lines = payload.splitlines()
-        if len(lines) > _MAX_BUCKET_ROWS:
+        framed_lines = payload.splitlines(keepends=True)
+        if len(framed_lines) > _MAX_BUCKET_ROWS:
             self._increment(diagnostics, "skipped_files")
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt")
-        if budget is not None and len(lines) > budget["rows"]:
+        if budget is not None and len(framed_lines) > budget["rows"]:
             if fail_on_budget:
                 raise OSError("storage_corrupt")
             self._increment(diagnostics, "skipped_files")
             return []
         if budget is not None:
-            budget["rows"] -= len(lines)
+            budget["rows"] -= len(framed_lines)
         rows: list[dict[str, Any]] = []
-        for line in lines:
+        source_payload_parts: list[bytes] = []
+        corrupt_rows = 0
+
+        def reject_corrupt_row() -> None:
+            nonlocal corrupt_rows
+            corrupt_rows += 1
+            self._increment(diagnostics, "skipped_corrupt_rows")
+            if not tolerant or corrupt_rows > _MAX_TOLERATED_CORRUPT_ROWS:
+                self._last_diagnostics = diagnostics
+                raise OSError("storage_corrupt")
+
+        for framed_line in framed_lines:
+            if framed_line.endswith(b"\r\n"):
+                line = framed_line[:-2]
+            elif framed_line.endswith((b"\n", b"\r")):
+                line = framed_line[:-1]
+            else:
+                line = framed_line
             self._increment(diagnostics, "scanned_rows")
-            if not line or len(line) > _MAX_ROW_BYTES:
-                self._increment(diagnostics, "skipped_corrupt_rows")
-                if strict_rows:
+            if budget is not None:
+                if budget["nodes"] <= 0:
                     self._last_diagnostics = diagnostics
                     raise OSError("storage_corrupt")
+                # Every physical row consumes at least its root node even when the
+                # JSON or schema is corrupt.  A corrupt row can never be a free
+                # shared-budget continuation.
+                budget["nodes"] -= 1
+            if len(line) > _MAX_ROW_BYTES:
+                self._increment(diagnostics, "skipped_corrupt_rows")
+                self._last_diagnostics = diagnostics
+                raise OSError("storage_corrupt")
+            if not line:
+                reject_corrupt_row()
                 continue
             try:
-                parsed = _archive_from_document(self._parse_json(line))
-                _validate_temporal_row(parsed, validation_now or _utc(self._now(), "archive clock"))
-                if _bucket_name(parsed) != name:
-                    raise ValueError("archive row is in the wrong bucket")
+                if budget is not None:
+                    _preflight_json_payload(
+                        line + b"\n",
+                        maximum_depth=16,
+                        maximum_tokens=min(
+                            _MAX_SCAN_NODES,
+                            budget["nodes"] * 4 + 16,
+                        ),
+                    )
+                document = self._parse_json(line)
+                document_nodes = 1
                 if budget is not None:
                     try:
-                        _row_bytes, row_nodes = _json_metrics(
-                            parsed,
+                        _document_bytes, document_nodes = _json_metrics(
+                            document,
                             maximum_bytes=_MAX_ROW_BYTES,
-                            maximum_nodes=budget["nodes"],
+                            maximum_nodes=budget["nodes"] + 1,
                         )
                     except ValueError as error:
                         if "budget" not in str(error):
                             raise
-                        if fail_on_budget:
-                            raise OSError("storage_corrupt") from None
-                        self._increment(diagnostics, "skipped_files")
-                        return rows
-                    if row_nodes > budget["nodes"]:
-                        raise ValueError("archive scan node budget exceeded")
-                    budget["nodes"] -= row_nodes
+                        self._last_diagnostics = diagnostics
+                        raise OSError("storage_corrupt") from None
+                    additional_nodes = document_nodes - 1
+                    if additional_nodes > budget["nodes"]:
+                        self._last_diagnostics = diagnostics
+                        raise OSError("storage_corrupt")
+                    budget["nodes"] -= additional_nodes
+                parsed = _archive_from_document(document)
             except _ArchiveFutureSchemaError:
-                self._increment(diagnostics, "skipped_corrupt_rows")
-                if strict_rows:
-                    self._last_diagnostics = diagnostics
-                    raise OSError("storage_corrupt") from None
+                reject_corrupt_row()
                 continue
             except OSError:
                 self._last_diagnostics = diagnostics
                 raise
-            except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
-                self._increment(diagnostics, "skipped_corrupt_rows")
-                if strict_rows:
+            except ValueError as error:
+                if "budget" in str(error):
                     self._last_diagnostics = diagnostics
                     raise OSError("storage_corrupt") from None
+                reject_corrupt_row()
                 continue
+            except (KeyError, TypeError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
+                reject_corrupt_row()
+                continue
+            try:
+                _validate_temporal_row(parsed, validation_now or _utc(self._now(), "archive clock"))
+                if _bucket_name(parsed) != name:
+                    raise ValueError("archive row is in the wrong bucket")
+                if budget is not None:
+                    _row_bytes, canonical_nodes = _json_metrics(
+                        parsed,
+                        maximum_bytes=_MAX_ROW_BYTES,
+                        maximum_nodes=budget["nodes"] + document_nodes,
+                    )
+                    additional_nodes = max(0, canonical_nodes - document_nodes)
+                    if additional_nodes > budget["nodes"]:
+                        raise OSError("storage_corrupt")
+                    budget["nodes"] -= additional_nodes
+            except OSError:
+                self._last_diagnostics = diagnostics
+                raise
+            except (KeyError, TypeError, ValueError, RecursionError):
+                # A parsed native row with an impossible time or physical bucket
+                # is an authority violation, not a skippable corrupt fragment.
+                self._last_diagnostics = diagnostics
+                raise OSError("storage_corrupt") from None
             rows.append(parsed)
+            source_payload_parts.append(framed_line)
         event_ids = [row["event_id"] for row in rows]
         if event_ids != sorted(event_ids) or len(event_ids) != len(set(event_ids)):
             self._increment(diagnostics, "skipped_files")
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt")
+        resolved_digest = raw_digest
+        if expected_digests is not None and raw_digest not in expected_digests:
+            canonical_digests = {
+                self._payload_digest(self._bucket_payload(name, rows)),
+                self._payload_digest(b"".join(source_payload_parts)),
+            }
+            matched_digests = canonical_digests & expected_digests
+            if not matched_digests:
+                self._last_diagnostics = diagnostics
+                raise OSError("storage_corrupt")
+            resolved_digest = sorted(matched_digests)[0]
+        if observed_digests is not None:
+            observed_digests[name] = resolved_digest
         return rows
 
     def _bucket_names(self) -> list[str]:
@@ -2814,7 +2903,7 @@ class EvidenceArchive:
         return target
 
     @staticmethod
-    def _v2_causal_lower_bound(rows: list[dict[str, Any]]) -> datetime | None:
+    def _v2_causal_lower_bound(rows: Iterator[dict[str, Any]] | list[dict[str, Any]]) -> datetime | None:
         causal: list[datetime] = []
         for row in rows:
             for key in ("snapshot_generated_at", "archived_at", "last_updated_at"):
@@ -2922,7 +3011,12 @@ class EvidenceArchive:
         current = _utc(now, "archive clock")
         latest_allowed = _shift_datetime(current, _MAX_CLOCK_SKEW)
         projected_rows = self._v2_projection_rows(journal, physical_rows, locations)
-        causal_lower = self._v2_causal_lower_bound(journal["rows"])
+        authenticated_maximum = self._v2_causal_lower_bound(list(projected_rows.values()))
+        causal_lower = (
+            None
+            if authenticated_maximum is None
+            else _shift_datetime(authenticated_maximum, -_MAX_CLOCK_SKEW)
+        )
         persisted_upper = journal.get("transaction_mtime")
         if not projected_rows:
             selected_upper = (
@@ -3282,6 +3376,7 @@ class EvidenceArchive:
         required_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
         include_discovered: bool = True,
         strict_rows: bool = True,
+        expected_digests: dict[str, set[str]] | None = None,
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
         dict[str, str],
@@ -3305,6 +3400,11 @@ class EvidenceArchive:
                 strict_rows=strict_rows,
                 validation_now=now,
                 observed_digests=observed,
+                expected_digests=(
+                    None
+                    if expected_digests is None
+                    else expected_digests.get(name)
+                ),
             )
             bucket_rows[name] = rows
             for row in rows:
@@ -3360,6 +3460,7 @@ class EvidenceArchive:
                 diagnostics,
                 budget=budget,
                 fail_on_budget=True,
+                strict_rows=False,
                 validation_now=now,
             )
             if any(
@@ -3373,6 +3474,10 @@ class EvidenceArchive:
             budget=budget,
             required_names=active_manifest,
             include_discovered=False,
+            expected_digests={
+                name: {digest}
+                for name, digest in active_manifest.items()
+            },
         )
         if observed != active_manifest:
             self._last_diagnostics = diagnostics
@@ -3428,6 +3533,13 @@ class EvidenceArchive:
                 required_names=required,
                 include_discovered=True,
                 strict_rows=True,
+                expected_digests={
+                    name: {
+                        state["base_bucket_digests"][name],
+                        state["target_bucket_digests"][name],
+                    }
+                    for name in required
+                },
             )
         discovered = {
             name
@@ -3461,6 +3573,24 @@ class EvidenceArchive:
                 state["base_bucket_digests"][name],
                 state["target_bucket_digests"][name],
             }:
+                raise OSError("storage_corrupt")
+        planned_index_digest = self._index_digest() if actual_index_digest is None else actual_index_digest
+        if planned_index_digest not in {state["base_index_digest"], state["target_index_digest"]}:
+            raise OSError("storage_corrupt")
+        if planned_index_digest == state["target_index_digest"]:
+            # Prepared rows cannot manufacture physical membership for a target
+            # index.  When the target differs from the base, writer ordering also
+            # proves that every target manifest digest must already be physical.
+            self._validate_index_projection(
+                state["target_index"],
+                bucket_rows,
+                cutoff=state["cutoff"],
+                upper=_shift_days(state["cutoff"], 90),
+            )
+            if (
+                state["target_index_digest"] != state["base_index_digest"]
+                and observed != state["target_bucket_digests"]
+            ):
                 raise OSError("storage_corrupt")
         affected = {
             name
@@ -3508,9 +3638,6 @@ class EvidenceArchive:
         finalized_payload = self._finalized_authority_payload(state)
         mutation_bytes = len(index_payload) + len(finalized_payload) + sum(map(len, bucket_payloads.values()))
         if mutation_bytes > _MAX_MUTATION_BYTES:
-            raise OSError("storage_corrupt")
-        planned_index_digest = self._index_digest() if actual_index_digest is None else actual_index_digest
-        if planned_index_digest not in {state["base_index_digest"], state["target_index_digest"]}:
             raise OSError("storage_corrupt")
         return {
             "affected": affected,
@@ -3710,6 +3837,13 @@ class EvidenceArchive:
                 diagnostics=diagnostics,
                 budget=budget,
                 required_names=journal["target_bucket_digests"],
+                expected_digests={
+                    name: {
+                        journal["base_bucket_digests"][name],
+                        journal["target_bucket_digests"][name],
+                    }
+                    for name in journal["target_bucket_digests"]
+                },
             )
             self._validate_journal_bucket_state(journal, journal_observed)
             if journal["native_schema_version"] == _PREVIOUS_JOURNAL_SCHEMA_VERSION:
@@ -3787,6 +3921,14 @@ class EvidenceArchive:
             budget=budget,
             required_names=required,
             strict_rows=bool(journal is not None and not journal["legacy"]),
+            expected_digests=(
+                {
+                    name: {digest}
+                    for name, digest in state_document["bucket_digests"].items()
+                }
+                if state_document is not None and state_document["bucket_digests"]
+                else None
+            ),
         )
         cutoff = _shift_days(now, -90)
         authority_upper = _shift_datetime(now, _MAX_CLOCK_SKEW)
@@ -3863,6 +4005,11 @@ class EvidenceArchive:
             if _bucket_name_in_window(name, cutoff, authority_upper)
         }
         if state_document is None and journal is None and physical_index_document is None:
+            if not existing:
+                # A discovered bucket containing only one bounded corrupt row is
+                # diagnostic input, not sufficient authority for a new v4 state.
+                self._last_diagnostics = diagnostics
+                return None
             active_physical_index = {
                 event_id: _bucket_name(row)
                 for event_id, row in existing.items()

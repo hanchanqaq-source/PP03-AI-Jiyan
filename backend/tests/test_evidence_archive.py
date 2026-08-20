@@ -458,7 +458,7 @@ def test_archive_query_accepts_exact_windows_and_known_statuses_and_sorts_descen
             archive.query(days=90, status=invalid_status)
 
 
-def test_archive_finalized_manifest_fails_closed_on_bounded_malformed_row_append(tmp_path):
+def test_archive_finalized_manifest_skips_one_bounded_malformed_row_append(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     archive.upsert(snapshot(event()))
     bucket = tmp_path / "archive" / "2026-08-20.jsonl"
@@ -469,8 +469,7 @@ def test_archive_finalized_manifest_fails_closed_on_bounded_malformed_row_append
             json.dumps(malformed, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         )
 
-    with pytest.raises(OSError, match="storage_corrupt"):
-        archive.query(days=90)
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
     assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
     assert 0 <= archive.last_diagnostics["scanned_files"] <= 90
     assert set(archive.last_diagnostics) == {
@@ -4383,7 +4382,9 @@ def test_archive_v2_recovery_falls_back_to_unique_event_window_when_mtime_moved(
         "b" * 20: f"{newer_base_time.date().isoformat()}.jsonl",
         "i" * 20: f"{imported_time.date().isoformat()}.jsonl",
     }
-    assert recovered_states[0]["cutoff"] == transaction_time - timedelta(days=90)
+    assert recovered_states[0]["cutoff"] == (
+        transaction_time - archive_module._MAX_CLOCK_SKEW - timedelta(days=90)
+    )
     assert [row["event_id"] for row in archive.query(days=90)] == ["r" * 20]
 
 
@@ -4518,7 +4519,7 @@ def test_archive_legacy_migration_fails_closed_when_final_state_read_exceeds_sha
         archive.query(days=90)
 
 
-def test_archive_v2_mtime_cannot_predate_authenticated_row_causality(tmp_path, monkeypatch):
+def test_archive_v2_mtime_within_authenticated_clock_skew_is_causal(tmp_path, monkeypatch):
     clock = [NOW]
     archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
     imported_time = NOW - timedelta(days=30)
@@ -4566,7 +4567,7 @@ def test_archive_v2_mtime_cannot_predate_authenticated_row_causality(tmp_path, m
         generated_at=clock[0],
     ))
 
-    assert recovered_states[0]["cutoff"] == row_contract_time - timedelta(days=90)
+    assert recovered_states[0]["cutoff"] == NOW + timedelta(minutes=1) - timedelta(days=90)
     assert recovered_states[0]["target_index"] == {
         "i" * 20: f"{imported_time.date().isoformat()}.jsonl",
     }
@@ -4613,6 +4614,12 @@ def test_archive_v2_fallback_includes_pruned_physical_rows_with_bounded_work(
     assert journal["target_index_digest"] == archive._payload_digest(
         archive._index_payload(expected_target)
     )
+    imported_row = journal["rows"][0]
+    _write_bucket_for_test(
+        archive,
+        archive_module._bucket_name(imported_row),
+        [imported_row],
+    )
     archive._write_index(expected_target)
     _set_journal_mtime(archive, NOW + timedelta(days=91))
     monkeypatch.setattr(archive_module, "_MAX_V2_CUTOFF_CANDIDATES", 8)
@@ -4634,7 +4641,9 @@ def test_archive_v2_fallback_includes_pruned_physical_rows_with_bounded_work(
     ))
 
     assert recovered_states[0]["target_index"] == expected_target
-    assert recovered_states[0]["cutoff"] == NOW - timedelta(days=90)
+    assert recovered_states[0]["cutoff"] == (
+        NOW - archive_module._MAX_CLOCK_SKEW - timedelta(days=90)
+    )
     assert [row["event_id"] for row in archive.query(days=90)] == ["n" * 20]
 
 
@@ -4869,3 +4878,426 @@ def test_archive_query_skips_one_unmanifested_future_schema_row_with_diagnostic(
 
     assert [row["event_id"] for row in rows] == ["v" * 20]
     assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
+
+
+@pytest.mark.parametrize("authority_kind", ("v4_prepared", "v2_journal"))
+def test_archive_target_index_cannot_substitute_a_missing_physical_target_row(
+    tmp_path,
+    monkeypatch,
+    authority_kind,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ),
+    )
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    if authority_kind == "v2_journal":
+        _rewrite_pending_journal_as_v2(archive)
+    archive._write_index(prepared["target_index"])
+    before_state = archive.state_path.read_bytes()
+    before_index = archive.index_path.read_bytes()
+    before_buckets = {
+        path.name: path.read_bytes()
+        for path in sorted(archive.archive_root.glob("*.jsonl"))
+    }
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert archive.state_path.read_bytes() == before_state
+    assert archive.index_path.read_bytes() == before_index
+    assert {
+        path.name: path.read_bytes()
+        for path in sorted(archive.archive_root.glob("*.jsonl"))
+    } == before_buckets
+
+
+def _write_empty_v2_noop_over_current_authority(
+    archive: EvidenceArchive,
+    *,
+    transaction_time: datetime,
+) -> None:
+    current = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    _downgrade_authority_to_legacy_state(archive, 2)
+    document = {
+        "schema_version": 2,
+        "transaction_id": "",
+        "base_generation": current["generation"],
+        "target_generation": current["generation"] + 1,
+        "base_index_digest": current["target_index_digest"],
+        "target_index_digest": current["target_index_digest"],
+        "base_bucket_digests": current["target_bucket_digests"],
+        "target_bucket_digests": current["target_bucket_digests"],
+        "rows": [],
+    }
+    document["transaction_id"] = archive._journal_transaction_id(
+        base_generation=document["base_generation"],
+        target_generation=document["target_generation"],
+        base_index_digest=document["base_index_digest"],
+        target_index_digest=document["target_index_digest"],
+        base_bucket_digests=document["base_bucket_digests"],
+        target_bucket_digests=document["target_bucket_digests"],
+        rows=[],
+    )
+    archive.journal_path.write_text(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _set_journal_mtime(archive, transaction_time)
+
+
+def test_archive_empty_v2_noop_authenticates_nonempty_base_with_clock_skew(tmp_path):
+    boundary_time = NOW - timedelta(days=90) + timedelta(minutes=2)
+    authenticated_time = NOW + timedelta(minutes=4)
+    selected = snapshot(
+        replace(
+            event(
+                "n" * 20,
+                published_at=boundary_time,
+                history=(StatusTransition(
+                    None,
+                    VerificationStatus.VERIFIED,
+                    authenticated_time,
+                    "reason-verified",
+                ),),
+            ),
+            verified_at=authenticated_time,
+            evidence_as_of=authenticated_time,
+        ),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=authenticated_time,
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(selected)
+    _write_empty_v2_noop_over_current_authority(archive, transaction_time=NOW)
+
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["n" * 20]
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 4
+    assert state["phase"] == "finalized"
+    assert state["cutoff"] == (NOW - timedelta(days=90)).isoformat()
+
+
+def test_archive_empty_v2_noop_falls_back_at_full_projection_causal_skew(
+    tmp_path,
+):
+    authenticated_time = NOW + timedelta(minutes=4)
+    selected = snapshot(
+        replace(
+            event(
+                "n" * 20,
+                published_at=NOW - timedelta(days=1),
+                history=(StatusTransition(
+                    None,
+                    VerificationStatus.VERIFIED,
+                    authenticated_time,
+                    "reason-verified",
+                ),),
+            ),
+            verified_at=authenticated_time,
+            evidence_as_of=authenticated_time,
+        ),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=authenticated_time,
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(selected)
+    _write_empty_v2_noop_over_current_authority(
+        archive,
+        transaction_time=NOW - timedelta(minutes=2),
+    )
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["n" * 20]
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["cutoff"] == (
+        authenticated_time - archive_module._MAX_CLOCK_SKEW - timedelta(days=90)
+    ).isoformat()
+
+
+@pytest.mark.parametrize("corrupt_kind", ("malformed_json", "future_schema"))
+def test_archive_native_manifest_skips_one_bounded_corrupt_row_by_valid_projection(
+    tmp_path,
+    corrupt_kind,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    if corrupt_kind == "malformed_json":
+        corrupt = b'{"schema_version":2,"broken":}\n'
+    else:
+        future = json.loads(bucket.read_text(encoding="utf-8"))
+        future["event_id"] = "z" * 20
+        future["schema_version"] = 99
+        corrupt = json.dumps(future, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    with bucket.open("ab") as handle:
+        handle.write(corrupt)
+
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["a" * 20]
+    assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
+
+
+@pytest.mark.parametrize("corrupt_kind", ("malformed_json", "future_schema"))
+def test_archive_unmanifested_corrupt_only_bucket_is_skipped_without_new_authority(
+    tmp_path,
+    corrupt_kind,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    before_state = archive.state_path.read_bytes()
+    unmanifested = archive.archive_root / "2026-08-19.jsonl"
+    if corrupt_kind == "malformed_json":
+        payload = b'{"schema_version":2,"broken":}\n'
+    else:
+        valid_bucket = archive.archive_root / "2026-08-20.jsonl"
+        future = json.loads(valid_bucket.read_text(encoding="utf-8"))
+        future["event_id"] = "z" * 20
+        future["schema_version"] = 99
+        payload = json.dumps(future, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    unmanifested.write_bytes(payload)
+
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["a" * 20]
+    assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
+    assert archive.state_path.read_bytes() == before_state
+    state = json.loads(before_state)
+    assert "2026-08-19.jsonl" not in state["target_bucket_digests"]
+
+
+def test_archive_corrupt_only_first_bucket_does_not_create_v4_authority(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    corrupt_bucket = archive.archive_root / "2026-08-20.jsonl"
+    corrupt_bucket.write_bytes(b'{"schema_version":99}\n')
+
+    assert archive.query(days=90) == []
+    assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
+    assert not archive.state_path.exists()
+    assert not archive.index_path.exists()
+
+
+@pytest.mark.parametrize("authority_kind", ("v4_prepared", "v2_journal"))
+def test_archive_recovery_accepts_target_valid_projection_with_one_corrupt_row(
+    tmp_path,
+    monkeypatch,
+    authority_kind,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ),
+    )
+    prepared = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    target_name = prepared["target_index"]["b" * 20]
+    physical_rows = archive._read_bucket(target_name, archive._diagnostics())
+    target_rows = sorted(
+        physical_rows + prepared["rows"],
+        key=lambda row: row["event_id"],
+    )
+    target_payload = archive._bucket_payload(target_name, target_rows)
+    future = json.loads(json.dumps(target_rows[-1], ensure_ascii=False))
+    future["event_id"] = "z" * 20
+    future["schema_version"] = 99
+    corrupt = json.dumps(future, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    (archive.archive_root / target_name).write_bytes(target_payload + corrupt)
+    if authority_kind == "v2_journal":
+        _rewrite_pending_journal_as_v2(archive)
+
+    rows = archive.query(days=90)
+
+    assert {row["event_id"] for row in rows} == {"a" * 20, "b" * 20}
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 4
+    assert state["phase"] == "finalized"
+
+
+def test_archive_legacy_manifest_migration_skips_one_corrupt_row_by_v1_projection(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    native = json.loads(bucket.read_text(encoding="utf-8"))
+    legacy = _legacy_v1_row(native)
+    bucket.write_text(
+        json.dumps(legacy, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _downgrade_authority_to_legacy_state(archive, 1)
+    with bucket.open("ab") as handle:
+        handle.write(b'{"schema_version":99}\n')
+
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["a" * 20]
+    assert archive.last_diagnostics["skipped_corrupt_rows"] == 1
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 4
+    assert state["phase"] == "finalized"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"schema_version":2,"broken":}\n',
+        b'{"schema_version":99}\n',
+    ),
+)
+def test_archive_corrupt_row_node_budget_is_checked_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+    payload,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    name = "2026-08-20.jsonl"
+    (archive.archive_root / name).write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+    budget = {"bytes": len(payload), "rows": 1, "nodes": 0, "files": 1}
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive._read_bucket(
+            name,
+            archive._diagnostics(),
+            budget=budget,
+            fail_on_budget=True,
+            strict_rows=False,
+        )
+
+    assert parse_calls == 0
+    assert budget["rows"] == 0
+
+
+def test_archive_corrupt_row_cannot_turn_preflight_node_exhaustion_into_a_skip(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    name = "2026-08-20.jsonl"
+    payload = (
+        json.dumps(
+            {"schema_version": 99, "padding": list(range(32))},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    (archive.archive_root / name).write_bytes(payload)
+    budget = {"bytes": len(payload), "rows": 1, "nodes": 1, "files": 1}
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive._read_bucket(
+            name,
+            archive._diagnostics(),
+            budget=budget,
+            fail_on_budget=True,
+            strict_rows=True,
+            expected_digests={archive._payload_digest(b"")},
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'[{"rows":[]}]\n',
+        b'{"schema_version":4,"rows":{}}\n',
+        b'{"rows":[],"rows":[]}\n',
+    ),
+)
+def test_archive_malformed_state_rows_shape_is_rejected_before_zero_row_parse(
+    tmp_path,
+    monkeypatch,
+    payload,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    archive.state_path.write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+    budget = {"bytes": len(payload), "rows": 0, "nodes": 64, "files": 1}
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive._read_authority_state(NOW, budget=budget)
+
+    assert parse_calls == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'[{"rows":[]}]\n',
+        b'{"schema_version":2,"rows":{}}\n',
+        b'{"schema_version":2,"rows":[],"rows":[]}\n',
+    ),
+)
+def test_archive_malformed_journal_rows_shape_is_rejected_before_zero_row_parse(
+    tmp_path,
+    monkeypatch,
+    payload,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    archive.journal_path.write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+    budget = {"bytes": len(payload), "rows": 0, "nodes": 64, "files": 1}
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive._read_journal(
+            NOW,
+            archive._diagnostics(),
+            budget=budget,
+        )
+
+    assert parse_calls == 0
