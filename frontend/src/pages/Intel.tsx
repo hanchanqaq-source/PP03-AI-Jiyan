@@ -4,7 +4,7 @@ import { TrendingUp, FileText, Newspaper, Rss, RefreshCw, Loader2, ExternalLink,
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
-import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
+import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
 import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
@@ -87,7 +87,6 @@ function InvestmentNewsPanel() {
       });
       if (!terminal || cycle !== refreshCycleRef.current || controller.signal.aborted) return;
       if (terminal.phase !== "trusted_published") {
-        setErr(newsPipelineFailureMessage(terminal));
         return;
       }
       if (terminal.redacted_error === "radar_compatibility_failed") return;

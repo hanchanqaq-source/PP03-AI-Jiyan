@@ -489,15 +489,14 @@ function marketNewsError(): never {
   throw new ApiError("市场资讯响应无效", 502);
 }
 
-function assertMarketNewsDocumentBudget(value: unknown): void {
+export function validateMarketNewsDocumentBudget(value: unknown): void {
   const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
   const seen = new WeakSet<object>();
-  let nodes = 0;
+  let nodes = 1;
   let characters = 0;
   while (pending.length > 0) {
     const current = pending.pop()!;
-    nodes += 1;
-    if (nodes > MARKET_NEWS_MAX_DOCUMENT_NODES || current.depth > MARKET_NEWS_MAX_DOCUMENT_DEPTH) marketNewsError();
+    if (current.depth > MARKET_NEWS_MAX_DOCUMENT_DEPTH) marketNewsError();
     if (typeof current.value === "string") {
       characters += current.value.length;
       if (characters > MARKET_NEWS_MAX_DOCUMENT_CHARACTERS) marketNewsError();
@@ -507,13 +506,24 @@ function assertMarketNewsDocumentBudget(value: unknown): void {
     if (seen.has(current.value)) marketNewsError();
     seen.add(current.value);
     if (Array.isArray(current.value)) {
-      for (const item of current.value) pending.push({ value: item, depth: current.depth + 1 });
+      if (current.value.length > MARKET_NEWS_MAX_DOCUMENT_NODES - nodes) marketNewsError();
+      const childDepth = current.depth + 1;
+      if (current.value.length > 0 && childDepth > MARKET_NEWS_MAX_DOCUMENT_DEPTH) marketNewsError();
+      for (let index = 0; index < current.value.length; index += 1) {
+        nodes += 1;
+        pending.push({ value: current.value[index], depth: childDepth });
+      }
       continue;
     }
-    for (const [key, item] of Object.entries(current.value as Record<string, unknown>)) {
+    const record = current.value as Record<string, unknown>;
+    for (const key in record) {
+      if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
       characters += key.length;
       if (characters > MARKET_NEWS_MAX_DOCUMENT_CHARACTERS) marketNewsError();
-      pending.push({ value: item, depth: current.depth + 1 });
+      nodes += 1;
+      const childDepth = current.depth + 1;
+      if (nodes > MARKET_NEWS_MAX_DOCUMENT_NODES || childDepth > MARKET_NEWS_MAX_DOCUMENT_DEPTH) marketNewsError();
+      pending.push({ value: record[key], depth: childDepth });
     }
   }
 }
@@ -609,13 +619,15 @@ function marketNewsIpv6(hostname: string): number[] | null {
 }
 
 function marketNewsPrivateIpv4(octets: number[]): boolean {
-  const [a, b] = octets;
+  const [a, b, c] = octets;
   return a === 0 || a === 10 || a === 127 || a >= 224
     || (a === 100 && b >= 64 && b <= 127)
     || (a === 169 && b === 254)
     || (a === 172 && b >= 16 && b <= 31)
     || (a === 192 && (b === 0 || b === 168))
-    || (a === 198 && (b === 18 || b === 19));
+    || (a === 192 && b === 88 && c === 99)
+    || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100)))
+    || (a === 203 && b === 0 && c === 113);
 }
 
 function marketNewsNonPublicHost(hostname: string): boolean {
@@ -631,37 +643,62 @@ function marketNewsNonPublicHost(hostname: string): boolean {
   const loopback = words.slice(0, 7).every((word) => word === 0) && words[7] === 1;
   const uniqueLocal = (words[0] & 0xfe00) === 0xfc00;
   const linkLocal = (words[0] & 0xffc0) === 0xfe80;
+  const siteLocal = (words[0] & 0xffc0) === 0xfec0;
   const multicast = (words[0] & 0xff00) === 0xff00;
+  const discardOnly = words[0] === 0x0100 && words.slice(1, 4).every((word) => word === 0);
+  const ietfSpecial = words[0] === 0x2001 && words[1] <= 0x01ff;
+  const documentation = words[0] === 0x2001 && words[1] === 0x0db8;
+  const sixToFour = words[0] === 0x2002;
   const mappedV4 = words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff;
   const compatibleV4 = words.slice(0, 6).every((word) => word === 0);
   const embeddedV4 = mappedV4 || compatibleV4
     ? [(words[6] >> 8) & 0xff, words[6] & 0xff, (words[7] >> 8) & 0xff, words[7] & 0xff]
     : null;
-  return allZero || loopback || uniqueLocal || linkLocal || multicast
+  return allZero || loopback || uniqueLocal || linkLocal || siteLocal || multicast
+    || discardOnly || ietfSpecial || documentation || sixToFour
     || (embeddedV4 !== null && marketNewsPrivateIpv4(embeddedV4));
 }
 
-const MARKET_NEWS_SENSITIVE_QUERY_KEYS = new Set([
-  "key", "api_key", "apikey", "x-api-key", "token", "access_token", "refresh_token",
+const MARKET_NEWS_SENSITIVE_QUERY_KEY_PARTS = new Set([
+  "key", "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "authtoken", "idtoken",
   "auth", "authorization", "password", "passwd", "pwd", "code", "signature", "sig",
-  "secret", "client_secret", "credential", "cookie",
+  "secret", "clientsecret", "credential", "cookie", "session", "sessionid", "accesskey",
 ]);
-const MARKET_NEWS_SENSITIVE_QUERY_VALUE = /(?:^|[?&#;])(?:key|api[_-]?key|x-api-key|token|access[_-]?token|refresh[_-]?token|auth|authorization|password|passwd|pwd|code|signature|sig|secret|client[_-]?secret|credential|cookie)=/i;
+
+function marketNewsSensitiveQueryKey(key: string): boolean {
+  const parts = key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  for (let start = 0; start < parts.length; start += 1) {
+    let candidate = "";
+    for (let end = start; end < parts.length && end < start + 3; end += 1) {
+      candidate += parts[end];
+      if (MARKET_NEWS_SENSITIVE_QUERY_KEY_PARTS.has(candidate)) return true;
+    }
+  }
+  return false;
+}
+
+function marketNewsSensitiveAssignment(value: string): boolean {
+  const assignments = value.matchAll(/([A-Za-z0-9_.\-\[\]]{1,128})\s*=/g);
+  for (const match of assignments) {
+    if (marketNewsSensitiveQueryKey(match[1])) return true;
+  }
+  return false;
+}
 
 function marketNewsSensitiveQueryValue(value: string): boolean {
   let decoded = value;
-  for (let depth = 0; depth < 2; depth += 1) {
-    if (MARKET_NEWS_SENSITIVE_QUERY_VALUE.test(decoded)
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (marketNewsSensitiveAssignment(decoded)
       || /(?:^|[\s,;])(?:bearer|basic)\s+\S+/i.test(decoded)) return true;
     try {
       const next = decodeURIComponent(decoded);
       if (next === decoded) return false;
       decoded = next;
     } catch {
-      return false;
+      return true;
     }
   }
-  return MARKET_NEWS_SENSITIVE_QUERY_VALUE.test(decoded);
+  return marketNewsSensitiveAssignment(decoded);
 }
 
 function marketNewsPublicUrl(value: unknown): string {
@@ -676,9 +713,17 @@ function marketNewsPublicUrl(value: unknown): string {
     || !parsed.hostname || parsed.username || parsed.password || parsed.hash
     || marketNewsNonPublicHost(parsed.hostname)
     || [...parsed.searchParams].some(([key, queryValue]) => (
-      MARKET_NEWS_SENSITIVE_QUERY_KEYS.has(key.toLowerCase()) || marketNewsSensitiveQueryValue(queryValue)
+      marketNewsSensitiveQueryKey(key) || marketNewsSensitiveQueryValue(queryValue)
     ))) marketNewsError();
   return raw;
+}
+
+export function safeMarketNewsPublicUrl(value: unknown): string | null {
+  try {
+    return marketNewsPublicUrl(value);
+  } catch {
+    return null;
+  }
 }
 
 function marketNewsOptionalPublicUrl(value: unknown): string | null {
@@ -914,18 +959,25 @@ function validateMarketNewsSourceSummary(
   failedSources: number,
   cacheStatus: string,
   sourceState: MarketNewsResponse["source_summary"]["source_state"],
+  refreshFailed: boolean,
   sourceStatuses: MarketNewsResponse["source_summary"]["source_statuses"],
 ): void {
-  const exactAttempt = sourceStatuses.length === totalSources;
-  if (sourceState === "all_success" && (!exactAttempt || totalSources === 0 || failedSources !== 0 || cacheStatus !== "realtime")) marketNewsError();
-  if (sourceState === "partial_failure" && (!exactAttempt || failedSources <= 0 || failedSources >= totalSources
+  const observedFailures = sourceStatuses.filter((status) => status.status === "failed").length;
+  const observedSuccesses = sourceStatuses.length - observedFailures;
+  if (observedFailures > failedSources || observedSuccesses > totalSources - failedSources) marketNewsError();
+  if (refreshFailed && (cacheStatus === "realtime" || cacheStatus === "trusted" || cacheStatus === "pipeline_pending")) marketNewsError();
+  if (sourceState === "all_success" && (totalSources === 0 || sourceStatuses.length === 0
+    || failedSources !== 0 || cacheStatus !== "realtime" || refreshFailed)) marketNewsError();
+  if (sourceState === "partial_failure" && (failedSources <= 0 || failedSources >= totalSources
     || (cacheStatus !== "partial" && cacheStatus !== "cache"))) marketNewsError();
-  if (sourceState === "all_failed" && (!exactAttempt || totalSources === 0 || failedSources !== totalSources || cacheStatus !== "source_failure")) marketNewsError();
+  if (sourceState === "all_failed" && (cacheStatus !== "source_failure"
+    || (totalSources === 0 ? failedSources !== 0 || sourceStatuses.length !== 0 || !refreshFailed
+      : failedSources !== totalSources || sourceStatuses.length === 0))) marketNewsError();
   if (sourceState === "cached" && (failedSources !== 0 || cacheStatus !== "cache")) marketNewsError();
   if (sourceState === "stale_cache" && cacheStatus !== "stale") marketNewsError();
   if (sourceState === "empty" && (failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "empty")) marketNewsError();
-  if (sourceState === "pipeline_pending" && (totalSources !== 0 || failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "pipeline_pending")) marketNewsError();
-  if (sourceState === "trusted" && (failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "trusted")) marketNewsError();
+  if (sourceState === "pipeline_pending" && (totalSources !== 0 || failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "pipeline_pending" || refreshFailed)) marketNewsError();
+  if (sourceState === "trusted" && (failedSources !== 0 || sourceStatuses.length !== 0 || cacheStatus !== "trusted" || refreshFailed)) marketNewsError();
 }
 
 function shapeMarketNewsSourceStatus(value: unknown): MarketNewsResponse["source_summary"]["source_statuses"][number] {
@@ -967,7 +1019,7 @@ function shapeMarketNewsQuery(value: unknown): MarketNewsQuery {
 }
 
 function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
-  assertMarketNewsDocumentBudget(value);
+  validateMarketNewsDocumentBudget(value);
   const row = exactMarketNewsRecord(value, MARKET_NEWS_RESPONSE_KEYS);
   if (!Array.isArray(row.events) || row.events.length > MARKET_NEWS_MAX_EVENTS
     || !Array.isArray(row.focus_events) || row.focus_events.length > MARKET_NEWS_MAX_FOCUS_EVENTS) marketNewsError();
@@ -990,8 +1042,7 @@ function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
   const sourceStatuses = marketNewsArray(source.source_statuses, MARKET_NEWS_MAX_SOURCE_STATUSES, shapeMarketNewsSourceStatus);
   const totalSources = pipelineCount(source.total_sources);
   const failedSources = pipelineCount(source.failed_sources);
-  if (failedSources > totalSources || sourceStatuses.length > totalSources
-    || failedSources !== sourceStatuses.filter((status) => status.status === "failed").length
+  if (totalSources > MARKET_NEWS_MAX_SOURCE_STATUSES || failedSources > totalSources || sourceStatuses.length > totalSources
     || new Set(sourceStatuses.map((status) => status.source_id)).size !== sourceStatuses.length) marketNewsError();
   const filters = shapeMarketNewsQuery(row.filters);
   const options = exactMarketNewsRecord(row.filter_options, MARKET_NEWS_FILTER_OPTION_KEYS);
@@ -1025,7 +1076,9 @@ function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
   if (row.ai_status !== "available" && row.ai_status !== "unavailable") marketNewsError();
   const cacheStatus = marketNewsEnum(source.cache_status, MARKET_NEWS_DATA_STATUSES);
   const sourceState = marketNewsEnum(source.source_state, MARKET_NEWS_SOURCE_STATES) as MarketNewsResponse["source_summary"]["source_state"];
-  validateMarketNewsSourceSummary(totalSources, failedSources, cacheStatus, sourceState, sourceStatuses);
+  const refreshFailed = marketNewsBoolean(source.refresh_failed);
+  if (dataStatus !== "trusted" && cacheStatus !== dataStatus) marketNewsError();
+  validateMarketNewsSourceSummary(totalSources, failedSources, cacheStatus, sourceState, refreshFailed, sourceStatuses);
 
   return {
     events,
@@ -1042,7 +1095,7 @@ function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
       failed_sources: failedSources,
       cache_status: cacheStatus,
       source_state: sourceState,
-      refresh_failed: marketNewsBoolean(source.refresh_failed),
+      refresh_failed: refreshFailed,
       source_statuses: sourceStatuses,
     },
     portfolio_status: marketNewsEnum(row.portfolio_status, MARKET_NEWS_PORTFOLIO_STATES) as MarketNewsResponse["portfolio_status"],
@@ -1061,7 +1114,7 @@ function shapeMarketNewsRetryResult(value: unknown, requestedSourceId: string): 
     if (response.source_summary.source_statuses.filter((status) => status.source_id === requestedSourceId).length !== 1) marketNewsError();
     return response;
   }
-  assertMarketNewsDocumentBudget(value);
+  validateMarketNewsDocumentBudget(value);
   const row = exactMarketNewsRecord(value, new Set(["retry_succeeded", "source_status"]));
   if (row.retry_succeeded !== false) marketNewsError();
   const sourceStatus = shapeMarketNewsSourceStatus(row.source_status);

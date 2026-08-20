@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
+import * as apiModule from "@/lib/api";
 import { MarketNews } from "@/pages/MarketNews";
 import type { MarketNewsResponse, NewsPipelineStatusData } from "@/features/market-news/types";
 import { directEvent, marketNewsResponse } from "./fixtures";
@@ -297,17 +298,146 @@ describe("MarketNews trusted evidence admission", () => {
 
   it.each([
     "http://127.0.0.1/internal",
+    "http://0.0.0.0/internal",
     "http://10.2.3.4/internal",
+    "http://172.16.0.1/internal",
+    "http://192.168.0.1/internal",
+    "http://100.64.0.1/internal",
+    "http://169.254.1.1/internal",
+    "http://192.0.2.1/internal",
     "http://[::1]/internal",
+    "http://198.51.100.42/internal",
+    "http://203.0.113.8/internal",
+    "http://224.0.0.1/internal",
+    "http://240.0.0.1/internal",
+    "http://[::]/internal",
+    "http://[fc00::1]/internal",
+    "http://[fe80::1]/internal",
+    "http://[fec0::1]/internal",
+    "http://[2001:db8::1]/internal",
+    "http://[ff02::1]/internal",
+    "http://[::ffff:10.2.3.4]/internal",
+    "http://[::ffff:198.51.100.42]/internal",
+    "https://localhost/private",
     "https://feed.local/private",
+    "https://user:password@public.example.org/feed",
     "https://public.example.org/feed?token=secret",
+    "https://public.example.org/feed?access-key=secret",
+    "https://public.example.org/feed?accessToken=secret",
+    "https://public.example.org/feed?auth_token=secret",
+    "https://public.example.org/feed?id_token=secret",
+    "https://public.example.org/feed?api-key=secret",
+    "https://public.example.org/feed?client-secret=secret",
+    "https://public.example.org/feed?session=secret",
+    "https://public.example.org/feed?user%5Baccess_key%5D=secret",
     "https://public.example.org/feed?redirect=https%3A%2F%2Fpublic.example.org%2Fcallback%3Ftoken%3Dsecret",
+    "https://public.example.org/feed?redirect=https%253A%252F%252Fpublic.example.org%252Fcallback%253Faccess-key%253Dsecret",
     "https://public.example.org/feed#credential",
-  ])("rejects a non-public or credential-bearing market-news URL: %s", async (unsafeUrl) => {
+  ])("rejects a non-public or credential-bearing market-news URL through GET and retry: %s", async (unsafeUrl) => {
     const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
     const payload = structuredClone(marketNewsResponse) as any;
     payload.events[0].original_links[0] = unsafeUrl;
     payload.focus_events = [structuredClone(payload.events[0])];
+    payload.source_summary.source_statuses = [{
+      source_id: "0123456789abcdef",
+      source_name: "来源一",
+      source_url: "https://public.example.org/feed",
+      status: "ok",
+      error_type: null,
+      error_reason: null,
+      last_success_at: null,
+      used_cached_items: false,
+      item_count: 1,
+    }];
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })));
+
+    const [getResult, retryResult] = await Promise.allSettled([
+      api.marketNewsEvents(query),
+      api.marketNewsRetrySource("0123456789abcdef", query),
+    ]);
+    expect(getResult).toMatchObject({ status: "rejected", reason: { status: 502 } });
+    expect(retryResult).toMatchObject({ status: "rejected", reason: { status: 502 } });
+  });
+
+  it("accepts a partial source observation without pretending it covers the full configured catalog", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.data_status = "partial";
+    payload.source_summary = {
+      total_sources: 4,
+      failed_sources: 2,
+      cache_status: "partial",
+      source_state: "partial_failure",
+      refresh_failed: false,
+      source_statuses: [{
+        source_id: "0123456789abcdef",
+        source_name: "已观测失败来源",
+        source_url: "https://one.example.org/feed",
+        status: "failed",
+        error_type: "timeout",
+        error_reason: "连接超时",
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 0,
+      }, {
+        source_id: "fedcba9876543210",
+        source_name: "已观测成功来源",
+        source_url: "https://two.example.org/feed",
+        status: "ok",
+        error_type: null,
+        error_reason: null,
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 1,
+      }],
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).resolves.toMatchObject({
+      source_summary: { total_sources: 4, failed_sources: 2, source_statuses: [{ status: "failed" }, { status: "ok" }] },
+    });
+  });
+
+  it("rejects total_sources beyond the product cap even when no source rows are emitted", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.source_summary.total_sources = 513;
+    payload.source_summary.source_statuses = [];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+  });
+
+  it("rejects refresh_failed paired with an all-success realtime aggregate", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    payload.source_summary = {
+      total_sources: 1,
+      failed_sources: 0,
+      cache_status: "realtime",
+      source_state: "all_success",
+      refresh_failed: true,
+      source_statuses: [{
+        source_id: "0123456789abcdef",
+        source_name: "来源一",
+        source_url: "https://one.example.org/feed",
+        status: "ok",
+        error_type: null,
+        error_reason: null,
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 1,
+      }],
+    };
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: payload }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -354,6 +484,17 @@ describe("MarketNews trusted evidence admission", () => {
     ["source state", (payload: any) => {
       payload.source_summary.source_state = "all_success";
       payload.source_summary.cache_status = "realtime";
+      payload.source_summary.source_statuses = [{
+        source_id: "0123456789abcdef",
+        source_name: "来源一",
+        source_url: "https://one.example.org/feed",
+        status: "ok",
+        error_type: null,
+        error_reason: null,
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 1,
+      }];
     }],
     ["impact facts", (payload: any) => {
       payload.impact_summary = {
@@ -481,6 +622,23 @@ describe("MarketNews trusted evidence admission", () => {
     await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
   });
 
+  it("rejects an over-budget child array before bulk-enqueuing values beyond the node cap", async () => {
+    const overBudget = new Proxy(Array.from({ length: 50_001 }, () => null), {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) throw new Error("bulk traversal attempted before enforcing node cap");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const validateDocument = (apiModule as Record<string, unknown>).validateMarketNewsDocumentBudget as ((value: unknown) => void) | undefined;
+    let thrown: unknown;
+    try {
+      validateDocument!(overBudget);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ status: 502 });
+  });
+
   it("bounds cumulative text across the whole market-news document", async () => {
     const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
     const payload = structuredClone(marketNewsResponse) as any;
@@ -526,5 +684,45 @@ describe("MarketNews trusted evidence admission", () => {
     render(<MarketNews />);
 
     expect(await screen.findByText("状态：可信资讯快照")).toBeInTheDocument();
+  });
+
+  it("keeps stale-cache aggregate facts unchanged when a failed source retry remains failed", async () => {
+    const user = userEvent.setup();
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const failedStatus = {
+      source_id: "0123456789abcdef",
+      source_name: "失败来源",
+      source_url: "https://public.example.org/feed",
+      status: "failed" as const,
+      error_type: "timeout" as const,
+      error_reason: "连接超时",
+      last_success_at: null,
+      used_cached_items: true,
+      item_count: 0,
+    };
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({
+      ...marketNewsResponse,
+      filters: query,
+      source_summary: {
+        total_sources: 108,
+        failed_sources: 1,
+        cache_status: "stale",
+        source_state: "stale_cache",
+        refresh_failed: true,
+        source_statuses: [failedStatus],
+      },
+    });
+    vi.spyOn(api, "marketNewsRetrySource").mockResolvedValue({
+      retry_succeeded: false,
+      source_status: { ...failedStatus, error_reason: "重试仍然超时" },
+    });
+    render(<MarketNews />);
+
+    expect(await screen.findByText("来源：使用过期缓存")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "1 个来源失败，查看详情" }));
+    await user.click(screen.getByRole("button", { name: "重试来源 失败来源" }));
+    expect(await screen.findByText("该来源重试失败，请稍后再试。")).toBeInTheDocument();
+    expect(screen.getByText("来源：使用过期缓存")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "1 个来源失败，查看详情" })).toBeInTheDocument();
   });
 });

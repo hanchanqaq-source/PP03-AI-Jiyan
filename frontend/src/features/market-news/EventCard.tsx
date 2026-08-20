@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Building2, Clock3, ExternalLink, Languages, Layers3, Link2, Newspaper } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { safeMarketNewsPublicUrl } from "@/lib/api";
 import type { MarketNewsEvent } from "./types";
 
 const RELATION = {
@@ -27,7 +28,9 @@ function shortDateTime(value: string | null) {
 
 export function EventCard({ event, onOpenDetails, onViewEvidence }: { event: MarketNewsEvent; onOpenDetails: (event: MarketNewsEvent) => void; onViewEvidence?: (event: MarketNewsEvent) => void }) {
   const relation = RELATION[event.relation_level];
-  const originalUrl = event.original_links[0] || event.sources[0]?.original_url || "";
+  const originalUrl = [...event.original_links, ...event.sources.map((source) => source.original_url)]
+    .map(safeMarketNewsPublicUrl)
+    .find((url): url is string => url !== null) || "";
   const hasTranslation = event.translation_status === "translated" && Boolean(event.translated_title_zh);
   const [language, setLanguage] = useState<"zh" | "original">(hasTranslation ? "zh" : "original");
   useEffect(() => {

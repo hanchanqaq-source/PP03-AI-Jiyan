@@ -179,4 +179,26 @@ describe("legacy Intel investment-news pipeline compatibility", () => {
     expect(screen.getByText("上一份可信雷达资讯")).toBeInTheDocument();
     expect(radar).toHaveBeenCalledTimes(initialReads);
   });
+
+  it("announces a failed pipeline through exactly one live alert while retaining old radar data", async () => {
+    const user = userEvent.setup();
+    const radar = vi.spyOn(api, "radar").mockResolvedValue(oldRadar);
+    vi.spyOn(api, "radarRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue({
+      ...status("verifying"),
+      phase: "failed",
+      redacted_error: "verification_failed",
+    });
+    render(<Intel />);
+    await screen.findByText("上一份可信雷达资讯");
+    const initialReads = radar.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toHaveTextContent("确定性核验失败；继续显示上一份可信快照。");
+    expect(screen.getByText("上一份可信雷达资讯")).toBeInTheDocument();
+    expect(radar).toHaveBeenCalledTimes(initialReads);
+  });
 });

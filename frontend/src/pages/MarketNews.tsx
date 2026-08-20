@@ -432,18 +432,16 @@ export function MarketNews() {
     const current = responseCacheRef.current.get(retryQueryKey);
     if (!current || current.snapshot_id !== retrySnapshotId) return;
     if (!("events" in result)) {
-      if (current.source_summary.source_statuses.filter((source) => source.source_id === sourceId).length !== 1
+      const previousSources = current.source_summary.source_statuses.filter((source) => source.source_id === sourceId);
+      if (previousSources.length !== 1 || previousSources[0].status !== "failed"
         || result.source_status.source_id !== sourceId) throw new Error("market-news retry source mismatch");
       const sourceStatuses = current.source_summary.source_statuses.map((source) => (
         source.source_id === sourceId ? result.source_status : source
       ));
-      const failedSources = sourceStatuses.filter((source) => source.status === "failed").length;
       const updated: MarketNewsResponse = {
         ...current,
         source_summary: {
           ...current.source_summary,
-          failed_sources: failedSources,
-          source_state: failedSources >= current.source_summary.total_sources ? "all_failed" : "partial_failure",
           source_statuses: sourceStatuses,
         },
       };

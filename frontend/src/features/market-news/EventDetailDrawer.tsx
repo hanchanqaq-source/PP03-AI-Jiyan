@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Languages, X } from "lucide-react";
+import { safeMarketNewsPublicUrl } from "@/lib/api";
 import type { MarketNewsEvent } from "./types";
 
 function dateTime(value: string | null) {
@@ -58,11 +59,14 @@ export function EventDetailDrawer({ open, event, onClose }: { open: boolean; eve
         <div className="flex-1 space-y-4 overflow-y-auto p-5">
           <Section title="事件摘要"><p className="text-sm leading-6 text-muted-foreground">{displaySummary}</p>{event.translation_status === "unavailable" && <p className="mt-2 text-xs text-warning">中文翻译暂不可用</p>}</Section>
           <Section title={`全部公开来源（${event.source_count}）`}>
-            <div className="space-y-2">{event.sources.map((source) => <div key={`${source.source_name}-${source.original_url}`} className="rounded-xl border border-border/50 p-3 text-xs">
-              <div className="flex flex-wrap items-center gap-2 text-muted-foreground"><strong className="text-foreground">{source.source_name}</strong><span>{dateTime(source.published_at)}</span><span>{source.data_status === "stale" ? "过期缓存" : "公开来源"}</span></div>
-              <p className="mt-2 font-medium">{source.title}</p><p className="mt-1 line-clamp-2 text-muted-foreground">{source.summary_or_excerpt || "来源未提供摘要"}</p>
-              {source.original_url && <a href={source.original_url} target="_blank" rel="noreferrer" aria-label={`打开原始来源 ${source.source_name}`} className="mt-2 inline-flex items-center gap-1 text-primary hover:underline">打开原始来源<ExternalLink className="h-3 w-3" /></a>}
-            </div>)}</div>
+            <div className="space-y-2">{event.sources.map((source) => {
+              const originalUrl = safeMarketNewsPublicUrl(source.original_url);
+              return <div key={`${source.source_name}-${source.original_url}`} className="rounded-xl border border-border/50 p-3 text-xs">
+                <div className="flex flex-wrap items-center gap-2 text-muted-foreground"><strong className="text-foreground">{source.source_name}</strong><span>{dateTime(source.published_at)}</span><span>{source.data_status === "stale" ? "过期缓存" : "公开来源"}</span></div>
+                <p className="mt-2 font-medium">{source.title}</p><p className="mt-1 line-clamp-2 text-muted-foreground">{source.summary_or_excerpt || "来源未提供摘要"}</p>
+                {originalUrl && <a href={originalUrl} target="_blank" rel="noreferrer" aria-label={`打开原始来源 ${source.source_name}`} className="mt-2 inline-flex items-center gap-1 text-primary hover:underline">打开原始来源<ExternalLink className="h-3 w-3" /></a>}
+              </div>;
+            })}</div>
           </Section>
 
           <Section title="关联对象">
@@ -74,16 +78,19 @@ export function EventDetailDrawer({ open, event, onClose }: { open: boolean; eve
           </Section>
 
           <Section title="关联证据链">
-            {event.relation_evidence.length ? <div className="space-y-2">{event.relation_evidence.map((evidence, index) => <div key={`${evidence.matched_kind}-${evidence.matched_value}-${index}`} className="rounded-xl border border-border/50 p-3 text-xs leading-5">
-              {evidence.fund_name && <p>基金：{evidence.fund_name}（{evidence.fund_code}）</p>}
-              {evidence.stock_name && <p>重仓公司：{evidence.stock_name}（{evidence.stock_code}）</p>}
-              {evidence.holding_disclosure_date && <p>持仓披露日期：{evidence.holding_disclosure_date}</p>}
-              {evidence.industry_classification && <p>行业分类：{evidence.industry_classification}</p>}
-              {evidence.classification_standard && <p>分类标准：{evidence.classification_standard}</p>}
-              <p>匹配依据：{evidence.matched_value}</p>
-              {evidence.source_name && <p className="text-muted-foreground">依据来源：{evidence.source_name}</p>}
-              {evidence.source_reference && <a href={evidence.source_reference} target="_blank" rel="noreferrer" className="text-primary hover:underline">查看关联依据</a>}
-            </div>)}</div> : <p className="text-sm text-muted-foreground">当前仅有普通资讯信号，没有持仓证据链。</p>}
+            {event.relation_evidence.length ? <div className="space-y-2">{event.relation_evidence.map((evidence, index) => {
+              const sourceReference = safeMarketNewsPublicUrl(evidence.source_reference);
+              return <div key={`${evidence.matched_kind}-${evidence.matched_value}-${index}`} className="rounded-xl border border-border/50 p-3 text-xs leading-5">
+                {evidence.fund_name && <p>基金：{evidence.fund_name}（{evidence.fund_code}）</p>}
+                {evidence.stock_name && <p>重仓公司：{evidence.stock_name}（{evidence.stock_code}）</p>}
+                {evidence.holding_disclosure_date && <p>持仓披露日期：{evidence.holding_disclosure_date}</p>}
+                {evidence.industry_classification && <p>行业分类：{evidence.industry_classification}</p>}
+                {evidence.classification_standard && <p>分类标准：{evidence.classification_standard}</p>}
+                <p>匹配依据：{evidence.matched_value}</p>
+                {evidence.source_name && <p className="text-muted-foreground">依据来源：{evidence.source_name}</p>}
+                {sourceReference && <a href={sourceReference} target="_blank" rel="noreferrer" className="text-primary hover:underline">查看关联依据</a>}
+              </div>;
+            })}</div> : <p className="text-sm text-muted-foreground">当前仅有普通资讯信号，没有持仓证据链。</p>}
           </Section>
 
           <Section title="影响判断与证据缺口">
