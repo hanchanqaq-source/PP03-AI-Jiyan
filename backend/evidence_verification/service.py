@@ -12,7 +12,7 @@ import re
 import socket
 import threading
 from types import SimpleNamespace
-from typing import Callable
+from typing import Callable, Protocol
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -21,6 +21,7 @@ from news_intelligence.clustering import cluster_items
 from news_intelligence.normalizer import normalize_radar, normalize_title
 from news_pipeline.models import RawSnapshot
 
+from .archive import EvidenceArchive
 from .models import EvidenceItem, EvidenceSnapshot, FieldVerificationStatus, SourceRole, VerificationStatus
 from .source_identity import OFFICIAL_PUBLISHERS, canonicalize_public_url, identify_evidence, official_content_source
 from .storage import EvidenceStorage, field_document, trusted_event_text
@@ -33,6 +34,10 @@ class PublicDocument:
     title: str
     excerpt: str
     published_at: datetime | None
+
+
+class EvidenceArchiveWriter(Protocol):
+    def upsert(self, snapshot: EvidenceSnapshot) -> None: ...
 
 
 class _TextExtractor(HTMLParser):
@@ -225,12 +230,14 @@ class EvidenceVerificationService:
         self,
         *,
         storage: EvidenceStorage | None = None,
+        archive: EvidenceArchiveWriter | None = None,
         event_loader: Callable[[], list] | None = None,
         document_fetcher: Callable[[str], PublicDocument] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.storage = storage or EvidenceStorage(now=self._now)
+        self.archive = archive if archive is not None else EvidenceArchive(self.storage.root, now=self._now)
         self._event_loader = event_loader
         self._document_fetcher = document_fetcher or fetch_public_document
 
@@ -313,6 +320,7 @@ class EvidenceVerificationService:
         )
 
     def publish_snapshot(self, snapshot: EvidenceSnapshot) -> None:
+        self.archive.upsert(snapshot)
         self.storage.publish(snapshot)
 
     def refresh(self) -> EvidenceSnapshot:
@@ -324,7 +332,7 @@ class EvidenceVerificationService:
                 raw_snapshot_id=None,
                 require_nonempty=True,
             )
-            self.storage.publish(snapshot)
+            self.publish_snapshot(snapshot)
             return snapshot
         except Exception as error:
             try:

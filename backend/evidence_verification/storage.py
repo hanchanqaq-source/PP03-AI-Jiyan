@@ -630,6 +630,7 @@ class EvidenceStorage:
         self.current_path = self.root / "current.json"
         self.last_refresh_path = self.root / "last-refresh.json"
         self.history_root = self.root / "history"
+        self.archive_root = self.root / "archive"
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def _inside_root(self, path: Path) -> bool:

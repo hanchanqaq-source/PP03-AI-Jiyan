@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from evidence_verification.models import VerificationStatus
+from evidence_verification.archive import EvidenceArchive
 from evidence_verification.service import EvidenceVerificationService, PublicDocument
 from evidence_verification.storage import EvidenceStorage
 from news_intelligence.models import NewsSourceItem
@@ -190,3 +191,49 @@ def test_refresh_rejects_empty_upstream_instead_of_erasing_trusted_events(tmp_pa
         empty.refresh()
 
     assert empty.get_event("a" * 20).verification_status == VerificationStatus.VERIFIED
+
+
+def test_refresh_archives_the_same_evidence_and_raw_snapshot_identity(tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    archive = EvidenceArchive(storage.root, now=lambda: NOW)
+    service = EvidenceVerificationService(
+        storage=storage,
+        archive=archive,
+        event_loader=lambda: [event("a" * 20, [official_source()])],
+        now=lambda: NOW,
+    )
+
+    refreshed = service.refresh()
+
+    archived = archive.get("a" * 20)
+    assert archived["evidence_snapshot_id"] == refreshed.snapshot_id
+    assert archived["raw_snapshot_id"] == refreshed.raw_snapshot_id
+    assert storage.load_current() == refreshed
+
+
+def test_archive_failure_does_not_replace_previous_current_evidence_snapshot(tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    previous = EvidenceVerificationService(
+        storage=storage,
+        archive=EvidenceArchive(storage.root, now=lambda: NOW),
+        event_loader=lambda: [event("a" * 20, [official_source()])],
+        now=lambda: NOW,
+    ).refresh()
+    before = storage.current_path.read_bytes()
+
+    class FailingArchive:
+        def upsert(self, _snapshot):
+            raise OSError("storage_error")
+
+    failing = EvidenceVerificationService(
+        storage=storage,
+        archive=FailingArchive(),
+        event_loader=lambda: [event("b" * 20, [official_source()])],
+        now=lambda: NOW.replace(hour=13),
+    )
+
+    with pytest.raises(OSError, match="storage_error"):
+        failing.refresh()
+
+    assert storage.current_path.read_bytes() == before
+    assert storage.load_current() == previous
