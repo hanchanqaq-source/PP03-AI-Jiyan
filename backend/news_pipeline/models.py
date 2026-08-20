@@ -48,6 +48,11 @@ class RawSnapshot:
     raw_snapshot_id: str
     collected_at: datetime
     items: tuple[dict[str, Any], ...]
+    source_statuses: tuple[dict[str, Any], ...] = ()
+    total_source_count: int = 0
+    failed_source_count: int = 0
+    cache_status: str = "unknown"
+    source_state: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

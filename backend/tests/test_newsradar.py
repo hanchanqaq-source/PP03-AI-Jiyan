@@ -793,6 +793,59 @@ def test_retry_without_cache_does_not_invent_success_for_unfetched_sources(tmp_p
     assert statuses[urls[1]]["error_reason"] == "暂无成功缓存，本次单源重试未抓取该来源"
 
 
+@pytest.mark.parametrize(
+    ("source_state", "statuses", "expected_success", "expected_attempted", "expected_failed"),
+    [
+        (
+            "stale_cache",
+            [
+                {"source_id": "one", "status": "failed"},
+                {"source_id": "two", "status": "failed"},
+            ],
+            False,
+            2,
+            2,
+        ),
+        (
+            "all_success",
+            [{"source_id": "one", "status": "ok"}],
+            True,
+            1,
+            0,
+        ),
+    ],
+)
+def test_collect_radar_exposes_current_attempt_outcome_without_using_cached_items(
+    monkeypatch,
+    source_state,
+    statuses,
+    expected_success,
+    expected_attempted,
+    expected_failed,
+):
+    radar = {
+        "generated_at": "2026-08-20T09:00:00+00:00",
+        "recent_days": 7,
+        "industries": [],
+        "stats": {
+            "industries": 0,
+            "total_sources": len(statuses),
+            "failed_sources": expected_failed,
+        },
+        "cache_status": "stale" if source_state == "stale_cache" else "realtime",
+        "source_state": source_state,
+        "source_statuses": statuses,
+    }
+    monkeypatch.setattr(newsradar, "_collect_radar_data", lambda: radar)
+
+    result = newsradar.collect_radar()
+
+    assert result.current_attempt_success is expected_success
+    assert result.attempted_source_count == expected_attempted
+    assert result.failed_source_count == expected_failed
+    assert result.raw_events == ()
+
+
 def test_retry_source_rejects_unknown_id_and_failed_retry_preserves_cache_bytes(tmp_path, monkeypatch):
     sources = tmp_path / "sources.json"
     cache = tmp_path / "radar.json"

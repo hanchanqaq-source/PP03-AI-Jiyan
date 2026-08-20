@@ -76,10 +76,15 @@ async def _lifespan(_app: FastAPI):
             pass
         yield
     finally:
-        if pipeline_service is not None:
-            pipeline_service.close()
-        if health_service is not None:
-            health_service.shutdown()
+        try:
+            if pipeline_service is not None:
+                pipeline_service.close()
+        finally:
+            try:
+                news_pipeline_service.reset_service()
+            finally:
+                if health_service is not None:
+                    health_service.shutdown()
 
 
 app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
@@ -759,6 +764,8 @@ def _market_news_payload(
         )}
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
+    except (OSError, RuntimeError) as error:
+        raise HTTPException(503, "可信资讯暂时不可用") from error
 
 
 @app.get("/api/market-news/events")

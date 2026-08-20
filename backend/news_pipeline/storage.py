@@ -39,6 +39,11 @@ _NEXT = {
 }
 _MAX_BYTES, _MAX_DEPTH, _MAX_ENTRIES, _MAX_TEXT, _MAX_INT = 1_048_576, 16, 5_000, 8_192, 1_000_000_000
 _RUN_KEYS = {"schema_version", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id", "phase", "counts", "created_at", "updated_at", "redacted_error", "displayed_trusted_snapshot_id"}
+_RAW_V1_KEYS = {"schema_version", "raw_snapshot_id", "collected_at", "items"}
+_RAW_V2_KEYS = {
+    "schema_version", "raw_snapshot_id", "collected_at", "items", "source_statuses",
+    "total_source_count", "failed_source_count", "cache_status", "source_state",
+}
 _GENERATION_KEYS = {"schema_version", "generation"}
 _POINTER_KEYS = {"schema_version", "generation", "raw_snapshot_id", "trusted_digest"}
 _TRUSTED_KEYS = {"schema_version", "pointer_generation", "raw_snapshot_id", "published_at", "events"}
@@ -83,6 +88,12 @@ _SOURCE_KEYS = {
     "source_name", "source_url", "original_url", "published_at", "fetched_at",
     "title", "summary_or_excerpt", "language", "region", "data_status",
 }
+_SOURCE_STATUS_KEYS = {
+    "source_id", "source_name", "source_url", "status", "error_type",
+    "error_reason", "last_success_at", "used_cached_items", "item_count",
+}
+_CACHE_STATUSES = {"unknown", "realtime", "partial", "cache", "stale", "source_failure", "empty"}
+_SOURCE_STATES = {"unknown", "all_success", "partial_failure", "cached", "stale_cache", "all_failed", "empty"}
 _MARKET_EVENT_KEYS = {
     "event_id", "title", "summary", "summary_status", "category",
     "published_at_first", "published_at_latest", "sources", "source_count",
@@ -336,6 +347,33 @@ def _validate_raw_items(value: object) -> list[dict[str, object]]:
         else:
             result.append(_validate_market_event(item, trusted=False))
     return result
+
+
+def _validate_source_statuses(value: object) -> list[dict[str, object]]:
+    if type(value) is not list or len(value) > _MAX_ENTRIES:
+        raise ValueError("source statuses must be a list")
+    result: list[dict[str, object]] = []
+    for value_row in value:
+        row = _row(value_row, _SOURCE_STATUS_KEYS, "source status")
+        for key in ("source_id", "source_name", "source_url"):
+            _text(row[key], f"source status {key}")
+        if row["status"] not in {"ok", "failed"}:
+            raise ValueError("invalid source status")
+        for key in ("error_type", "error_reason", "last_success_at"):
+            _nullable_text(row[key], f"source status {key}")
+        if type(row["used_cached_items"]) is not bool:
+            raise ValueError("invalid source status cache flag")
+        if type(row["item_count"]) is not int or not 0 <= row["item_count"] <= _MAX_INT:
+            raise ValueError("invalid source status item count")
+        result.append(row)
+    return result
+
+
+def canonical_source_statuses(value: object) -> tuple[dict[str, object], ...]:
+    """Return the exact durable source-status shape accepted by raw storage."""
+    if type(value) is not tuple:
+        raise ValueError("source statuses must be a tuple")
+    return tuple(_validate_source_statuses(_bounded(list(value))))
 
 
 def _validate_trusted_events(value: object) -> list[dict[str, object]]:
@@ -794,8 +832,12 @@ class NewsPipelineStorage:
         return self.runs_root / f"{_id(run_id, 'run_id')}.json"
 
     @staticmethod
-    def _schema(document: dict[str, object], keys: set[str]) -> None:
-        if set(document) != keys or type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+    def _schema(document: dict[str, object], keys: set[str], *, version: int = 1) -> None:
+        if (
+            set(document) != keys
+            or type(document.get("schema_version")) is not int
+            or document["schema_version"] != version
+        ):
             raise ValueError("invalid pipeline schema")
 
     def _load_generation(self) -> int | None:
@@ -965,7 +1007,26 @@ class NewsPipelineStorage:
         if not isinstance(snapshot.collected_at, datetime) or snapshot.collected_at.tzinfo is None or snapshot.collected_at.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError("collected_at must be aware UTC")
         items = _validate_raw_items(_bounded(list(snapshot.items)))
-        document: dict[str, object] = {"schema_version": 1, "raw_snapshot_id": raw_id, "collected_at": snapshot.collected_at.isoformat(), "items": items}
+        source_statuses = _validate_source_statuses(_bounded(list(snapshot.source_statuses)))
+        if (
+            type(snapshot.total_source_count) is not int
+            or type(snapshot.failed_source_count) is not int
+            or not 0 <= snapshot.failed_source_count <= snapshot.total_source_count <= _MAX_INT
+        ):
+            raise ValueError("invalid raw source counts")
+        if snapshot.cache_status not in _CACHE_STATUSES or snapshot.source_state not in _SOURCE_STATES:
+            raise ValueError("invalid raw source state")
+        document: dict[str, object] = {
+            "schema_version": 2,
+            "raw_snapshot_id": raw_id,
+            "collected_at": snapshot.collected_at.isoformat(),
+            "items": items,
+            "source_statuses": source_statuses,
+            "total_source_count": snapshot.total_source_count,
+            "failed_source_count": snapshot.failed_source_count,
+            "cache_status": snapshot.cache_status,
+            "source_state": snapshot.source_state,
+        }
         with CACHE_IO_LOCK, self._process_lock():
             self._require_writer()
             path = self._path(self.raw_root, raw_id)
@@ -982,11 +1043,44 @@ class NewsPipelineStorage:
         try:
             if document is None:
                 return None
-            self._schema(document, {"schema_version", "raw_snapshot_id", "collected_at", "items"})
+            version = document.get("schema_version")
+            if version == 1:
+                self._schema(document, _RAW_V1_KEYS)
+            elif version == 2:
+                self._schema(document, _RAW_V2_KEYS, version=2)
+            else:
+                return None
             identity, items = _id(document["raw_snapshot_id"], "raw_snapshot_id"), document["items"]
             if identity != raw_id:
                 return None
-            return RawSnapshot(identity, _timestamp(document["collected_at"]), tuple(_validate_raw_items(items)))
+            if version == 1:
+                return RawSnapshot(
+                    identity,
+                    _timestamp(document["collected_at"]),
+                    tuple(_validate_raw_items(items)),
+                )
+            total_source_count = document["total_source_count"]
+            failed_source_count = document["failed_source_count"]
+            cache_status = document["cache_status"]
+            source_state = document["source_state"]
+            if (
+                type(total_source_count) is not int
+                or type(failed_source_count) is not int
+                or not 0 <= failed_source_count <= total_source_count <= _MAX_INT
+                or cache_status not in _CACHE_STATUSES
+                or source_state not in _SOURCE_STATES
+            ):
+                return None
+            return RawSnapshot(
+                identity,
+                _timestamp(document["collected_at"]),
+                tuple(_validate_raw_items(items)),
+                tuple(_validate_source_statuses(document["source_statuses"])),
+                total_source_count,
+                failed_source_count,
+                cache_status,
+                source_state,
+            )
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -1365,6 +1459,32 @@ class NewsPipelineStorage:
     def load_run(self, run_id: str) -> PipelineRun | None:
         with CACHE_IO_LOCK, self._process_lock():
             return self._load_run(_id(run_id, "run_id"))
+
+    def load_latest_run(self) -> PipelineRun | None:
+        """Load the newest durable run using updated time and run ID as a stable tie."""
+        with CACHE_IO_LOCK, self._process_lock():
+            if not self.runs_root.exists():
+                return None
+            try:
+                self._verify_directory_chain(self.runs_root)
+                paths = sorted(
+                    Path(entry.path)
+                    for entry in os.scandir(self.runs_root)
+                    if entry.name.endswith(".json")
+                    and entry.is_file(follow_symlinks=False)
+                    and _single_link(entry.stat(follow_symlinks=False))
+                )
+            except OSError:
+                raise OSError("storage_corrupt") from None
+            runs: list[PipelineRun] = []
+            for path in paths:
+                try:
+                    run = self._load_run(_id(path.stem, "run_id"))
+                except ValueError:
+                    continue
+                if run is not None:
+                    runs.append(run)
+            return max(runs, key=lambda run: (run.updated_at, run.run_id), default=None)
 
     def recover_incomplete_runs(self) -> int:
         interrupted = 0

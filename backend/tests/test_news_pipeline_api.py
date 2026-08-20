@@ -90,3 +90,68 @@ def test_pipeline_status_returns_selected_run_and_displayed_trusted(monkeypatch)
     assert response.json()["data"]["run_id"] == "run-selected"
     assert response.json()["data"]["displayed_trusted_snapshot_id"] == "trusted-old"
     assert fake.selected == ["run-selected"]
+
+
+def test_pipeline_api_normalizes_runtime_failures_without_leaking_details(monkeypatch):
+    class BrokenStart(FakePipeline):
+        def start(self):
+            raise OSError("C:\\Users\\private\\token.txt?api_key=secret")
+
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: BrokenStart())
+    response = client.post("/api/market-news/refresh")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "资讯刷新暂时不可用"}
+    assert "secret" not in response.text
+
+    class BrokenStatus(FakePipeline):
+        def get_status(self, run_id=None):
+            raise RuntimeError("Authorization: Bearer private")
+
+    monkeypatch.setattr("news_pipeline.api.get_service", lambda: BrokenStatus())
+    response = client.get("/api/news/pipeline-status")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "资讯刷新状态暂时不可用"}
+    assert "private" not in response.text
+
+
+def test_app_lifespan_closes_and_clears_pipeline_before_source_health(monkeypatch):
+    calls = []
+
+    class Pipeline:
+        def recover_startup(self):
+            calls.append("pipeline_recover")
+
+        def close(self):
+            calls.append("pipeline_close")
+
+    class Health:
+        def shutdown(self):
+            calls.append("health_shutdown")
+
+    pipeline = Pipeline()
+    monkeypatch.setenv("VR_SOURCE_HEALTH_STARTUP", "0")
+    monkeypatch.setattr(app_module, "_run_startup_cache_cleanup", lambda: calls.append("cache"))
+    monkeypatch.setattr(app_module.source_health, "get_service", lambda: (calls.append("health_get"), Health())[1])
+    monkeypatch.setattr(
+        app_module.news_pipeline_service,
+        "get_service",
+        lambda: (calls.append("pipeline_get"), pipeline)[1],
+    )
+    monkeypatch.setattr(
+        app_module.news_pipeline_service,
+        "reset_service",
+        lambda: calls.append("pipeline_reset"),
+    )
+
+    with TestClient(app_module.app) as lifespan_client:
+        assert lifespan_client.get("/api/health").status_code == 200
+
+    assert calls == [
+        "cache",
+        "health_get",
+        "pipeline_get",
+        "pipeline_recover",
+        "pipeline_close",
+        "pipeline_reset",
+        "health_shutdown",
+    ]

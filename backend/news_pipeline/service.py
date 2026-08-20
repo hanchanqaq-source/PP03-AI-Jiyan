@@ -14,7 +14,7 @@ from evidence_verification import service as evidence_service
 from news_intelligence.service import project_trusted_snapshot
 
 from .models import PipelineCounts, PipelinePhase, PipelineRun, RawSnapshot, TrustedSnapshot
-from .storage import NewsPipelineStorage
+from .storage import NewsPipelineStorage, canonical_source_statuses
 
 
 _NONTERMINAL = {
@@ -56,7 +56,8 @@ class NewsPipelineService:
         self._owns_executor = executor is None
         self._lock = threading.RLock()
         self._active_run_id: str | None = None
-        self._latest_run_id: str | None = None
+        latest = self.storage.load_latest_run()
+        self._latest_run_id: str | None = latest.run_id if latest is not None else None
         self._futures: dict[str, Future[None]] = {}
         self._recovery_future: Future[int] | None = None
         self._closed = False
@@ -94,6 +95,28 @@ class NewsPipelineService:
             failed_source_count=previous.failed_source_count,
         )
 
+    @staticmethod
+    def _validate_evidence_for_raw(
+        raw_snapshot: RawSnapshot,
+        snapshot: EvidenceSnapshot,
+    ) -> None:
+        if type(snapshot) is not EvidenceSnapshot or snapshot.raw_snapshot_id != raw_snapshot.raw_snapshot_id:
+            raise ValueError("verifier returned a different raw snapshot identity")
+        if type(snapshot.events) is not tuple:
+            raise ValueError("evidence events are not canonical")
+        raw_event_ids = evidence_service.raw_snapshot_event_ids(raw_snapshot)
+        evidence_event_ids: list[str] = []
+        for event in snapshot.events:
+            if type(event.event_id) is not str or not event.event_id:
+                raise ValueError("evidence event identity is invalid")
+            if type(event.verification_status) is not VerificationStatus:
+                raise ValueError("evidence status is incomplete")
+            evidence_event_ids.append(event.event_id)
+        if len(evidence_event_ids) != len(set(evidence_event_ids)):
+            raise ValueError("evidence event identity is duplicated")
+        if set(evidence_event_ids) != set(raw_event_ids):
+            raise ValueError("evidence event identities must equal durable raw event identities")
+
     def _record_failure(self, run_id: str, error_code: str) -> None:
         try:
             current = self.storage.load_run(run_id)
@@ -120,7 +143,24 @@ class NewsPipelineService:
             collection = self._radar_fetcher()
             if type(collection) is not newsradar.RadarCollection:
                 raise ValueError("radar_fetcher must return RadarCollection")
-            if str(collection.radar.get("source_state") or "") == "all_failed":
+            canonical_statuses = canonical_source_statuses(collection.source_statuses)
+            if (
+                type(collection.current_attempt_success) is not bool
+                or type(collection.attempted_source_count) is not int
+                or type(collection.failed_source_count) is not int
+                or canonical_statuses != collection.source_statuses
+                or collection.attempted_source_count <= 0
+                or not 0 <= collection.failed_source_count <= collection.attempted_source_count
+                or len(collection.source_statuses) != collection.attempted_source_count
+                or sum(
+                    type(status) is dict and status.get("status") == "failed"
+                    for status in canonical_statuses
+                ) != collection.failed_source_count
+                or collection.current_attempt_success
+                is not (collection.failed_source_count < collection.attempted_source_count)
+            ):
+                raise ValueError("radar collection attempt metadata is invalid")
+            if not collection.current_attempt_success:
                 self._transition(
                     run_id,
                     PipelinePhase.FAILED,
@@ -132,21 +172,32 @@ class NewsPipelineService:
                 raw_snapshot_id=run.raw_snapshot_id,
                 collected_at=collection.generated_at,
                 items=collection.raw_events,
+                source_statuses=canonical_statuses,
+                total_source_count=max(
+                    collection.attempted_source_count,
+                    collection.failed_source_count,
+                    int((collection.radar.get("stats") or {}).get("total_sources") or 0),
+                ),
+                failed_source_count=collection.failed_source_count,
+                cache_status=str(collection.radar.get("cache_status") or "unknown"),
+                source_state=str(collection.radar.get("source_state") or "unknown"),
             )
             error_code = "storage_error"
             self.storage.write_raw(raw)
+            durable_raw = self.storage.load_raw(raw.raw_snapshot_id)
+            if durable_raw is None:
+                raise OSError("storage_error")
             counts = replace(
                 run.counts,
-                raw_event_count=len(raw.items),
+                raw_event_count=len(durable_raw.items),
                 failed_source_count=collection.failed_source_count,
             )
             run = self._transition(run_id, PipelinePhase.RAW_SAVED, counts=counts)
             run = self._transition(run_id, PipelinePhase.VERIFYING)
 
             error_code = "verification_failed"
-            evidence = self._deterministic_verifier(raw)
-            if type(evidence) is not EvidenceSnapshot or evidence.raw_snapshot_id != raw.raw_snapshot_id:
-                raise ValueError("verifier returned a different raw snapshot identity")
+            evidence = self._deterministic_verifier(durable_raw)
+            self._validate_evidence_for_raw(durable_raw, evidence)
             counts = self._evidence_counts(evidence, run.counts)
             error_code = "evidence_persistence_failed"
             self.storage.write_evidence(evidence)
@@ -161,7 +212,7 @@ class NewsPipelineService:
 
             error_code = "publication_failed"
             trusted = self._trusted_projector(evidence)
-            if type(trusted) is not TrustedSnapshot or trusted.raw_snapshot_id != raw.raw_snapshot_id:
+            if type(trusted) is not TrustedSnapshot or trusted.raw_snapshot_id != durable_raw.raw_snapshot_id:
                 raise ValueError("trusted projector returned a different raw snapshot identity")
             if self._radar_publisher is not None:
                 self._radar_publisher(collection)
@@ -218,7 +269,18 @@ class NewsPipelineService:
                 self._record_failure(run_id, "pipeline_error")
                 raise
             self._futures[run_id] = future
+            future.add_done_callback(
+                lambda completed, selected_run_id=run_id: self._evict_completed_future(
+                    selected_run_id,
+                    completed,
+                )
+            )
             return run
+
+    def _evict_completed_future(self, run_id: str, future: Future[None]) -> None:
+        with self._lock:
+            if future.done() and self._futures.get(run_id) is future:
+                self._futures.pop(run_id, None)
 
     def wait(self, run_id: str, timeout: float | None = None) -> PipelineRun:
         with self._lock:
@@ -233,12 +295,31 @@ class NewsPipelineService:
     def current_trusted(self) -> TrustedSnapshot | None:
         return self.storage.load_current_trusted()
 
+    def current_trusted_context(
+        self,
+    ) -> tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None:
+        trusted = self.storage.load_current_trusted()
+        if trusted is None:
+            return None
+        raw = self.storage.load_raw(trusted.raw_snapshot_id)
+        evidence = self.storage.load_evidence(trusted.raw_snapshot_id)
+        if (
+            raw is None
+            or evidence is None
+            or raw.raw_snapshot_id != trusted.raw_snapshot_id
+            or evidence.raw_snapshot_id != trusted.raw_snapshot_id
+        ):
+            raise OSError("storage_corrupt")
+        return trusted, raw, evidence
+
     def get_status(self, run_id: str | None = None) -> dict[str, object]:
         selected = self.storage.load_run(run_id) if run_id is not None else None
         if run_id is not None and selected is None:
             raise KeyError(run_id)
-        if selected is None and self._latest_run_id is not None:
-            selected = self.storage.load_run(self._latest_run_id)
+        if selected is None:
+            selected = self.storage.load_latest_run()
+            if selected is not None:
+                self._latest_run_id = selected.run_id
         displayed = self.storage.load_current_trusted()
         if selected is None:
             return {
@@ -313,9 +394,22 @@ class NewsPipelineService:
             if self._closed:
                 return
             self._closed = True
+            pending = list(self._futures.values())
+            if self._recovery_future is not None:
+                pending.append(self._recovery_future)
+        for future in dict.fromkeys(pending):
+            try:
+                future.result()
+            except Exception:
+                pass
         if self._owns_executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
         self.storage.close()
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
 
 _service: NewsPipelineService | None = None
@@ -325,6 +419,8 @@ _service_lock = threading.Lock()
 def get_service() -> NewsPipelineService:
     global _service
     with _service_lock:
+        if _service is not None and _service.is_closed:
+            _service = None
         if _service is None:
             storage = NewsPipelineStorage()
             verifier_service = evidence_service.get_service()

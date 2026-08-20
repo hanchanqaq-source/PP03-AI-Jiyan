@@ -317,5 +317,137 @@ def test_market_news_can_read_current_trusted_without_reloading_radar():
     payload = service.get_events(mode="my_focus", tag_ids=["storage"])
 
     assert [row["event_id"] for row in payload["events"]] == [event.event_id]
-    assert payload["evidence_snapshot_id"] == trusted.raw_snapshot_id
+    assert payload["raw_snapshot_id"] == trusted.raw_snapshot_id
+    assert payload["trusted_snapshot_id"] == trusted.raw_snapshot_id
+    assert payload["evidence_snapshot_id"] is None
     assert payload["source_summary"]["refresh_failed"] is False
+
+
+def _pipeline_context_for_market_news():
+    from evidence_verification.models import EvidenceEvent, EvidenceSnapshot, VerificationStatus
+    from news_intelligence.service import project_trusted_snapshot
+    from news_pipeline.models import RawSnapshot
+
+    event = cluster_items(normalize_radar(_radar(
+        _item(
+            "600001 星河科技建设存储算力中心",
+            "https://one.example.test/a",
+            "2026-08-17T09:00:00+08:00",
+            "来源一",
+        ),
+    ), now=NOW))[0]
+    source_statuses = ({
+        "source_id": "source-one",
+        "source_name": "来源一",
+        "source_url": "https://one.example.test/feed",
+        "status": "failed",
+        "error_type": "timeout",
+        "error_reason": "连接超时",
+        "last_success_at": "2026-08-16T09:00:00+00:00",
+        "used_cached_items": True,
+        "item_count": 1,
+    },)
+    raw = RawSnapshot(
+        "raw-current-context",
+        NOW,
+        (event.to_dict(),),
+        source_statuses,
+        108,
+        1,
+        "partial",
+        "partial_failure",
+    )
+    evidence = EvidenceSnapshot(
+        snapshot_id="evidence-current-context",
+        raw_snapshot_id=raw.raw_snapshot_id,
+        generated_at=NOW,
+        events=(EvidenceEvent(
+            event_id=event.event_id,
+            title=event.title,
+            summary=event.summary,
+            category=event.category,
+            related_tags=tuple((tag["id"], tag["name"]) for tag in event.related_tags),
+            published_at=event.published_at_latest,
+            core_claim=event.title,
+            verification_status=VerificationStatus.VERIFIED,
+            verification_reason="官方证据支持",
+            verified_at=NOW,
+            evidence_as_of=NOW,
+        ),),
+    )
+    trusted = project_trusted_snapshot(evidence, raw, now=lambda: NOW)
+    return trusted, raw, evidence
+
+
+def test_trusted_market_news_preserves_exact_raw_source_summary_and_lineage_ids():
+    from news_intelligence.service import MarketNewsService
+
+    trusted, raw, evidence = _pipeline_context_for_market_news()
+    service = MarketNewsService(
+        trusted_context_loader=lambda: (trusted, raw, evidence),
+        portfolio_loader=lambda: {"overview": {"fund_count": 0}, "holdings": []},
+        now=lambda: NOW,
+    )
+
+    payload = service.get_events(mode="global_tech")
+
+    assert payload["data_status"] == "trusted"
+    assert payload["source_summary"] == {
+        "total_sources": 108,
+        "failed_sources": 1,
+        "cache_status": "partial",
+        "source_state": "partial_failure",
+        "refresh_failed": False,
+        "source_statuses": list(raw.source_statuses),
+    }
+    assert payload["raw_snapshot_id"] == raw.raw_snapshot_id
+    assert payload["trusted_snapshot_id"] == trusted.raw_snapshot_id
+    assert payload["evidence_snapshot_id"] == evidence.snapshot_id
+
+
+def test_trusted_response_snapshot_id_tracks_only_exposed_stable_relationship_facts():
+    from news_intelligence.service import MarketNewsService
+
+    trusted, raw, evidence = _pipeline_context_for_market_news()
+    portfolio_state = {"stock_code": "600001", "stock_name": "星河科技", "private_amount": 100}
+
+    def portfolio_loader():
+        return {
+            "overview": {"fund_count": 1},
+            "holdings": [{
+                "code": "000001",
+                "name": "公开基金",
+                "private_amount": portfolio_state["private_amount"],
+                "analysis": {
+                    "holdings": {
+                        "data": {
+                            "disclosure_date": "2026-06-30",
+                            "holdings": [{
+                                "stock_code": portfolio_state["stock_code"],
+                                "stock_name": portfolio_state["stock_name"],
+                            }],
+                        },
+                        "meta": {
+                            "source_name": "基金定期报告",
+                            "source_reference": "https://example.test/fund/report",
+                        },
+                    },
+                    "industry_exposure": {"data": {"holding_industry_evidence": []}},
+                },
+            }],
+        }
+
+    service = MarketNewsService(
+        trusted_context_loader=lambda: (trusted, raw, evidence),
+        portfolio_loader=portfolio_loader,
+        now=lambda: NOW,
+    )
+    related = service.get_events(mode="my_holdings")
+    portfolio_state["private_amount"] = 999999
+    private_only_changed = service.get_events(mode="my_holdings")
+    portfolio_state["stock_name"] = "无关公司"
+    portfolio_state["stock_code"] = "999999"
+    relationship_changed = service.get_events(mode="my_holdings")
+
+    assert related["snapshot_id"] == private_only_changed["snapshot_id"]
+    assert related["snapshot_id"] != relationship_changed["snapshot_id"]

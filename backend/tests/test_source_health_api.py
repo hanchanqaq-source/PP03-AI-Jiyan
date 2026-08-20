@@ -703,8 +703,21 @@ def test_source_health_api_returns_202_409_and_404(monkeypatch, tmp_path):
     service.shutdown()
 
 
+def _isolate_news_pipeline_lifespan(monkeypatch):
+    class Pipeline:
+        def recover_startup(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(app_module.news_pipeline_service, "get_service", lambda: Pipeline())
+    monkeypatch.setattr(app_module.news_pipeline_service, "reset_service", lambda: None)
+
+
 def test_lifespan_schedules_quick_without_waiting_and_shutdowns(monkeypatch):
     calls = []
+    _isolate_news_pipeline_lifespan(monkeypatch)
 
     class Service:
         def schedule_quick_if_due(self):
@@ -726,6 +739,7 @@ def test_lifespan_schedules_quick_without_waiting_and_shutdowns(monkeypatch):
 
 def test_lifespan_can_disable_quick_and_startup_failure_never_blocks(monkeypatch):
     calls = []
+    _isolate_news_pipeline_lifespan(monkeypatch)
 
     class Service:
         def schedule_quick_if_due(self):
@@ -750,6 +764,7 @@ def test_lifespan_can_disable_quick_and_startup_failure_never_blocks(monkeypatch
 
 
 def test_lifespan_service_construction_failure_never_blocks_api(monkeypatch):
+    _isolate_news_pipeline_lifespan(monkeypatch)
     monkeypatch.setattr(
         app_module.source_health,
         "get_service",

@@ -15,6 +15,8 @@ def _start_pipeline() -> dict[str, object]:
         run = get_service().start()
     except NewsPipelineActiveError as error:
         raise HTTPException(status.HTTP_409_CONFLICT, "资讯刷新正在运行") from error
+    except (OSError, RuntimeError, ValueError) as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "资讯刷新暂时不可用") from error
     return {"data": {
         "run_id": run.run_id,
         "raw_snapshot_id": run.raw_snapshot_id,
@@ -56,3 +58,5 @@ def pipeline_status(run_id: str | None = Query(default=None, min_length=1, max_l
         raise HTTPException(status.HTTP_404_NOT_FOUND, "资讯刷新运行不存在") from error
     except ValueError as error:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "无效的资讯刷新运行 ID") from error
+    except (OSError, RuntimeError) as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "资讯刷新状态暂时不可用") from error

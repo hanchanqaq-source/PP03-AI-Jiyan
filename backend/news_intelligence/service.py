@@ -181,6 +181,9 @@ class MarketNewsService:
         evidence_admitter: Callable[[list[Any]], tuple[str, list[Any]]] = _default_evidence_admitter,
         evidence_version: Callable[[], str] = _default_evidence_version,
         trusted_loader: Callable[[], TrustedSnapshot | None] | None = None,
+        trusted_context_loader: Callable[
+            [], tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None
+        ] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self.radar_loader = radar_loader
@@ -189,6 +192,7 @@ class MarketNewsService:
         self.evidence_admitter = evidence_admitter
         self.evidence_version = evidence_version
         self.trusted_loader = trusted_loader
+        self.trusted_context_loader = trusted_context_loader
         self.now = now
         self._snapshot_lock = threading.RLock()
         self._base_snapshots: OrderedDict[str, list[Any]] = OrderedDict()
@@ -308,6 +312,8 @@ class MarketNewsService:
     def _trusted_events(
         self,
         trusted: TrustedSnapshot,
+        raw: RawSnapshot | None,
+        evidence: EvidenceSnapshot | None,
         *,
         mode: str,
         selected_tags: list[str],
@@ -369,8 +375,22 @@ class MarketNewsService:
             "days": days,
             "sort": sort,
         }
+        relationship_facts = [
+            {
+                "event_id": event.event_id,
+                "relation_level": event.relation_level,
+                "related_companies": copy.deepcopy(event.related_companies),
+                "related_funds": copy.deepcopy(event.related_funds),
+                "relation_evidence": copy.deepcopy(event.relation_evidence),
+            }
+            for event in filtered
+        ]
         snapshot_id = hashlib.sha256(
-            f"{trusted.raw_snapshot_id}|{self._fingerprint(normalized_query)}|{self._fingerprint([event.event_id for event in filtered])}".encode("utf-8")
+            (
+                f"{trusted.raw_snapshot_id}|{self._fingerprint(normalized_query)}|"
+                f"{self._fingerprint([event.event_id for event in filtered])}|"
+                f"{self._fingerprint(relationship_facts)}"
+            ).encode("utf-8")
         ).hexdigest()[:20]
         self._remember_details(snapshot_id, filtered)
         relation_counts = Counter(event.relation_level for event in filtered)
@@ -378,10 +398,28 @@ class MarketNewsService:
         for event in filtered:
             for fund in event.related_funds:
                 fund_counts[(str(fund.get("fund_code") or ""), str(fund.get("fund_name") or ""))] += 1
-        source_ids = {
-            (source.source_name, source.source_url, source.original_url)
-            for event in events for source in event.sources
-        }
+        if raw is None:
+            source_ids = {
+                (source.source_name, source.source_url, source.original_url)
+                for event in events for source in event.sources
+            }
+            source_summary = {
+                "total_sources": len(source_ids),
+                "failed_sources": 0,
+                "cache_status": "trusted",
+                "source_state": "trusted",
+                "refresh_failed": False,
+                "source_statuses": [],
+            }
+        else:
+            source_summary = {
+                "total_sources": raw.total_source_count,
+                "failed_sources": raw.failed_source_count,
+                "cache_status": raw.cache_status,
+                "source_state": raw.source_state,
+                "refresh_failed": False,
+                "source_statuses": copy.deepcopy(list(raw.source_statuses)),
+            }
         return {
             "events": [event.to_dict() for event in filtered],
             "focus_events": [event.to_dict() for event in filtered[:5]],
@@ -397,17 +435,12 @@ class MarketNewsService:
             },
             "generated_at": trusted.published_at.isoformat(),
             "data_status": "trusted",
-            "source_summary": {
-                "total_sources": len(source_ids),
-                "failed_sources": 0,
-                "cache_status": "trusted",
-                "source_state": "trusted",
-                "refresh_failed": False,
-                "source_statuses": [],
-            },
+            "source_summary": source_summary,
             "portfolio_status": portfolio_status,
             "snapshot_id": snapshot_id,
-            "evidence_snapshot_id": trusted.raw_snapshot_id,
+            "raw_snapshot_id": trusted.raw_snapshot_id,
+            "trusted_snapshot_id": trusted.raw_snapshot_id,
+            "evidence_snapshot_id": evidence.snapshot_id if evidence is not None else None,
             "ai_status": "unavailable",
             "empty_reason": empty_reason,
             "empty_message": (
@@ -433,11 +466,35 @@ class MarketNewsService:
         if mode not in MODES or category not in CATEGORIES or days not in {1, 3, 7, 30} or sort not in SORTS:
             raise ValueError("invalid market-news filters")
         selected_tags = list(dict.fromkeys(tag_ids or []))
+        if self.trusted_context_loader is not None:
+            context = self.trusted_context_loader()
+            if context is not None:
+                trusted, raw, evidence = context
+                if (
+                    type(trusted) is not TrustedSnapshot
+                    or type(raw) is not RawSnapshot
+                    or type(evidence) is not EvidenceSnapshot
+                    or trusted.raw_snapshot_id != raw.raw_snapshot_id
+                    or evidence.raw_snapshot_id != raw.raw_snapshot_id
+                ):
+                    raise ValueError("invalid trusted pipeline context")
+                return self._trusted_events(
+                    trusted,
+                    raw,
+                    evidence,
+                    mode=mode,
+                    selected_tags=selected_tags,
+                    category=category,
+                    days=days,
+                    sort=sort,
+                )
         if self.trusted_loader is not None:
             trusted = self.trusted_loader()
             if trusted is not None:
                 return self._trusted_events(
                     trusted,
+                    None,
+                    None,
                     mode=mode,
                     selected_tags=selected_tags,
                     category=category,
@@ -582,16 +639,16 @@ class MarketNewsService:
 _service: MarketNewsService | None = None
 
 
-def _default_trusted_loader() -> TrustedSnapshot | None:
+def _default_trusted_context_loader() -> tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None:
     from news_pipeline.service import get_service as get_pipeline_service
 
-    return get_pipeline_service().current_trusted()
+    return get_pipeline_service().current_trusted_context()
 
 
 def get_service() -> MarketNewsService:
     global _service
     if _service is None:
-        _service = MarketNewsService(trusted_loader=_default_trusted_loader)
+        _service = MarketNewsService(trusted_context_loader=_default_trusted_context_loader)
     return _service
 
 

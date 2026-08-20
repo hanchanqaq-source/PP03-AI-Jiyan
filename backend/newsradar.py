@@ -59,6 +59,8 @@ class RadarCollection:
     generated_at: datetime
     failed_source_count: int
     radar: dict
+    current_attempt_success: bool
+    attempted_source_count: int
 
 
 class _RecordingRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -627,12 +629,19 @@ def collect_radar() -> RadarCollection:
     collected_at = datetime.now(timezone.utc)
     radar = _collect_radar_data()
     events = cluster_items(normalize_radar(radar, now=collected_at))
+    source_statuses = tuple(dict(row) for row in radar.get("source_statuses") or [])
+    attempted_source_count = len(source_statuses)
+    failed_source_count = sum(row.get("status") == "failed" for row in source_statuses)
     return RadarCollection(
         raw_events=tuple(event.to_dict() for event in events),
-        source_statuses=tuple(dict(row) for row in radar.get("source_statuses") or []),
+        source_statuses=source_statuses,
         generated_at=collected_at,
-        failed_source_count=int((radar.get("stats") or {}).get("failed_sources") or 0),
+        failed_source_count=failed_source_count,
         radar=json.loads(json.dumps(radar, ensure_ascii=False)),
+        current_attempt_success=(
+            attempted_source_count > 0 and failed_source_count < attempted_source_count
+        ),
+        attempted_source_count=attempted_source_count,
     )
 
 

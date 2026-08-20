@@ -325,7 +325,7 @@ def test_load_raw_rejects_future_schema_unknown_keys_wrong_path_and_oversize(tmp
     path = storage.raw_root / "raw-1.json"
     valid = json.loads(path.read_text(encoding="utf-8"))
 
-    path.write_text(json.dumps({**valid, "schema_version": 2}), encoding="utf-8")
+    path.write_text(json.dumps({**valid, "schema_version": 3}), encoding="utf-8")
     assert storage.load_raw("raw-1") is None
     path.write_text(json.dumps({**valid, "unexpected": True}), encoding="utf-8")
     assert storage.load_raw("raw-1") is None
@@ -1454,3 +1454,55 @@ storage.write_raw(RawSnapshot('crashed', datetime(2026, 8, 20, tzinfo=timezone.u
 
     assert not residue[0].exists()
     assert unknown.read_text(encoding="utf-8") == "keep"
+
+
+def test_raw_snapshot_round_trips_exact_source_observation_summary(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    statuses = ({
+        "source_id": "source-one",
+        "source_name": "公开源",
+        "source_url": "https://example.test/feed",
+        "status": "failed",
+        "error_type": "timeout",
+        "error_reason": "连接超时",
+        "last_success_at": "2026-08-19T09:00:00+00:00",
+        "used_cached_items": True,
+        "item_count": 2,
+    },)
+    snapshot = RawSnapshot(
+        raw_snapshot_id="raw-source-summary",
+        collected_at=NOW,
+        items=(),
+        source_statuses=statuses,
+        total_source_count=108,
+        failed_source_count=1,
+        cache_status="partial",
+        source_state="partial_failure",
+    )
+
+    storage.write_raw(snapshot)
+
+    assert storage.load_raw(snapshot.raw_snapshot_id) == snapshot
+    document = json.loads((storage.raw_root / "raw-source-summary.json").read_text(encoding="utf-8"))
+    assert document["schema_version"] == 2
+
+
+def test_load_raw_preserves_exact_legacy_v1_snapshot_with_explicit_defaults(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    path = storage.raw_root / "legacy-v1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "raw_snapshot_id": "legacy-v1",
+            "collected_at": NOW.isoformat(),
+            "items": [],
+        }),
+        encoding="utf-8",
+    )
+
+    assert storage.load_raw("legacy-v1") == RawSnapshot(
+        raw_snapshot_id="legacy-v1",
+        collected_at=NOW,
+        items=(),
+    )

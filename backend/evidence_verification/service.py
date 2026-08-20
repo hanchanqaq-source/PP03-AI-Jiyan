@@ -202,6 +202,24 @@ def _raw_event_from_document(document: object) -> SimpleNamespace:
     )
 
 
+def _raw_snapshot_events(raw_snapshot: RawSnapshot) -> tuple[SimpleNamespace, ...]:
+    """Parse the storage-validated raw schema through the verifier's canonical model."""
+    if type(raw_snapshot) is not RawSnapshot or type(raw_snapshot.items) is not tuple:
+        raise ValueError("invalid raw snapshot")
+    events = tuple(_raw_event_from_document(document) for document in raw_snapshot.items)
+    event_ids = tuple(event.event_id for event in events)
+    if any(type(event_id) is not str or not event_id for event_id in event_ids):
+        raise ValueError("raw event identity is invalid")
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("raw event identity is duplicated")
+    return events
+
+
+def raw_snapshot_event_ids(raw_snapshot: RawSnapshot) -> tuple[str, ...]:
+    """Return unique event IDs only after canonical raw-event parsing."""
+    return tuple(event.event_id for event in _raw_snapshot_events(raw_snapshot))
+
+
 class EvidenceVerificationService:
     def __init__(
         self,
@@ -285,15 +303,10 @@ class EvidenceVerificationService:
         )
 
     def verify_raw_snapshot(self, raw_snapshot: RawSnapshot) -> EvidenceSnapshot:
-        if type(raw_snapshot) is not RawSnapshot or type(raw_snapshot.items) is not tuple:
-            raise ValueError("invalid raw snapshot")
+        events = _raw_snapshot_events(raw_snapshot)
         attempted_at = self._now()
-        events = [_raw_event_from_document(document) for document in raw_snapshot.items]
-        event_ids = [event.event_id for event in events]
-        if len(event_ids) != len(set(event_ids)):
-            raise ValueError("raw event identity is duplicated")
         return self._verify_events(
-            events,
+            list(events),
             attempted_at=attempted_at,
             raw_snapshot_id=raw_snapshot.raw_snapshot_id,
             require_nonempty=False,
