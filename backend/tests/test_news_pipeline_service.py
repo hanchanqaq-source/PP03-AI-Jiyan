@@ -295,6 +295,7 @@ def test_all_source_collection_failure_does_not_replace_previous_trusted_snapsho
         completed = pipeline.wait(pipeline.start().run_id, timeout=5)
 
         assert completed.phase is PipelinePhase.FAILED
+        assert completed.durable_phase is None
         assert completed.redacted_error == "collection_failed"
         assert completed.counts.failed_source_count == 108
         assert pipeline.current_trusted().raw_snapshot_id == first.raw_snapshot_id
@@ -872,3 +873,165 @@ def test_selected_corrupt_run_is_a_storage_error_not_a_missing_run(tmp_path):
             pipeline.get_status("run-absent")
     finally:
         pipeline.close()
+
+
+def test_recovery_submit_failure_latches_barrier_until_explicit_retry(tmp_path, monkeypatch):
+    """Catches synchronous executor rejection being mistaken for no recovery need."""
+    executor = ThreadPoolExecutor(max_workers=2)
+    pipeline = NewsPipelineService(
+        storage=NewsPipelineStorage(tmp_path / "pipeline", now=lambda: NOW),
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        now=lambda: NOW,
+        executor=executor,
+    )
+    original_submit = executor.submit
+
+    def reject_submit(*_args, **_kwargs):
+        raise RuntimeError("executor rejected recovery")
+
+    monkeypatch.setattr(executor, "submit", reject_submit)
+    with pytest.raises(RuntimeError, match="executor rejected recovery"):
+        pipeline.recover_startup()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        pipeline.get_status()
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        pipeline.start()
+
+    monkeypatch.setattr(executor, "submit", original_submit)
+    assert pipeline.recover_startup().result(timeout=5) == 0
+    assert pipeline.get_status()["recovery_status"] == "ready"
+    pipeline.close()
+    executor.shutdown(wait=True)
+
+
+def test_multiworker_recovery_never_interrupts_an_active_worker(tmp_path):
+    """Catches startup recovery running beside an active refresh on a wider executor."""
+    entered = Event()
+    release = Event()
+    executor = ThreadPoolExecutor(max_workers=2)
+    identifiers = iter(("run-active", "raw-active"))
+
+    def blocked_fetch():
+        entered.set()
+        assert release.wait(timeout=5)
+        return collection(raw_event())
+
+    pipeline = NewsPipelineService(
+        storage=NewsPipelineStorage(tmp_path / "pipeline", now=lambda: NOW),
+        radar_fetcher=blocked_fetch,
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        now=lambda: NOW,
+        id_factory=lambda: next(identifiers),
+        executor=executor,
+    )
+    run = pipeline.start()
+    assert entered.wait(timeout=5)
+
+    assert pipeline.recover_startup() is None
+    assert pipeline.storage.load_run(run.run_id).phase is PipelinePhase.FETCHING
+
+    release.set()
+    assert pipeline.wait(run.run_id, timeout=5).phase is PipelinePhase.TRUSTED_PUBLISHED
+    assert pipeline.recover_startup().result(timeout=5) == 0
+    pipeline.close()
+    executor.shutdown(wait=True)
+
+
+def test_failed_terminalization_latches_recovery_barrier_until_reconciled(tmp_path, monkeypatch):
+    """Catches a failed terminal write being swallowed before another run starts."""
+    root = tmp_path / "pipeline"
+    storage = NewsPipelineStorage(root, now=lambda: NOW)
+    original_write_run = storage.write_run
+
+    def fail_terminal_write(run, *, expected_phase=None):
+        if run.phase is PipelinePhase.FAILED:
+            raise OSError("terminal status unavailable")
+        return original_write_run(run, expected_phase=expected_phase)
+
+    monkeypatch.setattr(storage, "write_run", fail_terminal_write)
+    identifiers = iter(("run-failed", "raw-failed", "run-next", "raw-next"))
+    pipeline = NewsPipelineService(
+        storage=storage,
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda _raw: (_ for _ in ()).throw(ValueError("verification broke")),
+        trusted_projector=trusted,
+        now=lambda: NOW,
+        id_factory=lambda: next(identifiers),
+    )
+    first = pipeline.start()
+    persisted = pipeline.wait(first.run_id, timeout=5)
+    assert persisted.phase is PipelinePhase.VERIFYING
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        pipeline.get_status(first.run_id)
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        pipeline.start()
+
+    monkeypatch.setattr(storage, "write_run", original_write_run)
+    assert pipeline.recover_startup().result(timeout=5) == 1
+    assert pipeline.get_status(first.run_id)["phase"] == PipelinePhase.INTERRUPTED.value
+    pipeline.close()
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_checkpoint", "expects_evidence"),
+    [
+        ("verification", PipelinePhase.RAW_SAVED, False),
+        ("evidence", PipelinePhase.RAW_SAVED, False),
+        ("publication", PipelinePhase.EVIDENCE_SAVED, True),
+    ],
+)
+def test_zero_event_failure_retains_the_last_exact_durable_checkpoint(
+    tmp_path,
+    monkeypatch,
+    failure_stage,
+    expected_checkpoint,
+    expects_evidence,
+):
+    """Catches empty raw snapshots being mistaken for a pre-collection failure."""
+    root = tmp_path / failure_stage
+    storage = NewsPipelineStorage(root, now=lambda: NOW)
+
+    def empty_evidence(raw):
+        raw_id = raw.raw_snapshot_id
+        return EvidenceSnapshot(
+            snapshot_id=f"evidence-{raw_id}",
+            raw_snapshot_id=raw_id,
+            generated_at=NOW,
+            events=(),
+        )
+
+    verifier = empty_evidence
+    projector = lambda snapshot: TrustedSnapshot(snapshot.raw_snapshot_id, NOW, ())
+    if failure_stage == "verification":
+        verifier = lambda _raw: (_ for _ in ()).throw(ValueError("verification failed"))
+    elif failure_stage == "evidence":
+        monkeypatch.setattr(
+            storage,
+            "write_evidence",
+            lambda _snapshot: (_ for _ in ()).throw(OSError("evidence unavailable")),
+        )
+    else:
+        projector = lambda _snapshot: (_ for _ in ()).throw(ValueError("publication failed"))
+    identifiers = iter((f"run-{failure_stage}", f"raw-{failure_stage}"))
+    pipeline = NewsPipelineService(
+        storage=storage,
+        radar_fetcher=lambda: collection(),
+        deterministic_verifier=verifier,
+        trusted_projector=projector,
+        now=lambda: NOW,
+        id_factory=lambda: next(identifiers),
+    )
+
+    started = pipeline.start()
+    failed = pipeline.wait(started.run_id, timeout=5)
+
+    assert failed.phase is PipelinePhase.FAILED
+    assert failed.durable_phase is expected_checkpoint
+    assert failed.counts.raw_event_count == 0
+    assert storage.load_raw(started.raw_snapshot_id) is not None
+    assert (storage.load_evidence(started.raw_snapshot_id) is not None) is expects_evidence
+    pipeline.close()

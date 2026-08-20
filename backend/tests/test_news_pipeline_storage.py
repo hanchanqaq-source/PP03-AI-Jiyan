@@ -33,7 +33,11 @@ NOW = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
 
 
 def raw_snapshot(raw_snapshot_id: str) -> RawSnapshot:
-    return RawSnapshot(raw_snapshot_id=raw_snapshot_id, collected_at=NOW, items=())
+    return RawSnapshot(
+        raw_snapshot_id=raw_snapshot_id,
+        collected_at=NOW,
+        items=(canonical_market_event(),),
+    )
 
 
 def evidence_snapshot(raw_snapshot_id: str) -> EvidenceSnapshot:
@@ -134,7 +138,12 @@ def write_trusted_run(storage: NewsPipelineStorage, *, run_id: str, raw_id: str)
     fetching = replace(queued, phase=PipelinePhase.FETCHING)
     storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
     storage.write_raw(raw_snapshot(raw_id))
-    raw_saved = replace(fetching, phase=PipelinePhase.RAW_SAVED)
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(raw_event_count=1),
+        durable_phase=PipelinePhase.RAW_SAVED,
+    )
     storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
     verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
     storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
@@ -144,6 +153,8 @@ def write_trusted_run(storage: NewsPipelineStorage, *, run_id: str, raw_id: str)
         verifying,
         phase=PipelinePhase.EVIDENCE_SAVED,
         evidence_snapshot_id=evidence.snapshot_id,
+        counts=PipelineCounts(raw_event_count=1, verified_count=1),
+        durable_phase=PipelinePhase.EVIDENCE_SAVED,
     )
     storage.write_run(evidence_saved, expected_phase=PipelinePhase.VERIFYING)
     storage.publish_trusted(trusted_snapshot(raw_id))
@@ -151,6 +162,7 @@ def write_trusted_run(storage: NewsPipelineStorage, *, run_id: str, raw_id: str)
         evidence_saved,
         phase=PipelinePhase.TRUSTED_PUBLISHED,
         trusted_snapshot_id=raw_id,
+        durable_phase=PipelinePhase.TRUSTED_PUBLISHED,
     )
     storage.write_run(completed, expected_phase=PipelinePhase.EVIDENCE_SAVED)
     return completed
@@ -348,6 +360,20 @@ def test_explicit_recovery_interrupts_every_nonterminal_phase(tmp_path, phase):
                 replace(
                     run,
                     phase=next_phase,
+                    counts=(
+                        PipelineCounts(raw_event_count=1, verified_count=1)
+                        if next_phase is PipelinePhase.EVIDENCE_SAVED
+                        else PipelineCounts(raw_event_count=1)
+                        if next_phase in {PipelinePhase.RAW_SAVED, PipelinePhase.VERIFYING}
+                        else PipelineCounts()
+                    ),
+                    durable_phase=(
+                        PipelinePhase.EVIDENCE_SAVED
+                        if next_phase is PipelinePhase.EVIDENCE_SAVED
+                        else PipelinePhase.RAW_SAVED
+                        if next_phase in {PipelinePhase.RAW_SAVED, PipelinePhase.VERIFYING}
+                        else None
+                    ),
                     evidence_snapshot_id=(
                         "evidence-raw-1"
                         if next_phase is PipelinePhase.EVIDENCE_SAVED else None
@@ -456,7 +482,7 @@ def test_trusted_publish_rejects_legacy_evidence_document_even_when_path_identit
         snapshot_id="evidence-raw-1",
         raw_snapshot_id="raw-1",
         generated_at=NOW,
-        events=(),
+        events=evidence_snapshot("raw-1").events,
         recovery_metadata={"legacy_identity": True},
     )
     storage.evidence_root.mkdir(parents=True)
@@ -473,7 +499,12 @@ def test_persisted_phase_requires_present_matching_snapshot_ids(tmp_path):
     storage.write_raw(raw_snapshot("raw-1"))
     fetching = replace(queued, phase=PipelinePhase.FETCHING)
     storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
-    raw_saved = replace(fetching, phase=PipelinePhase.RAW_SAVED)
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(raw_event_count=1),
+        durable_phase=PipelinePhase.RAW_SAVED,
+    )
     storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
     verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
     storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
@@ -481,7 +512,11 @@ def test_persisted_phase_requires_present_matching_snapshot_ids(tmp_path):
 
     with pytest.raises(ValueError, match="snapshot IDs"):
         storage.write_run(
-            replace(verifying, phase=PipelinePhase.EVIDENCE_SAVED),
+            replace(
+                verifying,
+                phase=PipelinePhase.EVIDENCE_SAVED,
+                durable_phase=PipelinePhase.EVIDENCE_SAVED,
+            ),
             expected_phase=PipelinePhase.VERIFYING,
         )
 
@@ -964,7 +999,9 @@ def test_trusted_publish_accepts_empty_projection_only_when_evidence_has_no_elig
 
 def test_trusted_event_ids_must_equal_the_complete_eligible_evidence_set(tmp_path):
     storage = NewsPipelineStorage(tmp_path)
-    storage.write_raw(raw_snapshot("raw-1"))
+    second_raw = canonical_market_event()
+    second_raw["event_id"] = "b" * 20
+    storage.write_raw(RawSnapshot("raw-1", NOW, (canonical_market_event(), second_raw)))
     source = evidence_snapshot("raw-1")
     second = replace(
         source.events[0],
@@ -984,7 +1021,9 @@ def test_trusted_event_ids_must_equal_the_complete_eligible_evidence_set(tmp_pat
 
 def test_invalid_trusted_projection_does_not_claim_a_new_writer_generation(tmp_path):
     writer = NewsPipelineStorage(tmp_path)
-    writer.write_raw(raw_snapshot("raw-1"))
+    second_raw = canonical_market_event()
+    second_raw["event_id"] = "b" * 20
+    writer.write_raw(RawSnapshot("raw-1", NOW, (canonical_market_event(), second_raw)))
     source = evidence_snapshot("raw-1")
     second = replace(source.events[0], event_id="b" * 20)
     writer.write_evidence(replace(source, events=(source.events[0], second)))
@@ -1019,7 +1058,9 @@ def test_trusted_publish_binds_event_id_and_status_to_same_evidence_snapshot(tmp
 
 def test_trusted_publish_rejects_an_event_id_absent_from_same_evidence_snapshot(tmp_path):
     storage = NewsPipelineStorage(tmp_path)
-    storage.write_raw(raw_snapshot("raw-1"))
+    evidence_raw = canonical_market_event()
+    evidence_raw["event_id"] = "evidence-only"
+    storage.write_raw(RawSnapshot("raw-1", NOW, (evidence_raw,)))
     source = evidence_snapshot("raw-1")
     storage.write_evidence(replace(source, events=(replace(source.events[0], event_id="evidence-only"),)))
 
@@ -1401,22 +1442,70 @@ def test_forked_child_close_drops_only_its_inherited_handle(tmp_path):
 @pytest.mark.parametrize("count_field", list(PipelineCounts.__dataclass_fields__))
 def test_run_audit_counts_never_decrease(count_field, tmp_path):
     storage = NewsPipelineStorage(tmp_path)
-    baseline_counts = PipelineCounts(**{
-        name: 2 for name in PipelineCounts.__dataclass_fields__
-    })
-    queued = replace(pipeline_run(phase=PipelinePhase.QUEUED), counts=baseline_counts)
+    statuses = tuple(VerificationStatus)
+    raw_rows = []
+    evidence_rows = []
+    template = evidence_snapshot("raw-1").events[0]
+    for index, status in enumerate(statuses):
+        event_id = f"event-{index}"
+        row = canonical_market_event()
+        row["event_id"] = event_id
+        raw_rows.append(row)
+        evidence_rows.append(replace(template, event_id=event_id, verification_status=status))
+    baseline_counts = PipelineCounts(
+        raw_event_count=len(statuses),
+        verified_count=1,
+        corroborated_count=1,
+        pending_count=1,
+        conflicting_count=1,
+        corrected_count=1,
+        disproved_count=1,
+        failed_source_count=2,
+    )
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
     storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(RawSnapshot(
+        "raw-1",
+        NOW,
+        tuple(raw_rows),
+        total_source_count=2,
+        failed_source_count=2,
+    ))
+    raw_counts = PipelineCounts(raw_event_count=len(statuses), failed_source_count=2)
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        counts=raw_counts,
+        durable_phase=PipelinePhase.RAW_SAVED,
+    )
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
+    storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
+    snapshot = replace(evidence_snapshot("raw-1"), events=tuple(evidence_rows))
+    storage.write_evidence(snapshot)
+    evidence_saved = replace(
+        verifying,
+        phase=PipelinePhase.EVIDENCE_SAVED,
+        evidence_snapshot_id=snapshot.snapshot_id,
+        counts=baseline_counts,
+        durable_phase=PipelinePhase.EVIDENCE_SAVED,
+    )
+    storage.write_run(evidence_saved, expected_phase=PipelinePhase.VERIFYING)
+    value = getattr(baseline_counts, count_field)
     decreased = replace(
-        queued,
-        phase=PipelinePhase.FETCHING,
-        counts=replace(baseline_counts, **{count_field: 1}),
+        evidence_saved,
+        phase=PipelinePhase.FAILED,
+        counts=replace(baseline_counts, **{count_field: value - 1}),
         updated_at=NOW + timedelta(seconds=1),
+        redacted_error="pipeline_error",
     )
 
     with pytest.raises(ValueError, match="counts cannot decrease"):
-        storage.write_run(decreased, expected_phase=PipelinePhase.QUEUED)
+        storage.write_run(decreased, expected_phase=PipelinePhase.EVIDENCE_SAVED)
 
-    assert storage.load_run("run-1") == queued
+    assert storage.load_run("run-1") == evidence_saved
 
 
 def test_run_audit_preserves_created_at_and_nondecreasing_updated_at(tmp_path):
@@ -1608,7 +1697,12 @@ def test_loaded_verifying_run_requires_its_durable_raw_snapshot(tmp_path):
     fetching = replace(queued, phase=PipelinePhase.FETCHING)
     storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
     storage.write_raw(raw_snapshot(queued.raw_snapshot_id))
-    raw_saved = replace(fetching, phase=PipelinePhase.RAW_SAVED)
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(raw_event_count=1),
+        durable_phase=PipelinePhase.RAW_SAVED,
+    )
     storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
     verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
     storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
@@ -1641,3 +1735,184 @@ def test_failed_recovery_preflight_does_not_claim_a_new_writer_generation(tmp_pa
     assert generation_path.read_bytes() == generation_before
     with pytest.raises(OSError, match="storage_corrupt"):
         restarted.load_run(completed.run_id)
+
+
+def test_raw_artifact_rejects_duplicate_event_ids_before_mutation(tmp_path):
+    """Catches two canonical raw rows sharing one identity being persisted."""
+    storage = NewsPipelineStorage(tmp_path)
+    duplicate = canonical_market_event()
+
+    with pytest.raises(ValueError, match="raw event identity is duplicated"):
+        storage.write_raw(RawSnapshot("raw-duplicate", NOW, (duplicate, duplicate)))
+
+    assert not (storage.raw_root / "raw-duplicate.json").exists()
+
+
+def test_evidence_artifact_requires_the_exact_durable_raw_event_set(tmp_path):
+    """Catches a same-snapshot evidence file omitting/substituting a raw event."""
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(RawSnapshot("raw-exact", NOW, (canonical_market_event(),)))
+    mismatched = replace(
+        evidence_snapshot("raw-exact"),
+        events=(replace(evidence_snapshot("raw-exact").events[0], event_id="b" * 20),),
+    )
+
+    with pytest.raises(ValueError, match="evidence event identities must equal durable raw event identities"):
+        storage.write_evidence(mismatched)
+
+    assert not (storage.evidence_root / "raw-exact.json").exists()
+
+
+def test_raw_checkpoint_run_counts_must_equal_the_durable_raw_artifact(tmp_path):
+    """Catches a run claiming counts that differ from its durable raw checkpoint."""
+    storage = NewsPipelineStorage(tmp_path)
+    queued = replace(pipeline_run(phase=PipelinePhase.QUEUED), run_id="run-counts", raw_snapshot_id="raw-counts")
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(RawSnapshot(
+        "raw-counts",
+        NOW,
+        (canonical_market_event(),),
+        total_source_count=2,
+        failed_source_count=1,
+    ))
+    wrong = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        durable_phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(raw_event_count=0, failed_source_count=0),
+    )
+
+    with pytest.raises(ValueError, match="run counts must match durable raw snapshot"):
+        storage.write_run(wrong, expected_phase=PipelinePhase.FETCHING)
+
+    assert storage.load_run(queued.run_id).phase is PipelinePhase.FETCHING
+
+
+def test_evidence_checkpoint_run_counts_must_equal_every_evidence_status(tmp_path):
+    """Catches a run relabelling one pending event as verified in durable status."""
+    storage = NewsPipelineStorage(tmp_path)
+    queued = replace(pipeline_run(phase=PipelinePhase.QUEUED), run_id="run-evidence-counts", raw_snapshot_id="raw-evidence-counts")
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(RawSnapshot("raw-evidence-counts", NOW, (canonical_market_event(),)))
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        durable_phase=PipelinePhase.RAW_SAVED,
+        counts=PipelineCounts(raw_event_count=1),
+    )
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    verifying = replace(raw_saved, phase=PipelinePhase.VERIFYING)
+    storage.write_run(verifying, expected_phase=PipelinePhase.RAW_SAVED)
+    pending = replace(
+        evidence_snapshot("raw-evidence-counts"),
+        events=(replace(
+            evidence_snapshot("raw-evidence-counts").events[0],
+            verification_status=VerificationStatus.UNVERIFIED,
+        ),),
+    )
+    storage.write_evidence(pending)
+    wrong = replace(
+        verifying,
+        phase=PipelinePhase.EVIDENCE_SAVED,
+        durable_phase=PipelinePhase.EVIDENCE_SAVED,
+        evidence_snapshot_id=pending.snapshot_id,
+        counts=PipelineCounts(raw_event_count=1, verified_count=1),
+    )
+
+    with pytest.raises(ValueError, match="run counts must match durable evidence snapshot"):
+        storage.write_run(wrong, expected_phase=PipelinePhase.VERIFYING)
+
+    assert storage.load_run(queued.run_id).phase is PipelinePhase.VERIFYING
+
+
+def test_terminal_zero_event_failure_retains_and_requires_its_raw_checkpoint(tmp_path):
+    """Catches zero-item raw durability being lost when a run becomes failed."""
+    storage = NewsPipelineStorage(tmp_path)
+    queued = replace(pipeline_run(phase=PipelinePhase.QUEUED), run_id="run-zero", raw_snapshot_id="raw-zero")
+    storage.write_run(queued)
+    fetching = replace(queued, phase=PipelinePhase.FETCHING)
+    storage.write_run(fetching, expected_phase=PipelinePhase.QUEUED)
+    storage.write_raw(RawSnapshot("raw-zero", NOW, ()))
+    raw_saved = replace(
+        fetching,
+        phase=PipelinePhase.RAW_SAVED,
+        durable_phase=PipelinePhase.RAW_SAVED,
+    )
+    storage.write_run(raw_saved, expected_phase=PipelinePhase.FETCHING)
+    failed = replace(
+        raw_saved,
+        phase=PipelinePhase.FAILED,
+        redacted_error="verification_failed",
+    )
+    storage.write_run(failed, expected_phase=PipelinePhase.RAW_SAVED)
+    (storage.raw_root / "raw-zero.json").unlink()
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run(failed.run_id)
+
+
+def test_run_schema_v2_is_exact_and_legacy_terminal_checkpoint_is_fail_closed(tmp_path):
+    """Catches heuristic recovery of an ambiguous v1 terminal run with raw data."""
+    storage = NewsPipelineStorage(tmp_path)
+    queued = pipeline_run(phase=PipelinePhase.QUEUED)
+    storage.write_run(queued)
+    written = json.loads((storage.runs_root / "run-1.json").read_text(encoding="utf-8"))
+    assert written["schema_version"] == 2
+    assert written["durable_phase"] is None
+
+    legacy = {key: value for key, value in written.items() if key != "durable_phase"}
+    legacy.update({
+        "schema_version": 1,
+        "phase": PipelinePhase.FAILED.value,
+        "redacted_error": "verification_failed",
+    })
+    (storage.runs_root / "run-1.json").write_text(json.dumps(legacy), encoding="utf-8")
+    storage.write_raw(RawSnapshot("raw-1", NOW, ()))
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run("run-1")
+
+
+def test_semantic_run_tamper_blocks_load_latest_and_recovery_before_mutation(tmp_path):
+    """Catches exact artifact counts being checked only while writing a run."""
+    storage = NewsPipelineStorage(tmp_path)
+    completed = write_trusted_run(storage, run_id="run-semantic", raw_id="raw-semantic")
+    run_path = storage.runs_root / f"{completed.run_id}.json"
+    document = json.loads(run_path.read_text(encoding="utf-8"))
+    document["counts"]["verified_count"] = 0
+    run_path.write_text(json.dumps(document), encoding="utf-8")
+    tampered = run_path.read_bytes()
+    generation_path = tmp_path / ".news-pipeline-generation.json"
+    generation = generation_path.read_bytes()
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run(completed.run_id)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+    assert run_path.read_bytes() == tampered
+    assert generation_path.read_bytes() == generation
+
+
+def test_semantic_artifact_tamper_is_rejected_by_artifact_and_run_loads(tmp_path):
+    """Catches a duplicated durable raw identity remaining visible as trusted data."""
+    storage = NewsPipelineStorage(tmp_path)
+    completed = write_trusted_run(storage, run_id="run-artifact", raw_id="raw-artifact")
+    raw_path = storage.raw_root / "raw-artifact.json"
+    document = json.loads(raw_path.read_text(encoding="utf-8"))
+    document["items"].append(document["items"][0])
+    raw_path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert storage.load_raw("raw-artifact") is None
+    assert storage.load_evidence("raw-artifact") is None
+    assert storage.load_trusted("raw-artifact") is None
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_current_trusted()
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_run(completed.run_id)

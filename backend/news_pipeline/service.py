@@ -65,6 +65,7 @@ class NewsPipelineService:
         self._latest_run_id: str | None = latest.run_id if latest is not None else None
         self._futures: dict[str, Future[None]] = {}
         self._recovery_future: Future[int] | None = None
+        self._recovery_failed = self._initial_storage_error
         self._closed = False
 
     def _clock(self) -> datetime:
@@ -122,11 +123,15 @@ class NewsPipelineService:
         if set(evidence_event_ids) != set(raw_event_ids):
             raise ValueError("evidence event identities must equal durable raw event identities")
 
-    def _record_failure(self, run_id: str, error_code: str) -> None:
+    def _latch_recovery_failure(self) -> None:
+        with self._lock:
+            self._recovery_failed = True
+
+    def _record_failure(self, run_id: str, error_code: str) -> bool:
         try:
             current = self.storage.load_run(run_id)
             if current is None or current.phase not in _NONTERMINAL:
-                return
+                return True
             displayed = self.storage.load_current_trusted()
             if displayed is not None and displayed.raw_snapshot_id == current.raw_snapshot_id:
                 self._transition(
@@ -134,11 +139,14 @@ class NewsPipelineService:
                     PipelinePhase.TRUSTED_PUBLISHED,
                     trusted_snapshot_id=current.raw_snapshot_id,
                     redacted_error=None,
+                    durable_phase=PipelinePhase.TRUSTED_PUBLISHED,
                 )
-                return
+                return True
             self._transition(run_id, PipelinePhase.FAILED, redacted_error=error_code)
+            return True
         except Exception:
-            return
+            self._latch_recovery_failure()
+            return False
 
     def _run(self, run_id: str) -> None:
         error_code = "pipeline_error"
@@ -197,7 +205,12 @@ class NewsPipelineService:
                 raw_event_count=len(durable_raw.items),
                 failed_source_count=collection.failed_source_count,
             )
-            run = self._transition(run_id, PipelinePhase.RAW_SAVED, counts=counts)
+            run = self._transition(
+                run_id,
+                PipelinePhase.RAW_SAVED,
+                counts=counts,
+                durable_phase=PipelinePhase.RAW_SAVED,
+            )
             run = self._transition(run_id, PipelinePhase.VERIFYING)
 
             error_code = "verification_failed"
@@ -211,6 +224,7 @@ class NewsPipelineService:
                 PipelinePhase.EVIDENCE_SAVED,
                 counts=counts,
                 evidence_snapshot_id=evidence.snapshot_id,
+                durable_phase=PipelinePhase.EVIDENCE_SAVED,
             )
             if self._evidence_publisher is not None:
                 error_code = "evidence_compatibility_failed"
@@ -232,6 +246,7 @@ class NewsPipelineService:
                 PipelinePhase.TRUSTED_PUBLISHED,
                 trusted_snapshot_id=trusted.raw_snapshot_id,
                 redacted_error=compatibility_error,
+                durable_phase=PipelinePhase.TRUSTED_PUBLISHED,
                 displayed_trusted_snapshot_id=(
                     run.displayed_trusted_snapshot_id or trusted.raw_snapshot_id
                 ),
@@ -406,36 +421,52 @@ class NewsPipelineService:
         }
         return result
 
-    @staticmethod
-    def _consume_future(future: Future[object]) -> None:
+    def _finish_recovery(self, future: Future[object]) -> None:
         try:
-            future.exception()
+            failed = future.exception() is not None
         except Exception:
-            return
+            failed = True
+        with self._lock:
+            if self._recovery_future is future:
+                self._recovery_failed = failed
+                if not failed:
+                    self._initial_storage_error = False
 
     def recover_startup(self) -> Future[int] | None:
         with self._lock:
             if self._closed:
                 return None
+            if self._active_run_id is not None:
+                active = self.storage.load_run(self._active_run_id)
+                if active is not None and active.phase in _NONTERMINAL:
+                    return None
+                self._active_run_id = None
             if self._recovery_future is not None:
                 if not self._recovery_future.done():
                     return self._recovery_future
-                if self._recovery_future.exception() is None:
+                if self._recovery_future.exception() is None and not self._recovery_failed:
                     return self._recovery_future
-            future = self._executor.submit(self.storage.recover_incomplete_runs)
-            future.add_done_callback(self._consume_future)
+            try:
+                future = self._executor.submit(self.storage.recover_incomplete_runs)
+            except Exception:
+                self._recovery_future = None
+                self._recovery_failed = True
+                raise
             self._recovery_future = future
+            future.add_done_callback(self._finish_recovery)
             return future
 
     def _recovery_state_unlocked(self) -> tuple[str, str | None]:
         future = self._recovery_future
         if future is None:
-            if self._initial_storage_error:
+            if self._recovery_failed or self._initial_storage_error:
                 return "failed", "storage_corrupt"
             return "not_started", None
         if not future.done():
             return "pending", None
         if future.exception() is not None:
+            return "failed", "storage_corrupt"
+        if self._recovery_failed:
             return "failed", "storage_corrupt"
         return "ready", None
 

@@ -41,6 +41,7 @@ class PipelineRun:
     updated_at: datetime
     redacted_error: str | None
     displayed_trusted_snapshot_id: str | None
+    durable_phase: PipelinePhase | None = None
 
 
 @dataclass(frozen=True, slots=True)

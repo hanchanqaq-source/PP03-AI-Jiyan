@@ -411,6 +411,22 @@ def test_evidence_immutable_retry_compares_the_canonical_projected_document(tmp_
         ),),
     )
     storage = __import__("news_pipeline.storage", fromlist=["NewsPipelineStorage"]).NewsPipelineStorage(tmp_path)
+    models = __import__("news_intelligence.models", fromlist=["MarketNewsEvent"])
+    pipeline_models = __import__("news_pipeline.models", fromlist=["RawSnapshot"])
+    raw_event = models.MarketNewsEvent(
+        event_id=projected.events[0].event_id,
+        title=projected.events[0].title,
+        summary=projected.events[0].summary,
+        category=projected.events[0].category,
+        published_at_first=projected.events[0].published_at,
+        published_at_latest=projected.events[0].published_at,
+        sources=[],
+        related_tags=[],
+        original_links=[],
+        data_status="realtime",
+        tag_evidence=[],
+    ).to_dict()
+    storage.write_raw(pipeline_models.RawSnapshot("raw-1", NOW, (raw_event,)))
 
     storage.write_evidence(projected)
     storage.write_evidence(projected)

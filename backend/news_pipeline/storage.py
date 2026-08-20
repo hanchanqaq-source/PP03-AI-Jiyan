@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -38,7 +39,8 @@ _NEXT = {
     PipelinePhase.EVIDENCE_SAVED: {PipelinePhase.TRUSTED_PUBLISHED, PipelinePhase.FAILED, PipelinePhase.INTERRUPTED},
 }
 _MAX_BYTES, _MAX_DEPTH, _MAX_ENTRIES, _MAX_TEXT, _MAX_INT = 1_048_576, 16, 5_000, 8_192, 1_000_000_000
-_RUN_KEYS = {"schema_version", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id", "phase", "counts", "created_at", "updated_at", "redacted_error", "displayed_trusted_snapshot_id"}
+_RUN_V1_KEYS = {"schema_version", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id", "phase", "counts", "created_at", "updated_at", "redacted_error", "displayed_trusted_snapshot_id"}
+_RUN_V2_KEYS = _RUN_V1_KEYS | {"durable_phase"}
 _RAW_V1_KEYS = {"schema_version", "raw_snapshot_id", "collected_at", "items"}
 _RAW_V2_KEYS = {
     "schema_version", "raw_snapshot_id", "collected_at", "items", "source_statuses",
@@ -121,6 +123,25 @@ _VERIFIED_FIELD_KEYS = {
 }
 _VERIFICATION_STATUSES = {"verified", "corroborated", "unverified", "conflicting", "corrected", "disproved"}
 _TRUSTED_STATUSES = {"verified", "corroborated"}
+_DURABLE_PHASES = {
+    PipelinePhase.RAW_SAVED,
+    PipelinePhase.EVIDENCE_SAVED,
+    PipelinePhase.TRUSTED_PUBLISHED,
+}
+_DURABLE_RANK = {
+    None: 0,
+    PipelinePhase.RAW_SAVED: 1,
+    PipelinePhase.EVIDENCE_SAVED: 2,
+    PipelinePhase.TRUSTED_PUBLISHED: 3,
+}
+_PHASE_CHECKPOINT = {
+    PipelinePhase.QUEUED: None,
+    PipelinePhase.FETCHING: None,
+    PipelinePhase.RAW_SAVED: PipelinePhase.RAW_SAVED,
+    PipelinePhase.VERIFYING: PipelinePhase.RAW_SAVED,
+    PipelinePhase.EVIDENCE_SAVED: PipelinePhase.EVIDENCE_SAVED,
+    PipelinePhase.TRUSTED_PUBLISHED: PipelinePhase.TRUSTED_PUBLISHED,
+}
 
 
 def _json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
@@ -382,6 +403,51 @@ def _validate_trusted_events(value: object) -> list[dict[str, object]]:
     if type(value) is not list or len(value) > _MAX_ENTRIES:
         raise ValueError("trusted events must be a list")
     return [_validate_market_event(item, trusted=True) for item in value]
+
+
+def _raw_event_ids(snapshot: RawSnapshot) -> tuple[str, ...]:
+    if type(snapshot) is not RawSnapshot or type(snapshot.items) is not tuple:
+        raise ValueError("invalid raw snapshot")
+    identities: list[str] = []
+    for item in snapshot.items:
+        if type(item) is not dict or type(item.get("event_id")) is not str or not item["event_id"]:
+            raise ValueError("raw event identity is invalid")
+        identities.append(item["event_id"])
+    if len(identities) != len(set(identities)):
+        raise ValueError("raw event identity is duplicated")
+    return tuple(identities)
+
+
+def _evidence_status_counts(
+    raw: RawSnapshot,
+    evidence: EvidenceSnapshot,
+) -> PipelineCounts:
+    if type(evidence) is not EvidenceSnapshot or type(evidence.events) is not tuple:
+        raise ValueError("invalid evidence snapshot")
+    raw_ids = _raw_event_ids(raw)
+    evidence_ids: list[str] = []
+    statuses: Counter[VerificationStatus] = Counter()
+    for event in evidence.events:
+        if type(event.event_id) is not str or not event.event_id:
+            raise ValueError("evidence event identity is invalid")
+        if type(event.verification_status) is not VerificationStatus:
+            raise ValueError("evidence status is invalid")
+        evidence_ids.append(event.event_id)
+        statuses[event.verification_status] += 1
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise ValueError("evidence event identity is duplicated")
+    if set(evidence_ids) != set(raw_ids) or len(evidence_ids) != len(raw_ids):
+        raise ValueError("evidence event identities must equal durable raw event identities")
+    return PipelineCounts(
+        raw_event_count=len(raw_ids),
+        verified_count=statuses[VerificationStatus.VERIFIED],
+        corroborated_count=statuses[VerificationStatus.CORROBORATED],
+        pending_count=statuses[VerificationStatus.UNVERIFIED],
+        conflicting_count=statuses[VerificationStatus.CONFLICTING],
+        corrected_count=statuses[VerificationStatus.CORRECTED],
+        disproved_count=statuses[VerificationStatus.DISPROVED],
+        failed_source_count=raw.failed_source_count,
+    )
 
 
 def _document_digest(document: dict[str, object]) -> str:
@@ -1009,6 +1075,17 @@ class NewsPipelineStorage:
         if not isinstance(snapshot.collected_at, datetime) or snapshot.collected_at.tzinfo is None or snapshot.collected_at.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError("collected_at must be aware UTC")
         items = _validate_raw_items(_bounded(list(snapshot.items)))
+        canonical = RawSnapshot(
+            raw_snapshot_id=raw_id,
+            collected_at=snapshot.collected_at,
+            items=tuple(items),
+            source_statuses=snapshot.source_statuses,
+            total_source_count=snapshot.total_source_count,
+            failed_source_count=snapshot.failed_source_count,
+            cache_status=snapshot.cache_status,
+            source_state=snapshot.source_state,
+        )
+        _raw_event_ids(canonical)
         source_statuses = _validate_source_statuses(_bounded(list(snapshot.source_statuses)))
         if (
             type(snapshot.total_source_count) is not int
@@ -1035,7 +1112,7 @@ class NewsPipelineStorage:
             previous = self._load_raw(raw_id)
             if previous is None and path.exists():
                 raise OSError("storage_corrupt")
-            if previous is not None and previous != snapshot:
+            if previous is not None and previous != canonical:
                 raise ValueError("raw snapshot identity is immutable")
             if previous is None:
                 self._atomic_write(path, document)
@@ -1056,11 +1133,13 @@ class NewsPipelineStorage:
             if identity != raw_id:
                 return None
             if version == 1:
-                return RawSnapshot(
+                snapshot = RawSnapshot(
                     identity,
                     _timestamp(document["collected_at"]),
                     tuple(_validate_raw_items(items)),
                 )
+                _raw_event_ids(snapshot)
+                return snapshot
             total_source_count = document["total_source_count"]
             failed_source_count = document["failed_source_count"]
             cache_status = document["cache_status"]
@@ -1073,7 +1152,7 @@ class NewsPipelineStorage:
                 or source_state not in _SOURCE_STATES
             ):
                 return None
-            return RawSnapshot(
+            snapshot = RawSnapshot(
                 identity,
                 _timestamp(document["collected_at"]),
                 tuple(_validate_raw_items(items)),
@@ -1083,6 +1162,8 @@ class NewsPipelineStorage:
                 cache_status,
                 source_state,
             )
+            _raw_event_ids(snapshot)
+            return snapshot
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -1099,6 +1180,10 @@ class NewsPipelineStorage:
         _bounded(document)
         with CACHE_IO_LOCK, self._process_lock():
             self._require_writer()
+            raw = self._load_raw(raw_id)
+            if raw is None:
+                raise ValueError("raw artifact must be durable before evidence")
+            _evidence_status_counts(raw, snapshot)
             path = self._path(self.evidence_root, raw_id)
             previous = self._load_evidence(raw_id)
             if previous is None and path.exists():
@@ -1114,7 +1199,11 @@ class NewsPipelineStorage:
             return None
         try:
             snapshot = evidence_snapshot_from_document(document)
-            return snapshot if snapshot.raw_snapshot_id == raw_id else None
+            raw = self._load_raw(raw_id)
+            if snapshot.raw_snapshot_id != raw_id or raw is None:
+                return None
+            _evidence_status_counts(raw, snapshot)
+            return snapshot
         except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
             return None
 
@@ -1316,9 +1405,24 @@ class NewsPipelineStorage:
         record = self._load_trusted_record(raw_id)
         return record.snapshot if record is not None else None
 
+    def _load_validated_trusted(self, raw_id: str) -> TrustedSnapshot | None:
+        trusted = self._load_trusted(raw_id)
+        if trusted is None:
+            return None
+        raw = self._load_raw(raw_id)
+        evidence = self._load_evidence(raw_id)
+        if raw is None or evidence is None:
+            return None
+        try:
+            _evidence_status_counts(raw, evidence)
+            _validate_trusted_admission(list(trusted.events), evidence)
+        except ValueError:
+            return None
+        return trusted
+
     def load_trusted(self, raw_snapshot_id: str) -> TrustedSnapshot | None:
         with CACHE_IO_LOCK, self._process_lock():
-            return self._load_trusted(_id(raw_snapshot_id, "raw_snapshot_id"))
+            return self._load_validated_trusted(_id(raw_snapshot_id, "raw_snapshot_id"))
 
     def _trusted_artifact_names(self) -> list[str]:
         if not self.trusted_root.exists():
@@ -1379,7 +1483,12 @@ class NewsPipelineStorage:
 
     def _load_current(self) -> TrustedSnapshot | None:
         pointer = self._load_pointer_record()
-        return self._load_trusted(pointer.raw_snapshot_id) if pointer is not None else None
+        if pointer is None:
+            return None
+        trusted = self._load_validated_trusted(pointer.raw_snapshot_id)
+        if trusted is None:
+            raise OSError("storage_corrupt")
+        return trusted
 
     def load_current_trusted(self) -> TrustedSnapshot | None:
         with CACHE_IO_LOCK, self._process_lock():
@@ -1388,54 +1497,125 @@ class NewsPipelineStorage:
     def _run_document(self, run: PipelineRun) -> dict[str, object]:
         if type(run.phase) is not PipelinePhase or type(run.counts) is not PipelineCounts or not isinstance(run.created_at, datetime) or not isinstance(run.updated_at, datetime):
             raise ValueError("invalid pipeline run")
+        if run.durable_phase is not None and run.durable_phase not in _DURABLE_PHASES:
+            raise ValueError("invalid durable phase")
+        required_checkpoint = _PHASE_CHECKPOINT.get(run.phase)
+        if required_checkpoint is not None or run.phase in _PHASE_CHECKPOINT:
+            if run.durable_phase is not required_checkpoint:
+                raise ValueError("phase does not match durable checkpoint")
         if any(value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(None) for value in (run.created_at, run.updated_at)):
             raise ValueError("run timestamps must be aware UTC")
         if run.updated_at < run.created_at:
             raise ValueError("updated_at cannot precede created_at")
         if run.redacted_error is not None and type(run.redacted_error) is not str:
             raise ValueError("invalid redacted_error")
-        return {"schema_version": 1, "run_id": _id(run.run_id, "run_id"), "raw_snapshot_id": _id(run.raw_snapshot_id, "raw_snapshot_id"), "evidence_snapshot_id": _optional_id(run.evidence_snapshot_id, "evidence_snapshot_id"), "trusted_snapshot_id": _optional_id(run.trusted_snapshot_id, "trusted_snapshot_id"), "phase": run.phase.value, "counts": asdict(_counts(asdict(run.counts))), "created_at": run.created_at.isoformat(), "updated_at": run.updated_at.isoformat(), "redacted_error": _safe_error(run.redacted_error) if run.redacted_error else None, "displayed_trusted_snapshot_id": _optional_id(run.displayed_trusted_snapshot_id, "displayed_trusted_snapshot_id")}
+        return {"schema_version": 2, "run_id": _id(run.run_id, "run_id"), "raw_snapshot_id": _id(run.raw_snapshot_id, "raw_snapshot_id"), "evidence_snapshot_id": _optional_id(run.evidence_snapshot_id, "evidence_snapshot_id"), "trusted_snapshot_id": _optional_id(run.trusted_snapshot_id, "trusted_snapshot_id"), "phase": run.phase.value, "durable_phase": run.durable_phase.value if run.durable_phase is not None else None, "counts": asdict(_counts(asdict(run.counts))), "created_at": run.created_at.isoformat(), "updated_at": run.updated_at.isoformat(), "redacted_error": _safe_error(run.redacted_error) if run.redacted_error else None, "displayed_trusted_snapshot_id": _optional_id(run.displayed_trusted_snapshot_id, "displayed_trusted_snapshot_id")}
 
     def _load_run(self, run_id: str) -> PipelineRun | None:
         document = self._read(self._run_path(run_id))
         try:
             if document is None:
                 return None
-            self._schema(document, _RUN_KEYS)
+            version = document.get("schema_version")
+            if version == 1:
+                self._schema(document, _RUN_V1_KEYS)
+            elif version == 2:
+                self._schema(document, _RUN_V2_KEYS, version=2)
+            else:
+                return None
             if _id(document["run_id"], "run_id") != run_id or type(document["phase"]) is not str:
                 return None
             error = document["redacted_error"]
             if error is not None and (type(error) is not str or error not in _SAFE_ERROR_CODES):
                 return None
-            return PipelineRun(run_id, _id(document["raw_snapshot_id"], "raw_snapshot_id"), _optional_id(document["evidence_snapshot_id"], "evidence_snapshot_id"), _optional_id(document["trusted_snapshot_id"], "trusted_snapshot_id"), PipelinePhase(document["phase"]), _counts(document["counts"]), _timestamp(document["created_at"]), _timestamp(document["updated_at"]), error, _optional_id(document["displayed_trusted_snapshot_id"], "displayed_trusted_snapshot_id"))
+            raw_id = _id(document["raw_snapshot_id"], "raw_snapshot_id")
+            evidence_id = _optional_id(document["evidence_snapshot_id"], "evidence_snapshot_id")
+            trusted_id = _optional_id(document["trusted_snapshot_id"], "trusted_snapshot_id")
+            phase = PipelinePhase(document["phase"])
+            counts = _counts(document["counts"])
+            if version == 2:
+                raw_checkpoint = document["durable_phase"]
+                durable_phase = None if raw_checkpoint is None else PipelinePhase(raw_checkpoint)
+                if durable_phase is not None and durable_phase not in _DURABLE_PHASES:
+                    return None
+            elif phase in _PHASE_CHECKPOINT:
+                durable_phase = _PHASE_CHECKPOINT[phase]
+            else:
+                # Schema v1 terminal rows never recorded a durable checkpoint.
+                # Accept only the unambiguous pre-raw form; anything with an
+                # artifact or post-raw count fails closed rather than guessing.
+                evidence_counts = (
+                    counts.verified_count
+                    + counts.corroborated_count
+                    + counts.pending_count
+                    + counts.conflicting_count
+                    + counts.corrected_count
+                    + counts.disproved_count
+                )
+                if (
+                    evidence_id is not None
+                    or trusted_id is not None
+                    or counts.raw_event_count != 0
+                    or evidence_counts != 0
+                    or self._path(self.raw_root, raw_id).exists()
+                ):
+                    return None
+                durable_phase = None
+            return PipelineRun(
+                run_id=run_id,
+                raw_snapshot_id=raw_id,
+                evidence_snapshot_id=evidence_id,
+                trusted_snapshot_id=trusted_id,
+                phase=phase,
+                counts=counts,
+                created_at=_timestamp(document["created_at"]),
+                updated_at=_timestamp(document["updated_at"]),
+                redacted_error=error,
+                displayed_trusted_snapshot_id=_optional_id(document["displayed_trusted_snapshot_id"], "displayed_trusted_snapshot_id"),
+                durable_phase=durable_phase,
+            )
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
 
     def _artifact_phase(self, run: PipelineRun) -> None:
+        checkpoint = run.durable_phase
+        if checkpoint is not None and checkpoint not in _DURABLE_PHASES:
+            raise ValueError("invalid durable checkpoint")
+        required_checkpoint = _PHASE_CHECKPOINT.get(run.phase)
+        if required_checkpoint is not None or run.phase in _PHASE_CHECKPOINT:
+            if checkpoint is not required_checkpoint:
+                raise ValueError("phase does not match durable checkpoint")
+
         raw = self._load_raw(run.raw_snapshot_id)
-        raw_required = (
-            run.phase in {
-                PipelinePhase.RAW_SAVED,
-                PipelinePhase.VERIFYING,
-                PipelinePhase.EVIDENCE_SAVED,
-                PipelinePhase.TRUSTED_PUBLISHED,
-            }
-            or run.evidence_snapshot_id is not None
-            or run.trusted_snapshot_id is not None
-            or (
-                run.phase in {PipelinePhase.FAILED, PipelinePhase.INTERRUPTED}
-                and run.counts.raw_event_count > 0
-            )
-        )
+        raw_required = _DURABLE_RANK[checkpoint] >= _DURABLE_RANK[PipelinePhase.RAW_SAVED]
         if raw_required and raw is None:
             raise ValueError("raw snapshot must be durable for the persisted phase")
-
-        evidence_required = (
-            run.phase in {PipelinePhase.EVIDENCE_SAVED, PipelinePhase.TRUSTED_PUBLISHED}
-            or run.evidence_snapshot_id is not None
-            or run.trusted_snapshot_id is not None
+        evidence_total = (
+            run.counts.verified_count
+            + run.counts.corroborated_count
+            + run.counts.pending_count
+            + run.counts.conflicting_count
+            + run.counts.corrected_count
+            + run.counts.disproved_count
         )
-        evidence = self._load_evidence(run.raw_snapshot_id) if evidence_required else None
+        if not raw_required:
+            if (
+                run.evidence_snapshot_id is not None
+                or run.trusted_snapshot_id is not None
+                or run.counts.raw_event_count != 0
+                or evidence_total != 0
+                or (run.phase not in _TERMINAL and run.counts.failed_source_count != 0)
+            ):
+                raise ValueError("pre-raw run contains post-raw state")
+            return
+        assert raw is not None
+        raw_counts = PipelineCounts(
+            raw_event_count=len(_raw_event_ids(raw)),
+            failed_source_count=raw.failed_source_count,
+        )
+
+        evidence_required = _DURABLE_RANK[checkpoint] >= _DURABLE_RANK[PipelinePhase.EVIDENCE_SAVED]
+        evidence = self._load_evidence(run.raw_snapshot_id)
         if evidence_required and (
             evidence is None
             or run.evidence_snapshot_id is None
@@ -1443,16 +1623,31 @@ class NewsPipelineStorage:
             or evidence.recovery_metadata.get("legacy_identity") is True
         ):
             raise ValueError("snapshot IDs must match durable non-legacy evidence")
+        if not evidence_required:
+            if run.evidence_snapshot_id is not None or evidence_total != 0:
+                raise ValueError("raw checkpoint contains evidence state")
+            if run.counts != raw_counts:
+                raise ValueError("run counts must match durable raw snapshot")
+        else:
+            assert evidence is not None
+            evidence_counts = _evidence_status_counts(raw, evidence)
+            if run.counts != evidence_counts:
+                raise ValueError("run counts must match durable evidence snapshot")
 
-        if run.phase is not PipelinePhase.TRUSTED_PUBLISHED and run.trusted_snapshot_id is None:
+        trusted_required = _DURABLE_RANK[checkpoint] >= _DURABLE_RANK[PipelinePhase.TRUSTED_PUBLISHED]
+        if not trusted_required and run.trusted_snapshot_id is not None:
+            raise ValueError("pre-publication checkpoint contains trusted state")
+        if not trusted_required:
+            orphan = self._load_trusted_record(run.raw_snapshot_id)
+            if orphan is not None and evidence is not None:
+                _validate_trusted_admission(list(orphan.snapshot.events), evidence)
             return
         record = self._load_trusted_record(run.raw_snapshot_id)
         pointer = self._load_pointer_record()
         if record is not None and evidence is not None:
             _validate_trusted_admission(list(record.snapshot.events), evidence)
         if (
-            run.phase is not PipelinePhase.TRUSTED_PUBLISHED
-            or run.trusted_snapshot_id != run.raw_snapshot_id
+            run.trusted_snapshot_id != run.raw_snapshot_id
             or record is None
             or pointer is None
             or record.pointer_generation > pointer.generation
@@ -1466,6 +1661,8 @@ class NewsPipelineStorage:
             )
         ):
             raise ValueError("trusted artifact and pointer generation are inconsistent")
+        if len(record.snapshot.events) != run.counts.verified_count + run.counts.corroborated_count:
+            raise ValueError("trusted admitted count must match durable evidence counts")
 
     def _validate_loaded_run(self, run: PipelineRun) -> PipelineRun:
         try:
@@ -1497,6 +1694,10 @@ class NewsPipelineStorage:
                     raise ValueError("created_at is immutable")
                 if run.updated_at < current.updated_at:
                     raise ValueError("updated_at cannot decrease")
+                if _DURABLE_RANK[run.durable_phase] < _DURABLE_RANK[current.durable_phase]:
+                    raise ValueError("durable checkpoint cannot decrease")
+                if run.phase in {PipelinePhase.FAILED, PipelinePhase.INTERRUPTED} and run.durable_phase is not current.durable_phase:
+                    raise ValueError("terminal transition cannot invent a checkpoint")
                 if any(
                     getattr(run.counts, field) < getattr(current.counts, field)
                     for field in PipelineCounts.__dataclass_fields__
