@@ -1506,3 +1506,25 @@ def test_load_raw_preserves_exact_legacy_v1_snapshot_with_explicit_defaults(tmp_
         collected_at=NOW,
         items=(),
     )
+
+
+def test_corrupt_recognized_run_blocks_latest_selection_instead_of_falling_back(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    corrupt = storage.runs_root / "run-newer.json"
+    corrupt.write_text(json.dumps({"schema_version": 999}), encoding="utf-8")
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_latest_run()
+
+
+def test_corrupt_recognized_run_blocks_recovery_instead_of_being_skipped(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_run(pipeline_run(phase=PipelinePhase.QUEUED))
+    corrupt = storage.runs_root / "run-future.json"
+    corrupt.write_text(json.dumps({"schema_version": 999}), encoding="utf-8")
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.recover_incomplete_runs()
+
+    assert storage.load_run("run-1").phase is PipelinePhase.QUEUED

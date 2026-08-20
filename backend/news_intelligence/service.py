@@ -184,6 +184,7 @@ class MarketNewsService:
         trusted_context_loader: Callable[
             [], tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None
         ] | None = None,
+        pipeline_state_loader: Callable[[], bool] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self.radar_loader = radar_loader
@@ -193,10 +194,13 @@ class MarketNewsService:
         self.evidence_version = evidence_version
         self.trusted_loader = trusted_loader
         self.trusted_context_loader = trusted_context_loader
+        self.pipeline_state_loader = pipeline_state_loader
         self.now = now
         self._snapshot_lock = threading.RLock()
         self._base_snapshots: OrderedDict[str, list[Any]] = OrderedDict()
         self._detail_snapshots: OrderedDict[str, dict[str, dict[str, Any]]] = OrderedDict()
+        self._detail_authorities: OrderedDict[str, str | None] = OrderedDict()
+        self._current_detail_snapshot_id: str | None = None
 
     def _load_radar(self, refresh: bool) -> tuple[dict, bool]:
         refresh_failed = False
@@ -293,13 +297,89 @@ class MarketNewsService:
                 self._base_snapshots.popitem(last=False)
         return base_key, evidence_snapshot_id, events
 
-    def _remember_details(self, snapshot_id: str, events: list[Any]) -> None:
+    def _remember_details(
+        self,
+        snapshot_id: str,
+        events: list[Any],
+        *,
+        trusted_authority: str | None = None,
+    ) -> None:
         details = {event.event_id: event.to_dict() for event in events}
         with self._snapshot_lock:
             self._detail_snapshots[snapshot_id] = details
             self._detail_snapshots.move_to_end(snapshot_id)
+            self._detail_authorities[snapshot_id] = trusted_authority
+            self._detail_authorities.move_to_end(snapshot_id)
+            self._current_detail_snapshot_id = snapshot_id
             while len(self._detail_snapshots) > 16:
-                self._detail_snapshots.popitem(last=False)
+                expired, _ = self._detail_snapshots.popitem(last=False)
+                self._detail_authorities.pop(expired, None)
+
+    def _load_trusted_context(
+        self,
+    ) -> tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None:
+        if self.trusted_context_loader is None:
+            return None
+        context = self.trusted_context_loader()
+        if context is None:
+            return None
+        if (
+            type(context) is not tuple
+            or len(context) != 3
+            or type(context[0]) is not TrustedSnapshot
+            or type(context[1]) is not RawSnapshot
+            or type(context[2]) is not EvidenceSnapshot
+            or context[0].raw_snapshot_id != context[1].raw_snapshot_id
+            or context[2].raw_snapshot_id != context[1].raw_snapshot_id
+        ):
+            raise OSError("storage_corrupt")
+        return context
+
+    def _pipeline_pending_events(
+        self,
+        *,
+        mode: str,
+        selected_tags: list[str],
+        category: str,
+        days: int,
+        sort: str,
+    ) -> dict[str, Any]:
+        return {
+            "events": [],
+            "focus_events": [],
+            "impact_summary": None,
+            "generated_at": None,
+            "data_status": "pipeline_pending",
+            "source_summary": {
+                "total_sources": 0,
+                "failed_sources": 0,
+                "cache_status": "pipeline_pending",
+                "source_state": "pipeline_pending",
+                "refresh_failed": False,
+                "source_statuses": [],
+            },
+            "portfolio_status": "unavailable",
+            "snapshot_id": None,
+            "raw_snapshot_id": None,
+            "trusted_snapshot_id": None,
+            "evidence_snapshot_id": None,
+            "ai_status": "unavailable",
+            "empty_reason": "no_trusted_snapshot",
+            "empty_message": "资讯流水线尚无成功发布的可信快照。",
+            "filters": {
+                "mode": mode,
+                "tag_ids": sorted(selected_tags),
+                "category": category,
+                "days": days,
+                "sort": sort,
+            },
+            "filter_options": {
+                "modes": sorted(MODES),
+                "categories": sorted(CATEGORIES),
+                "days": [1, 3, 7, 30],
+                "sorts": sorted(SORTS),
+            },
+        }
 
     @staticmethod
     def _article_tag_ids(event: Any) -> set[str]:
@@ -322,8 +402,7 @@ class MarketNewsService:
         sort: str,
     ) -> dict[str, Any]:
         events = [_trusted_event(copy.deepcopy(document)) for document in trusted.events]
-        portfolio, portfolio_status = self._load_portfolio()
-        relate_events(events, portfolio if portfolio_status == "ready" else None, [])
+        portfolio_status = "unavailable"
         events = rank_events(events, "importance")
         apply_watch_relations(events, selected_tags)
         now = self.now()
@@ -343,14 +422,8 @@ class MarketNewsService:
                 selected = set(selected_tags)
                 filtered = [event for event in filtered if selected & {tag["id"] for tag in event.related_tags}]
         elif mode == "my_holdings":
-            if portfolio_status == "empty":
-                filtered = []
-                empty_reason = "no_holdings"
-            elif portfolio_status == "error":
-                filtered = []
-                empty_reason = "portfolio_error"
-            else:
-                filtered = [event for event in filtered if event.relation_level in {"direct_holding", "industry_relation"}]
+            filtered = []
+            empty_reason = "portfolio_unavailable"
         elif mode == "global_tech":
             filtered = [
                 event for event in filtered
@@ -392,12 +465,11 @@ class MarketNewsService:
                 f"{self._fingerprint(relationship_facts)}"
             ).encode("utf-8")
         ).hexdigest()[:20]
-        self._remember_details(snapshot_id, filtered)
-        relation_counts = Counter(event.relation_level for event in filtered)
-        fund_counts: Counter[tuple[str, str]] = Counter()
-        for event in filtered:
-            for fund in event.related_funds:
-                fund_counts[(str(fund.get("fund_code") or ""), str(fund.get("fund_name") or ""))] += 1
+        self._remember_details(
+            snapshot_id,
+            filtered,
+            trusted_authority=trusted.raw_snapshot_id,
+        )
         if raw is None:
             source_ids = {
                 (source.source_name, source.source_url, source.original_url)
@@ -423,16 +495,7 @@ class MarketNewsService:
         return {
             "events": [event.to_dict() for event in filtered],
             "focus_events": [event.to_dict() for event in filtered[:5]],
-            "impact_summary": None if portfolio_status == "error" else {
-                "holding_related_count": relation_counts["direct_holding"] + relation_counts["industry_relation"],
-                "direct_count": relation_counts["direct_holding"],
-                "industry_count": relation_counts["industry_relation"],
-                "watch_count": relation_counts["watch_tag"],
-                "funds": [
-                    {"fund_code": code, "fund_name": name, "event_count": count}
-                    for (code, name), count in sorted(fund_counts.items(), key=lambda item: (-item[1], item[0][0]))
-                ],
-            },
+            "impact_summary": None,
             "generated_at": trusted.published_at.isoformat(),
             "data_status": "trusted",
             "source_summary": source_summary,
@@ -466,28 +529,27 @@ class MarketNewsService:
         if mode not in MODES or category not in CATEGORIES or days not in {1, 3, 7, 30} or sort not in SORTS:
             raise ValueError("invalid market-news filters")
         selected_tags = list(dict.fromkeys(tag_ids or []))
-        if self.trusted_context_loader is not None:
-            context = self.trusted_context_loader()
-            if context is not None:
-                trusted, raw, evidence = context
-                if (
-                    type(trusted) is not TrustedSnapshot
-                    or type(raw) is not RawSnapshot
-                    or type(evidence) is not EvidenceSnapshot
-                    or trusted.raw_snapshot_id != raw.raw_snapshot_id
-                    or evidence.raw_snapshot_id != raw.raw_snapshot_id
-                ):
-                    raise ValueError("invalid trusted pipeline context")
-                return self._trusted_events(
-                    trusted,
-                    raw,
-                    evidence,
-                    mode=mode,
-                    selected_tags=selected_tags,
-                    category=category,
-                    days=days,
-                    sort=sort,
-                )
+        context = self._load_trusted_context()
+        if context is not None:
+            trusted, raw, evidence = context
+            return self._trusted_events(
+                trusted,
+                raw,
+                evidence,
+                mode=mode,
+                selected_tags=selected_tags,
+                category=category,
+                days=days,
+                sort=sort,
+            )
+        if self.pipeline_state_loader is not None and self.pipeline_state_loader():
+            return self._pipeline_pending_events(
+                mode=mode,
+                selected_tags=selected_tags,
+                category=category,
+                days=days,
+                sort=sort,
+            )
         if self.trusted_loader is not None:
             trusted = self.trusted_loader()
             if trusted is not None:
@@ -624,16 +686,34 @@ class MarketNewsService:
         with self._snapshot_lock:
             if snapshot_id:
                 snapshot = self._detail_snapshots.get(snapshot_id)
-                return snapshot.get(event_id) if snapshot else None
-            for snapshot in reversed(self._detail_snapshots.values()):
-                if event_id in snapshot:
-                    return snapshot[event_id]
+                authority = self._detail_authorities.get(snapshot_id)
+            else:
+                selected_snapshot_id = self._current_detail_snapshot_id
+                snapshot = self._detail_snapshots.get(selected_snapshot_id) if selected_snapshot_id else None
+                authority = self._detail_authorities.get(selected_snapshot_id) if selected_snapshot_id else None
+        if snapshot is not None:
+            if (
+                authority is None
+                and self.pipeline_state_loader is not None
+                and self.pipeline_state_loader()
+            ):
+                return None
+            if authority is not None:
+                context = self._load_trusted_context()
+                current_authority = context[0].raw_snapshot_id if context is not None else None
+                if current_authority is None and self.trusted_loader is not None:
+                    trusted = self.trusted_loader()
+                    current_authority = trusted.raw_snapshot_id if trusted is not None else None
+                if current_authority != authority:
+                    return None
+            return snapshot.get(event_id)
+        if snapshot_id is not None:
+            return None
         self.get_events(mode="global_tech")
         with self._snapshot_lock:
-            for snapshot in reversed(self._detail_snapshots.values()):
-                if event_id in snapshot:
-                    return snapshot[event_id]
-        return None
+            selected_snapshot_id = self._current_detail_snapshot_id
+            snapshot = self._detail_snapshots.get(selected_snapshot_id) if selected_snapshot_id else None
+        return snapshot.get(event_id) if snapshot else None
 
 
 _service: MarketNewsService | None = None
@@ -645,10 +725,19 @@ def _default_trusted_context_loader() -> tuple[TrustedSnapshot, RawSnapshot, Evi
     return get_pipeline_service().current_trusted_context()
 
 
+def _default_pipeline_state_loader() -> bool:
+    from news_pipeline.service import get_service as get_pipeline_service
+
+    return get_pipeline_service().has_pipeline_state()
+
+
 def get_service() -> MarketNewsService:
     global _service
     if _service is None:
-        _service = MarketNewsService(trusted_context_loader=_default_trusted_context_loader)
+        _service = MarketNewsService(
+            trusted_context_loader=_default_trusted_context_loader,
+            pipeline_state_loader=_default_pipeline_state_loader,
+        )
     return _service
 
 

@@ -55,6 +55,7 @@ _MAX_TEMP_SCAN = 1024
 _MAX_TEMP_CLEANUP = 128
 _SAFE_ERROR_CODES = {
     "collection_failed",
+    "evidence_compatibility_failed",
     "evidence_persistence_failed",
     "pipeline_error",
     "pipeline_interrupted",
@@ -1479,11 +1480,13 @@ class NewsPipelineStorage:
             runs: list[PipelineRun] = []
             for path in paths:
                 try:
-                    run = self._load_run(_id(path.stem, "run_id"))
+                    run_id = _id(path.stem, "run_id")
                 except ValueError:
                     continue
-                if run is not None:
-                    runs.append(run)
+                run = self._load_run(run_id)
+                if run is None:
+                    raise OSError("storage_corrupt")
+                runs.append(run)
             return max(runs, key=lambda run: (run.updated_at, run.run_id), default=None)
 
     def recover_incomplete_runs(self) -> int:
@@ -1504,12 +1507,18 @@ class NewsPipelineStorage:
                 )
             except OSError:
                 raise OSError("storage_corrupt") from None
+            runs: list[PipelineRun] = []
             for path in paths:
                 try:
-                    run = self._load_run(_id(path.stem, "run_id"))
+                    run_id = _id(path.stem, "run_id")
                 except ValueError:
                     continue
-                if run is None or run.phase not in _NONTERMINAL:
+                run = self._load_run(run_id)
+                if run is None:
+                    raise OSError("storage_corrupt")
+                runs.append(run)
+            for run in runs:
+                if run.phase not in _NONTERMINAL:
                     continue
                 recovered = replace(
                     run,

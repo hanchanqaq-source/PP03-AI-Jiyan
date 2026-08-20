@@ -385,6 +385,21 @@ def test_invalid_market_news_filters_return_422(monkeypatch):
         assert client.get(f"/api/market-news/events?{query}").status_code == 422
 
 
+def test_market_news_detail_normalizes_pipeline_runtime_failure(monkeypatch):
+    class BrokenDetail:
+        def get_event(self, event_id, snapshot_id=None):
+            raise OSError("C:\\Users\\private\\trusted.json?token=secret")
+
+    monkeypatch.setattr(app_module.market_news_service, "get_service", lambda: BrokenDetail())
+
+    response = client.get(f"/api/market-news/events/{'a' * 20}")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "可信资讯暂时不可用"}
+    assert "private" not in response.text
+    assert "secret" not in response.text
+
+
 def test_market_news_translation_endpoint_passes_ephemeral_model_config(monkeypatch):
     captured = {}
 

@@ -668,3 +668,135 @@ def test_deterministic_verifier_rejects_duplicate_raw_event_identities(tmp_path)
 
     with pytest.raises(ValueError, match="identity"):
         verifier.verify_raw_snapshot(RawSnapshot("raw-duplicates", NOW, (duplicate, duplicate)))
+
+
+def test_evidence_phase_is_durable_before_fallible_compatibility_publication(tmp_path):
+    root = tmp_path / "pipeline"
+    storage = NewsPipelineStorage(root, now=lambda: NOW)
+    ids = iter(("run-compat-evidence", "raw-compat-evidence"))
+
+    def broken_evidence_publisher(snapshot):
+        run = storage.load_run("run-compat-evidence")
+        assert run.phase is PipelinePhase.EVIDENCE_SAVED
+        assert run.evidence_snapshot_id == snapshot.snapshot_id
+        assert run.counts.verified_count == 1
+        raise OSError("C:\\private\\evidence.json?token=secret")
+
+    pipeline = NewsPipelineService(
+        storage=storage,
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        evidence_publisher=broken_evidence_publisher,
+        now=lambda: NOW,
+        id_factory=lambda: next(ids),
+    )
+    try:
+        completed = pipeline.wait(pipeline.start().run_id, timeout=5)
+        assert completed.phase is PipelinePhase.FAILED
+        assert completed.evidence_snapshot_id == "evidence-raw-compat-evidence"
+        assert completed.counts.verified_count == 1
+        assert completed.redacted_error == "evidence_compatibility_failed"
+        assert pipeline.current_trusted() is None
+    finally:
+        pipeline.close()
+
+
+def test_radar_compatibility_publication_happens_only_after_trusted_commit(tmp_path):
+    root = tmp_path / "pipeline"
+    storage = NewsPipelineStorage(root, now=lambda: NOW)
+    ids = iter(("run-radar-order", "raw-radar-order"))
+
+    def radar_publisher(_collection):
+        current = storage.load_current_trusted()
+        run = storage.load_run("run-radar-order")
+        assert current is not None and current.raw_snapshot_id == "raw-radar-order"
+        assert run.phase is PipelinePhase.TRUSTED_PUBLISHED
+        raise OSError("compatibility cache unavailable")
+
+    pipeline = NewsPipelineService(
+        storage=storage,
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        radar_publisher=radar_publisher,
+        now=lambda: NOW,
+        id_factory=lambda: next(ids),
+    )
+    try:
+        completed = pipeline.wait(pipeline.start().run_id, timeout=5)
+        assert completed.phase is PipelinePhase.TRUSTED_PUBLISHED
+        assert pipeline.current_trusted().raw_snapshot_id == "raw-radar-order"
+        assert pipeline.get_status(completed.run_id)["compatibility_error"] == "radar_compatibility_failed"
+    finally:
+        pipeline.close()
+
+
+def test_failed_startup_recovery_blocks_refresh_until_explicit_retry_succeeds(tmp_path, monkeypatch):
+    pipeline = service(tmp_path)
+    attempts = iter((OSError("D:\\private\\future.json?token=secret"), 0))
+
+    def recover():
+        outcome = next(attempts)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(pipeline.storage, "recover_incomplete_runs", recover)
+    try:
+        failed = pipeline.recover_startup()
+        with pytest.raises(OSError):
+            failed.result(timeout=5)
+        with pytest.raises(RuntimeError, match="recovery"):
+            pipeline.start()
+        status = pipeline.get_status()
+        assert status["recovery_status"] == "failed"
+        assert status["recovery_error"] == "storage_corrupt"
+        assert "private" not in str(status)
+        assert pipeline.recover_startup().result(timeout=5) == 0
+        assert pipeline.wait(pipeline.start().run_id, timeout=5).phase is PipelinePhase.TRUSTED_PUBLISHED
+    finally:
+        pipeline.close()
+
+
+def test_corrupt_latest_run_still_allows_bounded_recovery_retry_after_reconstruction(tmp_path):
+    root = tmp_path / "pipeline"
+    seed = NewsPipelineStorage(root, now=lambda: NOW)
+    seed.write_run(PipelineRun(
+        run_id="run-old",
+        raw_snapshot_id="raw-old",
+        evidence_snapshot_id=None,
+        trusted_snapshot_id=None,
+        phase=PipelinePhase.QUEUED,
+        counts=PipelineCounts(),
+        created_at=NOW,
+        updated_at=NOW,
+        redacted_error=None,
+        displayed_trusted_snapshot_id=None,
+    ))
+    seed.close()
+    corrupt = root / "runs" / "run-future.json"
+    corrupt.write_text('{"schema_version":999}', encoding="utf-8")
+    ids = iter(("run-after-recovery", "raw-after-recovery"))
+
+    pipeline = NewsPipelineService(
+        storage=NewsPipelineStorage(root, now=lambda: NOW),
+        radar_fetcher=lambda: collection(raw_event()),
+        deterministic_verifier=lambda raw: evidence(raw.raw_snapshot_id),
+        trusted_projector=trusted,
+        now=lambda: NOW,
+        id_factory=lambda: next(ids),
+    )
+    try:
+        failed = pipeline.recover_startup()
+        with pytest.raises(OSError, match="storage_corrupt"):
+            failed.result(timeout=5)
+        with pytest.raises(RuntimeError, match="recovery"):
+            pipeline.start()
+
+        corrupt.unlink()
+        assert pipeline.recover_startup().result(timeout=5) == 1
+        completed = pipeline.wait(pipeline.start().run_id, timeout=5)
+        assert completed.phase is PipelinePhase.TRUSTED_PUBLISHED
+    finally:
+        pipeline.close()

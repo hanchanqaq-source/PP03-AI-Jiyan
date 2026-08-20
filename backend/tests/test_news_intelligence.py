@@ -405,49 +405,127 @@ def test_trusted_market_news_preserves_exact_raw_source_summary_and_lineage_ids(
     assert payload["evidence_snapshot_id"] == evidence.snapshot_id
 
 
-def test_trusted_response_snapshot_id_tracks_only_exposed_stable_relationship_facts():
+def test_trusted_pipeline_read_never_loads_private_portfolio_fields():
     from news_intelligence.service import MarketNewsService
 
     trusted, raw, evidence = _pipeline_context_for_market_news()
-    portfolio_state = {"stock_code": "600001", "stock_name": "星河科技", "private_amount": 100}
+    private_accesses: list[str] = []
+
+    class PrivatePortfolio(dict):
+        def get(self, key, default=None):
+            if key in {"amount", "cost", "notes", "holdings"}:
+                private_accesses.append(key)
+                raise AssertionError(f"private portfolio field accessed: {key}")
+            return super().get(key, default)
 
     def portfolio_loader():
-        return {
-            "overview": {"fund_count": 1},
-            "holdings": [{
-                "code": "000001",
-                "name": "公开基金",
-                "private_amount": portfolio_state["private_amount"],
-                "analysis": {
-                    "holdings": {
-                        "data": {
-                            "disclosure_date": "2026-06-30",
-                            "holdings": [{
-                                "stock_code": portfolio_state["stock_code"],
-                                "stock_name": portfolio_state["stock_name"],
-                            }],
-                        },
-                        "meta": {
-                            "source_name": "基金定期报告",
-                            "source_reference": "https://example.test/fund/report",
-                        },
-                    },
-                    "industry_exposure": {"data": {"holding_industry_evidence": []}},
-                },
-            }],
-        }
+        private_accesses.append("loader")
+        return PrivatePortfolio()
 
     service = MarketNewsService(
         trusted_context_loader=lambda: (trusted, raw, evidence),
         portfolio_loader=portfolio_loader,
         now=lambda: NOW,
     )
-    related = service.get_events(mode="my_holdings")
-    portfolio_state["private_amount"] = 999999
-    private_only_changed = service.get_events(mode="my_holdings")
-    portfolio_state["stock_name"] = "无关公司"
-    portfolio_state["stock_code"] = "999999"
-    relationship_changed = service.get_events(mode="my_holdings")
+    payload = service.get_events(mode="my_holdings")
 
-    assert related["snapshot_id"] == private_only_changed["snapshot_id"]
-    assert related["snapshot_id"] != relationship_changed["snapshot_id"]
+    assert private_accesses == []
+    assert payload["events"] == []
+    assert payload["portfolio_status"] == "unavailable"
+    assert payload["empty_reason"] == "portfolio_unavailable"
+
+
+def test_pipeline_state_without_trusted_pointer_never_falls_back_to_legacy_radar():
+    from news_intelligence.service import MarketNewsService
+
+    legacy_reads: list[str] = []
+    service = MarketNewsService(
+        trusted_context_loader=lambda: None,
+        pipeline_state_loader=lambda: True,
+        radar_loader=lambda: legacy_reads.append("radar") or _radar(_item(
+            "未发布的兼容缓存事件",
+            "https://legacy.example.test/item",
+            "2026-08-17T09:00:00+08:00",
+            "兼容缓存",
+        )),
+        portfolio_loader=lambda: (_ for _ in ()).throw(AssertionError("private portfolio loaded")),
+        now=lambda: NOW,
+    )
+
+    payload = service.get_events(mode="global_tech")
+
+    assert legacy_reads == []
+    assert payload["events"] == []
+    assert payload["data_status"] == "pipeline_pending"
+    assert payload["trusted_snapshot_id"] is None
+
+
+def test_pipeline_state_invalidates_preexisting_legacy_detail_cache():
+    from news_intelligence.service import MarketNewsService
+
+    pipeline_state = [False]
+    service = MarketNewsService(
+        trusted_context_loader=lambda: None,
+        pipeline_state_loader=lambda: pipeline_state[0],
+        radar_loader=lambda: _radar(_item(
+            "存储产品公开资讯",
+            "https://legacy.example.test/item",
+            "2026-08-17T09:00:00+08:00",
+            "兼容缓存",
+        )),
+        portfolio_loader=lambda: {"overview": {"fund_count": 0}, "holdings": []},
+        evidence_version=lambda: "legacy-evidence",
+        evidence_admitter=lambda events: ("legacy-evidence", events),
+        now=lambda: NOW,
+    )
+    legacy = service.get_events(mode="my_focus", tag_ids=["storage"])
+    event_id = legacy["events"][0]["event_id"]
+    assert service.get_event(event_id) is not None
+
+    pipeline_state[0] = True
+
+    assert service.get_event(event_id) is None
+    assert service.get_event(event_id, legacy["snapshot_id"]) is None
+
+
+def test_default_detail_uses_only_latest_response_and_explicit_old_pointer_is_rejected():
+    from dataclasses import replace
+    from news_intelligence.service import MarketNewsService
+
+    first_trusted, first_raw, first_evidence = _pipeline_context_for_market_news()
+    first_event_id = first_trusted.events[0]["event_id"]
+    context = [first_trusted, first_raw, first_evidence]
+    service = MarketNewsService(
+        trusted_context_loader=lambda: tuple(context),
+        pipeline_state_loader=lambda: True,
+        portfolio_loader=lambda: (_ for _ in ()).throw(AssertionError("private portfolio loaded")),
+        now=lambda: NOW,
+    )
+    first_payload = service.get_events(mode="my_focus", tag_ids=["storage"])
+    assert service.get_event(first_event_id) is not None
+
+    second_id = "b" * 20
+    second_document = dict(first_trusted.events[0])
+    second_document["event_id"] = second_id
+    second_raw_document = dict(first_raw.items[0])
+    second_raw_document["event_id"] = second_id
+    second_raw = replace(first_raw, raw_snapshot_id="raw-next-context", items=(second_raw_document,))
+    second_evidence_event = replace(first_evidence.events[0], event_id=second_id)
+    second_evidence = replace(
+        first_evidence,
+        snapshot_id="evidence-next-context",
+        raw_snapshot_id=second_raw.raw_snapshot_id,
+        events=(second_evidence_event,),
+    )
+    second_trusted = replace(
+        first_trusted,
+        raw_snapshot_id=second_raw.raw_snapshot_id,
+        events=(second_document,),
+    )
+    context[:] = [second_trusted, second_raw, second_evidence]
+    second_payload = service.get_events(mode="my_focus", tag_ids=["storage"])
+
+    assert service.get_event(first_event_id) is None
+    assert service.get_event(first_event_id, first_payload["snapshot_id"]) is None
+    assert service.get_event(second_id) is not None
+    assert second_payload["snapshot_id"] != first_payload["snapshot_id"]

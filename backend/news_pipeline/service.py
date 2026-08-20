@@ -56,10 +56,16 @@ class NewsPipelineService:
         self._owns_executor = executor is None
         self._lock = threading.RLock()
         self._active_run_id: str | None = None
-        latest = self.storage.load_latest_run()
+        self._initial_storage_error = False
+        try:
+            latest = self.storage.load_latest_run()
+        except OSError:
+            latest = None
+            self._initial_storage_error = True
         self._latest_run_id: str | None = latest.run_id if latest is not None else None
         self._futures: dict[str, Future[None]] = {}
         self._recovery_future: Future[int] | None = None
+        self._compatibility_error: str | None = None
         self._closed = False
 
     def _clock(self) -> datetime:
@@ -201,21 +207,20 @@ class NewsPipelineService:
             counts = self._evidence_counts(evidence, run.counts)
             error_code = "evidence_persistence_failed"
             self.storage.write_evidence(evidence)
-            if self._evidence_publisher is not None:
-                self._evidence_publisher(evidence)
             run = self._transition(
                 run_id,
                 PipelinePhase.EVIDENCE_SAVED,
                 counts=counts,
                 evidence_snapshot_id=evidence.snapshot_id,
             )
+            if self._evidence_publisher is not None:
+                error_code = "evidence_compatibility_failed"
+                self._evidence_publisher(evidence)
 
             error_code = "publication_failed"
             trusted = self._trusted_projector(evidence)
             if type(trusted) is not TrustedSnapshot or trusted.raw_snapshot_id != durable_raw.raw_snapshot_id:
                 raise ValueError("trusted projector returned a different raw snapshot identity")
-            if self._radar_publisher is not None:
-                self._radar_publisher(collection)
             self.storage.publish_trusted(trusted)
             self._transition(
                 run_id,
@@ -225,6 +230,12 @@ class NewsPipelineService:
                     run.displayed_trusted_snapshot_id or trusted.raw_snapshot_id
                 ),
             )
+            if self._radar_publisher is not None:
+                try:
+                    self._radar_publisher(collection)
+                except Exception:
+                    with self._lock:
+                        self._compatibility_error = "radar_compatibility_failed"
         except Exception:
             self._record_failure(run_id, error_code)
         finally:
@@ -236,8 +247,11 @@ class NewsPipelineService:
         with self._lock:
             if self._closed:
                 raise RuntimeError("news pipeline service is closed")
-            if self._recovery_future is not None and not self._recovery_future.done():
+            recovery_status, _ = self._recovery_state_unlocked()
+            if recovery_status == "pending":
                 raise NewsPipelineActiveError("news pipeline recovery is pending")
+            if recovery_status == "failed":
+                raise RuntimeError("news pipeline recovery failed")
             if self._active_run_id is not None:
                 active = self.storage.load_run(self._active_run_id)
                 if active is not None and active.phase in _NONTERMINAL:
@@ -245,6 +259,7 @@ class NewsPipelineService:
                 self._active_run_id = None
             run_id = self._id_factory()
             raw_snapshot_id = self._id_factory()
+            self._compatibility_error = None
             created_at = self._clock()
             displayed = self.storage.load_current_trusted()
             run = PipelineRun(
@@ -295,6 +310,9 @@ class NewsPipelineService:
     def current_trusted(self) -> TrustedSnapshot | None:
         return self.storage.load_current_trusted()
 
+    def has_pipeline_state(self) -> bool:
+        return self.storage.load_latest_run() is not None or self.storage.load_current_trusted() is not None
+
     def current_trusted_context(
         self,
     ) -> tuple[TrustedSnapshot, RawSnapshot, EvidenceSnapshot] | None:
@@ -313,6 +331,9 @@ class NewsPipelineService:
         return trusted, raw, evidence
 
     def get_status(self, run_id: str | None = None) -> dict[str, object]:
+        with self._lock:
+            recovery_status, recovery_error = self._recovery_state_unlocked()
+            compatibility_error = self._compatibility_error
         selected = self.storage.load_run(run_id) if run_id is not None else None
         if run_id is not None and selected is None:
             raise KeyError(run_id)
@@ -335,6 +356,9 @@ class NewsPipelineService:
                 "created_at": None,
                 "updated_at": None,
                 "redacted_error": None,
+                "recovery_status": recovery_status,
+                "recovery_error": recovery_error,
+                "compatibility_error": compatibility_error,
                 "displayed_trusted_snapshot_id": displayed.raw_snapshot_id if displayed is not None else None,
                 "displayed_trusted": None if displayed is None else {
                     "snapshot_id": displayed.raw_snapshot_id,
@@ -362,6 +386,9 @@ class NewsPipelineService:
             "created_at": selected.created_at.isoformat(),
             "updated_at": selected.updated_at.isoformat(),
             "redacted_error": selected.redacted_error,
+            "recovery_status": recovery_status,
+            "recovery_error": recovery_error,
+            "compatibility_error": compatibility_error,
             "displayed_trusted_snapshot_id": displayed.raw_snapshot_id if displayed is not None else None,
             "displayed_trusted": None if displayed is None else {
                 "snapshot_id": displayed.raw_snapshot_id,
@@ -382,12 +409,27 @@ class NewsPipelineService:
         with self._lock:
             if self._closed:
                 return None
-            if self._recovery_future is not None and not self._recovery_future.done():
-                return self._recovery_future
+            if self._recovery_future is not None:
+                if not self._recovery_future.done():
+                    return self._recovery_future
+                if self._recovery_future.exception() is None:
+                    return self._recovery_future
             future = self._executor.submit(self.storage.recover_incomplete_runs)
             future.add_done_callback(self._consume_future)
             self._recovery_future = future
             return future
+
+    def _recovery_state_unlocked(self) -> tuple[str, str | None]:
+        future = self._recovery_future
+        if future is None:
+            if self._initial_storage_error:
+                return "failed", "storage_corrupt"
+            return "not_started", None
+        if not future.done():
+            return "pending", None
+        if future.exception() is not None:
+            return "failed", "storage_corrupt"
+        return "ready", None
 
     def close(self) -> None:
         with self._lock:

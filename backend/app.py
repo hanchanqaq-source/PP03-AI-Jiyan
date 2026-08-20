@@ -813,7 +813,10 @@ def market_news_event(
     event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$"),
     snapshot_id: str | None = Query(default=None, pattern=r"^[a-f0-9]{20}$"),
 ):
-    event = market_news_service.get_service().get_event(event_id, snapshot_id=snapshot_id)
+    try:
+        event = market_news_service.get_service().get_event(event_id, snapshot_id=snapshot_id)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise HTTPException(503, "可信资讯暂时不可用") from error
     if event is None:
         raise HTTPException(404, "资讯事件不存在或已不在当前缓存中")
     return {"data": event}
