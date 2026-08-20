@@ -5631,3 +5631,307 @@ def test_archive_prepared_recovery_rejects_same_bytes_index_identity_replacement
         )
 
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"schema_version":1,"schema_version":1,"events":{}}\n',
+        b'{"schema_version":1,"events":{},"extra":"x"}\n',
+        b'{"schema_version":"1","events":{}}\n',
+        b'{"schema_version":1.0,"events":{}}\n',
+        b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":null}}\n',
+        b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":7}}\n',
+        b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":[]}}\n',
+        b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":{}}}\n',
+        (
+            b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":"2026-08-20.jsonl",'
+            b'"\\u0061aaaaaaaaaaaaaaaaaaa":"2026-08-20.jsonl"}}\n'
+        ),
+        b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":"\xff"}}\n',
+    ),
+)
+def test_archive_index_preparser_rejects_noncanonical_flat_schema_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+    payload,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    archive.index_path.write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == payload:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+def test_archive_index_preparser_accepts_escaped_utf8_flat_strings_and_charges_exact_budget(
+    tmp_path,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive._prepare()
+    payload = (
+        '{"\\u0073chema_version":1,"\\u0065vents":'
+        '{"éééééééééééééééééééé":"2026-08-20\\u002ejsonl"}}\n'
+    ).encode("utf-8")
+    archive.index_path.write_bytes(payload)
+    budget = {
+        "bytes": len(payload),
+        "rows": 1,
+        "nodes": 7,
+        "files": 1,
+    }
+
+    record = archive._read_index_record(budget=budget)
+
+    assert record is not None
+    assert record["events"] == {"é" * 20: "2026-08-20.jsonl"}
+    assert budget == {"bytes": 0, "rows": 0, "nodes": 0, "files": 0}
+
+
+def _changed_stat_result(metadata, **changes):
+    fields = {
+        "st_dev": metadata.st_dev,
+        "st_ino": metadata.st_ino,
+        "st_size": metadata.st_size,
+        "st_mtime_ns": metadata.st_mtime_ns,
+        "st_ctime_ns": metadata.st_ctime_ns,
+        "st_nlink": metadata.st_nlink,
+        "st_mode": metadata.st_mode,
+        "st_reparse_tag": getattr(metadata, "st_reparse_tag", 0),
+    }
+    fields.update(changes)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    (
+        ("st_dev", lambda value: value + 1),
+        ("st_ino", lambda value: value + 1),
+        ("st_size", lambda value: value + 1),
+        ("st_mtime_ns", lambda value: value + 1),
+        ("st_ctime_ns", lambda value: value + 1),
+        ("st_nlink", lambda value: value + 1),
+        ("st_mode", lambda value: value ^ 0o200),
+        ("st_reparse_tag", lambda value: value + 1),
+    ),
+)
+def test_archive_index_cas_rejects_every_final_path_signature_change(
+    tmp_path,
+    monkeypatch,
+    field,
+    mutate,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    record = archive._read_index_record(budget=archive_module._new_scan_budget())
+    assert record is not None
+    real_stat = Path.stat
+    index_stat_calls = 0
+
+    def changed_final_stat(path: Path, *args, **kwargs):
+        nonlocal index_stat_calls
+        metadata = real_stat(path, *args, **kwargs)
+        if path == archive.index_path:
+            index_stat_calls += 1
+            if index_stat_calls == 2:
+                return _changed_stat_result(
+                    metadata,
+                    **{field: mutate(getattr(metadata, field, 0))},
+                )
+        return metadata
+
+    monkeypatch.setattr(Path, "stat", changed_final_stat)
+
+    assert archive._index_record_is_current(record) is False
+
+
+def test_archive_index_cas_rechecks_open_descriptor_after_final_path_lstat(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    record = archive._read_index_record(budget=archive_module._new_scan_budget())
+    assert record is not None
+    real_fstat = os.fstat
+    fstat_calls = 0
+
+    def changed_second_fstat(descriptor):
+        nonlocal fstat_calls
+        metadata = real_fstat(descriptor)
+        fstat_calls += 1
+        if fstat_calls == 2:
+            return _changed_stat_result(metadata, st_mtime_ns=metadata.st_mtime_ns + 1)
+        return metadata
+
+    monkeypatch.setattr(os, "fstat", changed_second_fstat)
+
+    assert archive._index_record_is_current(record) is False
+    assert fstat_calls >= 2
+
+
+def test_archive_native_upsert_rejects_index_identity_change_before_any_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    real_prepared_payload = archive._prepared_authority_payload
+    replaced = False
+
+    def replace_index_before_mutation(*args, **kwargs):
+        nonlocal replaced
+        payload = real_prepared_payload(*args, **kwargs)
+        if not replaced:
+            replacement = archive.archive_root / "replacement-index.json"
+            replacement.write_bytes(archive.index_path.read_bytes())
+            os.replace(replacement, archive.index_path)
+            replaced = True
+        return payload
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_prepared_authority_payload", replace_index_before_mutation)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(
+            snapshot(
+                event("b" * 20),
+                snapshot_id="1" * 20,
+                raw_snapshot_id="2" * 20,
+            )
+        )
+
+    assert writes == []
+
+
+def test_archive_legacy_migration_rejects_index_identity_change_before_prepared_state_write(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    _downgrade_authority_to_legacy_state(archive)
+    diagnostics = archive._diagnostics()
+    budget = archive_module._new_scan_budget()
+    legacy_state = archive._read_authority_state(
+        NOW,
+        diagnostics=diagnostics,
+        budget=budget,
+    )
+    real_plan = archive._plan_prepared_authority
+
+    def replace_index_after_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        replacement = archive.archive_root / "replacement-index.json"
+        replacement.write_bytes(archive.index_path.read_bytes())
+        os.replace(replacement, archive.index_path)
+        return plan
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", replace_index_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with archive._process_lock(), pytest.raises(OSError, match="storage_corrupt"):
+        archive._migrate_legacy_authority(
+            legacy_state,
+            now=NOW,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
+
+    assert writes == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"schema_version":1,"events":{"\\u0x12aaaaaaaaaaaaaaaa":"2026-08-20.jsonl"}}\n',
+        b'{"schema_version":1,"events":{"aaaaaaaaaaaaaaaaaaaa":"2026-08-20\\u0x2ejsonl"}}\n',
+    ),
+)
+def test_archive_index_preparser_rejects_nonhex_unicode_escape_before_json_materialization(
+    tmp_path,
+    monkeypatch,
+    payload,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    archive.index_path.write_bytes(payload)
+    parse_calls = 0
+    real_parse = archive._parse_json
+
+    def count_parse(raw: bytes):
+        nonlocal parse_calls
+        if raw == payload:
+            parse_calls += 1
+        return real_parse(raw)
+
+    monkeypatch.setattr(archive, "_parse_json", count_parse)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert parse_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    (
+        ("st_dev", lambda value: value + 1),
+        ("st_ino", lambda value: value + 1),
+        ("st_size", lambda value: value + 1),
+        ("st_mtime_ns", lambda value: value + 1),
+        ("st_ctime_ns", lambda value: value + 1),
+        ("st_nlink", lambda value: value + 1),
+        ("st_mode", lambda value: value ^ 0o200),
+        ("st_reparse_tag", lambda value: value + 1),
+    ),
+)
+def test_archive_index_cas_binds_complete_open_descriptor_signature_to_record(
+    tmp_path,
+    monkeypatch,
+    field,
+    mutate,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    record = archive._read_index_record(budget=archive_module._new_scan_budget())
+    assert record is not None
+    real_fstat = os.fstat
+
+    def changed_descriptor_stat(descriptor):
+        metadata = real_fstat(descriptor)
+        return _changed_stat_result(
+            metadata,
+            **{field: mutate(getattr(metadata, field, 0))},
+        )
+
+    monkeypatch.setattr(os, "fstat", changed_descriptor_stat)
+
+    assert archive._index_record_is_current(record) is False

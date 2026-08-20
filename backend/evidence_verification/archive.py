@@ -209,6 +209,7 @@ _NAT64_NETWORKS = (
 )
 _IPV4_COMPATIBLE_NETWORK = ipaddress.IPv6Network("::/96")
 _UNRESERVED_PATH_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
 
 
 def _new_scan_budget() -> dict[str, int]:
@@ -282,9 +283,22 @@ def _bucket_name_in_window(value: str, cutoff: datetime, upper: datetime) -> boo
     return cutoff.date() <= bucket_day <= upper.date()
 
 
-def _file_mtime_utc(metadata: tuple[int, int, int, int, int, int]) -> datetime | None:
+def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_nlink,
+        metadata.st_mode,
+        getattr(metadata, "st_reparse_tag", 0),
+    )
+
+
+def _file_mtime_utc(metadata: tuple[int, int, int, int, int, int, int, int]) -> datetime | None:
     try:
-        mtime_ns = metadata[4]
+        mtime_ns = metadata[3]
         if type(mtime_ns) is not int or mtime_ns < 0:
             return None
         return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(
@@ -1040,6 +1054,201 @@ def _preflight_json_payload(raw: bytes, *, maximum_depth: int, maximum_tokens: i
             raise ValueError("archive JSON token budget exceeded")
     if in_string or escaped or stack:
         raise ValueError("invalid archive JSON structure")
+
+
+def _decode_index_json_string(
+    data: bytes,
+    cursor: int,
+    *,
+    maximum_characters: int = 128,
+) -> tuple[str, int]:
+    if cursor >= len(data) or data[cursor] != 0x22:
+        raise ValueError("invalid archive index string")
+    cursor += 1
+    segment_start = cursor
+    parts: list[str] = []
+    character_count = 0
+
+    def append_raw(end: int) -> None:
+        nonlocal character_count
+        raw_segment = data[segment_start:end]
+        if len(raw_segment) > (maximum_characters - character_count) * 4:
+            raise ValueError("invalid archive index string")
+        decoded = raw_segment.decode("utf-8")
+        character_count += len(decoded)
+        if character_count > maximum_characters:
+            raise ValueError("invalid archive index string")
+        if decoded:
+            parts.append(decoded)
+
+    while cursor < len(data):
+        value = data[cursor]
+        if value == 0x22:
+            append_raw(cursor)
+            return "".join(parts), cursor + 1
+        if value < 0x20:
+            raise ValueError("invalid archive index string")
+        if value != 0x5C:
+            if cursor - segment_start > maximum_characters * 4:
+                raise ValueError("invalid archive index string")
+            cursor += 1
+            continue
+
+        append_raw(cursor)
+        cursor += 1
+        if cursor >= len(data):
+            raise ValueError("invalid archive index string")
+        escape = data[cursor]
+        simple_escape = {
+            0x22: '"',
+            0x5C: "\\",
+            0x2F: "/",
+            0x62: "\b",
+            0x66: "\f",
+            0x6E: "\n",
+            0x72: "\r",
+            0x74: "\t",
+        }.get(escape)
+        if simple_escape is not None:
+            parts.append(simple_escape)
+            character_count += 1
+            cursor += 1
+            segment_start = cursor
+            if character_count > maximum_characters:
+                raise ValueError("invalid archive index string")
+            continue
+        if escape != 0x75 or cursor + 5 > len(data):
+            raise ValueError("invalid archive index string")
+        codepoint_bytes = data[cursor + 1:cursor + 5]
+        if len(codepoint_bytes) != 4 or any(value not in _JSON_HEX_BYTES for value in codepoint_bytes):
+            raise ValueError("invalid archive index string")
+        try:
+            codepoint = int(codepoint_bytes.decode("ascii"), 16)
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError("invalid archive index string") from None
+        cursor += 5
+        if 0xD800 <= codepoint <= 0xDBFF:
+            if cursor + 6 > len(data) or data[cursor:cursor + 2] != b"\\u":
+                raise ValueError("invalid archive index string")
+            low_bytes = data[cursor + 2:cursor + 6]
+            if len(low_bytes) != 4 or any(value not in _JSON_HEX_BYTES for value in low_bytes):
+                raise ValueError("invalid archive index string")
+            try:
+                low = int(low_bytes.decode("ascii"), 16)
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("invalid archive index string") from None
+            if not 0xDC00 <= low <= 0xDFFF:
+                raise ValueError("invalid archive index string")
+            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+            cursor += 6
+        elif 0xDC00 <= codepoint <= 0xDFFF:
+            raise ValueError("invalid archive index string")
+        parts.append(chr(codepoint))
+        character_count += 1
+        if character_count > maximum_characters:
+            raise ValueError("invalid archive index string")
+        segment_start = cursor
+    raise ValueError("invalid archive index string")
+
+
+def _preparse_index_payload(raw: bytes, *, budget: dict[str, int]) -> int:
+    if not raw or raw[-1:] != b"\n" or raw.count(b"\n") != 1:
+        raise ValueError("invalid archive JSON framing")
+    if any(type(budget.get(name)) is not int or budget[name] < 0 for name in ("nodes", "rows")):
+        raise ValueError("invalid archive index budget")
+    data = raw[:-1]
+    cursor = 0
+
+    def skip_space(position: int) -> int:
+        while position < len(data) and data[position] in b" \t\r\n":
+            position += 1
+        return position
+
+    def expect(position: int, token: int) -> int:
+        position = skip_space(position)
+        if position >= len(data) or data[position] != token:
+            raise ValueError("invalid archive index")
+        return position + 1
+
+    def parse_events(position: int) -> tuple[int, int]:
+        position = expect(position, 0x7B)
+        position = skip_space(position)
+        event_ids: set[str] = set()
+        entry_count = 0
+        if position < len(data) and data[position] == 0x7D:
+            return position + 1, 0
+        while True:
+            event_id, position = _decode_index_json_string(data, position)
+            if event_id in event_ids:
+                raise ValueError("duplicate archive index event")
+            event_ids.add(event_id)
+            entry_count += 1
+            if entry_count > _MAX_INDEX_EVENTS or entry_count > budget["rows"]:
+                raise ValueError("archive index row budget exceeded")
+            position = expect(position, 0x3A)
+            position = skip_space(position)
+            if position >= len(data) or data[position] != 0x22:
+                raise ValueError("invalid archive index events")
+            _bucket, position = _decode_index_json_string(data, position)
+            position = skip_space(position)
+            if position >= len(data):
+                raise ValueError("invalid archive index events")
+            if data[position] == 0x7D:
+                return position + 1, entry_count
+            if data[position] != 0x2C:
+                raise ValueError("invalid archive index events")
+            position = skip_space(position + 1)
+            if position >= len(data) or data[position] == 0x7D:
+                raise ValueError("invalid archive index events")
+
+    cursor = expect(cursor, 0x7B)
+    cursor = skip_space(cursor)
+    root_keys: set[str] = set()
+    entry_count: int | None = None
+    schema_version_seen = False
+    if cursor < len(data) and data[cursor] == 0x7D:
+        raise ValueError("invalid archive index")
+    while True:
+        key, cursor = _decode_index_json_string(data, cursor)
+        if key in root_keys:
+            raise ValueError("duplicate archive index key")
+        if key not in _INDEX_KEYS:
+            raise ValueError("invalid archive index key")
+        root_keys.add(key)
+        cursor = expect(cursor, 0x3A)
+        cursor = skip_space(cursor)
+        if key == "schema_version":
+            if cursor >= len(data) or data[cursor] != 0x31:
+                raise ValueError("invalid archive index schema")
+            cursor += 1
+            schema_version_seen = True
+        else:
+            cursor, entry_count = parse_events(cursor)
+        cursor = skip_space(cursor)
+        if cursor >= len(data):
+            raise ValueError("invalid archive index")
+        if data[cursor] == 0x7D:
+            cursor += 1
+            break
+        if data[cursor] != 0x2C:
+            raise ValueError("invalid archive index")
+        cursor = skip_space(cursor + 1)
+        if cursor >= len(data) or data[cursor] == 0x7D:
+            raise ValueError("invalid archive index")
+    cursor = skip_space(cursor)
+    if (
+        cursor != len(data)
+        or root_keys != _INDEX_KEYS
+        or not schema_version_seen
+        or entry_count is None
+    ):
+        raise ValueError("invalid archive index")
+    document_nodes = 5 + entry_count * 2
+    if document_nodes > budget["nodes"]:
+        raise ValueError("archive index node budget exceeded")
+    budget["nodes"] -= document_nodes
+    budget["rows"] -= entry_count
+    return entry_count
 
 
 def _preflight_top_level_container_entries(
@@ -2176,11 +2385,13 @@ class EvidenceArchive:
         maximum: int,
         *,
         observed_identity: list[tuple[int, int]] | None = None,
-        observed_metadata: list[tuple[int, int, int, int, int, int]] | None = None,
+        observed_metadata: list[tuple[int, int, int, int, int, int, int, int]] | None = None,
+        observed_descriptor_metadata: list[tuple[int, int, int, int, int, int, int, int]] | None = None,
     ) -> bytes | None:
         before = self._safe_file(path)
         if before is None:
             return None
+        before_signature = _file_signature(before)
         self._verify_parent(path)
         descriptor: int | None = None
         identity: tuple[int, int] | None = None
@@ -2189,14 +2400,7 @@ class EvidenceArchive:
             descriptor = os.open(path, flags)
             opened = os.fstat(descriptor)
             identity = (opened.st_dev, opened.st_ino)
-            opened_signature = (
-                opened.st_dev,
-                opened.st_ino,
-                opened.st_nlink,
-                opened.st_size,
-                opened.st_mtime_ns,
-                opened.st_ctime_ns,
-            )
+            opened_signature = _file_signature(opened)
             if (
                 identity != (before.st_dev, before.st_ino)
                 or not stat.S_ISREG(opened.st_mode)
@@ -2209,25 +2413,34 @@ class EvidenceArchive:
             with handle:
                 payload = handle.read(maximum + 1)
                 after = os.fstat(handle.fileno())
-            after_signature = (
-                after.st_dev,
-                after.st_ino,
-                after.st_nlink,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
+                final_path = path.stat(follow_symlinks=False)
+                final_descriptor = os.fstat(handle.fileno())
+            after_signature = _file_signature(after)
+            final_path_signature = _file_signature(final_path)
+            final_descriptor_signature = _file_signature(final_descriptor)
             if (
                 len(payload) > maximum
                 or after_signature != opened_signature
-                or after.st_size != len(payload)
+                or final_descriptor_signature != opened_signature
+                or final_path_signature != before_signature
+                or final_path_signature[:2] != identity
+                or final_path.st_size != len(payload)
+                or final_path.st_nlink != 1
+                or getattr(final_path, "st_reparse_tag", 0)
+                or not stat.S_ISREG(final_path.st_mode)
+                or final_descriptor.st_size != len(payload)
+                or final_descriptor.st_nlink != 1
+                or getattr(final_descriptor, "st_reparse_tag", 0)
+                or not stat.S_ISREG(final_descriptor.st_mode)
                 or not stat.S_ISREG(after.st_mode)
             ):
                 return None
             if observed_identity is not None:
                 observed_identity.append((after.st_dev, after.st_ino))
             if observed_metadata is not None:
-                observed_metadata.append(after_signature)
+                observed_metadata.append(final_path_signature)
+            if observed_descriptor_metadata is not None:
+                observed_descriptor_metadata.append(final_descriptor_signature)
             return payload
         except OSError:
             return None
@@ -2247,7 +2460,8 @@ class EvidenceArchive:
         maximum: int,
         *,
         budget: dict[str, int],
-        observed_metadata: list[tuple[int, int, int, int, int, int]] | None = None,
+        observed_metadata: list[tuple[int, int, int, int, int, int, int, int]] | None = None,
+        observed_descriptor_metadata: list[tuple[int, int, int, int, int, int, int, int]] | None = None,
     ) -> bytes | None:
         metadata = self._safe_file(path)
         if metadata is None:
@@ -2269,6 +2483,7 @@ class EvidenceArchive:
             path,
             size,
             observed_metadata=observed_metadata,
+            observed_descriptor_metadata=observed_descriptor_metadata,
         )
         if payload is None or len(payload) != size:
             raise OSError("storage_corrupt")
@@ -2566,16 +2781,21 @@ class EvidenceArchive:
         if record is None:
             return not self._entry_present(self.index_path)
         expected = record.get("metadata")
+        expected_descriptor = record.get("descriptor_metadata")
         if (
             type(expected) is not tuple
-            or len(expected) != 6
+            or len(expected) != 8
             or any(type(value) is not int for value in expected)
+            or type(expected_descriptor) is not tuple
+            or len(expected_descriptor) != 8
+            or any(type(value) is not int for value in expected_descriptor)
+            or expected_descriptor[:2] != expected[:2]
         ):
             return False
         before = self._safe_file(self.index_path)
         if before is None:
             return False
-        if (before.st_dev, before.st_ino) != expected[:2]:
+        if _file_signature(before) != expected:
             return False
         self._verify_parent(self.index_path)
         descriptor: int | None = None
@@ -2585,20 +2805,25 @@ class EvidenceArchive:
             descriptor = os.open(self.index_path, flags)
             opened = os.fstat(descriptor)
             identity = (opened.st_dev, opened.st_ino)
-            opened_signature = (
-                opened.st_dev,
-                opened.st_ino,
-                opened.st_nlink,
-                opened.st_size,
-                opened.st_mtime_ns,
-                opened.st_ctime_ns,
-            )
-            after = self.index_path.stat(follow_symlinks=False)
+            opened_signature = _file_signature(opened)
+            final_path = self.index_path.stat(follow_symlinks=False)
+            final_path_signature = _file_signature(final_path)
+            final_descriptor = os.fstat(descriptor)
+            final_descriptor_signature = _file_signature(final_descriptor)
             return (
-                opened_signature == expected
-                and (after.st_dev, after.st_ino) == expected[:2]
+                (opened.st_dev, opened.st_ino) == expected[:2]
+                and opened_signature == expected_descriptor
+                and final_path_signature == expected
+                and final_descriptor_signature == expected_descriptor
                 and stat.S_ISREG(opened.st_mode)
-                and not getattr(after, "st_reparse_tag", 0)
+                and opened.st_nlink == 1
+                and not getattr(opened, "st_reparse_tag", 0)
+                and stat.S_ISREG(final_path.st_mode)
+                and final_path.st_nlink == 1
+                and not getattr(final_path, "st_reparse_tag", 0)
+                and stat.S_ISREG(final_descriptor.st_mode)
+                and final_descriptor.st_nlink == 1
+                and not getattr(final_descriptor, "st_reparse_tag", 0)
             )
         except OSError:
             return False
@@ -2923,30 +3148,23 @@ class EvidenceArchive:
             return None
         if any(budget[name] <= 0 for name in ("files", "bytes", "nodes", "rows")):
             raise OSError("storage_corrupt")
-        observed_metadata: list[tuple[int, int, int, int, int, int]] = []
+        observed_metadata: list[tuple[int, int, int, int, int, int, int, int]] = []
+        observed_descriptor_metadata: list[tuple[int, int, int, int, int, int, int, int]] = []
         raw = self._read_budgeted_bytes(
             self.index_path,
             _MAX_INDEX_BYTES,
             budget=budget,
             observed_metadata=observed_metadata,
+            observed_descriptor_metadata=observed_descriptor_metadata,
         )
-        if raw is None or len(observed_metadata) != 1:
+        if (
+            raw is None
+            or len(observed_metadata) != 1
+            or len(observed_descriptor_metadata) != 1
+        ):
             raise OSError("storage_corrupt")
         try:
-            _preflight_json_payload(
-                raw,
-                maximum_depth=4,
-                maximum_tokens=min(_MAX_SCAN_NODES, budget["nodes"] * 4 + 16),
-            )
-            entry_count = _preflight_top_level_object_entries(
-                raw,
-                key="events",
-                maximum_entries=min(_MAX_INDEX_EVENTS, budget["rows"]),
-                require_key=True,
-            )
-            document_nodes = 5 + entry_count * 2
-            if document_nodes > budget["nodes"]:
-                raise ValueError("archive index node budget exceeded")
+            entry_count = _preparse_index_payload(raw, budget=budget)
             document = self._parse_json(raw)
             if (
                 type(document) is not dict
@@ -2958,8 +3176,6 @@ class EvidenceArchive:
             events = self._index_events(document["events"])
             if len(events) != entry_count:
                 raise ValueError("invalid archive index events")
-            budget["nodes"] -= document_nodes
-            budget["rows"] -= entry_count
             if diagnostics is not None:
                 self._increment(diagnostics, "scanned_files")
                 self._increment(diagnostics, "scanned_rows", entry_count)
@@ -2968,6 +3184,7 @@ class EvidenceArchive:
                 "payload": raw,
                 "digest": self._payload_digest(raw),
                 "metadata": observed_metadata[0],
+                "descriptor_metadata": observed_descriptor_metadata[0],
             }
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
             if diagnostics is not None:
@@ -3350,7 +3567,7 @@ class EvidenceArchive:
         allow_unrecognized: bool = False,
         physical_index_record: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        observed_metadata: list[tuple[int, int, int, int, int, int]] = []
+        observed_metadata: list[tuple[int, int, int, int, int, int, int, int]] = []
         raw = self._read_budgeted_bytes(
             self.journal_path,
             _MAX_JOURNAL_BYTES,
@@ -3632,6 +3849,7 @@ class EvidenceArchive:
         now: datetime,
         diagnostics: dict[str, int],
         budget: dict[str, int],
+        observed_index_record: list[dict[str, Any]] | None = None,
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
         dict[str, str],
@@ -3653,6 +3871,8 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         if physical_index_record["digest"] != state["target_index_digest"]:
             raise OSError("storage_corrupt")
+        if observed_index_record is not None:
+            observed_index_record.append(physical_index_record)
         active_cutoff = _shift_days(now, -90)
         active_upper = _shift_datetime(now, _MAX_CLOCK_SKEW)
         discovered = self._bucket_names()
@@ -3995,6 +4215,8 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
+        if not self._index_record_is_current(recovery_plan["physical_index_record"]):
+            raise OSError("storage_corrupt")
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         self._recover_prepared_authority(
             prepared,
@@ -4328,6 +4550,8 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
+        if not self._index_record_is_current(recovery_plan["physical_index_record"]):
+            raise OSError("storage_corrupt")
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         self._recover_prepared_authority(
             prepared,
@@ -4400,6 +4624,7 @@ class EvidenceArchive:
                 base_generation = 0
                 base_index_digest = _MISSING_DIGEST
             else:
+                observed_index_records: list[dict[str, Any]] = []
                 (
                     bucket_rows,
                     observed_bucket_digests,
@@ -4410,7 +4635,11 @@ class EvidenceArchive:
                     now=archived_at,
                     diagnostics=diagnostics,
                     budget=budget,
+                    observed_index_record=observed_index_records,
                 )
+                if len(observed_index_records) != 1:
+                    raise OSError("storage_corrupt")
+                base_index_record = observed_index_records[0]
                 base_generation = state["generation"]
                 base_index_digest = state["target_index_digest"]
 
@@ -4509,6 +4738,9 @@ class EvidenceArchive:
             if mutation_bytes > _MAX_MUTATION_BYTES:
                 raise ValueError("archive snapshot mutation budget exceeded")
 
+            expected_index_record = None if state is None else base_index_record
+            if not self._index_record_is_current(expected_index_record):
+                raise OSError("storage_corrupt")
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
             write_order = sorted(target_names) + sorted(affected - target_names)
             for name in write_order:
