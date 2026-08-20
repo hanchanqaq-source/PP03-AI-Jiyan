@@ -33,7 +33,6 @@ from .storage import (
     _safe_directory,
     _strict_json_int,
     _strict_json_object,
-    _sync_directory,
     event_document,
     validated_snapshot_document,
 )
@@ -48,6 +47,7 @@ _MAX_INDEX_BYTES = 16 * 1_048_576
 _MAX_ROW_BYTES = 1_048_576
 _MAX_BUCKET_ROWS = 4_096
 _MAX_ARCHIVE_FILES = 512
+_MAX_SCAN_FILES = _MAX_ARCHIVE_FILES + 1
 _MAX_INDEX_EVENTS = 65_536
 _MAX_ARCHIVE_SCAN_BYTES = 64 * 1_048_576
 _MAX_JOURNAL_BYTES = 32 * 1_048_576
@@ -178,6 +178,17 @@ _NAT64_NETWORKS = (
 )
 _IPV4_COMPATIBLE_NETWORK = ipaddress.IPv6Network("::/96")
 _UNRESERVED_PATH_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def _new_scan_budget() -> dict[str, int]:
+    return {
+        "bytes": _MAX_SCAN_BYTES,
+        "rows": _MAX_SCAN_ROWS,
+        "nodes": _MAX_SCAN_NODES,
+        "files": _MAX_SCAN_FILES,
+    }
+
+
 _PATH_SAFE_CHARACTERS = "/:@-._~!$&'()*+,;="
 _CONTENT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _STATUS_PRECEDENCE = {
@@ -1292,9 +1303,20 @@ def _merge_evidence(
         pair = (loser[loser_index], winner[winner_index])
         canonical_id = min(item["evidence_id"] for item in pair)
         selected = dict(winner[winner_index])
-        for public_field in ("canonical_url", "title", "excerpt"):
-            if not selected[public_field] and loser[loser_index][public_field]:
-                selected[public_field] = loser[loser_index][public_field]
+        for static_provenance_field in (
+            "canonical_url",
+            "title",
+            "excerpt",
+            "published_at",
+            "content_source",
+            "collector_source",
+            "origin_cluster",
+        ):
+            if (
+                selected[static_provenance_field] in {None, ""}
+                and loser[loser_index][static_provenance_field] not in {None, ""}
+            ):
+                selected[static_provenance_field] = loser[loser_index][static_provenance_field]
         selected["evidence_id"] = canonical_id
         result.append(selected)
         for item in pair:
@@ -1999,6 +2021,8 @@ class EvidenceArchive:
         path = self.archive_root / name
         maximum = _MAX_BUCKET_BYTES
         if budget is not None:
+            if budget["files"] <= 0:
+                raise OSError("storage_corrupt")
             maximum = min(maximum, max(0, budget["bytes"]))
         payload = self._read_bytes(path, maximum)
         if payload is None:
@@ -2012,6 +2036,7 @@ class EvidenceArchive:
         if observed_digests is not None:
             observed_digests[name] = self._payload_digest(payload)
         if budget is not None:
+            budget["files"] -= 1
             budget["bytes"] -= len(payload)
         self._increment(diagnostics, "scanned_files")
         lines = payload.splitlines()
@@ -2341,6 +2366,35 @@ class EvidenceArchive:
         except (KeyError, TypeError, ValueError):
             raise OSError("storage_corrupt") from None
 
+    def _logical_native_index(
+        self,
+        journal: dict[str, Any],
+        physical_index: dict[str, str],
+        *,
+        cutoff: datetime,
+        upper: datetime,
+    ) -> dict[str, str]:
+        if journal["legacy"]:
+            raise OSError("storage_corrupt")
+        if journal["target_index"] is not None:
+            return dict(journal["target_index"])
+        if journal["native_schema_version"] != _PREVIOUS_JOURNAL_SCHEMA_VERSION:
+            raise OSError("storage_corrupt")
+        actual_digest = self._payload_digest(self._index_payload(physical_index))
+        if actual_digest == journal["target_index_digest"]:
+            return dict(physical_index)
+        if actual_digest != journal["base_index_digest"]:
+            raise OSError("storage_corrupt")
+        target = dict(physical_index)
+        for row in journal["rows"]:
+            if cutoff <= _event_time(row) <= upper:
+                target[row["event_id"]] = _bucket_name(row)
+            else:
+                target.pop(row["event_id"], None)
+        if self._payload_digest(self._index_payload(target)) != journal["target_index_digest"]:
+            raise OSError("storage_corrupt")
+        return target
+
     def _index_payload(self, events: dict[str, str]) -> bytes:
         if len(events) > _MAX_INDEX_EVENTS:
             raise ValueError("archive index is too large")
@@ -2483,6 +2537,8 @@ class EvidenceArchive:
         *,
         budget: dict[str, int],
     ) -> dict[str, Any] | None:
+        if budget["files"] <= 0:
+            raise OSError("storage_corrupt")
         maximum = min(_MAX_JOURNAL_BYTES, max(0, budget["bytes"]))
         observed_identity: list[tuple[int, int]] = []
         raw = self._read_bytes(
@@ -2498,6 +2554,7 @@ class EvidenceArchive:
             return None
         try:
             self._increment(diagnostics, "scanned_files")
+            budget["files"] -= 1
             budget["bytes"] -= len(raw)
             _preflight_json_payload(
                 raw,
@@ -2550,6 +2607,7 @@ class EvidenceArchive:
                     "legacy": True,
                     "rows": rows,
                     "file_identity": observed_identity[0],
+                    "file_digest": self._payload_digest(raw),
                 }
             transaction_id = document["transaction_id"]
             base_generation = document["base_generation"]
@@ -2599,6 +2657,7 @@ class EvidenceArchive:
                 raise ValueError("invalid archive journal")
             state = self._read_state()
             actual_index_digest = self._index_digest()
+            completed = False
             if state["phase"] == "prepared":
                 if (
                     state["generation"] != target_generation
@@ -2609,8 +2668,14 @@ class EvidenceArchive:
                     raise ValueError("stale archive journal")
             else:
                 if state["generation"] == target_generation:
-                    raise ValueError("stale archive journal")
-                if (
+                    if (
+                        state["transaction_id"] != transaction_id
+                        or state["index_digest"] != target_index_digest
+                        or actual_index_digest != target_index_digest
+                    ):
+                        raise ValueError("stale archive journal")
+                    completed = True
+                elif (
                     state["generation"] != base_generation
                     or state["generation"] > 0
                     and state["index_digest"] != base_index_digest
@@ -2628,40 +2693,42 @@ class EvidenceArchive:
                 "base_bucket_digests": base_bucket_digests,
                 "target_bucket_digests": target_bucket_digests,
                 "state_phase": state["phase"],
+                "completed": completed,
                 "native_schema_version": schema_version,
                 "cutoff": cutoff_time,
                 "target_index": target_index,
                 "file_identity": observed_identity[0],
+                "file_digest": self._payload_digest(raw),
             }
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
             self._increment(diagnostics, "skipped_files")
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt") from None
 
-    def _remove_journal(self, expected_identity: tuple[int, int]) -> None:
+    def _assert_journal_binding(
+        self,
+        expected_identity: tuple[int, int],
+        expected_digest: str,
+    ) -> None:
         if (
             type(expected_identity) is not tuple
             or len(expected_identity) != 2
             or any(type(value) is not int for value in expected_identity)
+            or type(expected_digest) is not str
+            or _CONTENT_DIGEST.fullmatch(expected_digest) is None
         ):
             raise OSError("storage_error")
-        metadata = self._safe_file(self.journal_path)
-        if metadata is None or (metadata.st_dev, metadata.st_ino) != expected_identity:
-            raise OSError("storage_error")
-        try:
-            current = self.journal_path.stat(follow_symlinks=False)
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or getattr(current, "st_reparse_tag", 0)
-                or current.st_nlink != 1
-                or (current.st_dev, current.st_ino) != expected_identity
-            ):
-                raise OSError("storage_error")
-            self.journal_path.unlink()
-            if self._entry_present(self.journal_path):
-                raise OSError("storage_error")
-            _sync_directory(self.archive_root)
-        except OSError:
+        observed_identity: list[tuple[int, int]] = []
+        payload = self._read_bytes(
+            self.journal_path,
+            _MAX_JOURNAL_BYTES,
+            observed_identity=observed_identity,
+        )
+        if (
+            payload is None
+            or observed_identity != [expected_identity]
+            or self._payload_digest(payload) != expected_digest
+        ):
             raise OSError("storage_error") from None
 
     def _validate_journal_bucket_state(
@@ -2677,7 +2744,11 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         for name in base:
             actual = observed[name]
-            allowed = {target[name]} if journal["state_phase"] == "prepared" else {base[name], target[name]}
+            allowed = (
+                {target[name]}
+                if journal["state_phase"] == "prepared" or journal["completed"]
+                else {base[name], target[name]}
+            )
             if actual not in allowed:
                 raise OSError("storage_corrupt")
 
@@ -2707,11 +2778,12 @@ class EvidenceArchive:
         journal: dict[str, Any],
         state: dict[str, Any],
         now: datetime,
+        *,
+        diagnostics: dict[str, int],
+        budget: dict[str, int],
     ) -> None:
         if journal["legacy"]:
             return
-        diagnostics = self._diagnostics()
-        budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
         cutoff = journal["cutoff"] if journal["cutoff"] is not None else now - timedelta(days=90)
         transaction_upper = cutoff + timedelta(days=90)
         calendar_names = self._calendar_bucket_candidates(cutoff, transaction_upper)
@@ -2760,7 +2832,14 @@ class EvidenceArchive:
             except (KeyError, TypeError, ValueError):
                 raise OSError("storage_corrupt") from None
 
-        actual_index_digest = self._index_digest()
+        physical_index = self._read_index() or {}
+        actual_index_digest = self._payload_digest(self._index_payload(physical_index))
+        logical_target_index = self._logical_native_index(
+            journal,
+            physical_index,
+            cutoff=cutoff,
+            upper=transaction_upper,
+        )
         if (
             actual_index_digest == journal["target_index_digest"]
             and all(
@@ -2768,14 +2847,15 @@ class EvidenceArchive:
                 for name, target_digest in journal["target_bucket_digests"].items()
             )
         ):
-            if journal["target_index"] is not None:
-                self._validate_index_projection(
-                    journal["target_index"],
-                    bucket_rows,
-                    cutoff=cutoff,
-                    upper=transaction_upper,
-                    authoritative_rows=journal["rows"],
-                )
+            self._validate_index_projection(
+                logical_target_index,
+                bucket_rows,
+                cutoff=cutoff,
+                upper=transaction_upper,
+                authoritative_rows=journal["rows"],
+            )
+            if journal["completed"]:
+                return
             self._write_state(
                 journal["target_generation"],
                 "prepared",
@@ -2783,7 +2863,7 @@ class EvidenceArchive:
                 journal["target_index_digest"],
                 journal["target_bucket_digests"],
             )
-            self._remove_journal(journal["file_identity"])
+            self._assert_journal_binding(journal["file_identity"], journal["file_digest"])
             self._write_state(
                 journal["target_generation"],
                 "finalized",
@@ -2815,16 +2895,7 @@ class EvidenceArchive:
         } != journal["target_bucket_digests"]:
             raise OSError("storage_corrupt")
 
-        if journal["target_index"] is not None:
-            planned_index = journal["target_index"]
-        else:
-            target_rows = dict(existing)
-            target_rows.update({row["event_id"]: row for row in journal["rows"]})
-            planned_index = {
-                event_id: _bucket_name(row)
-                for event_id, row in target_rows.items()
-                if cutoff <= _event_time(row) <= transaction_upper
-            }
+        planned_index = logical_target_index
         index_payload = self._index_payload(planned_index)
         if self._payload_digest(index_payload) != journal["target_index_digest"]:
             raise OSError("storage_corrupt")
@@ -2867,12 +2938,12 @@ class EvidenceArchive:
         if actual_index_digest != journal["target_index_digest"]:
             self._atomic_write(self.index_path, index_payload, _MAX_INDEX_BYTES)
         self._atomic_write(self.state_path, prepared_state, _MAX_STATE_BYTES)
-        self._remove_journal(journal["file_identity"])
+        self._assert_journal_binding(journal["file_identity"], journal["file_digest"])
         self._atomic_write(self.state_path, finalized_state, _MAX_STATE_BYTES)
 
     def _rebuild_index(self) -> dict[str, str]:
         diagnostics = self._diagnostics()
-        budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
+        budget = _new_scan_budget()
         events: dict[str, tuple[str, datetime]] = {}
         now = _utc(self._now(), "archive clock")
         cursor = (now - timedelta(days=90)).date()
@@ -2914,15 +2985,28 @@ class EvidenceArchive:
         _ensure_snapshot_budget(incoming)
         with CACHE_IO_LOCK, self._process_lock():
             diagnostics = self._diagnostics()
-            budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
+            budget = _new_scan_budget()
             journal = self._read_journal(archived_at, diagnostics, budget=budget)
             state = self._read_state()
-            if journal is not None and not journal["legacy"]:
-                self._recover_native_journal_before_upsert(journal, state, archived_at)
+            if journal is not None and not journal["legacy"] and not journal["completed"]:
+                self._recover_native_journal_before_upsert(
+                    journal,
+                    state,
+                    archived_at,
+                    diagnostics=diagnostics,
+                    budget=budget,
+                )
                 diagnostics = self._diagnostics()
-                budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
+                budget = _new_scan_budget()
                 journal = self._read_journal(archived_at, diagnostics, budget=budget)
                 state = self._read_state()
+            superseded_journal = (
+                journal
+                if journal is not None and not journal["legacy"] and journal["completed"]
+                else None
+            )
+            if superseded_journal is not None:
+                journal = None
             if (
                 journal is None
                 and state["generation"] > 0
@@ -2999,13 +3083,14 @@ class EvidenceArchive:
             )
 
             if journal is not None and journal["legacy"]:
-                self._remove_journal(journal["file_identity"])
+                self._assert_journal_binding(journal["file_identity"], journal["file_digest"])
+                superseded_journal = journal
                 journal = None
                 pending = []
 
             if state["phase"] == "prepared":
                 if journal is not None:
-                    self._remove_journal(journal["file_identity"])
+                    self._assert_journal_binding(journal["file_identity"], journal["file_digest"])
                 self._write_state(
                     state["generation"],
                     "finalized",
@@ -3116,6 +3201,11 @@ class EvidenceArchive:
             if mutation_bytes > _MAX_MUTATION_BYTES:
                 raise ValueError("archive snapshot mutation budget exceeded")
 
+            if superseded_journal is not None:
+                self._assert_journal_binding(
+                    superseded_journal["file_identity"],
+                    superseded_journal["file_digest"],
+                )
             journal_identity = self._atomic_write(
                 self.journal_path,
                 journal_payload,
@@ -3126,16 +3216,18 @@ class EvidenceArchive:
                 self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
             self._atomic_write(self.index_path, index_payload, _MAX_INDEX_BYTES)
             self._atomic_write(self.state_path, prepared_state_payload, _MAX_STATE_BYTES)
-            self._remove_journal(journal_identity)
+            self._assert_journal_binding(journal_identity, self._payload_digest(journal_payload))
             self._atomic_write(self.state_path, finalized_state_payload, _MAX_STATE_BYTES)
 
     def _query_unlocked(self, days: int, status: str | None) -> list[dict[str, Any]]:
         now = _utc(self._now(), "archive clock")
         cutoff = now - timedelta(days=days)
         diagnostics = self._diagnostics()
-        budget = {"bytes": _MAX_SCAN_BYTES, "rows": _MAX_SCAN_ROWS, "nodes": _MAX_SCAN_NODES}
+        budget = _new_scan_budget()
         selected: dict[str, dict[str, Any]] = {}
         journal = self._read_journal(now, diagnostics, budget=budget)
+        if journal is not None and not journal["legacy"] and journal["completed"]:
+            journal = None
         state = self._read_state()
         physical_index = self._read_index() or {}
         legacy_journal = journal is not None and journal["legacy"]
@@ -3156,15 +3248,24 @@ class EvidenceArchive:
                 if effective < cutoff or effective > now:
                     continue
                 selected[row["event_id"]] = row
+        native_journal = journal is not None and not journal["legacy"]
         native_bound_journal = (
-            journal is not None
-            and not journal["legacy"]
+            native_journal
             and journal["target_index"] is not None
             and journal["cutoff"] is not None
         )
-        logical_index = journal["target_index"] if native_bound_journal else physical_index
         validation_cutoff = journal["cutoff"] if native_bound_journal else now - timedelta(days=90)
         validation_upper = validation_cutoff + timedelta(days=90) if native_bound_journal else now
+        logical_index = (
+            self._logical_native_index(
+                journal,
+                physical_index,
+                cutoff=validation_cutoff,
+                upper=validation_upper,
+            )
+            if native_journal
+            else physical_index
+        )
         calendar_names = self._calendar_bucket_candidates(validation_cutoff, validation_upper)
         native_names = () if journal is None or journal["legacy"] else (
             *journal["base_bucket_digests"],
@@ -3226,15 +3327,14 @@ class EvidenceArchive:
         if legacy_journal and matched_legacy_ids != {event_id: 1 for event_id in journal_ids}:
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt")
-        if journal is None or legacy_journal or native_bound_journal:
-            self._validate_index_projection(
-                logical_index,
-                bucket_rows,
-                cutoff=validation_cutoff,
-                upper=validation_upper,
-                authoritative_rows=journal_rows if native_bound_journal else None,
-                allow_stale_index_entries=not native_bound_journal,
-            )
+        self._validate_index_projection(
+            logical_index,
+            bucket_rows,
+            cutoff=validation_cutoff,
+            upper=validation_upper,
+            authoritative_rows=journal_rows if native_journal else None,
+            allow_stale_index_entries=not native_bound_journal,
+        )
         self._last_diagnostics = diagnostics
         return sorted(
             (row for row in selected.values() if status is None or row["verification_status"] == status),

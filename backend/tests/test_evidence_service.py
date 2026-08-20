@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -241,7 +242,7 @@ def test_archive_failure_does_not_replace_previous_current_evidence_snapshot(tmp
     assert storage.load_current() == previous
 
 
-def test_journal_delete_failure_keeps_prepared_archive_and_previous_current_snapshot(
+def test_journal_finalization_never_depends_on_path_unlink(
     tmp_path,
     monkeypatch,
 ):
@@ -253,7 +254,7 @@ def test_journal_delete_failure_keeps_prepared_archive_and_previous_current_snap
         event_loader=lambda: [event("a" * 20, [official_source()])],
         now=lambda: NOW,
     )
-    previous = previous_service.refresh()
+    previous_service.refresh()
     before = storage.current_path.read_bytes()
     real_unlink = Path.unlink
 
@@ -270,10 +271,61 @@ def test_journal_delete_failure_keeps_prepared_archive_and_previous_current_snap
         now=lambda: NOW,
     )
 
+    refreshed = failing.refresh()
+
+    assert storage.current_path.read_bytes() != before
+    assert storage.load_current() == refreshed
+    assert archive.journal_path.is_file()
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
+
+
+def test_racing_foreign_journal_at_final_binding_keeps_previous_current_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    archive = EvidenceArchive(storage.root, now=lambda: NOW)
+    previous = EvidenceVerificationService(
+        storage=storage,
+        archive=archive,
+        event_loader=lambda: [event("a" * 20, [official_source()])],
+        now=lambda: NOW,
+    ).refresh()
+    before = storage.current_path.read_bytes()
+    real_atomic_write = archive._atomic_write
+    real_read_bytes = archive._read_bytes
+    armed = False
+    foreign_payload = b'{"owner":"foreign","must_survive":true}\n'
+
+    def arm_after_prepared(path: Path, payload: bytes, maximum: int):
+        nonlocal armed
+        identity = real_atomic_write(path, payload, maximum)
+        if path == archive.state_path and json.loads(payload)["phase"] == "prepared":
+            armed = True
+        return identity
+
+    def replace_before_final_binding(path: Path, maximum: int, **kwargs):
+        nonlocal armed
+        if armed and path == archive.journal_path:
+            armed = False
+            replacement = archive.archive_root / "foreign-transaction.json"
+            replacement.write_bytes(foreign_payload)
+            os.replace(replacement, archive.journal_path)
+        return real_read_bytes(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_atomic_write", arm_after_prepared)
+    monkeypatch.setattr(archive, "_read_bytes", replace_before_final_binding)
+    failing = EvidenceVerificationService(
+        storage=storage,
+        archive=archive,
+        event_loader=lambda: [event("b" * 20, [official_source()])],
+        now=lambda: NOW,
+    )
+
     with pytest.raises(OSError, match="storage_error"):
         failing.refresh()
 
+    assert archive.journal_path.read_bytes() == foreign_payload
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
     assert storage.current_path.read_bytes() == before
     assert storage.load_current() == previous
-    assert archive.journal_path.is_file()
-    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"

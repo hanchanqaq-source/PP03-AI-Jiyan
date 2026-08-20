@@ -113,6 +113,27 @@ def _legacy_v1_row(row: dict[str, object]) -> dict[str, object]:
     return legacy
 
 
+def _rewrite_pending_journal_as_v2(archive: EvidenceArchive) -> dict[str, object]:
+    document = json.loads(archive.journal_path.read_text(encoding="utf-8"))
+    document.pop("cutoff")
+    document.pop("target_index")
+    document["schema_version"] = 2
+    document["transaction_id"] = archive._journal_transaction_id(
+        base_generation=document["base_generation"],
+        target_generation=document["target_generation"],
+        base_index_digest=document["base_index_digest"],
+        target_index_digest=document["target_index_digest"],
+        base_bucket_digests=document["base_bucket_digests"],
+        target_bucket_digests=document["target_bucket_digests"],
+        rows=document["rows"],
+    )
+    archive.journal_path.write_text(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return document
+
+
 def _upsert_in_child(root: str, event_id: str) -> None:
     EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(event(event_id)))
 
@@ -380,7 +401,8 @@ def test_archive_index_io_failure_leaves_merged_journal_queryable_and_retryable(
 
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     archive.upsert(updated)
-    assert not archive.journal_path.exists()
+    assert archive.journal_path.is_file()
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
     assert archive.get("a" * 20)["verification_status"] == "disproved"
 
 
@@ -524,7 +546,8 @@ def test_archive_cross_bucket_target_failure_keeps_previous_history_queryable(tm
 
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     archive.upsert(updated)
-    assert not archive.journal_path.exists()
+    assert archive.journal_path.is_file()
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
     assert archive.get("c" * 20)["snapshot_history"][-1]["evidence_snapshot_id"] == "f" * 20
 
 
@@ -1940,11 +1963,35 @@ def test_archive_rejects_replayed_completed_transaction_journal(tmp_path, monkey
     monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
     archive.upsert(disproved)
     assert archive.get("a" * 20)["verification_status"] == "disproved"
-    assert not archive.journal_path.exists()
+    assert archive.journal_path.is_file()
 
     archive.journal_path.write_bytes(completed_transaction)
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
+
+
+def test_archive_keeps_one_manifest_bound_finalized_journal_across_transactions(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(snapshot(event()))
+    first = json.loads(archive.journal_path.read_text(encoding="utf-8"))
+    first_identity = archive.journal_path.stat(follow_symlinks=False).st_ino
+
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+
+    second = json.loads(archive.journal_path.read_text(encoding="utf-8"))
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert first["transaction_id"] != second["transaction_id"]
+    assert archive.journal_path.stat(follow_symlinks=False).st_ino != first_identity
+    assert state["phase"] == "finalized"
+    assert state["generation"] == second["target_generation"]
+    assert state["transaction_id"] == second["transaction_id"]
+    assert {path.name for path in archive.archive_root.glob("transaction*.json")} == {"transaction.json"}
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
 
 
 def test_archive_v1_lineage_digest_binds_the_actual_event_projection():
@@ -2448,6 +2495,88 @@ def test_archive_native_journal_binds_original_cutoff_and_complete_target_index(
     }
 
 
+def test_archive_v2_native_journal_rejects_unindexed_canonical_bucket_row(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    _leave_native_journal_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    _rewrite_pending_journal_as_v2(archive)
+    stray_time = NOW - timedelta(days=1)
+    stray_snapshot = snapshot(
+        _timed_event("c" * 20, stray_time),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+        generated_at=stray_time,
+    )
+    stray = archive_module._archive_document(
+        stray_snapshot,
+        archive_module.event_document(stray_snapshot.events[0]),
+        NOW,
+    )
+    archive._write_bucket(archive_module._bucket_name(stray), [stray])
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+@pytest.mark.parametrize("budget_dimension", ("bytes", "rows", "nodes", "files"))
+def test_archive_native_recovery_shares_journal_scan_budget_without_reset(
+    tmp_path,
+    monkeypatch,
+    budget_dimension,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    _leave_native_journal_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    journal_before = archive.journal_path.read_bytes()
+    state_before = archive.state_path.read_bytes()
+    bucket_path = next(archive.archive_root.glob("*.jsonl"))
+    journal_document = archive._parse_json(journal_before)
+    bucket_document = archive_module._archive_from_document(
+        archive._parse_json(bucket_path.read_bytes().splitlines()[0])
+    )
+    _journal_bytes, journal_nodes = archive_module._json_metrics(
+        journal_document,
+        maximum_bytes=archive_module._MAX_JOURNAL_BYTES,
+        maximum_nodes=archive_module._MAX_SCAN_NODES,
+    )
+    _bucket_bytes, bucket_nodes = archive_module._json_metrics(
+        bucket_document,
+        maximum_bytes=archive_module._MAX_ROW_BYTES,
+        maximum_nodes=archive_module._MAX_SCAN_NODES,
+    )
+    limits = {
+        "bytes": len(journal_before) + bucket_path.stat().st_size - 1,
+        "rows": len(journal_document["rows"]) + 1 - 1,
+        "nodes": journal_nodes + bucket_nodes - 1,
+        "files": 1,
+    }
+    constants = {
+        "bytes": "_MAX_SCAN_BYTES",
+        "rows": "_MAX_SCAN_ROWS",
+        "nodes": "_MAX_SCAN_NODES",
+        "files": "_MAX_SCAN_FILES",
+    }
+    monkeypatch.setattr(archive_module, constants[budget_dimension], limits[budget_dimension])
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("c" * 20),
+            snapshot_id="3" * 20,
+            raw_snapshot_id="4" * 20,
+        ))
+
+    assert archive.journal_path.read_bytes() == journal_before
+    assert archive.state_path.read_bytes() == state_before
+
+
 def test_archive_recovers_with_transaction_cutoff_then_next_transaction_prunes_normally(
     tmp_path,
     monkeypatch,
@@ -2479,7 +2608,7 @@ def test_archive_recovers_with_transaction_cutoff_then_next_transaction_prunes_n
         "n" * 20: NOW.date().isoformat() + ".jsonl",
     }
     assert {row["event_id"] for row in archive.query(days=90)} == {"f" * 20, "n" * 20}
-    assert not archive.journal_path.exists()
+    assert archive.journal_path.is_file()
 
 
 def test_archive_consumes_exact_v1_journal_before_starting_native_transaction(tmp_path, monkeypatch):
@@ -2509,7 +2638,8 @@ def test_archive_consumes_exact_v1_journal_before_starting_native_transaction(tm
         raw_snapshot_id="2" * 20,
     ))
 
-    assert observed_existing_journal == [False]
+    assert observed_existing_journal == [True]
+    assert json.loads(archive.journal_path.read_text(encoding="utf-8"))["schema_version"] == 3
     assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
 
 
@@ -2540,6 +2670,52 @@ def test_archive_refuses_to_delete_a_replaced_transaction_journal_identity(tmp_p
 
     metadata = archive.journal_path.stat(follow_symlinks=False)
     assert replacement_identities == [(metadata.st_dev, metadata.st_ino)]
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+
+
+def test_archive_finalization_rechecks_binding_without_deleting_a_racing_foreign_journal(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    real_atomic_write = archive._atomic_write
+    real_read_bytes = archive._read_bytes
+    armed = False
+    replacement_identities: list[tuple[int, int]] = []
+    foreign_payload = b'{"owner":"foreign","must_survive":true}\n'
+
+    def arm_after_prepared(path: Path, payload: bytes, maximum: int):
+        nonlocal armed
+        identity = real_atomic_write(path, payload, maximum)
+        if path == archive.state_path and json.loads(payload)["phase"] == "prepared":
+            armed = True
+        return identity
+
+    def replace_before_final_binding(path: Path, maximum: int, **kwargs):
+        nonlocal armed
+        if armed and path == archive.journal_path:
+            armed = False
+            replacement = archive.archive_root / "foreign-transaction.json"
+            replacement.write_bytes(foreign_payload)
+            os.replace(replacement, archive.journal_path)
+            metadata = archive.journal_path.stat(follow_symlinks=False)
+            replacement_identities.append((metadata.st_dev, metadata.st_ino))
+        return real_read_bytes(path, maximum, **kwargs)
+
+    monkeypatch.setattr(archive, "_atomic_write", arm_after_prepared)
+    monkeypatch.setattr(archive, "_read_bytes", replace_before_final_binding)
+
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    metadata = archive.journal_path.stat(follow_symlinks=False)
+    assert replacement_identities == [(metadata.st_dev, metadata.st_ino)]
+    assert archive.journal_path.read_bytes() == foreign_payload
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
 
 
@@ -2603,9 +2779,14 @@ def test_archive_new_role_wins_without_erasing_nonempty_public_evidence_metadata
     clock = [NOW]
     archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
     shared_url = "https://official.example.com/stable-proof"
+    original_published_at = NOW - timedelta(hours=1)
     archive.upsert(snapshot(event(
         primary_evidence=(replace(
             evidence_item("stable-proof", canonical_url=shared_url),
+            content_source="original.publisher.example",
+            collector_source="original-collector.example",
+            published_at=original_published_at,
+            origin_cluster="publisher:original.publisher.example",
             title="original public title",
             excerpt="original public excerpt",
         ),),
@@ -2621,11 +2802,18 @@ def test_archive_new_role_wins_without_erasing_nonempty_public_evidence_metadata
     clock[0] = NOW + timedelta(minutes=1)
     empty_new_metadata = replace(
         evidence_item("stable-proof", canonical_url=shared_url),
+        content_source="",
+        collector_source="",
         canonical_url="",
+        published_at=None,
+        origin_cluster="",
         title="",
         excerpt="",
         source_role=SourceRole.INDEPENDENT,
         supports_claim=False,
+        supports_fields=("amount",),
+        contradicts_claim=True,
+        is_official=False,
     )
     archive.upsert(snapshot(
         replace(
@@ -2649,10 +2837,17 @@ def test_archive_new_role_wins_without_erasing_nonempty_public_evidence_metadata
     assert row["primary_evidence"] == []
     retained = row["independent_evidence"][0]
     assert retained["canonical_url"] == shared_url
+    assert retained["content_source"] == "original.publisher.example"
+    assert retained["collector_source"] == "original-collector.example"
+    assert retained["published_at"] == original_published_at.isoformat()
+    assert retained["origin_cluster"] == "publisher:original.publisher.example"
     assert retained["title"] == "original public title"
     assert retained["excerpt"] == "original public excerpt"
     assert retained["source_role"] == "independent"
     assert retained["supports_claim"] is False
+    assert retained["supports_fields"] == ["amount"]
+    assert retained["contradicts_claim"] is True
+    assert retained["is_official"] is False
     assert row["key_fields"][0]["evidence_ids"] == ["stable-proof"]
     assert len(row["snapshot_history"]) == 2
 
