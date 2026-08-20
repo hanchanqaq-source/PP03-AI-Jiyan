@@ -104,4 +104,17 @@ describe("MarketNews SourceFailureDialog", () => {
     expect(screen.queryByRole("link", { name: "查看来源 全球科技公开源" })).not.toBeInTheDocument();
     expect(document.querySelector(`a[href="${unsafeUrl}"]`)).not.toBeInTheDocument();
   });
+
+  it("does not render a serialized lowercase compound secret when a row bypasses response shaping", () => {
+    const unsafeUrl = "https://public.example.org/feed?note=public%20(accesskeyid%3Dsecret)";
+    render(<SourceFailureDialog
+      open
+      statuses={[{ ...failures[0], source_url: unsafeUrl }]}
+      onClose={() => {}}
+      onRetry={async () => {}}
+    />);
+
+    expect(screen.queryByRole("link", { name: "查看来源 全球科技公开源" })).not.toBeInTheDocument();
+    expect(document.querySelector(`a[href="${unsafeUrl}"]`)).not.toBeInTheDocument();
+  });
 });

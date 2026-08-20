@@ -11,6 +11,11 @@ from news_intelligence.service import MarketNewsService
 
 client = TestClient(app_module.app)
 NOW = datetime(2026, 8, 17, 4, tzinfo=timezone.utc)
+WRITE_HEADERS = {
+    "X-PP03-Write-Intent": "1",
+    "Origin": "http://127.0.0.1:5899",
+    "Host": "127.0.0.1:8900",
+}
 
 
 def _source(name: str, title: str, url: str, published: str, *, region: str, language: str = "zh-CN") -> dict:
@@ -479,7 +484,8 @@ def test_single_source_retry_returns_one_complete_current_query_snapshot(monkeyp
 
     response = client.post(
         "/api/market-news/sources/0123456789abcdef/retry"
-        "?mode=global_tech&tag_id=storage&category=all&days=7&sort=latest"
+        "?mode=global_tech&tag_id=storage&category=all&days=7&sort=latest",
+        headers=WRITE_HEADERS,
     )
 
     assert response.status_code == 200
@@ -512,8 +518,8 @@ def test_single_source_retry_failure_is_inspectable_and_unknown_source_is_reject
 
     monkeypatch.setattr(app_module.newsradar, "retry_source", retry)
 
-    failed = client.post("/api/market-news/sources/0123456789abcdef/retry")
-    unknown = client.post(f"/api/market-news/sources/{'f' * 16}/retry")
+    failed = client.post("/api/market-news/sources/0123456789abcdef/retry", headers=WRITE_HEADERS)
+    unknown = client.post(f"/api/market-news/sources/{'f' * 16}/retry", headers=WRITE_HEADERS)
 
     assert failed.status_code == 200
     assert failed.json()["data"] == {"retry_succeeded": False, "source_status": failure}

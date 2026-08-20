@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlsplit
@@ -122,6 +123,10 @@ _PIPELINE_REFRESH_PATHS = {
     "/api/evidence/refresh",
     "/api/radar/refresh",
 }
+_MARKET_NEWS_SOURCE_RETRY_PATH = re.compile(
+    r"^/api/market-news/sources/[a-f0-9]{16}/retry$",
+    re.ASCII,
+)
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -185,6 +190,7 @@ def _protected_local_write_request(request: Request) -> bool:
     is_protected_path = (
         request.url.path.startswith("/api/data-sources/")
         or request.url.path in _PIPELINE_REFRESH_PATHS
+        or _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
     )
     if not is_protected_path:
         return False

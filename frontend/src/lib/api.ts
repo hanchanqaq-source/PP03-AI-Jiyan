@@ -118,6 +118,7 @@ export function isAbortError(error: unknown): boolean {
 }
 
 const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MARKET_NEWS_SOURCE_RETRY_WRITE_PATH = /^\/market-news\/sources\/[a-f0-9]{16}\/retry(?:\?|$)/;
 
 async function readBoundedJsonResponse(resp: Response): Promise<any> {
   const declaredLength = resp.headers.get("Content-Length");
@@ -171,6 +172,7 @@ async function request<T>(
   if (method !== "GET" && (
     path.startsWith("/data-sources/")
     || path.startsWith("/market-news/refresh")
+    || MARKET_NEWS_SOURCE_RETRY_WRITE_PATH.test(path)
     || path === "/evidence/refresh"
     || path === "/radar/refresh"
   )) {
@@ -671,8 +673,15 @@ const MARKET_NEWS_SENSITIVE_QUERY_KEY_PARTS = new Set([
 const MARKET_NEWS_SENSITIVE_QUERY_SUFFIXES = [
   "apikey", "xapikey", "accesstoken", "refreshtoken", "authtoken", "idtoken",
   "authorization", "password", "passwd", "signature", "clientsecret", "credential",
-  "sessionid", "accesskey",
+  "sessionid", "accesskey", "accesskeyid", "secretkey", "token", "secret", "cookie",
+  "jwt", "auth", "session",
 ];
+const MARKET_NEWS_SENSITIVE_QUERY_PREFIXES = [
+  "token", "secret", "cookie", "jwt", "auth", "session", "accesskey",
+];
+const MARKET_NEWS_SENSITIVE_QUERY_TRAILERS = new Set([
+  "id", "key", "value", "name", "header", "secret", "token",
+]);
 const MARKET_NEWS_MAX_QUERY_DECODE_LAYERS = 4;
 
 function marketNewsDecodedQueryLayers(value: string): string[] {
@@ -705,7 +714,11 @@ function marketNewsSensitiveDecodedQueryKey(key: string): boolean {
     }
   }
   const compact = parts.join("");
-  return MARKET_NEWS_SENSITIVE_QUERY_SUFFIXES.some((suffix) => compact.endsWith(suffix));
+  return MARKET_NEWS_SENSITIVE_QUERY_SUFFIXES.some((suffix) => compact.endsWith(suffix))
+    || MARKET_NEWS_SENSITIVE_QUERY_PREFIXES.some((prefix) => (
+      compact.startsWith(prefix)
+      && MARKET_NEWS_SENSITIVE_QUERY_TRAILERS.has(compact.slice(prefix.length))
+    ));
 }
 
 function marketNewsSensitiveQueryKey(key: string): boolean {
@@ -713,7 +726,7 @@ function marketNewsSensitiveQueryKey(key: string): boolean {
 }
 
 function marketNewsSensitiveAssignment(value: string): boolean {
-  const assignments = value.matchAll(/(?:^|[?&#;,{}\[])[\s"']*([A-Za-z0-9_%\.\-\[\]]{1,128})[\s"']*(?:=|:)/g);
+  const assignments = value.matchAll(/(?:^|[^A-Za-z0-9_%\.\-\[\]])[\s"']*([A-Za-z0-9_%\.\-\[\]]{1,128})[\s"']*(?:=|:)/g);
   for (const match of assignments) {
     if (marketNewsSensitiveQueryKey(match[1])) return true;
   }

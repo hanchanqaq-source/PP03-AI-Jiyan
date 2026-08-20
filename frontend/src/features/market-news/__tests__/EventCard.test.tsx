@@ -97,6 +97,18 @@ describe("MarketNews EventCard", () => {
     expect(document.querySelector(`a[href="${unsafeUrl}"]`)).not.toBeInTheDocument();
   });
 
+  it("does not render a lowercase compound secret assignment passed directly to the card", () => {
+    const unsafeUrl = "https://public.example.org/article?note=public%20(mytoken%3Dsecret)";
+    render(<EventCard event={{
+      ...directEvent,
+      original_links: [unsafeUrl],
+      sources: directEvent.sources.map((source) => ({ ...source, original_url: null })),
+    }} onOpenDetails={() => {}} />);
+
+    expect(screen.queryByRole("link", { name: `打开原始来源 ${directEvent.title}` })).not.toBeInTheDocument();
+    expect(document.querySelector(`a[href="${unsafeUrl}"]`)).not.toBeInTheDocument();
+  });
+
   it("only offers evidence navigation for a trusted backend verification", async () => {
     const user = userEvent.setup();
     const onViewEvidence = vi.fn();

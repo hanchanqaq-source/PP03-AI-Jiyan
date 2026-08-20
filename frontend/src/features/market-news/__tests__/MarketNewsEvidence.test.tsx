@@ -336,11 +336,24 @@ describe("MarketNews trusted evidence admission", () => {
     "https://public.example.org/feed?api-key=secret",
     "https://public.example.org/feed?client-secret=secret",
     "https://public.example.org/feed?session=secret",
+    "https://public.example.org/feed?mytoken=secret",
+    "https://public.example.org/feed?mysecret=secret",
+    "https://public.example.org/feed?mycookie=secret",
+    "https://public.example.org/feed?secretkey=secret",
+    "https://public.example.org/feed?accesskeyid=secret",
+    "https://public.example.org/feed?jwt=secret",
+    "https://public.example.org/feed?tokenvalue=secret",
+    "https://public.example.org/feed?authheader=secret",
+    "https://public.example.org/feed?note=public%20(token%3Dsecret)",
+    "https://public.example.org/feed?note=public%20!jwt%3Dsecret",
+    "https://public.example.org/feed?note=public%20%2528mysecret%253Dsecret%2529",
     "https://public.example.org/feed?user%5Baccess_key%5D=secret",
     "https://public.example.org/feed?redirect=https%3A%2F%2Fpublic.example.org%2Fcallback%3Ftoken%3Dsecret",
     "https://public.example.org/feed?redirect=https%253A%252F%252Fpublic.example.org%252Fcallback%253Faccess-key%253Dsecret",
     `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ nested: { token: "secret" } }))}`,
     `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ nested: JSON.stringify({ clientSecret: "secret" }) }))}`,
+    `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ nested: { mycookie: "secret" } }))}`,
+    `https://public.example.org/feed?config=${encodeURIComponent(JSON.stringify({ nested: "public (accesskeyid=secret)" }))}`,
     "https://public.example.org/feed#credential",
   ])("rejects a non-public or credential-bearing market-news URL through GET and retry: %s", async (unsafeUrl) => {
     const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
@@ -369,6 +382,68 @@ describe("MarketNews trusted evidence admission", () => {
     ]);
     expect(getResult).toMatchObject({ status: "rejected", reason: { status: 502 } });
     expect(retryResult).toMatchObject({ status: "rejected", reason: { status: 502 } });
+  });
+
+  it("keeps ordinary public query keys that merely contain key-like substrings", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = structuredClone(marketNewsResponse) as any;
+    const publicUrl = "https://public.example.org/feed?monkey=capuchin&turnkey=public&tokenizer=public";
+    payload.events[0].original_links[0] = publicUrl;
+    payload.focus_events = [structuredClone(payload.events[0])];
+    payload.source_summary.source_statuses = [{
+      source_id: "0123456789abcdef",
+      source_name: "来源一",
+      source_url: publicUrl,
+      status: "ok",
+      error_type: null,
+      error_reason: null,
+      last_success_at: null,
+      used_cached_items: false,
+      item_count: 1,
+    }];
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })));
+
+    const [loaded, retried] = await Promise.all([
+      api.marketNewsEvents(query),
+      api.marketNewsRetrySource("0123456789abcdef", query),
+    ]);
+
+    expect(loaded.events[0].original_links).toContain(publicUrl);
+    expect(retried).toMatchObject({ source_summary: { source_statuses: [{ source_url: publicUrl }] } });
+  });
+
+  it("sends the local write intent and caller AbortSignal for a source retry", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const sourceId = "0123456789abcdef";
+    const controller = new AbortController();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: {
+      retry_succeeded: false,
+      source_status: {
+        source_id: sourceId,
+        source_name: "来源一",
+        source_url: "https://public.example.org/feed",
+        status: "failed",
+        error_type: "timeout",
+        error_reason: "连接超时",
+        last_success_at: null,
+        used_cached_items: false,
+        item_count: 0,
+      },
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await api.marketNewsRetrySource(sourceId, query, controller.signal);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(`/api/market-news/sources/${sourceId}/retry`),
+      expect.objectContaining({
+        method: "POST",
+        signal: controller.signal,
+        headers: expect.objectContaining({ "X-PP03-Write-Intent": "1" }),
+      }),
+    );
   });
 
   it("accepts a partial source observation without pretending it covers the full configured catalog", async () => {
