@@ -185,6 +185,67 @@ def _rewrite_pending_journal_as_v2(archive: EvidenceArchive) -> dict[str, object
     return document
 
 
+def _journal_only_document(
+    archive: EvidenceArchive,
+    selected: EvidenceSnapshot,
+    schema_version: int,
+) -> dict[str, object]:
+    row = archive_module._archive_document(
+        selected,
+        archive_module.event_document(selected.events[0]),
+        NOW,
+    )
+    if schema_version == 1:
+        return {"schema_version": 1, "rows": [_legacy_v1_row(row)]}
+
+    bucket_name = archive_module._bucket_name(row)
+    target_index = {row["event_id"]: bucket_name}
+    base_bucket_digests = {bucket_name: archive_module._MISSING_DIGEST}
+    target_bucket_digests = {
+        bucket_name: archive._payload_digest(archive._bucket_payload(bucket_name, [row]))
+    }
+    target_index_digest = archive._payload_digest(archive._index_payload(target_index))
+    document: dict[str, object] = {
+        "schema_version": schema_version,
+        "transaction_id": "",
+        "base_generation": 0,
+        "target_generation": 1,
+        "base_index_digest": archive_module._MISSING_DIGEST,
+        "target_index_digest": target_index_digest,
+        "base_bucket_digests": base_bucket_digests,
+        "target_bucket_digests": target_bucket_digests,
+        "rows": [row],
+    }
+    cutoff = (NOW - timedelta(days=90)).isoformat() if schema_version == 3 else None
+    if schema_version == 3:
+        document["cutoff"] = cutoff
+        document["target_index"] = target_index
+    document["transaction_id"] = archive._journal_transaction_id(
+        base_generation=0,
+        target_generation=1,
+        base_index_digest=archive_module._MISSING_DIGEST,
+        target_index_digest=target_index_digest,
+        base_bucket_digests=base_bucket_digests,
+        target_bucket_digests=target_bucket_digests,
+        rows=[row],
+        cutoff=cutoff,
+        target_index=target_index if schema_version == 3 else None,
+    )
+    return document
+
+
+def _write_bucket_for_test(
+    archive: EvidenceArchive,
+    name: str,
+    rows: list[dict[str, object]],
+) -> None:
+    archive._atomic_write(
+        archive.archive_root / name,
+        archive._bucket_payload(name, rows),
+        archive_module._MAX_BUCKET_BYTES,
+    )
+
+
 def _upsert_in_child(root: str, event_id: str) -> None:
     EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(event(event_id)))
 
@@ -2482,7 +2543,7 @@ def test_archive_cross_validates_finalized_index_bucket_and_event_before_every_o
     if corruption == "missing_bucket":
         _rewrite_finalized_index(archive, {event_id: missing_bucket})
     elif corruption == "missing_row":
-        archive._write_bucket(missing_bucket, [])
+        _write_bucket_for_test(archive, missing_bucket, [])
         _rewrite_finalized_index(archive, {event_id: missing_bucket})
     else:
         _rewrite_finalized_index(archive, {})
@@ -2565,7 +2626,7 @@ def test_archive_v2_native_journal_rejects_unindexed_canonical_bucket_row(tmp_pa
         archive_module.event_document(stray_snapshot.events[0]),
         NOW,
     )
-    archive._write_bucket(archive_module._bucket_name(stray), [stray])
+    _write_bucket_for_test(archive, archive_module._bucket_name(stray), [stray])
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
@@ -3110,6 +3171,10 @@ def test_archive_rejects_partial_provenance_tuple_instead_of_constructing_mixed_
         "https://official.example.com/proof?token2=SECRET",
         "https://official.example.com/proof?subscriptionKey2026=SECRET",
         "https://official.example.com/proof?payload=%257B%2522apiKey2%2522%253A%2522SECRET%2522%257D",
+        "https://official.example.com/proof?apiKey2v3=SECRET",
+        "https://official.example.com/proof?token2v3=SECRET",
+        "https://official.example.com/proof?subscriptionKey2026v2=SECRET",
+        "https://official.example.com/proof?payload=%25257B%252522apiKey2v3%252522%25253A%252522SECRET%252522%25257D",
     ),
 )
 def test_archive_rejects_version_suffixed_secret_names_at_all_nested_decode_layers(tmp_path, unsafe_url):
@@ -3258,7 +3323,7 @@ def test_archive_complete_new_provenance_tuple_wins_as_one_source_identity(tmp_p
     )
 
 
-@pytest.mark.parametrize("name", ("monkey2", "turnkey2026"))
+@pytest.mark.parametrize("name", ("monkey2", "turnkey2026", "monkey2v3", "turnkey2026v2"))
 def test_archive_versioned_benign_query_names_remain_public(tmp_path, name):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     public_url = f"https://official.example.com/proof?{name}=allowed"
@@ -3269,3 +3334,264 @@ def test_archive_versioned_benign_query_names_remain_public(tmp_path, name):
     ),))))
 
     assert archive.get("a" * 20)["primary_evidence"][0]["canonical_url"] == public_url
+
+
+@pytest.mark.parametrize("journal_schema", (1, 2, 3))
+def test_archive_recovers_strict_journal_only_first_transaction_before_native_upsert(
+    tmp_path,
+    journal_schema,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    legacy_time = NOW - timedelta(hours=1)
+    legacy_snapshot = snapshot(
+        _timed_event("l" * 20, legacy_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=legacy_time,
+    )
+    journal = _journal_only_document(archive, legacy_snapshot, journal_schema)
+    archive.archive_root.mkdir(parents=True)
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    original_journal = archive.journal_path.read_bytes()
+
+    archive.upsert(snapshot(
+        event("n" * 20),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+    ))
+
+    assert {row["event_id"] for row in archive.query(days=90)} == {"l" * 20, "n" * 20}
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["schema_version"] == 4
+    assert archive.journal_path.read_bytes() == original_journal
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    (
+        b"{not-json\n",
+        b'{"owner":"foreign"}\n',
+        b'{"schema_version":999,"rows":[]}\n',
+    ),
+)
+def test_archive_ignores_nonlegacy_foreign_transaction_on_first_native_upsert(tmp_path, foreign):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.archive_root.mkdir(parents=True)
+    archive.journal_path.write_bytes(foreign)
+
+    archive.upsert(snapshot(event()))
+
+    assert archive.journal_path.read_bytes() == foreign
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+
+
+def test_archive_finalized_manifest_excludes_already_expired_bucket(tmp_path):
+    expired_time = NOW - timedelta(days=91)
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(snapshot(
+        _timed_event("o" * 20, expired_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=expired_time,
+    ))
+
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["phase"] == "finalized"
+    assert state["target_index"] == {}
+    assert expired_time.date().isoformat() + ".jsonl" not in state["target_bucket_digests"]
+
+
+def test_archive_query_survives_cleanup_of_bucket_that_aged_out_of_retention(tmp_path):
+    clock = [NOW]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    old_time = NOW - timedelta(days=89)
+    archive.upsert(snapshot(
+        _timed_event("o" * 20, old_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=old_time,
+    ))
+    archive.upsert(snapshot(
+        event("n" * 20),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+    ))
+    clock[0] = NOW + timedelta(days=2)
+    (archive.archive_root / f"{old_time.date().isoformat()}.jsonl").unlink()
+
+    assert [row["event_id"] for row in archive.query(days=90)] == ["n" * 20]
+    assert archive.count() == 1
+
+
+def _legacy_finalized_state_from_v4(
+    archive: EvidenceArchive,
+    *,
+    index_digest: str | None = None,
+    bucket_digests: dict[str, str] | None = None,
+) -> dict[str, object]:
+    current = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    return {
+        "schema_version": 3,
+        "generation": current["generation"],
+        "phase": "finalized",
+        "transaction_id": current["transaction_id"],
+        "index_digest": index_digest or current["target_index_digest"],
+        "bucket_digests": current["target_bucket_digests"] if bucket_digests is None else bucket_digests,
+    }
+
+
+@pytest.mark.parametrize("authority", ("index_digest", "bucket_manifest"))
+def test_archive_legacy_finalized_state_validates_declared_physical_authority(tmp_path, authority):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    current = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    wrong_digest = "f" * 64
+    if wrong_digest == current["target_index_digest"]:
+        wrong_digest = "e" * 64
+    if authority == "index_digest":
+        legacy = _legacy_finalized_state_from_v4(archive, index_digest=wrong_digest)
+    else:
+        bucket_name = next(iter(current["target_bucket_digests"]))
+        legacy = _legacy_finalized_state_from_v4(
+            archive,
+            bucket_digests={bucket_name: wrong_digest},
+        )
+    archive.state_path.write_text(
+        json.dumps(legacy, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_legacy_finalized_state_rejects_injected_row_and_index(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    legacy = _legacy_finalized_state_from_v4(archive)
+    persisted = archive.get("a" * 20)
+    injected_snapshot = snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    )
+    injected = archive_module._archive_document(
+        injected_snapshot,
+        archive_module.event_document(injected_snapshot.events[0]),
+        NOW,
+    )
+    bucket_name = archive_module._bucket_name(injected)
+    _write_bucket_for_test(archive, bucket_name, [persisted, injected])
+    archive._write_index({"a" * 20: bucket_name, "b" * 20: bucket_name})
+    archive.state_path.write_text(
+        json.dumps(legacy, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_scandir_stops_after_bounded_total_entries_before_sorting(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive._prepare()
+    yielded = 0
+    total = archive_module._MAX_ARCHIVE_FILES + 100
+
+    class ForeignEntry:
+        def __init__(self, number: int) -> None:
+            self.name = f"foreign-{number}"
+
+    class ManyForeignEntries:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def __iter__(self):
+            nonlocal yielded
+            for number in range(total):
+                yielded += 1
+                yield ForeignEntry(number)
+
+    monkeypatch.setattr(archive_module.os, "scandir", lambda _path: ManyForeignEntries())
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive._bucket_names()
+
+    assert yielded <= archive_module._MAX_ARCHIVE_FILES + 8
+
+
+def test_archive_state_cutoff_overflow_is_normalized_to_storage_corrupt(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    state["cutoff"] = "9999-12-31T23:59:59.999999+00:00"
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_legacy_journal_cutoff_overflow_is_normalized_to_storage_corrupt(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    current = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    legacy_state = _legacy_finalized_state_from_v4(archive, bucket_digests={})
+    archive.state_path.write_text(
+        json.dumps(legacy_state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    journal = {
+        "schema_version": 3,
+        "transaction_id": "0" * 64,
+        "base_generation": current["generation"],
+        "target_generation": current["generation"] + 1,
+        "base_index_digest": current["target_index_digest"],
+        "target_index_digest": current["target_index_digest"],
+        "base_bucket_digests": current["target_bucket_digests"],
+        "target_bucket_digests": current["target_bucket_digests"],
+        "cutoff": "9999-12-31T23:59:59.999999+00:00",
+        "target_index": current["target_index"],
+        "rows": [],
+    }
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_state_clock_skew_overflow_is_normalized_to_storage_corrupt(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    maximum = datetime.max.replace(tzinfo=timezone.utc)
+    state["cutoff"] = (maximum - timedelta(days=90)).isoformat()
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    archive._now = lambda: maximum
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_empty_reader_does_not_overflow_after_maximum_utc_day(tmp_path):
+    archive = EvidenceArchive(
+        tmp_path,
+        now=lambda: datetime.max.replace(tzinfo=timezone.utc),
+    )
+    archive.archive_root.mkdir(parents=True)
+
+    assert archive.query(days=1) == []

@@ -47,6 +47,7 @@ _MAX_INDEX_BYTES = 16 * 1_048_576
 _MAX_ROW_BYTES = 1_048_576
 _MAX_BUCKET_ROWS = 4_096
 _MAX_ARCHIVE_FILES = 512
+_MAX_ARCHIVE_DIRECTORY_ENTRIES = _MAX_ARCHIVE_FILES + 4
 _MAX_SCAN_FILES = _MAX_ARCHIVE_FILES + 2
 _MAX_INDEX_EVENTS = 65_536
 _MAX_ARCHIVE_SCAN_BYTES = 64 * 1_048_576
@@ -266,6 +267,17 @@ def _valid_bucket_name(value: object) -> bool:
         return False
 
 
+def _bucket_date(value: str) -> date:
+    if not _valid_bucket_name(value):
+        raise ValueError("invalid archive bucket name")
+    return date.fromisoformat(value.removesuffix(".jsonl"))
+
+
+def _bucket_name_in_window(value: str, cutoff: datetime, upper: datetime) -> bool:
+    bucket_day = _bucket_date(value)
+    return cutoff.date() <= bucket_day <= upper.date()
+
+
 def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[str, str]:
     if _CONTENT_DIGEST.fullmatch(content_digest) is None:
         raise ValueError("invalid archive lineage digest")
@@ -349,14 +361,34 @@ def _bucket_name(row: dict[str, Any]) -> str:
     return f"{_event_time(row).date().isoformat()}.jsonl"
 
 
+def _shift_datetime(value: datetime, delta: timedelta) -> datetime:
+    try:
+        return value + delta
+    except OverflowError:
+        raise OSError("storage_corrupt") from None
+
+
+def _shift_days(value: datetime, days: int) -> datetime:
+    return _shift_datetime(value, timedelta(days=days))
+
+
+def _strip_query_version_suffixes(value: str) -> str:
+    normalized = value
+    while True:
+        stripped = re.sub(r"(?:version|ver|v)?[0-9]+$", "", normalized)
+        if stripped == normalized:
+            return normalized
+        normalized = stripped
+
+
 def _query_name_is_sensitive(value: str) -> bool:
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
     tokens = re.findall(r"[a-z0-9]+", separated.casefold())
     compact = "".join(tokens)
-    normalized = re.sub(r"(?:version|ver|v)?[0-9]+$", "", compact)
+    normalized = _strip_query_version_suffixes(compact)
     if normalized in _SENSITIVE_QUERY_NAMES:
         return True
-    if any(re.sub(r"(?:version|ver|v)?[0-9]+$", "", token) in _SENSITIVE_QUERY_NAMES for token in tokens):
+    if any(_strip_query_version_suffixes(token) in _SENSITIVE_QUERY_NAMES for token in tokens):
         return True
     sensitive_suffixes = (
         "apikey",
@@ -1033,14 +1065,14 @@ def _row_times(row: dict[str, Any]) -> Iterator[datetime]:
 
 def _validate_temporal_row(row: dict[str, Any], now: datetime) -> None:
     current = _utc(now, "archive clock")
-    maximum = current + _MAX_CLOCK_SKEW
+    maximum = _shift_datetime(current, _MAX_CLOCK_SKEW)
     generated_at = _metadata_time(row["snapshot_generated_at"], "snapshot_generated_at")
     archived_at = _metadata_time(row["archived_at"], "archived_at")
     if generated_at > maximum or archived_at > maximum:
         raise ValueError("invalid archive time")
-    if len(row["snapshot_history"]) == 1 and generated_at > archived_at + _MAX_CLOCK_SKEW:
+    if len(row["snapshot_history"]) == 1 and generated_at > _shift_datetime(archived_at, _MAX_CLOCK_SKEW):
         raise ValueError("invalid archive time")
-    snapshot_maximum = generated_at + _MAX_CLOCK_SKEW
+    snapshot_maximum = _shift_datetime(generated_at, _MAX_CLOCK_SKEW)
     status_times = [
         _metadata_time(transition["changed_at"], "status changed_at")
         for transition in row["status_history"]
@@ -2030,9 +2062,6 @@ class EvidenceArchive:
             raise ValueError("archive document is too large")
         return payload
 
-    def _write_bucket(self, name: str, rows: list[dict[str, Any]]) -> None:
-        self._atomic_write(self.archive_root / name, self._bucket_payload(name, rows), _MAX_BUCKET_BYTES)
-
     def _parse_json(self, raw: bytes) -> object:
         return json.loads(
             raw.decode("utf-8"),
@@ -2136,14 +2165,21 @@ class EvidenceArchive:
 
     def _bucket_names(self) -> list[str]:
         self._prepare()
+        names: list[str] = []
+        entry_count = 0
         try:
-            entries = list(os.scandir(self.archive_root))
+            with os.scandir(self.archive_root) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                        raise OSError("storage_corrupt")
+                    if _valid_bucket_name(entry.name):
+                        names.append(entry.name)
+                        if len(names) > _MAX_ARCHIVE_FILES:
+                            raise OSError("storage_corrupt")
         except OSError:
-            raise OSError("storage_error") from None
-        names = sorted(entry.name for entry in entries if _valid_bucket_name(entry.name))
-        if len(names) > _MAX_ARCHIVE_FILES:
-            raise OSError("storage_corrupt")
-        return names
+            raise OSError("storage_corrupt") from None
+        return sorted(names)
 
     @staticmethod
     def _payload_digest(payload: bytes | None) -> str:
@@ -2195,61 +2231,6 @@ class EvidenceArchive:
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
             raise OSError("storage_corrupt") from None
 
-    def _state_payload(
-        self,
-        generation: int,
-        phase: str,
-        transaction_id: str,
-        index_digest: str,
-        bucket_digests: dict[str, str],
-    ) -> bytes:
-        if (
-            type(generation) is not int
-            or generation < 1
-            or phase not in {"prepared", "finalized"}
-            or type(transaction_id) is not str
-            or _CONTENT_DIGEST.fullmatch(transaction_id) is None
-            or type(index_digest) is not str
-            or _CONTENT_DIGEST.fullmatch(index_digest) is None
-        ):
-            raise ValueError("invalid archive state")
-        canonical_bucket_digests = self._bucket_digest_map(bucket_digests)
-        payload = (json.dumps(
-            {
-                "schema_version": 1,
-                "generation": generation,
-                "phase": phase,
-                "transaction_id": transaction_id,
-                "index_digest": index_digest,
-                "bucket_digests": canonical_bucket_digests,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ) + "\n").encode("utf-8")
-        if len(payload) > _MAX_STATE_BYTES:
-            raise ValueError("archive state is too large")
-        return payload
-
-    def _write_state(
-        self,
-        generation: int,
-        phase: str,
-        transaction_id: str,
-        index_digest: str,
-        bucket_digests: dict[str, str],
-    ) -> None:
-        self._atomic_write(
-            self.state_path,
-            self._state_payload(
-                generation,
-                phase,
-                transaction_id,
-                index_digest,
-                bucket_digests,
-            ),
-            _MAX_STATE_BYTES,
-        )
-
     def _parse_authority_state(
         self,
         document: object,
@@ -2275,7 +2256,7 @@ class EvidenceArchive:
             generation = document["generation"]
             transaction_id = document["transaction_id"]
             cutoff = _metadata_time(document["cutoff"], "archive state cutoff")
-            upper = cutoff + timedelta(days=90)
+            upper = _shift_days(cutoff, 90)
             target_index_digest = document["target_index_digest"]
             target_bucket_digests = self._bucket_digest_map(document["target_bucket_digests"])
             target_index = self._index_events(document["target_index"])
@@ -2286,7 +2267,7 @@ class EvidenceArchive:
                 or _CONTENT_DIGEST.fullmatch(transaction_id) is None
                 or type(target_index_digest) is not str
                 or _CONTENT_DIGEST.fullmatch(target_index_digest) is None
-                or upper > now + _MAX_CLOCK_SKEW
+                or upper > _shift_datetime(now, _MAX_CLOCK_SKEW)
                 or self._payload_digest(self._index_payload(target_index)) != target_index_digest
             ):
                 raise ValueError("invalid archive authority state")
@@ -2298,6 +2279,14 @@ class EvidenceArchive:
                 "target_index": target_index,
             })
             if phase == "finalized":
+                indexed_buckets = set(target_index.values())
+                if not indexed_buckets <= set(target_bucket_digests):
+                    raise ValueError("invalid archive finalized manifest")
+                if any(
+                    _bucket_name_in_window(name, cutoff, upper)
+                    for name in set(target_bucket_digests) - indexed_buckets
+                ):
+                    raise ValueError("invalid archive finalized manifest")
                 return result
             base_generation = document["base_generation"]
             target_generation = document["target_generation"]
@@ -2451,6 +2440,7 @@ class EvidenceArchive:
         return payload
 
     def _finalized_authority_payload(self, prepared: dict[str, Any]) -> bytes:
+        indexed_buckets = set(prepared["target_index"].values())
         document = {
             "schema_version": _STATE_SCHEMA_VERSION,
             "generation": prepared["target_generation"],
@@ -2458,7 +2448,11 @@ class EvidenceArchive:
             "transaction_id": prepared["transaction_id"],
             "cutoff": prepared["cutoff"].isoformat() if type(prepared["cutoff"]) is datetime else prepared["cutoff"],
             "target_index_digest": prepared["target_index_digest"],
-            "target_bucket_digests": prepared["target_bucket_digests"],
+            "target_bucket_digests": {
+                name: digest
+                for name, digest in prepared["target_bucket_digests"].items()
+                if name in indexed_buckets
+            },
             "target_index": prepared["target_index"],
         }
         payload = (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -2561,18 +2555,6 @@ class EvidenceArchive:
                     raise OSError("storage_corrupt")
         return names
 
-    @classmethod
-    def _calendar_bucket_candidates(cls, cutoff: datetime, upper: datetime) -> set[str]:
-        if upper < cutoff:
-            raise OSError("storage_corrupt")
-        count = (upper.date() - cutoff.date()).days + 1
-        if count < 1 or count > _MAX_ARCHIVE_FILES:
-            raise OSError("storage_corrupt")
-        return {
-            f"{(cutoff.date() + timedelta(days=offset)).isoformat()}.jsonl"
-            for offset in range(count)
-        }
-
     @staticmethod
     def _validate_index_projection(
         index: dict[str, str],
@@ -2633,7 +2615,7 @@ class EvidenceArchive:
             return dict(journal["target_index"])
         if journal["native_schema_version"] != _PREVIOUS_JOURNAL_SCHEMA_VERSION:
             raise OSError("storage_corrupt")
-        actual_digest = self._payload_digest(self._index_payload(physical_index))
+        actual_digest = self._index_digest()
         if actual_digest == journal["target_index_digest"]:
             return dict(physical_index)
         if actual_digest != journal["base_index_digest"]:
@@ -2664,6 +2646,30 @@ class EvidenceArchive:
 
     def _write_index(self, events: dict[str, str]) -> None:
         self._atomic_write(self.index_path, self._index_payload(events), _MAX_INDEX_BYTES)
+
+
+    def _recognized_legacy_journal_candidate(self) -> bool:
+        raw = self._read_bytes(self.journal_path, _MAX_JOURNAL_BYTES)
+        if raw is None:
+            return False
+        try:
+            _preflight_json_payload(
+                raw,
+                maximum_depth=16,
+                maximum_tokens=_MAX_SNAPSHOT_NODES * 4 + 16,
+            )
+            document = self._parse_json(raw)
+            return (
+                type(document) is dict
+                and type(document.get("schema_version")) is int
+                and document["schema_version"] in {
+                    _LEGACY_JOURNAL_SCHEMA_VERSION,
+                    _PREVIOUS_JOURNAL_SCHEMA_VERSION,
+                    _JOURNAL_SCHEMA_VERSION,
+                }
+            )
+        except (TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
+            return False
 
 
     def _read_journal(
@@ -2756,8 +2762,8 @@ class EvidenceArchive:
             target_index: dict[str, str] | None = None
             if not previous_native:
                 cutoff_time = _metadata_time(document["cutoff"], "archive transaction cutoff")
-                transaction_upper = cutoff_time + timedelta(days=90)
-                if transaction_upper > now + _MAX_CLOCK_SKEW:
+                transaction_upper = _shift_days(cutoff_time, 90)
+                if transaction_upper > _shift_datetime(now, _MAX_CLOCK_SKEW):
                     raise ValueError("invalid archive transaction cutoff")
                 target_index = self._index_events(document["target_index"])
                 if self._payload_digest(self._index_payload(target_index)) != target_index_digest:
@@ -2872,13 +2878,17 @@ class EvidenceArchive:
         diagnostics: dict[str, int],
         budget: dict[str, int],
         required_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
+        include_discovered: bool = True,
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
         dict[str, str],
         dict[str, dict[str, Any]],
         dict[str, set[str]],
     ]:
-        names = self._bounded_bucket_candidates(self._bucket_names(), required_names)
+        names = self._bounded_bucket_candidates(
+            self._bucket_names() if include_discovered else (),
+            required_names,
+        )
         bucket_rows: dict[str, list[dict[str, Any]]] = {}
         observed: dict[str, str] = {}
         existing: dict[str, dict[str, Any]] = {}
@@ -2920,21 +2930,50 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         if self._payload_digest(self._index_payload(physical_index)) != state["target_index_digest"]:
             raise OSError("storage_corrupt")
+        active_cutoff = _shift_days(now, -90)
+        discovered = self._bucket_names()
+        active_manifest = {
+            name: digest
+            for name, digest in state["target_bucket_digests"].items()
+            if _bucket_name_in_window(name, active_cutoff, now)
+        }
+        active_discovered = {
+            name
+            for name in discovered
+            if _bucket_name_in_window(name, active_cutoff, now)
+        }
+        active_index = {
+            event_id: name
+            for event_id, name in physical_index.items()
+            if _bucket_name_in_window(name, active_cutoff, now)
+        }
+        if set(active_index.values()) - set(active_manifest):
+            raise OSError("storage_corrupt")
+        for name in sorted(active_discovered - set(active_manifest)):
+            if self._read_bucket(
+                name,
+                diagnostics,
+                budget=budget,
+                fail_on_budget=True,
+                validation_now=now,
+            ):
+                raise OSError("storage_corrupt")
         bucket_rows, observed, existing, locations = self._read_all_buckets(
             now=now,
             diagnostics=diagnostics,
             budget=budget,
-            required_names=state["target_bucket_digests"],
+            required_names=active_manifest,
+            include_discovered=False,
         )
-        if observed != state["target_bucket_digests"]:
+        if observed != active_manifest:
             self._last_diagnostics = diagnostics
             raise OSError("storage_corrupt")
-        cutoff = state["cutoff"]
         self._validate_index_projection(
-            physical_index,
+            active_index,
             bucket_rows,
-            cutoff=cutoff,
-            upper=cutoff + timedelta(days=90),
+            cutoff=active_cutoff,
+            upper=now,
+            allow_stale_index_entries=True,
         )
         return bucket_rows, observed, existing, locations
 
@@ -2953,11 +2992,28 @@ class EvidenceArchive:
             state["target_bucket_digests"],
             state["target_index"].values(),
         )
+        discovered = self._bucket_names()
+        unexpected_active = {
+            name
+            for name in discovered
+            if _bucket_name_in_window(name, state["cutoff"], _shift_days(state["cutoff"], 90))
+            and name not in required
+        }
+        for name in sorted(unexpected_active):
+            if self._read_bucket(
+                name,
+                diagnostics,
+                budget=budget,
+                fail_on_budget=True,
+                validation_now=now,
+            ):
+                raise OSError("storage_corrupt")
         bucket_rows, observed, _existing, locations = self._read_all_buckets(
             now=now,
             diagnostics=diagnostics,
             budget=budget,
             required_names=required,
+            include_discovered=False,
         )
         if set(observed) != set(state["target_bucket_digests"]):
             raise OSError("storage_corrupt")
@@ -3004,7 +3060,7 @@ class EvidenceArchive:
             state["target_index"],
             target_bucket_rows,
             cutoff=state["cutoff"],
-            upper=state["cutoff"] + timedelta(days=90),
+            upper=_shift_days(state["cutoff"], 90),
             authoritative_rows=state["rows"],
         )
         index_payload = self._index_payload(state["target_index"])
@@ -3038,7 +3094,7 @@ class EvidenceArchive:
         return self._prepared_authority_payload(
             base_generation=target_generation - 1,
             target_generation=target_generation,
-            cutoff=now - timedelta(days=90),
+            cutoff=_shift_days(now, -90),
             base_index_digest=index_digest,
             target_index_digest=index_digest,
             base_bucket_digests=bucket_digests,
@@ -3046,6 +3102,61 @@ class EvidenceArchive:
             target_index=index,
             rows=[],
         )
+
+    def _recover_first_legacy_journal(
+        self,
+        journal: dict[str, Any],
+        *,
+        now: datetime,
+        diagnostics: dict[str, int],
+        budget: dict[str, int],
+    ) -> dict[str, Any]:
+        if not journal["legacy"] or not journal["rows"]:
+            raise OSError("storage_corrupt")
+        rows = list(journal["rows"])
+        cutoff = _shift_days(now, -90)
+        bucket_rows: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            bucket_rows.setdefault(_bucket_name(row), []).append(row)
+        names = self._bounded_bucket_candidates(bucket_rows)
+        bucket_payloads = {
+            name: self._bucket_payload(name, selected)
+            for name, selected in bucket_rows.items()
+        }
+        base_bucket_digests = {name: _MISSING_DIGEST for name in names}
+        target_bucket_digests = {
+            name: self._payload_digest(bucket_payloads[name])
+            for name in names
+        }
+        target_index = {
+            row["event_id"]: _bucket_name(row)
+            for row in rows
+            if cutoff <= _event_time(row) <= now
+        }
+        target_index_digest = self._payload_digest(self._index_payload(target_index))
+        prepared_payload = self._prepared_authority_payload(
+            base_generation=0,
+            target_generation=1,
+            cutoff=cutoff,
+            base_index_digest=_MISSING_DIGEST,
+            target_index_digest=target_index_digest,
+            base_bucket_digests=base_bucket_digests,
+            target_bucket_digests=target_bucket_digests,
+            target_index=target_index,
+            rows=rows,
+        )
+        self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
+        prepared = self._parse_authority_state(self._parse_json(prepared_payload), now=now)
+        self._recover_prepared_authority(
+            prepared,
+            now=now,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
+        recovered = self._read_authority_state(now)
+        if recovered is None or recovered["legacy"] or recovered["phase"] != "finalized":
+            raise OSError("storage_corrupt")
+        return recovered
 
     def _migrate_legacy_authority(
         self,
@@ -3056,7 +3167,8 @@ class EvidenceArchive:
         budget: dict[str, int],
     ) -> dict[str, Any] | None:
         legacy_files = self._entry_present(self.index_path) or bool(self._bucket_names())
-        if legacy_state is None and not legacy_files:
+        journal_only = legacy_state is None and not legacy_files
+        if journal_only and not self._recognized_legacy_journal_candidate():
             return None
         state_document = None if legacy_state is None else legacy_state["document"]
         if state_document is not None:
@@ -3075,15 +3187,22 @@ class EvidenceArchive:
             except (KeyError, TypeError, ValueError):
                 raise OSError("storage_corrupt") from None
         journal = self._read_journal(now, diagnostics, budget=budget)
+        if journal_only and journal is not None and journal["legacy"]:
+            return self._recover_first_legacy_journal(
+                journal,
+                now=now,
+                diagnostics=diagnostics,
+                budget=budget,
+            )
         if state_document is not None and state_document["phase"] == "prepared" and journal is None:
             raise OSError("storage_corrupt")
         if journal is not None and not journal["legacy"] and not journal["completed"]:
-            cutoff = journal["cutoff"] if journal["cutoff"] is not None else now - timedelta(days=90)
+            cutoff = journal["cutoff"] if journal["cutoff"] is not None else _shift_days(now, -90)
             target_index = self._logical_native_index(
                 journal,
                 self._read_index() or {},
                 cutoff=cutoff,
-                upper=cutoff + timedelta(days=90),
+                upper=_shift_days(cutoff, 90),
             )
             prepared_payload = self._prepared_authority_payload(
                 base_generation=journal["base_generation"],
@@ -3107,6 +3226,12 @@ class EvidenceArchive:
             return self._read_authority_state(now)
 
         physical_index = self._read_index() or {}
+        if (
+            state_document is not None
+            and state_document["phase"] == "finalized"
+            and self._index_digest() != state_document["index_digest"]
+        ):
+            raise OSError("storage_corrupt")
         if journal is None:
             required: set[str] | dict[str, str] = set()
         elif journal["legacy"]:
@@ -3121,6 +3246,12 @@ class EvidenceArchive:
             budget=budget,
             required_names=required,
         )
+        if state_document is not None and state_document["bucket_digests"]:
+            if any(
+                observed.get(name) != digest
+                for name, digest in state_document["bucket_digests"].items()
+            ):
+                raise OSError("storage_corrupt")
         if journal is not None and not journal["legacy"]:
             self._validate_journal_bucket_state(journal, observed)
         if journal is not None and journal["legacy"]:
@@ -3136,7 +3267,7 @@ class EvidenceArchive:
                 matched[row["event_id"]] = matched.get(row["event_id"], 0) + 1
             if matched != {row["event_id"]: 1 for row in journal["rows"]}:
                 raise OSError("storage_corrupt")
-        cutoff = now - timedelta(days=90)
+        cutoff = _shift_days(now, -90)
         self._validate_index_projection(
             physical_index,
             bucket_rows,
@@ -3236,7 +3367,7 @@ class EvidenceArchive:
                 base_generation = state["generation"]
                 base_index_digest = state["target_index_digest"]
 
-            cutoff = archived_at - timedelta(days=90)
+            cutoff = _shift_days(archived_at, -90)
             committed: dict[str, dict[str, Any]] = {}
             for row in incoming:
                 event_id = row["event_id"]
@@ -3387,7 +3518,7 @@ class EvidenceArchive:
             diagnostics=diagnostics,
             budget=budget,
         )
-        cutoff = now - timedelta(days=days)
+        cutoff = _shift_days(now, -days)
         self._last_diagnostics = diagnostics
         return sorted(
             (
@@ -3414,14 +3545,17 @@ class EvidenceArchive:
                 self._last_diagnostics = diagnostics
                 raise OSError("storage_corrupt")
         now = _utc(self._now(), "archive clock")
-        cursor = (now - timedelta(days=days)).date()
-        while cursor <= now.date():
+        cursor = _shift_days(now, -days).date()
+        final_day = now.date()
+        while cursor <= final_day:
             path = self.archive_root / f"{cursor.isoformat()}.jsonl"
             if self._safe_file(path) is not None:
                 self._last_diagnostics = diagnostics
                 raise OSError("storage_corrupt")
             if self._entry_present(path):
                 self._increment(diagnostics, "skipped_files")
+            if cursor == final_day:
+                break
             cursor += timedelta(days=1)
         self._last_diagnostics = diagnostics
         return []
