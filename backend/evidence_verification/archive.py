@@ -284,10 +284,24 @@ def _previous_journal_cutoff(rows: list[dict[str, Any]], now: datetime) -> datet
     current = _utc(now, "archive clock")
     if not rows:
         return _shift_days(current, -90)
-    transaction_upper = max(
-        _metadata_time(row["archived_at"], "archived_at")
-        for row in rows
+    common_lineages: set[tuple[str, str, str]] | None = None
+    for row in rows:
+        row_lineages = {
+            (
+                lineage["evidence_snapshot_id"],
+                lineage["raw_snapshot_id"],
+                lineage["generated_at"],
+            )
+            for lineage in row["snapshot_history"]
+        }
+        common_lineages = row_lineages if common_lineages is None else common_lineages & row_lineages
+    if not common_lineages:
+        raise ValueError("invalid archive transaction lineage")
+    transaction_lineage = max(
+        common_lineages,
+        key=lambda item: (_metadata_time(item[2], "lineage generated_at"), item[0], item[1]),
     )
+    transaction_upper = _metadata_time(transaction_lineage[2], "lineage generated_at")
     if transaction_upper > _shift_datetime(current, _MAX_CLOCK_SKEW):
         raise ValueError("invalid archive transaction time")
     return _shift_days(transaction_upper, -90)
@@ -1281,6 +1295,23 @@ def _legacy_archive_projection(row: dict[str, Any]) -> dict[str, Any]:
         for lineage in row["snapshot_history"]
     ]
     return projection
+
+
+def _mark_legacy_projection_unverifiable(
+    row: dict[str, Any],
+    *,
+    validation_now: datetime,
+) -> dict[str, Any]:
+    marked = dict(row)
+    history: list[dict[str, Any]] = []
+    for lineage in row["snapshot_history"]:
+        if lineage.get("legacy_v1") is not True:
+            raise ValueError("invalid historical v1 archive projection")
+        updated = dict(lineage)
+        updated["legacy_unverifiable"] = True
+        history.append(updated)
+    marked["snapshot_history"] = history
+    return _validate_archive_projection(marked, validation_now=validation_now)
 
 
 def _lineage_order(row: dict[str, str]) -> tuple[datetime, str, str, str]:
@@ -2637,6 +2668,8 @@ class EvidenceArchive:
         *,
         cutoff: datetime,
         upper: datetime,
+        physical_rows: dict[str, dict[str, Any]] | None = None,
+        locations: dict[str, set[str]] | None = None,
     ) -> dict[str, str]:
         if journal["legacy"]:
             raise OSError("storage_corrupt")
@@ -2649,7 +2682,24 @@ class EvidenceArchive:
             return dict(physical_index)
         if actual_digest != journal["base_index_digest"]:
             raise OSError("storage_corrupt")
-        target = dict(physical_index)
+        if physical_rows is None or locations is None:
+            raise OSError("storage_corrupt")
+        journal_ids = {row["event_id"] for row in journal["rows"]}
+        target: dict[str, str] = {}
+        for event_id, bucket_name in physical_index.items():
+            if event_id in journal_ids:
+                continue
+            if _bucket_date(bucket_name) < cutoff.date():
+                continue
+            row = physical_rows.get(event_id)
+            if (
+                row is None
+                or locations.get(event_id) != {bucket_name}
+                or _bucket_name(row) != bucket_name
+            ):
+                raise OSError("storage_corrupt")
+            if cutoff <= _event_time(row) <= upper:
+                target[event_id] = bucket_name
         for row in journal["rows"]:
             if cutoff <= _event_time(row) <= upper:
                 target[row["event_id"]] = _bucket_name(row)
@@ -3140,9 +3190,12 @@ class EvidenceArchive:
         self,
         *,
         legacy_generation: int,
-        now: datetime,
+        cutoff: datetime,
+        base_index_digest: str,
         index: dict[str, str],
-        bucket_digests: dict[str, str],
+        base_bucket_digests: dict[str, str],
+        target_bucket_digests: dict[str, str],
+        rows: list[dict[str, Any]],
     ) -> bytes:
         target_generation = max(0, legacy_generation) + 1
         index_payload = self._index_payload(index)
@@ -3150,13 +3203,13 @@ class EvidenceArchive:
         return self._prepared_authority_payload(
             base_generation=target_generation - 1,
             target_generation=target_generation,
-            cutoff=_shift_days(now, -90),
-            base_index_digest=index_digest,
+            cutoff=cutoff,
+            base_index_digest=base_index_digest,
             target_index_digest=index_digest,
-            base_bucket_digests=bucket_digests,
-            target_bucket_digests=bucket_digests,
+            base_bucket_digests=base_bucket_digests,
+            target_bucket_digests=target_bucket_digests,
             target_index=index,
-            rows=[],
+            rows=rows,
         )
 
     def _recover_first_legacy_journal(
@@ -3169,7 +3222,10 @@ class EvidenceArchive:
     ) -> dict[str, Any]:
         if not journal["legacy"]:
             raise OSError("storage_corrupt")
-        rows = list(journal["rows"])
+        rows = [
+            _mark_legacy_projection_unverifiable(row, validation_now=now)
+            for row in journal["rows"]
+        ]
         cutoff = _shift_days(now, -90)
         bucket_rows: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -3262,11 +3318,26 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         if journal is not None and not journal["legacy"] and not journal["completed"]:
             cutoff = journal["cutoff"] if journal["cutoff"] is not None else _shift_days(now, -90)
+            physical_index = self._read_index() or {}
+            (
+                _journal_bucket_rows,
+                journal_observed,
+                journal_existing,
+                journal_locations,
+            ) = self._read_all_buckets(
+                now=now,
+                diagnostics=diagnostics,
+                budget=budget,
+                required_names=journal["target_bucket_digests"],
+            )
+            self._validate_journal_bucket_state(journal, journal_observed)
             target_index = self._logical_native_index(
                 journal,
-                self._read_index() or {},
+                physical_index,
                 cutoff=cutoff,
                 upper=_shift_days(cutoff, 90),
+                physical_rows=journal_existing,
+                locations=journal_locations,
             )
             prepared_payload = self._prepared_authority_payload(
                 base_generation=journal["base_generation"],
@@ -3290,10 +3361,11 @@ class EvidenceArchive:
             return self._read_authority_state(now)
 
         physical_index = self._read_index() or {}
+        physical_index_digest = self._index_digest()
         if (
             state_document is not None
             and state_document["phase"] == "finalized"
-            and self._index_digest() != state_document["index_digest"]
+            and physical_index_digest != state_document["index_digest"]
         ):
             raise OSError("storage_corrupt")
         if journal is None:
@@ -3320,17 +3392,44 @@ class EvidenceArchive:
         active_nonempty_names = {
             name for name, rows in active_bucket_rows.items() if rows
         }
+        historical_v1_unmanifested = bool(
+            state_document is not None
+            and state_document["schema_version"] == _LEGACY_ARCHIVE_SCHEMA_VERSION
+            and state_document["phase"] == "finalized"
+            and not state_document["bucket_digests"]
+        )
         if state_document is not None and state_document["phase"] == "finalized":
-            active_declared = {
-                name: digest
-                for name, digest in state_document["bucket_digests"].items()
-                if _bucket_name_in_window(name, cutoff, authority_upper)
-            }
-            if (
-                set(active_declared) != active_nonempty_names
-                or any(observed.get(name) != digest for name, digest in active_declared.items())
-            ):
-                raise OSError("storage_corrupt")
+            if historical_v1_unmanifested:
+                # Historical state v1 authenticated its index but not bucket bytes.  Accept
+                # only one exact physical projection, then label every migrated lineage as
+                # unverifiable before schema-v4 computed manifests become authoritative.
+                if (
+                    diagnostics["skipped_files"] != 0
+                    or diagnostics["skipped_corrupt_rows"] != 0
+                    or set(physical_index) != set(existing)
+                    or any(
+                        locations.get(event_id) != {bucket_name}
+                        or _bucket_name(existing[event_id]) != bucket_name
+                        for event_id, bucket_name in physical_index.items()
+                    )
+                    or any(
+                        lineage.get("legacy_v1") is not True
+                        for row in existing.values()
+                        for lineage in row["snapshot_history"]
+                    )
+                ):
+                    raise OSError("storage_corrupt")
+            else:
+                active_declared = {
+                    name: digest
+                    for name, digest in state_document["bucket_digests"].items()
+                    if _bucket_name_in_window(name, cutoff, authority_upper)
+                }
+                if (
+                    set(active_declared) != active_nonempty_names
+                    or any(observed.get(name) != digest for name, digest in active_declared.items())
+                ):
+                    raise OSError("storage_corrupt")
         elif state_document is not None and state_document["bucket_digests"]:
             if any(
                 observed.get(name) != digest
@@ -3364,27 +3463,71 @@ class EvidenceArchive:
             upper=now,
             allow_stale_index_entries=True,
         )
+        migration_bucket_rows: dict[str, list[dict[str, Any]]] = {}
+        for name, rows in active_bucket_rows.items():
+            if not rows:
+                continue
+            migration_bucket_rows[name] = [
+                _mark_legacy_projection_unverifiable(row, validation_now=now)
+                if historical_v1_unmanifested
+                else row
+                for row in rows
+            ]
         target_index = {
             event_id: _bucket_name(row)
             for event_id, row in existing.items()
             if cutoff <= _event_time(row) <= now
         }
-        target_index_payload = self._index_payload(target_index)
-        if physical_index != target_index:
-            self._atomic_write(self.index_path, target_index_payload, _MAX_INDEX_BYTES)
+        target_bucket_payloads = {
+            name: self._bucket_payload(name, rows)
+            for name, rows in migration_bucket_rows.items()
+        }
+        base_bucket_digests = {
+            name: observed[name]
+            for name in sorted(migration_bucket_rows)
+        }
+        target_bucket_digests = {
+            name: self._payload_digest(payload)
+            for name, payload in sorted(target_bucket_payloads.items())
+        }
+        changed_names = {
+            name
+            for name in target_bucket_digests
+            if base_bucket_digests[name] != target_bucket_digests[name]
+        }
+        changed_rows = [
+            row
+            for name in sorted(changed_names)
+            for row in migration_bucket_rows[name]
+        ]
         legacy_generation = 0 if state_document is None else state_document["generation"]
         prepared_payload = self._migration_prepared_payload(
             legacy_generation=legacy_generation,
-            now=now,
+            cutoff=cutoff,
+            base_index_digest=physical_index_digest,
             index=target_index,
-            bucket_digests={
-                name: observed[name]
-                for name in sorted(active_nonempty_names)
-            },
+            base_bucket_digests=base_bucket_digests,
+            target_bucket_digests=target_bucket_digests,
+            rows=changed_rows,
         )
-        self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         prepared = self._parse_authority_state(self._parse_json(prepared_payload), now=now)
-        self._atomic_write(self.state_path, self._finalized_authority_payload(prepared), _MAX_STATE_BYTES)
+        finalized_payload = self._finalized_authority_payload(prepared)
+        index_payload = self._index_payload(target_index)
+        mutation_bytes = (
+            len(prepared_payload)
+            + len(finalized_payload)
+            + len(index_payload)
+            + sum(len(target_bucket_payloads[name]) for name in changed_names)
+        )
+        if mutation_bytes > _MAX_MUTATION_BYTES:
+            raise OSError("storage_corrupt")
+        self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
+        self._recover_prepared_authority(
+            prepared,
+            now=now,
+            diagnostics=diagnostics,
+            budget=budget,
+        )
         return self._read_authority_state(now)
 
 

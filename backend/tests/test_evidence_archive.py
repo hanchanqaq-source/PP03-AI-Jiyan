@@ -251,6 +251,61 @@ def _write_bucket_for_test(
     )
 
 
+def _write_historical_v1_finalized_archive(
+    archive: EvidenceArchive,
+    selected_snapshots: tuple[EvidenceSnapshot, ...],
+) -> dict[str, object]:
+    """Write the real schema-v1 shape: no synthetic bucket manifest."""
+    with archive._process_lock():
+        pass
+    rows: list[dict[str, object]] = []
+    for selected in selected_snapshots:
+        rows.append(archive_module._archive_document(
+            selected,
+            archive_module.event_document(selected.events[0]),
+            selected.generated_at,
+        ))
+    buckets: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        buckets.setdefault(archive_module._bucket_name(row), []).append(row)
+    bucket_bytes: dict[str, bytes] = {}
+    for name, bucket_rows in buckets.items():
+        payload = b"".join(
+            json.dumps(
+                _legacy_v1_row(row),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+            for row in sorted(bucket_rows, key=lambda item: item["event_id"])
+        )
+        (archive.archive_root / name).write_bytes(payload)
+        bucket_bytes[name] = payload
+    physical_index = {
+        row["event_id"]: archive_module._bucket_name(row)
+        for row in rows
+    }
+    index_bytes = archive._index_payload(physical_index)
+    archive.index_path.write_bytes(index_bytes)
+    legacy_state = {
+        "schema_version": 1,
+        "generation": 1,
+        "phase": "finalized",
+        "transaction_id": "1" * 64,
+        "index_digest": archive._payload_digest(index_bytes),
+        "bucket_digests": {},
+    }
+    state_bytes = (
+        json.dumps(legacy_state, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    archive.state_path.write_bytes(state_bytes)
+    return {
+        "rows": rows,
+        "bucket_bytes": bucket_bytes,
+        "index_bytes": index_bytes,
+        "state_bytes": state_bytes,
+    }
+
+
 def _upsert_in_child(root: str, event_id: str) -> None:
     EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(event(event_id)))
 
@@ -3900,3 +3955,302 @@ def test_archive_v2_journal_only_recovery_rejects_target_index_digest_mismatch(t
         archive.upsert(snapshot(event("n" * 20)))
 
     assert not archive.state_path.exists()
+
+
+@pytest.mark.parametrize("fault_phase", ("prepared", "bucket", "index", "finalized"))
+def test_archive_legacy_migration_persists_recoverable_v4_state_before_physical_projection(
+    tmp_path,
+    monkeypatch,
+    fault_phase,
+):
+    current = snapshot(
+        _timed_event("c" * 20, NOW),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=NOW,
+    )
+    expired_time = NOW - timedelta(days=91)
+    expired = snapshot(
+        _timed_event("o" * 20, expired_time),
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+        generated_at=expired_time,
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(archive, (expired, current))
+    real_atomic_write = archive._atomic_write
+    observed_phases: list[str] = []
+    prepared_documents: list[dict[str, object]] = []
+
+    def fail_selected_phase(path: Path, payload: bytes, maximum: int):
+        selected_phase: str | None = None
+        state_document: dict[str, object] | None = None
+        if path == archive.state_path:
+            state_document = json.loads(payload)
+            selected_phase = state_document["phase"]
+        elif path == archive.index_path:
+            selected_phase = "index"
+        elif path.suffix == ".jsonl":
+            selected_phase = "bucket"
+        if selected_phase == "prepared" and state_document is not None:
+            prepared_documents.append(state_document)
+        if selected_phase == fault_phase:
+            observed_phases.append(selected_phase)
+            raise OSError(f"simulated {selected_phase} migration fault")
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", fail_selected_phase)
+    with pytest.raises(OSError):
+        archive.query(days=90)
+
+    assert observed_phases == [fault_phase]
+    if fault_phase == "prepared":
+        assert archive.state_path.read_bytes() == legacy["state_bytes"]
+        assert archive.index_path.read_bytes() == legacy["index_bytes"]
+        assert {
+            path.name: path.read_bytes()
+            for path in archive.archive_root.glob("*.jsonl")
+        } == legacy["bucket_bytes"]
+    else:
+        pending = json.loads(archive.state_path.read_text(encoding="utf-8"))
+        assert pending["schema_version"] == 4
+        assert pending["phase"] == "prepared"
+        assert set(pending) == archive_module._PREPARED_STATE_KEYS
+        assert pending["base_generation"] == 1
+        assert pending["target_generation"] == 2
+        assert pending["base_bucket_digests"]
+        assert pending["target_bucket_digests"]
+        assert pending["rows"]
+        assert pending["cutoff"] == (NOW - timedelta(days=90)).isoformat()
+    assert prepared_documents
+
+    monkeypatch.setattr(archive, "_atomic_write", real_atomic_write)
+    assert [row["event_id"] for row in archive.query(days=90)] == ["c" * 20]
+    finalized = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert finalized["schema_version"] == 4
+    assert finalized["phase"] == "finalized"
+    assert finalized["target_index"] == {
+        "c" * 20: f"{NOW.date().isoformat()}.jsonl",
+    }
+    assert archive._payload_digest(archive.index_path.read_bytes()) == finalized["target_index_digest"]
+    assert {
+        name: archive._payload_digest((archive.archive_root / name).read_bytes())
+        for name in finalized["target_bucket_digests"]
+    } == finalized["target_bucket_digests"]
+
+
+def test_archive_migrates_historical_v1_finalized_empty_manifest_with_explicit_unverifiable_truth(
+    tmp_path,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    _write_historical_v1_finalized_archive(archive, (snapshot(event()),))
+
+    rows = archive.query(days=90)
+
+    assert [row["event_id"] for row in rows] == ["a" * 20]
+    assert all(
+        lineage.get("legacy_v1") is True
+        and lineage.get("legacy_unverifiable") is True
+        for lineage in rows[0]["snapshot_history"]
+    )
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 4
+    assert state["phase"] == "finalized"
+    assert state["target_bucket_digests"] == {
+        name: archive._payload_digest((archive.archive_root / name).read_bytes())
+        for name in state["target_bucket_digests"]
+    }
+
+
+def test_archive_legacy_migration_preflights_mutation_budget_before_prepared_state(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(archive, (snapshot(event()),))
+    monkeypatch.setattr(archive_module, "_MAX_MUTATION_BYTES", 1)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert archive.state_path.read_bytes() == legacy["state_bytes"]
+    assert archive.index_path.read_bytes() == legacy["index_bytes"]
+    assert {
+        path.name: path.read_bytes()
+        for path in archive.archive_root.glob("*.jsonl")
+    } == legacy["bucket_bytes"]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "state_keys",
+        "index_digest",
+        "index_projection",
+        "bucket_schema",
+        "bucket_identity",
+        "unindexed_corrupt_row",
+    ),
+)
+def test_archive_historical_v1_empty_manifest_still_requires_exact_physical_projection(
+    tmp_path,
+    corruption,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(archive, (snapshot(event()),))
+    state = json.loads(legacy["state_bytes"])
+    row = _legacy_v1_row(legacy["rows"][0])
+    bucket_name = archive_module._bucket_name(legacy["rows"][0])
+    if corruption == "state_keys":
+        state["unexpected"] = True
+    elif corruption == "index_digest":
+        state["index_digest"] = "f" * 64
+    elif corruption == "index_projection":
+        index_bytes = archive._index_payload({"b" * 20: bucket_name})
+        archive.index_path.write_bytes(index_bytes)
+        state["index_digest"] = archive._payload_digest(index_bytes)
+    elif corruption == "bucket_schema":
+        row["schema_version"] = 999
+        (archive.archive_root / bucket_name).write_text(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    elif corruption == "bucket_identity":
+        row["event_id"] = "b" * 20
+        (archive.archive_root / bucket_name).write_text(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        row.pop("title")
+        index_bytes = archive._index_payload({})
+        archive.index_path.write_bytes(index_bytes)
+        state["index_digest"] = archive._payload_digest(index_bytes)
+        (archive.archive_root / bucket_name).write_text(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_schema_v1_nonempty_manifest_remains_strictly_digest_bound(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(archive, (snapshot(event()),))
+    state = json.loads(legacy["state_bytes"])
+    bucket_name = next(iter(legacy["bucket_bytes"]))
+    state["bucket_digests"] = {bucket_name: "f" * 64}
+    archive.state_path.write_text(
+        json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+
+def test_archive_v2_cutoff_uses_latest_common_snapshot_lineage_not_earliest_archive_time(
+    tmp_path,
+    monkeypatch,
+):
+    transaction_start = NOW
+    update_time = NOW + timedelta(days=1)
+    clock = [transaction_start]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    future_time = transaction_start + timedelta(minutes=2)
+    archive.upsert(snapshot(
+        _timed_event("s" * 20, future_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=transaction_start,
+    ))
+    clock[0] = update_time
+    updated = replace(
+        _timed_event("s" * 20, update_time, status=VerificationStatus.DISPROVED),
+        status_history=(
+            StatusTransition(None, VerificationStatus.VERIFIED, future_time, "reason-verified"),
+            StatusTransition(
+                VerificationStatus.VERIFIED,
+                VerificationStatus.DISPROVED,
+                update_time,
+                "reason-disproved",
+            ),
+        ),
+    )
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            updated,
+            snapshot_id="3" * 20,
+            raw_snapshot_id="4" * 20,
+            generated_at=update_time,
+        ),
+    )
+    journal = _rewrite_pending_journal_as_v2(archive)
+    assert journal["rows"][0]["archived_at"] == transaction_start.isoformat()
+    assert journal["rows"][0]["snapshot_generated_at"] == update_time.isoformat()
+    recovered_cutoffs: list[datetime] = []
+    real_recover = archive._recover_prepared_authority
+
+    def record_recovery(state, **kwargs):
+        recovered_cutoffs.append(state["cutoff"])
+        return real_recover(state, **kwargs)
+
+    monkeypatch.setattr(archive, "_recover_prepared_authority", record_recovery)
+    clock[0] = update_time + timedelta(days=91)
+    archive.upsert(snapshot(
+        _timed_event("n" * 20, clock[0]),
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+        generated_at=clock[0],
+    ))
+
+    assert recovered_cutoffs[0] == update_time - timedelta(days=90)
+    assert [row["event_id"] for row in archive.query(days=90)] == ["n" * 20]
+
+
+def test_archive_v2_target_index_prunes_expired_unrelated_base_ids_before_journal_rows(
+    tmp_path,
+    monkeypatch,
+):
+    base_time = NOW - timedelta(days=2)
+    expired_time = base_time - timedelta(days=89)
+    clock = [base_time]
+    archive = EvidenceArchive(tmp_path, now=lambda: clock[0])
+    archive.upsert(snapshot(
+        _timed_event("o" * 20, expired_time),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=expired_time,
+    ))
+    assert archive._read_index() == {
+        "o" * 20: f"{expired_time.date().isoformat()}.jsonl",
+    }
+    clock[0] = NOW
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            _timed_event("n" * 20, NOW),
+            snapshot_id="3" * 20,
+            raw_snapshot_id="4" * 20,
+            generated_at=NOW,
+        ),
+    )
+    journal = _rewrite_pending_journal_as_v2(archive)
+    expected_target = {"n" * 20: f"{NOW.date().isoformat()}.jsonl"}
+    assert journal["target_index_digest"] == archive._payload_digest(
+        archive._index_payload(expected_target)
+    )
+
+    assert [row["event_id"] for row in archive.query(days=90)] == ["n" * 20]
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["phase"] == "finalized"
+    assert state["target_index"] == expected_target
+    assert archive._read_index() == expected_target
