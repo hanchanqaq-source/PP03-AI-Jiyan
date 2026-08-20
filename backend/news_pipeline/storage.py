@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,8 +15,14 @@ import time
 from typing import Any, Callable, Iterator
 
 from cache_io_lock import CACHE_IO_LOCK
-from evidence_verification.models import EvidenceSnapshot
-from evidence_verification.storage import evidence_snapshot_from_document, snapshot_document
+from evidence_verification.models import EvidenceSnapshot, FieldVerificationStatus, VerificationStatus
+from evidence_verification.storage import (
+    event_document,
+    evidence_snapshot_from_document,
+    field_document,
+    snapshot_document,
+    validated_snapshot_document,
+)
 from .models import PipelineCounts, PipelinePhase, PipelineRun, RawSnapshot, TrustedSnapshot
 
 
@@ -32,10 +40,14 @@ _NEXT = {
 _MAX_BYTES, _MAX_DEPTH, _MAX_ENTRIES, _MAX_TEXT, _MAX_INT = 1_048_576, 16, 5_000, 8_192, 1_000_000_000
 _RUN_KEYS = {"schema_version", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id", "phase", "counts", "created_at", "updated_at", "redacted_error", "displayed_trusted_snapshot_id"}
 _GENERATION_KEYS = {"schema_version", "generation"}
-_POINTER_KEYS = {"schema_version", "generation", "raw_snapshot_id"}
+_POINTER_KEYS = {"schema_version", "generation", "raw_snapshot_id", "trusted_digest"}
 _TRUSTED_KEYS = {"schema_version", "pointer_generation", "raw_snapshot_id", "published_at", "events"}
-_INTENT_KEYS = {"schema_version", "expected_generation", "target_generation", "raw_snapshot_id"}
-_COMPLETE_KEYS = {"schema_version", "generation", "raw_snapshot_id"}
+_INTENT_KEYS = {"schema_version", "expected_generation", "target_generation", "raw_snapshot_id", "trusted_digest"}
+_COMPLETE_KEYS = {"schema_version", "expected_generation", "target_generation", "generation", "raw_snapshot_id", "trusted_digest"}
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_TEMP_NONCE = re.compile(r"^[a-z0-9_-]{8}$", re.IGNORECASE)
+_MAX_TEMP_SCAN = 1024
+_MAX_TEMP_CLEANUP = 128
 _SAFE_ERROR_CODES = {
     "collection_failed",
     "evidence_persistence_failed",
@@ -51,6 +63,7 @@ _SAFE_ERROR_CODES = {
 class _WriterCapability:
     generation: int
     lock_handle: Any
+    creator_pid: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +76,7 @@ class _TrustedRecord:
 class _PointerRecord:
     raw_snapshot_id: str
     generation: int
+    trusted_digest: str
 
 
 _SOURCE_KEYS = {
@@ -169,6 +183,10 @@ def _timestamp(value: object) -> datetime:
 def _safe_error(value: str) -> str:
     """Persist only a closed set of diagnostic codes, never caller text."""
     return value if type(value) is str and value in _SAFE_ERROR_CODES else "pipeline_error"
+
+
+def _single_link(info: os.stat_result) -> bool:
+    return info.st_nlink == 1 or os.name == "nt" and info.st_nlink == 0
 
 
 def _counts(value: object) -> PipelineCounts:
@@ -326,12 +344,70 @@ def _validate_trusted_events(value: object) -> list[dict[str, object]]:
     return [_validate_market_event(item, trusted=True) for item in value]
 
 
+def _document_digest(document: dict[str, object]) -> str:
+    checked = _bounded(document)
+    if type(checked) is not dict:
+        raise ValueError("trusted document must be an object")
+    payload = json.dumps(checked, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _trusted_document(snapshot: TrustedSnapshot, events: list[dict[str, object]], generation: int) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "pointer_generation": generation,
+        "raw_snapshot_id": snapshot.raw_snapshot_id,
+        "published_at": snapshot.published_at.isoformat(),
+        "events": events,
+    }
+
+
+def _validate_trusted_admission(events: list[dict[str, object]], evidence: EvidenceSnapshot) -> None:
+    if not events:
+        raise ValueError("trusted events require same-snapshot evidence")
+    evidence_by_id: dict[str, object] = {}
+    for event in evidence.events:
+        if type(event.event_id) is not str or not event.event_id or event.event_id in evidence_by_id:
+            raise ValueError("evidence event identity is ambiguous")
+        evidence_by_id[event.event_id] = event
+    seen: set[str] = set()
+    approved_event_statuses = {VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED}
+    approved_field_statuses = {FieldVerificationStatus.VERIFIED, FieldVerificationStatus.CORROBORATED}
+    for trusted in events:
+        event_id = trusted["event_id"]
+        if event_id in seen:
+            raise ValueError("trusted event identity is duplicated")
+        seen.add(event_id)
+        evidence_event = evidence_by_id.get(event_id)
+        if evidence_event is None or evidence_event.verification_status not in approved_event_statuses:
+            raise ValueError("trusted event requires approved same-snapshot evidence")
+        if trusted["verification_status"] != evidence_event.verification_status.value:
+            raise ValueError("trusted event status must match evidence")
+        canonical = event_document(evidence_event)
+        if trusted["title"] != canonical["title"] or trusted["summary"] != canonical["summary"]:
+            raise ValueError("trusted title and summary must match canonical evidence text")
+        approved_fields = [
+            field_document(field)
+            for field in evidence_event.key_fields
+            if field.verification_status in approved_field_statuses
+        ]
+        approved_names = [field["field_name"] for field in approved_fields]
+        if len(approved_names) != len(set(approved_names)):
+            raise ValueError("approved evidence key field identity is ambiguous")
+        seen_fields: set[str] = set()
+        for trusted_field in trusted["verified_key_fields"]:
+            field_name = trusted_field["field_name"]
+            if field_name in seen_fields or trusted_field not in approved_fields:
+                raise ValueError("trusted key field requires approved same-snapshot evidence")
+            seen_fields.add(field_name)
+
+
 class NewsPipelineStorage:
     def __init__(self, root: str | os.PathLike[str] | None = None, *, now: Callable[[], datetime] | None = None, lock_timeout_seconds: float = 2.0) -> None:
         if root is None:
             configured = os.environ.get("VR_DATA_DIR")
             root = Path(configured) / "evidence-verification" / "v1" if configured else Path(os.environ.get("USERPROFILE") or Path.home()) / ".vibe-research" / "evidence-verification" / "v1"
-        self.root = Path(root)
+        self.root = Path(os.path.abspath(root))
         self.raw_root, self.evidence_root, self.trusted_root, self.runs_root = (self.root / name for name in ("raw", "evidence", "trusted", "runs"))
         self.current_pointer_path, self._lock_path = self.root / "current-trusted.json", self.root / ".news-pipeline.lock"
         self._generation_path = self.root / ".news-pipeline-generation.json"
@@ -353,6 +429,7 @@ class NewsPipelineStorage:
 
     def _prepare(self) -> None:
         self._ensure_directory(self.root)
+        self._verify_directory_chain(self.root)
 
     @staticmethod
     def _is_safe_directory(path: Path) -> bool:
@@ -382,6 +459,84 @@ class NewsPipelineStorage:
                 raise OSError("storage_error") from None
             if not cls._is_safe_directory(directory):
                 raise OSError("storage_error")
+
+    def _inside_root(self, path: Path) -> bool:
+        try:
+            return os.path.commonpath((str(self.root), os.path.abspath(path))) == str(self.root)
+        except (OSError, ValueError):
+            return False
+
+    def _verify_directory_chain(self, directory: Path) -> None:
+        if not self._inside_root(directory):
+            raise OSError("storage_error")
+        relative = directory.relative_to(self.root)
+        cursor = self.root
+        if not self._is_safe_directory(cursor):
+            raise OSError("storage_error")
+        for component in relative.parts:
+            cursor = cursor / component
+            if not self._is_safe_directory(cursor):
+                raise OSError("storage_error")
+
+    def _verify_parent(self, path: Path) -> None:
+        if not self._inside_root(path):
+            raise OSError("storage_error")
+        self._verify_directory_chain(path.parent)
+
+    def _open_lock_file(self, path: Path) -> Any:
+        self._verify_parent(path)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            try:
+                before = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                before = None
+            if before is not None and (
+                not stat.S_ISREG(before.st_mode)
+                or getattr(before, "st_reparse_tag", 0)
+                or not _single_link(before)
+            ):
+                raise OSError("storage_error")
+            if before is None:
+                try:
+                    descriptor = os.open(path, flags | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    before = path.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or getattr(before, "st_reparse_tag", 0)
+                        or not _single_link(before)
+                    ):
+                        raise OSError("storage_error")
+                    descriptor = os.open(path, flags, 0o600)
+            else:
+                descriptor = os.open(path, flags, 0o600)
+            opened = os.stat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or getattr(opened, "st_reparse_tag", 0)
+                or not _single_link(opened)
+                or before is not None
+                and (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise OSError("storage_error")
+            try:
+                handle = io.FileIO(descriptor, mode="r+", closefd=True)
+            except BaseException:
+                self._close_owned_descriptor(descriptor, identity)
+                descriptor = None
+                raise
+            descriptor = None
+            return handle
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise OSError("storage_error") from None
 
     @staticmethod
     def _try_lock(handle: Any) -> bool:
@@ -418,7 +573,7 @@ class NewsPipelineStorage:
     def _process_lock(self) -> Iterator[None]:
         try:
             self._prepare()
-            handle = self._lock_path.open("a+b")
+            handle = self._open_lock_file(self._lock_path)
         except OSError:
             raise OSError("storage_error") from None
         acquired = False
@@ -432,7 +587,10 @@ class NewsPipelineStorage:
         finally:
             if acquired:
                 self._unlock(handle)
-            handle.close()
+            try:
+                handle.close()
+            except OSError:
+                pass
 
     @staticmethod
     def _sync_dir(path: Path) -> None:
@@ -483,6 +641,34 @@ class NewsPipelineStorage:
         NewsPipelineStorage._sync_dir(destination.parent)
 
     @staticmethod
+    def _replace_final_commit(source: Path, destination: Path) -> None:
+        """Make the pointer replacement the final propagated publication operation."""
+        NewsPipelineStorage._sync_dir(destination.parent)
+        if os.name == "nt":
+            import ctypes
+
+            move_file_ex = ctypes.windll.kernel32.MoveFileExW
+            move_file_ex.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+            move_file_ex.restype = ctypes.c_int
+            if not move_file_ex(str(source), str(destination), 0x1 | 0x8):
+                raise ctypes.WinError()
+            return
+        os.replace(source, destination)
+
+    @staticmethod
+    def _close_owned_descriptor(descriptor: int, identity: tuple[int, int]) -> None:
+        try:
+            current = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino) != identity:
+                return
+        except OSError:
+            return
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    @staticmethod
     def _cleanup_owned_temp(path: Path, identity: tuple[int, int]) -> None:
         try:
             current = path.lstat()
@@ -496,7 +682,7 @@ class NewsPipelineStorage:
         except OSError:
             return
 
-    def _atomic_write(self, path: Path, document: dict[str, object]) -> None:
+    def _atomic_write(self, path: Path, document: dict[str, object], *, final_commit: bool = False) -> None:
         checked = _bounded(document)
         if type(checked) is not dict:
             raise ValueError("atomic document must be an object")
@@ -508,17 +694,26 @@ class NewsPipelineStorage:
         identity: tuple[int, int] | None = None
         try:
             self._ensure_directory(path.parent)
+            self._verify_parent(path)
             descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
             temporary = Path(raw)
             opened = os.fstat(descriptor)
             identity = (opened.st_dev, opened.st_ino)
-            handle = os.fdopen(descriptor, "wb")
+            try:
+                handle = os.fdopen(descriptor, "wb")
+            except BaseException:
+                self._close_owned_descriptor(descriptor, identity)
+                descriptor = None
+                raise
             descriptor = None
             with handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            self._replace_durable(temporary, path)
+            if final_commit:
+                self._replace_final_commit(temporary, path)
+            else:
+                self._replace_durable(temporary, path)
         except OSError:
             if descriptor is not None:
                 try:
@@ -539,21 +734,28 @@ class NewsPipelineStorage:
             raise
 
     def _read(self, path: Path) -> dict[str, object] | None:
+        descriptor: int | None = None
+        identity: tuple[int, int] | None = None
         try:
+            self._prepare()
+            self._verify_parent(path)
             before = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(before.st_mode) or getattr(before, "st_reparse_tag", 0):
+            if not stat.S_ISREG(before.st_mode) or getattr(before, "st_reparse_tag", 0) or not _single_link(before):
                 return None
             flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(path, flags)
-            try:
-                opened = os.fstat(descriptor)
-            except BaseException:
-                os.close(descriptor)
-                raise
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-                os.close(descriptor)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            if identity != (before.st_dev, before.st_ino) or not _single_link(opened):
                 return None
-            with os.fdopen(descriptor, "rb") as handle:
+            try:
+                handle = os.fdopen(descriptor, "rb")
+            except BaseException:
+                self._close_owned_descriptor(descriptor, identity)
+                descriptor = None
+                raise
+            descriptor = None
+            with handle:
                 raw = handle.read(_MAX_BYTES + 1)
             if len(raw) > _MAX_BYTES:
                 return None
@@ -562,6 +764,15 @@ class NewsPipelineStorage:
             return checked if type(checked) is dict else None
         except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
             return None
+        finally:
+            if descriptor is not None:
+                if identity is None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    self._close_owned_descriptor(descriptor, identity)
 
     def _path(self, directory: Path, raw_snapshot_id: str) -> Path:
         return directory / f"{_id(raw_snapshot_id, 'raw_snapshot_id')}.json"
@@ -594,26 +805,96 @@ class NewsPipelineStorage:
             return True
         for directory in (self.raw_root, self.evidence_root, self.trusted_root, self.runs_root):
             try:
+                if directory.exists():
+                    self._verify_directory_chain(directory)
                 if directory.exists() and any(directory.iterdir()):
                     return True
             except OSError:
                 raise OSError("storage_corrupt") from None
         return False
 
+    def _owned_temp_target(self, directory: Path, name: str) -> str | None:
+        if not name.startswith(".") or not name.endswith(".tmp"):
+            return None
+        body = name[1:-4]
+        try:
+            target, nonce = body.rsplit(".", 1)
+        except ValueError:
+            return None
+        if not _TEMP_NONCE.fullmatch(nonce):
+            return None
+        if directory == self.root:
+            allowed = {
+                self._generation_path.name,
+                self.current_pointer_path.name,
+                self._publication_intent_path.name,
+                self._publication_complete_path.name,
+            }
+            return target if target in allowed else None
+        if directory not in {self.raw_root, self.evidence_root, self.trusted_root, self.runs_root} or not target.endswith(".json"):
+            return None
+        try:
+            _id(target[:-5], "temporary artifact identity")
+        except ValueError:
+            return None
+        return target
+
+    def _cleanup_stale_owned_temps(self) -> None:
+        scanned = 0
+        removed = 0
+        removed_by_directory: set[Path] = set()
+        for directory in (self.root, self.raw_root, self.evidence_root, self.trusted_root, self.runs_root):
+            if not directory.exists():
+                continue
+            self._verify_directory_chain(directory)
+            try:
+                entries = os.scandir(directory)
+            except OSError:
+                raise OSError("storage_error") from None
+            with entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > _MAX_TEMP_SCAN or removed >= _MAX_TEMP_CLEANUP:
+                        break
+                    if self._owned_temp_target(directory, entry.name) is None:
+                        continue
+                    try:
+                        before = Path(entry.path)
+                        info = before.lstat()
+                    except OSError:
+                        continue
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or getattr(info, "st_reparse_tag", 0)
+                        or not _single_link(info)
+                    ):
+                        continue
+                    self._cleanup_owned_temp(before, (info.st_dev, info.st_ino))
+                    if not before.exists():
+                        removed += 1
+                        removed_by_directory.add(directory)
+            if scanned > _MAX_TEMP_SCAN:
+                break
+        for directory in removed_by_directory:
+            self._sync_dir(directory)
+
     def _claim_writer_unlocked(self) -> _WriterCapability:
         if self._closed:
             raise ValueError("pipeline storage is closed")
         if self._writer is not None:
+            if self._writer.creator_pid != os.getpid():
+                raise ValueError("pipeline writer belongs to another process")
             generation = self._load_generation()
             if generation != self._writer.generation:
                 raise ValueError("pipeline writer generation is stale")
             return self._writer
-        try:
-            handle = self._writer_lock_path.open("a+b")
-        except OSError:
-            raise OSError("storage_error") from None
+        self._prepare()
+        handle = self._open_lock_file(self._writer_lock_path)
         if not self._try_lock(handle):
-            handle.close()
+            try:
+                handle.close()
+            except OSError:
+                pass
             raise ValueError("pipeline writer is active")
         try:
             current = self._load_generation()
@@ -621,12 +902,20 @@ class NewsPipelineStorage:
                 raise OSError("storage_corrupt")
             generation = (current or 0) + 1
             self._atomic_write(self._generation_path, {"schema_version": 1, "generation": generation})
-            capability = _WriterCapability(generation, handle)
+            capability = _WriterCapability(generation, handle, os.getpid())
             self._writer = capability
+            try:
+                self._cleanup_stale_owned_temps()
+            except OSError:
+                raise OSError("storage_error") from None
             return capability
         except BaseException:
+            self._writer = None
             self._unlock(handle)
-            handle.close()
+            try:
+                handle.close()
+            except OSError:
+                pass
             raise
 
     def _require_writer(self) -> _WriterCapability:
@@ -636,8 +925,13 @@ class NewsPipelineStorage:
         writer, self._writer = self._writer, None
         self._closed = True
         if writer is not None:
+            if writer.creator_pid != os.getpid():
+                return
             self._unlock(writer.lock_handle)
-            writer.lock_handle.close()
+            try:
+                writer.lock_handle.close()
+            except OSError:
+                pass
 
     def __del__(self) -> None:
         try:
@@ -684,7 +978,7 @@ class NewsPipelineStorage:
             raise ValueError("legacy evidence identity cannot be published as a new pipeline artifact")
         _id(snapshot.snapshot_id, "snapshot_id")
         raw_id = _id(snapshot.raw_snapshot_id, "raw_snapshot_id")
-        document = snapshot_document(snapshot)
+        document = validated_snapshot_document(snapshot)
         _bounded(document)
         with CACHE_IO_LOCK, self._process_lock():
             self._require_writer()
@@ -712,8 +1006,10 @@ class NewsPipelineStorage:
             return self._load_evidence(_id(raw_snapshot_id, "raw_snapshot_id"))
 
     def publish_trusted(self, snapshot: TrustedSnapshot) -> None:
+        if type(snapshot) is not TrustedSnapshot or type(snapshot.events) is not tuple:
+            raise ValueError("invalid trusted snapshot")
         raw_id = _id(snapshot.raw_snapshot_id, "raw_snapshot_id")
-        if not isinstance(snapshot.published_at, datetime) or snapshot.published_at.tzinfo is None or snapshot.published_at.utcoffset() != timezone.utc.utcoffset(None):
+        if type(snapshot.published_at) is not datetime or snapshot.published_at.tzinfo is None or snapshot.published_at.utcoffset() != timezone.utc.utcoffset(None):
             raise ValueError("published_at must be aware UTC")
         events = _validate_trusted_events(_bounded(list(snapshot.events)))
         with CACHE_IO_LOCK, self._process_lock():
@@ -723,9 +1019,24 @@ class NewsPipelineStorage:
                 raise ValueError("raw and evidence artifacts must be durable before trusted publish")
             if evidence.recovery_metadata.get("legacy_identity") is True:
                 raise ValueError("legacy evidence must be deterministically reverified before trusted publish")
-            pointer = self._load_pointer_record(allow_initial_intent=raw_id)
+            _validate_trusted_admission(events, evidence)
+            initial_document = _trusted_document(snapshot, events, 1)
+            initial_intent = {
+                "raw_snapshot_id": raw_id,
+                "expected_generation": 0,
+                "target_generation": 1,
+                "trusted_digest": _document_digest(initial_document),
+            }
+            pointer = self._load_pointer_record(allow_initial_intent=initial_intent)
             current_generation = pointer.generation if pointer is not None else 0
             target_generation = current_generation + 1
+            document = _trusted_document(snapshot, events, target_generation)
+            intent = {
+                "raw_snapshot_id": raw_id,
+                "expected_generation": current_generation,
+                "target_generation": target_generation,
+                "trusted_digest": _document_digest(document),
+            }
             path = self._path(self.trusted_root, raw_id)
             existing = self._load_trusted_record(raw_id)
             if existing is None and path.exists():
@@ -733,52 +1044,76 @@ class NewsPipelineStorage:
             if existing is not None and existing.snapshot != snapshot:
                 raise ValueError("trusted snapshot identity is immutable")
             if pointer is not None and pointer.raw_snapshot_id == raw_id:
-                if existing is None or existing.pointer_generation != pointer.generation:
+                committed = {
+                    "raw_snapshot_id": raw_id,
+                    "expected_generation": pointer.generation - 1,
+                    "target_generation": pointer.generation,
+                    "trusted_digest": pointer.trusted_digest,
+                }
+                if (
+                    existing is None
+                    or existing.pointer_generation != pointer.generation
+                    or _document_digest(_trusted_document(existing.snapshot, list(existing.snapshot.events), existing.pointer_generation)) != pointer.trusted_digest
+                    or self._load_publication_intent() != committed
+                    or self._load_publication_complete() != {
+                        **committed,
+                        "generation": committed["target_generation"],
+                    }
+                ):
                     raise OSError("trusted pointer is corrupt")
-                self._write_publication_complete(raw_id, pointer.generation)
                 return
             if existing is not None and existing.pointer_generation != target_generation:
                 raise ValueError("trusted pointer cannot move backwards")
+            self._write_publication_intent(intent, pointer)
             if existing is None:
-                self._write_publication_intent(raw_id, current_generation, target_generation)
-                self._atomic_write(
-                    path,
-                    {
-                        "schema_version": 1,
-                        "pointer_generation": target_generation,
-                        "raw_snapshot_id": raw_id,
-                        "published_at": snapshot.published_at.isoformat(),
-                        "events": events,
-                    },
-                )
+                self._atomic_write(path, document)
             durable = self._load_trusted_record(raw_id)
-            if durable is None or durable.pointer_generation != target_generation:
+            if (
+                durable is None
+                or durable.pointer_generation != target_generation
+                or _document_digest(_trusted_document(durable.snapshot, list(durable.snapshot.events), durable.pointer_generation)) != intent["trusted_digest"]
+            ):
                 raise OSError("trusted snapshot did not become durable")
-            self._write_current_pointer(raw_id, expected_generation=current_generation)
+            self._write_publication_complete(intent, pointer)
+            self._write_current_pointer(intent)
 
-    def _write_current_pointer(self, raw_id: str, *, expected_generation: int) -> None:
-        current = self._load_pointer_record(allow_initial_intent=raw_id if expected_generation == 0 else None)
+    def _write_current_pointer(self, intent: dict[str, object]) -> None:
+        expected_generation = intent["expected_generation"]
+        current = self._load_pointer_record(allow_initial_intent=intent if expected_generation == 0 else None)
         actual_generation = current.generation if current is not None else 0
         if actual_generation != expected_generation:
             raise ValueError("trusted pointer generation changed")
+        if self._load_publication_intent() != intent or self._load_publication_complete() != {
+            **intent,
+            "generation": intent["target_generation"],
+        }:
+            raise OSError("storage_corrupt")
         self._atomic_write(
             self.current_pointer_path,
             {
                 "schema_version": 1,
-                "generation": expected_generation + 1,
-                "raw_snapshot_id": _id(raw_id, "raw_snapshot_id"),
+                "generation": intent["target_generation"],
+                "raw_snapshot_id": intent["raw_snapshot_id"],
+                "trusted_digest": intent["trusted_digest"],
             },
+            final_commit=True,
         )
-        self._write_publication_complete(raw_id, expected_generation + 1)
 
-    def _write_publication_complete(self, raw_id: str, generation: int) -> None:
+    def _write_publication_complete(self, intent: dict[str, object], pointer: _PointerRecord | None) -> None:
         current = self._load_publication_complete()
-        expected = {"raw_snapshot_id": raw_id, "generation": generation}
+        expected = {**intent, "generation": intent["target_generation"]}
         if current == expected:
             return
+        if current is not None and (
+            pointer is None
+            or current["generation"] != pointer.generation
+            or current["raw_snapshot_id"] != pointer.raw_snapshot_id
+            or current["trusted_digest"] != pointer.trusted_digest
+        ):
+            raise OSError("storage_corrupt")
         self._atomic_write(
             self._publication_complete_path,
-            {"schema_version": 1, "generation": generation, "raw_snapshot_id": raw_id},
+            {"schema_version": 1, **expected},
         )
 
     def _load_publication_complete(self) -> dict[str, object] | None:
@@ -790,22 +1125,30 @@ class NewsPipelineStorage:
         try:
             self._schema(document, _COMPLETE_KEYS)
             raw_id = _id(document["raw_snapshot_id"], "raw_snapshot_id")
+            expected = document["expected_generation"]
+            target = document["target_generation"]
             generation = document["generation"]
-            if type(generation) is not int or generation < 1:
+            digest = document["trusted_digest"]
+            if type(expected) is not int or type(target) is not int or type(generation) is not int or expected < 0 or target != expected + 1 or generation != target or type(digest) is not str or not _DIGEST.fullmatch(digest):
                 raise ValueError("invalid publication completion")
-            return {"raw_snapshot_id": raw_id, "generation": generation}
+            return {"raw_snapshot_id": raw_id, "expected_generation": expected, "target_generation": generation, "trusted_digest": digest, "generation": generation}
         except (KeyError, TypeError, ValueError):
             raise OSError("storage_corrupt") from None
 
-    def _write_publication_intent(self, raw_id: str, expected_generation: int, target_generation: int) -> None:
+    def _write_publication_intent(self, intent: dict[str, object], pointer: _PointerRecord | None) -> None:
+        current = self._load_publication_intent()
+        if current == intent:
+            return
+        if current is not None and (
+            pointer is None
+            or current["target_generation"] != pointer.generation
+            or current["raw_snapshot_id"] != pointer.raw_snapshot_id
+            or current["trusted_digest"] != pointer.trusted_digest
+        ):
+            raise OSError("storage_corrupt")
         self._atomic_write(
             self._publication_intent_path,
-            {
-                "schema_version": 1,
-                "expected_generation": expected_generation,
-                "target_generation": target_generation,
-                "raw_snapshot_id": raw_id,
-            },
+            {"schema_version": 1, **intent},
         )
 
     def _load_publication_intent(self) -> dict[str, object] | None:
@@ -819,9 +1162,10 @@ class NewsPipelineStorage:
             raw_id = _id(document["raw_snapshot_id"], "raw_snapshot_id")
             expected = document["expected_generation"]
             target = document["target_generation"]
-            if type(expected) is not int or type(target) is not int or expected < 0 or target != expected + 1:
+            digest = document["trusted_digest"]
+            if type(expected) is not int or type(target) is not int or expected < 0 or target != expected + 1 or type(digest) is not str or not _DIGEST.fullmatch(digest):
                 raise ValueError("invalid publication intent")
-            return {"raw_snapshot_id": raw_id, "expected_generation": expected, "target_generation": target}
+            return {"raw_snapshot_id": raw_id, "expected_generation": expected, "target_generation": target, "trusted_digest": digest}
         except (KeyError, TypeError, ValueError):
             raise OSError("storage_corrupt") from None
 
@@ -863,14 +1207,17 @@ class NewsPipelineStorage:
         if not self.trusted_root.exists():
             return []
         try:
+            self._verify_directory_chain(self.trusted_root)
             return sorted(
                 entry.name for entry in os.scandir(self.trusted_root)
-                if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)
+                if entry.name.endswith(".json")
+                and entry.is_file(follow_symlinks=False)
+                and _single_link(entry.stat(follow_symlinks=False))
             )
         except OSError:
             raise OSError("storage_corrupt") from None
 
-    def _load_pointer_record(self, *, allow_initial_intent: str | None = None) -> _PointerRecord | None:
+    def _load_pointer_record(self, *, allow_initial_intent: dict[str, object] | None = None) -> _PointerRecord | None:
         document = self._read(self.current_pointer_path)
         if document is None:
             if self.current_pointer_path.exists():
@@ -881,28 +1228,35 @@ class NewsPipelineStorage:
                 completed = self._load_publication_complete()
                 permitted = (
                     allow_initial_intent is not None
-                    and completed is None
-                    and artifacts == [f"{allow_initial_intent}.json"]
-                    and intent == {
-                        "raw_snapshot_id": allow_initial_intent,
-                        "expected_generation": 0,
-                        "target_generation": 1,
-                    }
-                    and (trusted := self._load_trusted_record(allow_initial_intent)) is not None
+                    and artifacts == [f"{allow_initial_intent['raw_snapshot_id']}.json"]
+                    and intent == allow_initial_intent
+                    and (
+                        completed is None
+                        or completed == {
+                            **allow_initial_intent,
+                            "generation": allow_initial_intent["target_generation"],
+                        }
+                    )
+                    and (trusted := self._load_trusted_record(str(allow_initial_intent["raw_snapshot_id"]))) is not None
                     and trusted.pointer_generation == 1
+                    and _document_digest(_trusted_document(trusted.snapshot, list(trusted.snapshot.events), 1)) == allow_initial_intent["trusted_digest"]
                 )
                 if not permitted:
                     raise OSError("storage_corrupt")
             return None
         try:
             self._schema(document, _POINTER_KEYS)
-            raw_id, generation = _id(document["raw_snapshot_id"], "raw_snapshot_id"), document["generation"]
-            if type(generation) is not int or generation < 1:
+            raw_id, generation, digest = _id(document["raw_snapshot_id"], "raw_snapshot_id"), document["generation"], document["trusted_digest"]
+            if type(generation) is not int or generation < 1 or type(digest) is not str or not _DIGEST.fullmatch(digest):
                 raise ValueError("invalid pointer generation")
             trusted = self._load_trusted_record(raw_id)
-            if trusted is None or trusted.pointer_generation != generation:
+            if (
+                trusted is None
+                or trusted.pointer_generation != generation
+                or _document_digest(_trusted_document(trusted.snapshot, list(trusted.snapshot.events), generation)) != digest
+            ):
                 raise ValueError("pointer target is unavailable")
-            return _PointerRecord(raw_id, generation)
+            return _PointerRecord(raw_id, generation, digest)
         except (KeyError, TypeError, ValueError):
             raise OSError("storage_corrupt") from None
 
@@ -988,10 +1342,13 @@ class NewsPipelineStorage:
                 return 0
             now = self._clock()
             try:
+                self._verify_directory_chain(self.runs_root)
                 paths = sorted(
                     Path(entry.path)
                     for entry in os.scandir(self.runs_root)
-                    if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False)
+                    if entry.name.endswith(".json")
+                    and entry.is_file(follow_symlinks=False)
+                    and _single_link(entry.stat(follow_symlinks=False))
                 )
             except OSError:
                 raise OSError("storage_corrupt") from None

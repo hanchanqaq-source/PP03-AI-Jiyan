@@ -477,3 +477,101 @@ def test_evidence_atomic_writer_does_not_double_close_reused_descriptor(tmp_path
                 os.close(reused[0])
             except OSError:
                 pass
+
+
+@pytest.mark.parametrize(
+    "invalid_snapshot",
+    [
+        lambda snapshot: replace(snapshot, events=list(snapshot.events)),
+        lambda snapshot: replace(
+            snapshot,
+            events=(replace(snapshot.events[0], verification_status="verified"),),
+        ),
+        lambda snapshot: replace(
+            snapshot,
+            events=(replace(
+                snapshot.events[0],
+                primary_evidence=(replace(snapshot.events[0].primary_evidence[0], supports_claim=1),),
+            ),),
+        ),
+        lambda snapshot: replace(
+            snapshot,
+            events=(replace(snapshot.events[0], related_tags=list(snapshot.events[0].related_tags)),),
+        ),
+        lambda snapshot: replace(snapshot, generated_at="2026-08-20T00:00:00+00:00"),
+    ],
+    ids=["events-list", "status-string", "bool-integer", "tags-list", "timestamp-string"],
+)
+def test_evidence_publish_semantically_roundtrips_before_mutating_current(tmp_path, invalid_snapshot):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    valid = rich_evidence_snapshot()
+    storage.publish(valid)
+    old_current = storage.current_path.read_bytes()
+    old_refresh = storage.last_refresh_path.read_bytes()
+
+    with pytest.raises((TypeError, ValueError, AttributeError)):
+        storage.publish(invalid_snapshot(valid))
+
+    assert storage.current_path.read_bytes() == old_current
+    assert storage.last_refresh_path.read_bytes() == old_refresh
+    assert storage.load_current() == valid
+
+
+def test_evidence_reader_closes_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    storage.publish(EvidenceSnapshot("snapshot", NOW, ()))
+    real_fstat = os.fstat
+    observed: list[int] = []
+
+    def fail_fdopen(descriptor: int, *_args, **_kwargs):
+        observed.append(descriptor)
+        raise OSError("C:\\private\\fdopen")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.fdopen", fail_fdopen)
+        assert storage.load_current() is None
+
+    assert observed
+    with pytest.raises(OSError):
+        real_fstat(observed[-1])
+
+
+def test_evidence_reader_rejects_a_symlinked_storage_root(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    snapshot = rich_evidence_snapshot()
+    (outside / "current.json").write_text(
+        json.dumps(snapshot_document(snapshot), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    linked_root = tmp_path / "linked"
+    try:
+        linked_root.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+
+    assert EvidenceStorage(root=linked_root).load_current() is None
+
+
+def test_evidence_writer_fdopen_failure_never_closes_a_reused_descriptor(tmp_path, monkeypatch):
+    storage = EvidenceStorage(root=tmp_path / "evidence")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("survive", encoding="utf-8")
+    reused: list[int] = []
+
+    def close_reuse_then_fail(descriptor: int, *_args, **_kwargs):
+        os.close(descriptor)
+        reused.append(os.open(victim, os.O_RDONLY))
+        assert reused[-1] == descriptor
+        raise OSError("D:\\private\\fdopen")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("evidence_verification.storage.os.fdopen", close_reuse_then_fail)
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage.publish(EvidenceSnapshot("snapshot", NOW, ()))
+
+    try:
+        assert os.fstat(reused[0]).st_size == len("survive")
+    finally:
+        if reused:
+            os.close(reused[0])

@@ -12,7 +12,13 @@ import tempfile
 
 import pytest
 
-from evidence_verification.models import EvidenceSnapshot
+from evidence_verification.models import (
+    EvidenceEvent,
+    EvidenceSnapshot,
+    FieldVerificationStatus,
+    KeyField,
+    VerificationStatus,
+)
 from news_pipeline.models import (
     PipelineCounts,
     PipelinePhase,
@@ -31,16 +37,33 @@ def raw_snapshot(raw_snapshot_id: str) -> RawSnapshot:
 
 
 def evidence_snapshot(raw_snapshot_id: str) -> EvidenceSnapshot:
+    event = EvidenceEvent(
+        event_id="a" * 20,
+        title="交易所公告：星河科技建设存储算力中心",
+        summary="星河科技披露建设存储算力中心。",
+        category="company",
+        related_tags=(),
+        published_at=NOW,
+        core_claim="星河科技建设存储算力中心",
+        verification_status=VerificationStatus.VERIFIED,
+        verification_reason="官方公告支持",
+        verified_at=NOW,
+        evidence_as_of=NOW,
+    )
     return EvidenceSnapshot(
         snapshot_id=f"evidence-{raw_snapshot_id}",
         raw_snapshot_id=raw_snapshot_id,
         generated_at=NOW,
-        events=(),
+        events=(event,),
     )
 
 
 def trusted_snapshot(raw_snapshot_id: str) -> TrustedSnapshot:
-    return TrustedSnapshot(raw_snapshot_id=raw_snapshot_id, published_at=NOW, events=())
+    return TrustedSnapshot(
+        raw_snapshot_id=raw_snapshot_id,
+        published_at=NOW,
+        events=(canonical_market_event(verification_status="verified"),),
+    )
 
 
 def canonical_market_event(*, verification_status: str | None = None) -> dict[str, object]:
@@ -857,3 +880,386 @@ def test_recovery_does_not_follow_symlinked_run_outside_storage_root(tmp_path):
     finally:
         link.unlink(missing_ok=True)
         outside.unlink(missing_ok=True)
+
+
+def test_trusted_publish_rejects_empty_projection_before_any_publication_mutation(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    storage.write_evidence(evidence_snapshot("raw-1"))
+
+    with pytest.raises(ValueError, match="trusted event"):
+        storage.publish_trusted(TrustedSnapshot("raw-1", NOW, ()))
+
+    assert not storage._publication_intent_path.exists()
+    assert not storage._publication_complete_path.exists()
+    assert not storage.current_pointer_path.exists()
+    assert not storage.trusted_root.exists()
+
+
+@pytest.mark.parametrize("evidence_status", [VerificationStatus.UNVERIFIED, VerificationStatus.CONFLICTING])
+def test_trusted_publish_binds_event_id_and_status_to_same_evidence_snapshot(tmp_path, evidence_status):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    evidence_event = replace(source.events[0], verification_status=evidence_status)
+    storage.write_evidence(replace(source, events=(evidence_event,)))
+    trusted = trusted_snapshot("raw-1")
+
+    with pytest.raises(ValueError, match="evidence"):
+        storage.publish_trusted(trusted)
+
+    assert not storage._publication_intent_path.exists()
+    assert not storage.current_pointer_path.exists()
+
+
+def test_trusted_publish_rejects_an_event_id_absent_from_same_evidence_snapshot(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    storage.write_evidence(replace(source, events=(replace(source.events[0], event_id="evidence-only"),)))
+
+    with pytest.raises(ValueError, match="evidence"):
+        storage.publish_trusted(trusted_snapshot("raw-1"))
+
+    assert not storage._publication_intent_path.exists()
+    assert not storage.current_pointer_path.exists()
+
+
+def test_trusted_verified_key_fields_must_match_approved_evidence_fields(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    pending = KeyField(
+        field_name="amount",
+        raw_value="12亿元",
+        normalized_value="1200000000",
+        verification_status=FieldVerificationStatus.UNVERIFIED,
+        evidence_ids=("official-1",),
+        reason="尚无证据",
+    )
+    storage.write_evidence(replace(source, events=(replace(source.events[0], key_fields=(pending,)),)))
+    event = canonical_market_event(verification_status="verified")
+    event["verified_key_fields"] = [{
+        "field_name": "amount",
+        "raw_value": "12亿元",
+        "normalized_value": "1200000000",
+        "verification_status": "verified",
+        "evidence_ids": ["official-1"],
+        "reason": "self-labelled",
+    }]
+
+    with pytest.raises(ValueError, match="key field"):
+        storage.publish_trusted(TrustedSnapshot("raw-1", NOW, (event,)))
+
+    assert not storage._publication_intent_path.exists()
+    assert not storage.current_pointer_path.exists()
+
+
+def test_trusted_verified_key_fields_accept_exact_approved_evidence_projection(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    approved = KeyField(
+        field_name="amount",
+        raw_value="12亿元",
+        normalized_value="1200000000",
+        verification_status=FieldVerificationStatus.VERIFIED,
+        evidence_ids=("official-1",),
+        reason="官方公告支持",
+    )
+    storage.write_evidence(replace(source, events=(replace(source.events[0], key_fields=(approved,)),)))
+    event = canonical_market_event(verification_status="verified")
+    event["verified_key_fields"] = [{
+        "field_name": approved.field_name,
+        "raw_value": approved.raw_value,
+        "normalized_value": approved.normalized_value,
+        "verification_status": approved.verification_status.value,
+        "evidence_ids": list(approved.evidence_ids),
+        "reason": approved.reason,
+    }]
+    snapshot = TrustedSnapshot("raw-1", NOW, (event,))
+
+    storage.publish_trusted(snapshot)
+
+    assert storage.load_current_trusted() == snapshot
+
+
+def test_prepared_record_failure_cannot_switch_the_current_pointer(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    for raw_id in ("old", "new"):
+        storage.write_raw(raw_snapshot(raw_id))
+        storage.write_evidence(evidence_snapshot(raw_id))
+    storage.publish_trusted(trusted_snapshot("old"))
+
+    monkeypatch.setattr(
+        storage,
+        "_write_publication_complete",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("storage_error")),
+    )
+
+    with pytest.raises(OSError, match="storage_error"):
+        storage.publish_trusted(trusted_snapshot("new"))
+
+    assert storage.load_current_trusted() == trusted_snapshot("old")
+
+
+def test_orphan_retry_requires_exact_matching_publication_intent(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    for raw_id in ("old", "new"):
+        storage.write_raw(raw_snapshot(raw_id))
+        storage.write_evidence(evidence_snapshot(raw_id))
+    storage.publish_trusted(trusted_snapshot("old"))
+    original = storage._write_current_pointer
+    monkeypatch.setattr(
+        storage,
+        "_write_current_pointer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("storage_error")),
+    )
+    with pytest.raises(OSError, match="storage_error"):
+        storage.publish_trusted(trusted_snapshot("new"))
+    monkeypatch.setattr(storage, "_write_current_pointer", original)
+    intent = json.loads(storage._publication_intent_path.read_text(encoding="utf-8"))
+    intent["raw_snapshot_id"] = "different"
+    storage._publication_intent_path.write_text(json.dumps(intent), encoding="utf-8")
+
+    with pytest.raises((OSError, ValueError)):
+        storage.publish_trusted(trusted_snapshot("new"))
+
+    assert storage.load_current_trusted() == trusted_snapshot("old")
+
+
+def test_orphan_retry_with_exact_intent_publishes_once(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    for raw_id in ("old", "new"):
+        storage.write_raw(raw_snapshot(raw_id))
+        storage.write_evidence(evidence_snapshot(raw_id))
+    storage.publish_trusted(trusted_snapshot("old"))
+    original = storage._write_current_pointer
+    monkeypatch.setattr(
+        storage,
+        "_write_current_pointer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("storage_error")),
+    )
+    with pytest.raises(OSError, match="storage_error"):
+        storage.publish_trusted(trusted_snapshot("new"))
+    monkeypatch.setattr(storage, "_write_current_pointer", original)
+
+    storage.publish_trusted(trusted_snapshot("new"))
+    storage.publish_trusted(trusted_snapshot("new"))
+
+    assert storage.load_current_trusted() == trusted_snapshot("new")
+    pointer = json.loads(storage.current_pointer_path.read_text(encoding="utf-8"))
+    assert pointer["generation"] == 2
+
+
+def test_initial_orphan_retry_resumes_when_prepared_record_was_interrupted(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    storage.write_evidence(evidence_snapshot("raw-1"))
+    original = storage._write_publication_complete
+    monkeypatch.setattr(
+        storage,
+        "_write_publication_complete",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("storage_error")),
+    )
+    with pytest.raises(OSError, match="storage_error"):
+        storage.publish_trusted(trusted_snapshot("raw-1"))
+    monkeypatch.setattr(storage, "_write_publication_complete", original)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        storage.load_current_trusted()
+    storage.publish_trusted(trusted_snapshot("raw-1"))
+
+    assert storage.load_current_trusted() == trusted_snapshot("raw-1")
+
+
+def test_trusted_publish_rejects_duplicate_verified_field_identity(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    source = evidence_snapshot("raw-1")
+    approved = KeyField(
+        field_name="amount",
+        raw_value="12亿元",
+        normalized_value="1200000000",
+        verification_status=FieldVerificationStatus.VERIFIED,
+        evidence_ids=("official-1",),
+        reason="官方公告支持",
+    )
+    storage.write_evidence(replace(source, events=(replace(source.events[0], key_fields=(approved,)),)))
+    event = canonical_market_event(verification_status="verified")
+    field = {
+        "field_name": approved.field_name,
+        "raw_value": approved.raw_value,
+        "normalized_value": approved.normalized_value,
+        "verification_status": approved.verification_status.value,
+        "evidence_ids": list(approved.evidence_ids),
+        "reason": approved.reason,
+    }
+    event["verified_key_fields"] = [field, dict(field)]
+
+    with pytest.raises(ValueError, match="key field"):
+        storage.publish_trusted(TrustedSnapshot("raw-1", NOW, (event,)))
+
+    assert not storage.current_pointer_path.exists()
+
+
+def test_pointer_directory_sync_failure_occurs_before_the_final_replace(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    for raw_id in ("old", "new"):
+        storage.write_raw(raw_snapshot(raw_id))
+        storage.write_evidence(evidence_snapshot(raw_id))
+    storage.publish_trusted(trusted_snapshot("old"))
+    old_pointer = storage.current_pointer_path.read_bytes()
+    real_sync = storage._sync_dir
+    real_replace = storage._replace_final_commit
+
+    def fail_only_pointer_parent(path):
+        if path == storage.current_pointer_path.parent:
+            raise OSError("storage_error")
+        real_sync(path)
+
+    def final_replace_with_failed_precommit(source, destination):
+        monkeypatch.setattr(NewsPipelineStorage, "_sync_dir", staticmethod(fail_only_pointer_parent))
+        try:
+            real_replace(source, destination)
+        finally:
+            monkeypatch.setattr(NewsPipelineStorage, "_sync_dir", staticmethod(real_sync))
+
+    monkeypatch.setattr(storage, "_replace_final_commit", final_replace_with_failed_precommit)
+
+    with pytest.raises(OSError, match="storage_error"):
+        storage.publish_trusted(trusted_snapshot("new"))
+
+    assert storage.current_pointer_path.read_bytes() == old_pointer
+    assert storage.load_current_trusted() == trusted_snapshot("old")
+
+
+def test_pipeline_writer_fdopen_failure_never_closes_a_reused_descriptor(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("survive", encoding="utf-8")
+    reused: list[int] = []
+    real_fdopen = os.fdopen
+
+    def close_reuse_then_fail(descriptor: int, *_args, **_kwargs):
+        os.close(descriptor)
+        reused.append(os.open(victim, os.O_RDONLY))
+        assert reused[-1] == descriptor
+        raise OSError("D:\\private\\fdopen")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("news_pipeline.storage.os.fdopen", close_reuse_then_fail)
+        with pytest.raises(OSError, match="^storage_error$"):
+            storage.write_raw(raw_snapshot("raw-1"))
+
+    try:
+        assert os.fstat(reused[0]).st_size == len("survive")
+    finally:
+        if reused:
+            os.close(reused[0])
+
+
+def test_pipeline_reader_closes_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("raw-1"))
+    real_fstat = os.fstat
+    observed: list[int] = []
+
+    def fail_fdopen(descriptor: int, *_args, **_kwargs):
+        observed.append(descriptor)
+        raise OSError("C:\\private\\fdopen")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("news_pipeline.storage.os.fdopen", fail_fdopen)
+        assert storage.load_raw("raw-1") is None
+
+    assert observed
+    with pytest.raises(OSError):
+        real_fstat(observed[-1])
+
+
+def test_lock_open_rejects_preexisting_symlink_or_hardlink(tmp_path):
+    root = tmp_path / "store"
+    root.mkdir()
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"x")
+    lock_path = root / ".news-pipeline.lock"
+    try:
+        os.link(outside, lock_path)
+    except OSError:
+        pytest.skip("hard-link creation is unavailable")
+
+    with pytest.raises(OSError, match="storage_error"):
+        NewsPipelineStorage(root).load_raw("raw-1")
+
+    assert outside.read_bytes() == b"x"
+
+
+def test_pipeline_reader_never_traverses_symlinked_artifact_parent(tmp_path):
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    document = {
+        "schema_version": 1,
+        "raw_snapshot_id": "raw-1",
+        "collected_at": NOW.isoformat(),
+        "items": [],
+    }
+    (outside / "raw-1.json").write_text(json.dumps(document), encoding="utf-8")
+    try:
+        (root / "raw").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+
+    assert NewsPipelineStorage(root).load_raw("raw-1") is None
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork is unavailable")
+def test_forked_child_cannot_use_or_close_parent_writer_capability(tmp_path):
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("parent-1"))
+    child = os.fork()
+    if child == 0:
+        try:
+            try:
+                storage.write_raw(raw_snapshot("child"))
+            except ValueError:
+                storage.close()
+                os._exit(0)
+            os._exit(2)
+        except BaseException:
+            os._exit(3)
+
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    storage.write_raw(raw_snapshot("parent-2"))
+    assert storage.load_raw("parent-2") == raw_snapshot("parent-2")
+
+
+def test_abrupt_writer_exit_cleans_only_exact_owned_temp_residue(tmp_path):
+    script = """
+import os, sys
+from datetime import datetime, timezone
+from news_pipeline.models import RawSnapshot
+from news_pipeline.storage import NewsPipelineStorage
+root = sys.argv[1]
+storage = NewsPipelineStorage(root)
+storage._claim_writer_unlocked()
+storage._replace_durable = lambda *_args: os._exit(23)
+storage.write_raw(RawSnapshot('crashed', datetime(2026, 8, 20, tzinfo=timezone.utc), ()))
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    crashed = subprocess.run([sys.executable, "-c", script, str(tmp_path)], env=env, capture_output=True, text=True, timeout=10)
+    assert crashed.returncode == 23
+    residue = list((tmp_path / "raw").glob(".crashed.json.*.tmp"))
+    assert len(residue) == 1
+    unknown = tmp_path / "raw" / ".unknown.keep.tmp"
+    unknown.write_text("keep", encoding="utf-8")
+
+    storage = NewsPipelineStorage(tmp_path)
+    storage.write_raw(raw_snapshot("recovered"))
+
+    assert not residue[0].exists()
+    assert unknown.read_text(encoding="utf-8") == "keep"

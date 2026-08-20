@@ -154,6 +154,19 @@ def _cleanup_owned_temp(path: Path, identity: tuple[int, int]) -> None:
         return
 
 
+def _close_owned_descriptor(descriptor: int, identity: tuple[int, int]) -> None:
+    try:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != identity:
+            return
+    except OSError:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
 def _strict_json_object(pairs: list[tuple[object, object]]) -> dict[str, object]:
     document: dict[str, object] = {}
     for key, value in pairs:
@@ -524,10 +537,89 @@ def evidence_snapshot_from_document(document: dict[str, Any]) -> EvidenceSnapsho
     )
 
 
+def _exact_text(value: object, name: str) -> None:
+    if type(value) is not str:
+        raise ValueError(f"invalid in-memory {name}")
+
+
+def _validate_in_memory_snapshot(snapshot: EvidenceSnapshot) -> None:
+    if type(snapshot) is not EvidenceSnapshot or type(snapshot.events) is not tuple or type(snapshot.recovery_metadata) is not dict:
+        raise ValueError("invalid in-memory evidence snapshot collections")
+    _exact_text(snapshot.snapshot_id, "snapshot_id")
+    _exact_text(snapshot.raw_snapshot_id, "raw_snapshot_id")
+    _required_timestamp(snapshot.generated_at)
+    for event in snapshot.events:
+        if type(event) is not EvidenceEvent:
+            raise ValueError("invalid in-memory evidence event")
+        for name in ("event_id", "title", "summary", "category", "core_claim", "verification_reason", "holding_relevance"):
+            _exact_text(getattr(event, name), name)
+        if type(event.verification_status) is not VerificationStatus:
+            raise ValueError("invalid in-memory verification status")
+        if type(event.related_tags) is not tuple:
+            raise ValueError("invalid in-memory related_tags")
+        for tag in event.related_tags:
+            if type(tag) is not tuple or len(tag) != 2:
+                raise ValueError("invalid in-memory related tag")
+            _exact_text(tag[0], "tag id")
+            _exact_text(tag[1], "tag name")
+        _optional_timestamp(event.published_at)
+        _required_timestamp(event.verified_at)
+        _required_timestamp(event.evidence_as_of)
+        if type(event.key_fields) is not tuple:
+            raise ValueError("invalid in-memory key_fields")
+        for field in event.key_fields:
+            if type(field) is not KeyField or type(field.verification_status) is not FieldVerificationStatus or type(field.evidence_ids) is not tuple:
+                raise ValueError("invalid in-memory key field")
+            for name in ("field_name", "raw_value", "normalized_value", "reason"):
+                _exact_text(getattr(field, name), name)
+            for evidence_id in field.evidence_ids:
+                _exact_text(evidence_id, "field evidence_id")
+        for collection_name in ("primary_evidence", "independent_evidence", "syndicated_copies", "contradicting_evidence"):
+            collection = getattr(event, collection_name)
+            if type(collection) is not tuple:
+                raise ValueError(f"invalid in-memory {collection_name}")
+            for item in collection:
+                if type(item) is not EvidenceItem or type(item.source_role) is not SourceRole:
+                    raise ValueError("invalid in-memory evidence item")
+                for name in ("evidence_id", "content_source", "collector_source", "canonical_url", "origin_cluster", "title", "excerpt"):
+                    _exact_text(getattr(item, name), name)
+                _optional_timestamp(item.published_at)
+                if type(item.supports_fields) is not tuple:
+                    raise ValueError("invalid in-memory supports_fields")
+                for supported in item.supports_fields:
+                    _exact_text(supported, "supports_field")
+                if any(type(value) is not bool for value in (item.supports_claim, item.contradicts_claim, item.is_official)):
+                    raise ValueError("invalid in-memory evidence boolean")
+        if type(event.status_history) is not tuple:
+            raise ValueError("invalid in-memory status_history")
+        for transition in event.status_history:
+            if (
+                type(transition) is not StatusTransition
+                or transition.from_status is not None and type(transition.from_status) is not VerificationStatus
+                or type(transition.to_status) is not VerificationStatus
+            ):
+                raise ValueError("invalid in-memory transition")
+            _required_timestamp(transition.changed_at)
+            _exact_text(transition.reason, "transition reason")
+
+
+def validated_snapshot_document(snapshot: EvidenceSnapshot) -> dict[str, Any]:
+    """Return a canonical document only after strict object/document symmetry."""
+    try:
+        _validate_in_memory_snapshot(snapshot)
+        document = snapshot_document(snapshot)
+        reparsed = evidence_snapshot_from_document(document)
+        if snapshot_document(reparsed) != document:
+            raise ValueError("evidence snapshot is not canonical")
+        return document
+    except (AttributeError, TypeError) as error:
+        raise ValueError("invalid in-memory evidence snapshot") from error
+
+
 class EvidenceStorage:
     def __init__(self, root: str | os.PathLike[str] | None = None, *, now: Callable[[], datetime] | None = None) -> None:
         if root is not None:
-            self.root = Path(root)
+            self.root = Path(os.path.abspath(root))
         else:
             configured = os.environ.get("VR_DATA_DIR")
             if configured:
@@ -540,6 +632,29 @@ class EvidenceStorage:
         self.history_root = self.root / "history"
         self._now = now or (lambda: datetime.now(timezone.utc))
 
+    def _inside_root(self, path: Path) -> bool:
+        try:
+            return os.path.commonpath((str(self.root), os.path.abspath(path))) == str(self.root)
+        except (OSError, ValueError):
+            return False
+
+    def _verify_directory_chain(self, directory: Path) -> None:
+        if not self._inside_root(directory):
+            raise OSError("storage_error")
+        relative = directory.relative_to(self.root)
+        cursor = self.root
+        if not _safe_directory(cursor):
+            raise OSError("storage_error")
+        for component in relative.parts:
+            cursor = cursor / component
+            if not _safe_directory(cursor):
+                raise OSError("storage_error")
+
+    def _verify_parent(self, path: Path) -> None:
+        if not self._inside_root(path):
+            raise OSError("storage_error")
+        self._verify_directory_chain(path.parent)
+
     def _atomic_write(self, path: Path, document: dict[str, Any]) -> None:
         _exact_builtin(document)
         payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -550,11 +665,17 @@ class EvidenceStorage:
         identity: tuple[int, int] | None = None
         try:
             _ensure_directory(path.parent)
+            self._verify_parent(path)
             descriptor, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
             temp_path = Path(raw_path)
             opened = os.fstat(descriptor)
             identity = (opened.st_dev, opened.st_ino)
-            handle = os.fdopen(descriptor, "wb")
+            try:
+                handle = os.fdopen(descriptor, "wb")
+            except BaseException:
+                _close_owned_descriptor(descriptor, identity)
+                descriptor = None
+                raise
             descriptor = None
             with handle:
                 handle.write(payload)
@@ -581,22 +702,28 @@ class EvidenceStorage:
             raise
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:
+        descriptor: int | None = None
+        identity: tuple[int, int] | None = None
         try:
             with CACHE_IO_LOCK:
+                self._verify_parent(path)
                 before = path.stat(follow_symlinks=False)
-                if not stat.S_ISREG(before.st_mode) or getattr(before, "st_reparse_tag", 0):
+                if not stat.S_ISREG(before.st_mode) or getattr(before, "st_reparse_tag", 0) or before.st_nlink != 1:
                     return None
                 flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
                 descriptor = os.open(path, flags)
-                try:
-                    opened = os.fstat(descriptor)
-                except BaseException:
-                    os.close(descriptor)
-                    raise
-                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-                    os.close(descriptor)
+                opened = os.fstat(descriptor)
+                identity = (opened.st_dev, opened.st_ino)
+                if identity != (before.st_dev, before.st_ino) or opened.st_nlink != 1:
                     return None
-                with os.fdopen(descriptor, "rb") as handle:
+                try:
+                    handle = os.fdopen(descriptor, "rb")
+                except BaseException:
+                    _close_owned_descriptor(descriptor, identity)
+                    descriptor = None
+                    raise
+                descriptor = None
+                with handle:
                     raw = handle.read(_MAX_EVIDENCE_DOCUMENT_BYTES + 1)
                 if len(raw) > _MAX_EVIDENCE_DOCUMENT_BYTES:
                     return None
@@ -611,6 +738,15 @@ class EvidenceStorage:
             return value if type(value) is dict else None
         except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError, RecursionError, json.JSONDecodeError):
             return None
+        finally:
+            if descriptor is not None:
+                if identity is None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    _close_owned_descriptor(descriptor, identity)
 
     def load_current(self) -> EvidenceSnapshot | None:
         document = self._read_json(self.current_path)
@@ -637,14 +773,38 @@ class EvidenceStorage:
         if not rows:
             return
         path = self.history_path(snapshot.generated_at)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
+        _ensure_directory(path.parent)
+        self._verify_parent(path)
+        try:
+            before = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            before = None
+        if before is not None and (
+            not stat.S_ISREG(before.st_mode)
+            or getattr(before, "st_reparse_tag", 0)
+            or before.st_nlink != 1
+        ):
+            raise OSError("storage_error")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags | (os.O_EXCL if before is None else 0), 0o600)
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino)
+        if before is not None and identity != (before.st_dev, before.st_ino):
+            _close_owned_descriptor(descriptor, identity)
+            raise OSError("storage_error")
+        try:
+            handle = os.fdopen(descriptor, "a", encoding="utf-8", newline="\n")
+        except BaseException:
+            _close_owned_descriptor(descriptor, identity)
+            raise
+        with handle:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             handle.flush()
+            os.fsync(handle.fileno())
 
     def publish(self, snapshot: EvidenceSnapshot) -> None:
-        document = snapshot_document(snapshot)
+        document = validated_snapshot_document(snapshot)
         generated_at = _required_timestamp(snapshot.generated_at)
         with CACHE_IO_LOCK:
             previous = self.load_current()
