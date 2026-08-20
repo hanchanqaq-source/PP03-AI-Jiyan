@@ -110,6 +110,8 @@ describe("EvidenceCenter real verification workspace", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("证据列表筛选失败");
     expect(screen.getByText(row.title)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "全部" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "待核验" })).toHaveAttribute("aria-pressed", "false");
   });
 
   it("rejects summary and list from different evidence snapshots atomically", async () => {
@@ -124,6 +126,10 @@ describe("EvidenceCenter real verification workspace", () => {
 
   it("reloads the exact current status filter when evidence becomes durable", async () => {
     const user = userEvent.setup();
+    vi.mocked(api.evidenceEvents).mockImplementation((query) => Promise.resolve({
+      ...listing,
+      filters: { ...listing.filters, verification_status: query?.verification_status ?? null },
+    }));
     render(<EvidenceCenter />);
     await screen.findByText(row.title);
 
@@ -148,7 +154,7 @@ describe("EvidenceCenter real verification workspace", () => {
     vi.mocked(api.evidenceEvents)
       .mockResolvedValueOnce(listing)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve; }))
-      .mockResolvedValueOnce({ ...listing, events: [freshRow], filters: { ...listing.filters, verification_status: "unverified" } });
+      .mockResolvedValueOnce({ ...listing, events: [freshRow], filters: { ...listing.filters, verification_status: null } });
 
     render(<EvidenceCenter />);
     await screen.findByText(row.title);
@@ -253,6 +259,72 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(await screen.findByText("核验刷新完成，已载入最新成功快照。")).toBeInTheDocument();
     expect(screen.getByText("67%")).toBeInTheDocument();
     expect(api.evidenceSummary).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps the prior evidence snapshot when a failed run has no durable evidence ID", async () => {
+    const user = userEvent.setup();
+    const failed: NewsPipelineStatusData = {
+      ...pipelineDone,
+      phase: "failed",
+      evidence_snapshot_id: null,
+      trusted_snapshot_id: null,
+      counts: { ...pipelineDone.counts!, verified_count: 0, corroborated_count: 0, pending_count: 0, conflicting_count: 0 },
+      admitted_count: 0,
+      redacted_error: "verification_failed",
+      compatibility_error: null,
+      displayed_trusted_snapshot_id: "trusted-old",
+      displayed_trusted: { ...pipelineDone.displayed_trusted!, snapshot_id: "trusted-old" },
+    };
+    vi.mocked(api.newsPipelineStatus).mockResolvedValue(failed);
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+    const summaryCalls = vi.mocked(api.evidenceSummary).mock.calls.length;
+    const eventCalls = vi.mocked(api.evidenceEvents).mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+
+    expect((await screen.findAllByText("确定性核验失败；继续显示上一份可信快照。")).length).toBeGreaterThan(0);
+    expect(api.evidenceSummary).toHaveBeenCalledTimes(summaryCalls);
+    expect(api.evidenceEvents).toHaveBeenCalledTimes(eventCalls);
+    expect(screen.getByText(row.title)).toBeInTheDocument();
+  });
+
+  it("rejects a failed-run evidence reload that does not match its durable ID", async () => {
+    const user = userEvent.setup();
+    const staleRow = { ...row, event_id: "dddddddddddddddddddd", title: "错误证据快照中的事件" };
+    const failedEvidence = { ...pipelineDone, phase: "failed" as const, trusted_snapshot_id: null, evidence_snapshot_id: "evidence-final", redacted_error: "publication_failed" as const, displayed_trusted_snapshot_id: "trusted-old", displayed_trusted: { ...pipelineDone.displayed_trusted!, snapshot_id: "trusted-old" } };
+    vi.mocked(api.newsPipelineStatus).mockResolvedValueOnce(failedEvidence);
+    vi.mocked(api.evidenceSummary)
+      .mockResolvedValueOnce(summary)
+      .mockResolvedValue({ ...summary, snapshot_id: "evidence-other" });
+    vi.mocked(api.evidenceEvents)
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValue({ ...listing, snapshot_id: "evidence-other", events: [staleRow] });
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+
+    await user.click(screen.getByRole("button", { name: "运行核验" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("证据快照加载失败");
+    expect((await screen.findAllByText("可信资讯发布失败；继续显示上一份可信快照。")).length).toBeGreaterThan(0);
+    expect(screen.getByText(row.title)).toBeInTheDocument();
+    expect(screen.queryByText(staleRow.title)).not.toBeInTheDocument();
+  });
+
+  it("starts only one Evidence controller on two synchronous clicks", async () => {
+    let resolveKickoff!: (value: typeof pipelineStarted) => void;
+    const kickoff = vi.spyOn(api, "marketNewsRefresh").mockImplementation(() => new Promise((resolve) => { resolveKickoff = resolve; }));
+    render(<EvidenceCenter />);
+    await screen.findByText(row.title);
+    const button = screen.getByRole("button", { name: "运行核验" });
+
+    act(() => {
+      button.click();
+      button.click();
+    });
+
+    expect(kickoff).toHaveBeenCalledTimes(1);
+    await act(async () => resolveKickoff(pipelineStarted));
   });
 
   it("derives correction rows from real transition data", async () => {

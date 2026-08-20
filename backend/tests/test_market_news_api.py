@@ -124,6 +124,8 @@ def test_api_supports_four_modes_and_keeps_filters(monkeypatch):
     policy = client.get("/api/market-news/events?mode=domestic_policy&tag_id=semiconductor&category=policy&days=7&sort=importance")
 
     assert focus.status_code == holdings.status_code == global_tech.status_code == policy.status_code == 200
+    assert focus.json()["data"]["raw_snapshot_id"] is None
+    assert focus.json()["data"]["trusted_snapshot_id"] is None
     assert [event["title"] for event in focus.json()["data"]["events"]] == [
         "存储产业支持政策发布",
         "DRAM 产品报价出现改善",

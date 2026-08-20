@@ -286,11 +286,20 @@ export function validateNewsPipelineStatus(status: NewsPipelineStatusData): News
       || evidenceTotal !== counts.raw_event_count || displayedId === null
       || (status.redacted_error !== null && status.redacted_error !== "radar_compatibility_failed")
       || status.has_pending_evidence_message !== pendingExpected) pipelineError();
-  } else if (phase === "failed" || phase === "interrupted") {
-    if (hasTrusted || status.redacted_error === null || status.has_pending_evidence_message
-      || (hasEvidence ? evidenceTotal !== counts.raw_event_count : evidenceTotal !== 0)
-      || (phase === "interrupted" && status.redacted_error !== "pipeline_interrupted")
-      || (phase === "failed" && status.redacted_error === "pipeline_interrupted")) pipelineError();
+  } else if (phase === "interrupted") {
+    if (hasTrusted || status.redacted_error !== "pipeline_interrupted" || status.has_pending_evidence_message
+      || (hasEvidence ? evidenceTotal !== counts.raw_event_count : evidenceTotal !== 0)) pipelineError();
+  } else if (phase === "failed") {
+    if (hasTrusted || status.redacted_error === null || status.redacted_error === "pipeline_interrupted"
+      || status.redacted_error === "radar_compatibility_failed" || status.has_pending_evidence_message) pipelineError();
+    if (status.redacted_error === "collection_failed" || status.redacted_error === "storage_error"
+      || status.redacted_error === "pipeline_error") {
+      if (hasEvidence || counts.raw_event_count !== 0 || evidenceTotal !== 0) pipelineError();
+    } else if (status.redacted_error === "verification_failed" || status.redacted_error === "evidence_persistence_failed") {
+      if (hasEvidence || evidenceTotal !== 0) pipelineError();
+    } else if (status.redacted_error === "evidence_compatibility_failed" || status.redacted_error === "publication_failed") {
+      if (!hasEvidence || evidenceTotal !== counts.raw_event_count) pipelineError();
+    } else pipelineError();
   }
   return status;
 }
@@ -362,6 +371,132 @@ function shapeNewsPipelineStatus(value: unknown): NewsPipelineStatusData {
     displayed_trusted_snapshot_id: nullablePipelineId(row.displayed_trusted_snapshot_id),
     displayed_trusted: displayedTrusted,
   });
+}
+
+const MARKET_NEWS_RESPONSE_KEYS = new Set([
+  "events", "focus_events", "impact_summary", "snapshot_id", "raw_snapshot_id",
+  "trusted_snapshot_id", "evidence_snapshot_id", "generated_at", "data_status",
+  "source_summary", "portfolio_status", "ai_status", "empty_reason", "empty_message",
+  "filters", "filter_options",
+]);
+const MARKET_NEWS_QUERY_KEYS = new Set(["mode", "tag_ids", "category", "days", "sort"]);
+const MARKET_NEWS_SOURCE_SUMMARY_KEYS = new Set([
+  "total_sources", "failed_sources", "cache_status", "source_state", "refresh_failed",
+  "source_statuses",
+]);
+const MARKET_NEWS_FILTER_OPTION_KEYS = new Set(["modes", "categories", "days", "sorts"]);
+const MARKET_NEWS_MODES = new Set(["my_focus", "my_holdings", "global_tech", "domestic_policy"]);
+const MARKET_NEWS_CATEGORIES = new Set(["all", "policy", "industry", "company", "fund_notice", "deep_content"]);
+const MARKET_NEWS_SORTS = new Set(["importance", "latest", "holding_relevance"]);
+const MARKET_NEWS_SOURCE_STATES = new Set(["all_success", "partial_failure", "cached", "stale_cache", "all_failed", "empty", "pipeline_pending", "trusted"]);
+const MARKET_NEWS_PORTFOLIO_STATES = new Set(["ready", "empty", "error", "public_relationships", "unavailable"]);
+const MARKET_NEWS_EMPTY_REASONS = new Set(["no_tags", "no_holdings", "portfolio_error", "portfolio_unavailable", "no_events", "no_trusted_snapshot"]);
+
+function marketNewsError(): never {
+  throw new ApiError("市场资讯响应无效", 502);
+}
+
+function marketNewsRecord(value: unknown, allowed: Set<string>): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) marketNewsError();
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !allowed.has(key))) marketNewsError();
+  return record;
+}
+
+function marketNewsString(value: unknown, maxLength = 512): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > maxLength || value !== value.trim()) marketNewsError();
+  return value;
+}
+
+function marketNewsNullableString(value: unknown, maxLength = 512): string | null {
+  return value === null ? null : marketNewsString(value, maxLength);
+}
+
+function marketNewsEnum(value: unknown, values: Set<string>): string {
+  const selected = marketNewsString(value, 64);
+  if (!values.has(selected)) marketNewsError();
+  return selected;
+}
+
+function shapeMarketNewsQuery(value: unknown): MarketNewsQuery {
+  const row = marketNewsRecord(value, MARKET_NEWS_QUERY_KEYS);
+  if (Object.keys(row).length !== MARKET_NEWS_QUERY_KEYS.size || !Array.isArray(row.tag_ids)) marketNewsError();
+  const tagIds = row.tag_ids.map((item) => marketNewsString(item, 128));
+  if (tagIds.length > 128 || new Set(tagIds).size !== tagIds.length) marketNewsError();
+  if (row.days !== 1 && row.days !== 3 && row.days !== 7 && row.days !== 30) marketNewsError();
+  return {
+    mode: marketNewsEnum(row.mode, MARKET_NEWS_MODES) as MarketNewsQuery["mode"],
+    tag_ids: tagIds,
+    category: marketNewsEnum(row.category, MARKET_NEWS_CATEGORIES) as MarketNewsQuery["category"],
+    days: row.days,
+    sort: marketNewsEnum(row.sort, MARKET_NEWS_SORTS) as MarketNewsQuery["sort"],
+  };
+}
+
+function shapeMarketNewsResponse(value: unknown): MarketNewsResponse {
+  const row = marketNewsRecord(value, MARKET_NEWS_RESPONSE_KEYS);
+  if (Object.keys(row).length !== MARKET_NEWS_RESPONSE_KEYS.size
+    || !Array.isArray(row.events) || !Array.isArray(row.focus_events)) marketNewsError();
+  const source = marketNewsRecord(row.source_summary, MARKET_NEWS_SOURCE_SUMMARY_KEYS);
+  if (Object.keys(source).length !== MARKET_NEWS_SOURCE_SUMMARY_KEYS.size
+    || !Array.isArray(source.source_statuses) || typeof source.refresh_failed !== "boolean") marketNewsError();
+  const totalSources = pipelineCount(source.total_sources);
+  const failedSources = pipelineCount(source.failed_sources);
+  if (failedSources > totalSources) marketNewsError();
+  const filters = shapeMarketNewsQuery(row.filters);
+  const options = marketNewsRecord(row.filter_options, MARKET_NEWS_FILTER_OPTION_KEYS);
+  if (Object.keys(options).length !== MARKET_NEWS_FILTER_OPTION_KEYS.size
+    || !Array.isArray(options.modes) || !Array.isArray(options.categories)
+    || !Array.isArray(options.days) || !Array.isArray(options.sorts)) marketNewsError();
+  const modes = options.modes.map((item) => marketNewsEnum(item, MARKET_NEWS_MODES)) as MarketNewsResponse["filter_options"]["modes"];
+  const categories = options.categories.map((item) => marketNewsEnum(item, MARKET_NEWS_CATEGORIES)) as MarketNewsResponse["filter_options"]["categories"];
+  const sorts = options.sorts.map((item) => marketNewsEnum(item, MARKET_NEWS_SORTS)) as MarketNewsResponse["filter_options"]["sorts"];
+  const days = options.days.map((item) => {
+    if (item !== 1 && item !== 3 && item !== 7 && item !== 30) marketNewsError();
+    return item;
+  });
+  const snapshotId = row.snapshot_id === null ? null : pipelineId(row.snapshot_id);
+  const rawSnapshotId = nullablePipelineId(row.raw_snapshot_id);
+  const trustedSnapshotId = nullablePipelineId(row.trusted_snapshot_id);
+  const evidenceSnapshotId = nullablePipelineId(row.evidence_snapshot_id);
+  const dataStatus = marketNewsString(row.data_status, 64);
+  if ((rawSnapshotId === null) !== (trustedSnapshotId === null)
+    || (rawSnapshotId !== null && rawSnapshotId !== trustedSnapshotId)) marketNewsError();
+  if (dataStatus === "pipeline_pending") {
+    if (snapshotId !== null || rawSnapshotId !== null || evidenceSnapshotId !== null
+      || row.events.length !== 0 || row.focus_events.length !== 0) marketNewsError();
+  } else if (snapshotId === null) marketNewsError();
+  const emptyReason = row.empty_reason === null
+    ? null
+    : marketNewsEnum(row.empty_reason, MARKET_NEWS_EMPTY_REASONS) as MarketNewsResponse["empty_reason"];
+  if (row.impact_summary !== null && (typeof row.impact_summary !== "object" || Array.isArray(row.impact_summary))) marketNewsError();
+  if (row.ai_status !== "available" && row.ai_status !== "unavailable") marketNewsError();
+
+  return {
+    events: row.events as MarketNewsResponse["events"],
+    focus_events: row.focus_events as MarketNewsResponse["focus_events"],
+    impact_summary: row.impact_summary as MarketNewsResponse["impact_summary"],
+    snapshot_id: snapshotId,
+    raw_snapshot_id: rawSnapshotId,
+    trusted_snapshot_id: trustedSnapshotId,
+    evidence_snapshot_id: evidenceSnapshotId,
+    generated_at: marketNewsNullableString(row.generated_at, 64),
+    data_status: dataStatus,
+    source_summary: {
+      total_sources: totalSources,
+      failed_sources: failedSources,
+      cache_status: marketNewsString(source.cache_status, 64),
+      source_state: marketNewsEnum(source.source_state, MARKET_NEWS_SOURCE_STATES) as MarketNewsResponse["source_summary"]["source_state"],
+      refresh_failed: source.refresh_failed,
+      source_statuses: source.source_statuses as MarketNewsResponse["source_summary"]["source_statuses"],
+    },
+    portfolio_status: marketNewsEnum(row.portfolio_status, MARKET_NEWS_PORTFOLIO_STATES) as MarketNewsResponse["portfolio_status"],
+    ai_status: row.ai_status,
+    empty_reason: emptyReason,
+    empty_message: marketNewsNullableString(row.empty_message, 2048),
+    filters,
+    filter_options: { modes, categories, days, sorts },
+  };
 }
 
 function dataSourceRecord(value: unknown): Record<string, unknown> {
@@ -743,7 +878,7 @@ export const api = {
   hkCashflow: (symbol: string) => get<HkCashflow>(`/global/hk/cashflow?symbol=${encodeURIComponent(symbol)}`),
   radar: (signal?: AbortSignal) => get<RadarData>("/radar", signal),
   radarRefresh: (signal?: AbortSignal) => request<unknown>("/radar/refresh", "POST", undefined, signal).then(shapeNewsPipelineStarted),
-  marketNewsEvents: (query: MarketNewsQuery, signal?: AbortSignal) => get<MarketNewsResponse>(marketNewsPath("/market-news/events", query), signal),
+  marketNewsEvents: (query: MarketNewsQuery, signal?: AbortSignal) => get<unknown>(marketNewsPath("/market-news/events", query), signal).then(shapeMarketNewsResponse),
   marketNewsRefresh: (query?: MarketNewsQuery, signal?: AbortSignal) => request<unknown>(
     query ? marketNewsPath("/market-news/refresh", query) : "/market-news/refresh",
     "POST",

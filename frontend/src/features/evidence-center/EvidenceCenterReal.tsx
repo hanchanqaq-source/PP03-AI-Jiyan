@@ -13,6 +13,7 @@ import type { EvidenceEventDetail, EvidenceEventList, EvidenceEventQuery, Eviden
 type Tab = "verification" | "health" | "corrections";
 type Filter = "all" | VerificationStatus;
 type Sort = "latest" | "status" | "holding_relevance";
+type SnapshotLoadResult = { loaded: boolean; snapshotId: string | null };
 
 const tabs: Array<{ value: Tab; label: string }> = [{ value: "verification", label: "资讯核验" }, { value: "health", label: "数据源健康" }, { value: "corrections", label: "更正记录" }];
 const filters: Array<{ value: Filter; label: string }> = [{ value: "all", label: "全部" }, ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value: value as VerificationStatus, label }))];
@@ -52,6 +53,7 @@ export function EvidenceCenter() {
   const filterRef = useRef<Filter>("all");
   const pipelineCycleRef = useRef(0);
   const pipelineAbortRef = useRef<AbortController | null>(null);
+  const refreshInFlightRef = useRef(false);
 
   const queryForFilter = useCallback((nextFilter: Filter): EvidenceEventQuery => ({
     days: 7,
@@ -78,7 +80,8 @@ export function EvidenceCenter() {
     nextFilter: Filter,
     expectedSnapshotId: string | null = null,
     failureMessage = "证据快照加载失败，请确认本地后端可用后重试。",
-  ): Promise<boolean> => {
+    commitFilter = false,
+  ): Promise<SnapshotLoadResult> => {
     const requestId = ++requestRef.current;
     evidenceLoadAbortRef.current?.abort();
     const controller = new AbortController();
@@ -90,18 +93,22 @@ export function EvidenceCenter() {
         api.evidenceSummary(controller.signal),
         api.evidenceEvents(query, controller.signal),
       ]);
-      if (requestId !== requestRef.current || controller.signal.aborted) return false;
+      if (requestId !== requestRef.current || controller.signal.aborted) return { loaded: false, snapshotId: null };
       if (!responseMatchesQuery(nextEvents, query)
         || nextSummary.snapshot_id !== nextEvents.snapshot_id
         || (expectedSnapshotId !== null && nextSummary.snapshot_id !== expectedSnapshotId)) {
         throw new Error("evidence snapshot response mismatch");
       }
       setSummary(nextSummary); setEvents(nextEvents.events);
-      return true;
+      if (commitFilter) {
+        filterRef.current = nextFilter;
+        setFilter(nextFilter);
+      }
+      return { loaded: true, snapshotId: nextSummary.snapshot_id };
     } catch (error) {
-      if (requestId !== requestRef.current || controller.signal.aborted || isAbortError(error)) return false;
+      if (requestId !== requestRef.current || controller.signal.aborted || isAbortError(error)) return { loaded: false, snapshotId: null };
       setError(failureMessage);
-      return false;
+      return { loaded: false, snapshotId: null };
     } finally {
       if (requestId === requestRef.current) {
         evidenceLoadAbortRef.current = null;
@@ -110,7 +117,7 @@ export function EvidenceCenter() {
     }
   }, [queryForFilter, responseMatchesQuery]);
 
-  useEffect(() => { void loadSnapshot(filterRef.current); }, [loadSnapshot]);
+  useEffect(() => { void loadSnapshot(filterRef.current, null, "证据快照加载失败，请确认本地后端可用后重试。", true); }, [loadSnapshot]);
   useEffect(() => () => {
     requestRef.current += 1;
     evidenceLoadAbortRef.current?.abort();
@@ -140,17 +147,17 @@ export function EvidenceCenter() {
   };
   const closeEvent = () => { setDetail(null); setDetailLoading(false); setFocusHistory(false); triggerRef.current?.focus(); };
   const changeFilter = async (next: Filter) => {
-    filterRef.current = next;
-    setFilter(next); setLoading(true); setError(null);
-    await loadSnapshot(next, null, "证据列表筛选失败，请稍后重试。" );
+    if (next === filterRef.current && !error) return;
+    await loadSnapshot(next, null, "证据列表筛选失败，请稍后重试。", true);
   };
   const refresh = async () => {
-    if (refreshing) return;
+    if (refreshInFlightRef.current || refreshing) return;
+    refreshInFlightRef.current = true;
     const pipelineCycle = ++pipelineCycleRef.current;
     pipelineAbortRef.current?.abort();
     const controller = new AbortController();
     pipelineAbortRef.current = controller;
-    let evidenceReloadSucceeded = false;
+    let loadedEvidenceSnapshotId: string | null = null;
     setRefreshing(true); setNotice(null); setPipelineStatus(null);
     try {
       const terminal = await runNewsPipelineRefresh({
@@ -160,23 +167,32 @@ export function EvidenceCenter() {
           setPipelineStatus(next);
           const evidenceDurable = next.phase === "evidence_saved" || next.phase === "trusted_published";
           const terminalFailure = next.phase === "failed" || next.phase === "interrupted";
-          if (!evidenceReloadSucceeded && (evidenceDurable || terminalFailure)) {
-            evidenceReloadSucceeded = await loadSnapshot(
+          const durableEvidenceId = next.evidence_snapshot_id;
+          if ((evidenceDurable || terminalFailure) && durableEvidenceId !== null
+            && loadedEvidenceSnapshotId !== durableEvidenceId) {
+            const result = await loadSnapshot(
               filterRef.current,
-              evidenceDurable ? next.evidence_snapshot_id : null,
+              durableEvidenceId,
             );
+            if (result.loaded && result.snapshotId === durableEvidenceId) {
+              loadedEvidenceSnapshotId = durableEvidenceId;
+            }
           }
         },
       });
       if (!terminal || pipelineCycle !== pipelineCycleRef.current) return;
-      if (!evidenceReloadSucceeded) {
-        evidenceReloadSucceeded = await loadSnapshot(
+      if (terminal.evidence_snapshot_id !== null
+        && loadedEvidenceSnapshotId !== terminal.evidence_snapshot_id) {
+        const result = await loadSnapshot(
           filterRef.current,
           terminal.evidence_snapshot_id,
         );
+        if (result.loaded && result.snapshotId === terminal.evidence_snapshot_id) {
+          loadedEvidenceSnapshotId = terminal.evidence_snapshot_id;
+        }
       }
       if (terminal.phase === "trusted_published") {
-        if (evidenceReloadSucceeded) setNotice("核验刷新完成，已载入最新成功快照。");
+        if (loadedEvidenceSnapshotId === terminal.evidence_snapshot_id) setNotice("核验刷新完成，已载入最新成功快照。");
       } else setNotice(newsPipelineFailureMessage(terminal));
     }
     catch (error) {
@@ -187,6 +203,7 @@ export function EvidenceCenter() {
     finally {
       if (pipelineCycle === pipelineCycleRef.current) {
         pipelineAbortRef.current = null;
+        refreshInFlightRef.current = false;
         setRefreshing(false);
       }
     }

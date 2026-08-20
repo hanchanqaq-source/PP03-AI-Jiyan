@@ -159,4 +159,24 @@ describe("legacy Intel investment-news pipeline compatibility", () => {
     expect(kickoff).toHaveBeenCalledTimes(1);
     await act(async () => kickoffResolvers.forEach((resolve) => resolve(started)));
   });
+
+  it("keeps the previous radar and labels a nonfatal compatibility warning", async () => {
+    const user = userEvent.setup();
+    const radar = vi.spyOn(api, "radar").mockResolvedValue(oldRadar);
+    vi.spyOn(api, "radarRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue({
+      ...status("trusted_published"),
+      redacted_error: "radar_compatibility_failed",
+      compatibility_error: "radar_compatibility_failed",
+    });
+    render(<Intel />);
+    await screen.findByText("上一份可信雷达资讯");
+    const initialReads = radar.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+
+    expect(await screen.findByText("资讯雷达兼容更新未完成；可信资讯快照仍可使用。")).toBeInTheDocument();
+    expect(screen.getByText("上一份可信雷达资讯")).toBeInTheDocument();
+    expect(radar).toHaveBeenCalledTimes(initialReads);
+  });
 });

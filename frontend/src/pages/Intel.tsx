@@ -86,6 +86,7 @@ function InvestmentNewsPanel() {
         setErr(newsPipelineFailureMessage(terminal));
         return;
       }
+      if (terminal.redacted_error === "radar_compatibility_failed") return;
       try {
         const next = await api.radar(controller.signal);
         if (cycle === refreshCycleRef.current && dataCycle === dataCycleRef.current && !controller.signal.aborted) setData(next);

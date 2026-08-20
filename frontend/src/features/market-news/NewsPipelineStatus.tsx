@@ -16,6 +16,15 @@ const ACTIVE_PHASES = new Set<NewsPipelinePhase>([
   "evidence_saved",
 ]);
 
+const PHASE_ORDER: Partial<Record<NewsPipelinePhase, number>> = {
+  queued: 0,
+  fetching: 1,
+  raw_saved: 2,
+  verifying: 3,
+  evidence_saved: 4,
+  trusted_published: 5,
+};
+
 const STAGES: Array<{ phase: NewsPipelinePhase; label: string }> = [
   { phase: "queued", label: "排队" },
   { phase: "fetching", label: "抓取来源" },
@@ -80,6 +89,45 @@ export interface RunNewsPipelineOptions {
   kickoff?: (signal?: AbortSignal) => Promise<NewsPipelineStarted>;
 }
 
+function validatePollSequence(
+  previous: NewsPipelineStatusData | null,
+  next: NewsPipelineStatusData,
+  started: NewsPipelineStarted,
+): void {
+  if (!next.loaded || next.run_id !== started.run_id || next.raw_snapshot_id !== started.raw_snapshot_id) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (next.phase === "trusted_published" && (
+    next.trusted_snapshot_id !== started.raw_snapshot_id
+    || next.displayed_trusted_snapshot_id !== started.raw_snapshot_id
+    || next.displayed_trusted?.snapshot_id !== started.raw_snapshot_id
+    || next.displayed_trusted.event_count !== next.admitted_count
+  )) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (!previous) return;
+  const previousOrder = previous.phase ? PHASE_ORDER[previous.phase] : undefined;
+  const nextOrder = next.phase ? PHASE_ORDER[next.phase] : undefined;
+  if (previousOrder !== undefined && nextOrder !== undefined && nextOrder < previousOrder) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (previous.evidence_snapshot_id !== null && next.evidence_snapshot_id !== previous.evidence_snapshot_id) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (previous.trusted_snapshot_id !== null && next.trusted_snapshot_id !== previous.trusted_snapshot_id) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (previous.counts && next.counts) {
+    for (const key of Object.keys(previous.counts) as Array<keyof typeof previous.counts>) {
+      if (next.counts[key] < previous.counts[key]) throw new ApiError("资讯流水线响应无效", 502);
+    }
+  }
+  if (next.phase !== "trusted_published"
+    && next.displayed_trusted_snapshot_id !== previous.displayed_trusted_snapshot_id) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+}
+
 export async function runNewsPipelineRefresh({
   query,
   signal,
@@ -99,6 +147,7 @@ export async function runNewsPipelineRefresh({
   }
   if (requestSignal.aborted) return null;
   onStarted?.(started.run_id);
+  let previousStatus: NewsPipelineStatusData | null = null;
 
   while (!requestSignal.aborted) {
     let status: NewsPipelineStatusData;
@@ -109,16 +158,9 @@ export async function runNewsPipelineRefresh({
       throw error;
     }
     if (requestSignal.aborted) return null;
-    const terminalDisplayMismatch = status.phase === "trusted_published" && (
-      status.displayed_trusted_snapshot_id !== started.raw_snapshot_id
-      || status.displayed_trusted?.snapshot_id !== started.raw_snapshot_id
-      || status.displayed_trusted.event_count !== status.admitted_count
-    );
-    if (!status.loaded || status.run_id !== started.run_id || status.raw_snapshot_id !== started.raw_snapshot_id
-      || terminalDisplayMismatch) {
-      throw new ApiError("资讯流水线响应无效", 502);
-    }
+    validatePollSequence(previousStatus, status, started);
     await onStatus?.(status);
+    previousStatus = status;
     if (requestSignal.aborted) return null;
     if (!isNewsPipelineActive(status.phase)) return status;
     if (!await nextPoll(requestSignal, pollIntervalMs)) return null;
@@ -143,7 +185,7 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
     status.has_pending_evidence_message
     || (status.phase === "trusted_published" && (counts?.raw_event_count ?? 0) > 0 && status.admitted_count === 0),
   );
-  const currentTrustedId = status.trusted_snapshot_id || status.displayed_trusted_snapshot_id;
+  const currentTrustedId = status.displayed_trusted_snapshot_id;
 
   return <section role="status" aria-label="资讯流水线状态" className="mb-4 overflow-hidden rounded-xl border border-border/65 bg-gradient-to-r from-slate-950/55 via-background/55 to-primary/5">
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/45 px-3 py-2.5">
@@ -180,14 +222,16 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
       <Count label="来源失败" value={counts?.failed_source_count} />
     </div>
 
-    <div className="grid gap-1 border-t border-border/35 px-3 py-2 text-[11px] sm:grid-cols-3">
+    <div className="grid gap-1 border-t border-border/35 px-3 py-2 text-[11px] sm:grid-cols-2 xl:grid-cols-4">
       <SnapshotId label="原始快照" value={status.raw_snapshot_id} />
       <SnapshotId label="证据快照" value={status.evidence_snapshot_id} />
+      <SnapshotId label="本轮可信快照" value={status.trusted_snapshot_id} />
       <SnapshotId label="当前可信快照" value={currentTrustedId} />
     </div>
 
     {inVerification && <p className="border-t border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">新资讯已抓取，核验处理中；当前显示上一份可信快照。</p>}
     {pendingEvidence && <p className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">本次已抓取 {counts?.raw_event_count ?? 0} 条资讯，目前尚无完成核验的内容。待核验资讯可在证据中心查看。</p>}
+    {status.phase === "trusted_published" && status.redacted_error === "radar_compatibility_failed" && <p className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{FAILURE_COPY.radar_compatibility_failed}</p>}
     {(status.phase === "failed" || status.phase === "interrupted") && <p className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">{newsPipelineFailureMessage(status)}</p>}
   </section>;
 }

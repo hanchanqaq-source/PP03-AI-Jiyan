@@ -112,6 +112,16 @@ function responseMatchesQuery(response: MarketNewsResponse, query: MarketNewsQue
   return marketNewsQueryKey(response.filters) === marketNewsQueryKey(query);
 }
 
+function responseMatchesTerminal(
+  response: MarketNewsResponse,
+  terminal: NewsPipelineStatusData,
+): boolean {
+  return terminal.phase === "trusted_published"
+    && terminal.trusted_snapshot_id !== null
+    && response.raw_snapshot_id === terminal.raw_snapshot_id
+    && response.trusted_snapshot_id === terminal.trusted_snapshot_id;
+}
+
 function sourceLanguage(event: MarketNewsEvent): string {
   return event.sources.find((source) => source.language && !source.language.toLowerCase().startsWith("zh"))?.language
     || event.sources[0]?.language
@@ -202,6 +212,7 @@ export function MarketNews() {
   const requestIdRef = useRef(0);
   const pipelineCycleRef = useRef(0);
   const pipelineAbortRef = useRef<AbortController | null>(null);
+  const refreshInFlightRef = useRef(false);
   const sourceRetryIdRef = useRef(0);
   const translationIdRef = useRef(0);
   const translationRequestedRef = useRef<Set<string>>(new Set());
@@ -251,6 +262,7 @@ export function MarketNews() {
     pipelineCycleRef.current += 1;
     pipelineAbortRef.current?.abort();
     pipelineAbortRef.current = null;
+    refreshInFlightRef.current = false;
     setPipelineStatus(null);
   }, [queryKey]);
 
@@ -344,7 +356,8 @@ export function MarketNews() {
   }, [data?.snapshot_id, queryKey]);
 
   const refresh = async () => {
-    if (refreshing || loading || (mode === "my_focus" && query.tag_ids.length === 0)) return;
+    if (refreshInFlightRef.current || refreshing || loading || (mode === "my_focus" && query.tag_ids.length === 0)) return;
+    refreshInFlightRef.current = true;
     const requestId = ++requestIdRef.current;
     const pipelineCycle = ++pipelineCycleRef.current;
     pipelineAbortRef.current?.abort();
@@ -372,6 +385,7 @@ export function MarketNews() {
       const response = await api.marketNewsEvents(query, controller.signal);
       if (requestId !== requestIdRef.current || pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
       if (!responseMatchesQuery(response, query)) throw new Error("market-news refresh filters mismatch");
+      if (!responseMatchesTerminal(response, terminal)) throw new Error("market-news refresh lineage mismatch");
       const accepted = preserveSameSnapshotTranslations(response, responseCacheRef.current.get(queryKey));
       cacheMarketNewsResponse(responseCacheRef.current, queryKey, accepted);
       setView({ queryKey, response: accepted });
@@ -391,6 +405,7 @@ export function MarketNews() {
     } finally {
       if (pipelineCycle === pipelineCycleRef.current && activeQueryKeyRef.current === queryKey) {
         pipelineAbortRef.current = null;
+        refreshInFlightRef.current = false;
         setRefreshing(false);
       }
     }
@@ -485,7 +500,7 @@ export function MarketNews() {
       {queryFailedWithoutCache ? <div className="rounded-2xl border border-destructive/30 bg-destructive/5"><QueryFailureState /></div> : loading && !data && !noTags ? <div className="flex items-center justify-center gap-2 py-20 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在读取公开资讯与本地缓存</div> : emptyReason ? <div className="rounded-2xl border border-border/65 bg-background/55"><EmptyState reason={emptyReason} message={data?.empty_message} onAddTag={() => setSelectorOpen(true)} /></div> : data && <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]">
         <main className="rounded-2xl border border-border/70 bg-gradient-to-b from-slate-950/55 to-background/45 px-5" aria-label="市场资讯事件列表">
           {loading && <p className="border-b border-border/45 py-2 text-xs text-muted-foreground">正在更新筛选结果…</p>}
-          {displayedEvents.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id, event: selectedEvent })} onViewEvidence={(selectedEvent) => openEvidenceCenter(selectedEvent.event_id)} />)}
+          {displayedEvents.map((event) => <EventCard key={event.event_id} event={event} onOpenDetails={(selectedEvent) => setDetailSelection({ queryKey, snapshotId: data.snapshot_id || "", event: selectedEvent })} onViewEvidence={(selectedEvent) => openEvidenceCenter(selectedEvent.event_id)} />)}
         </main>
         <MarketNewsSidebar focus={displayedFocusEvents} impact={data.impact_summary} days={data.filters.days} />
       </div>}

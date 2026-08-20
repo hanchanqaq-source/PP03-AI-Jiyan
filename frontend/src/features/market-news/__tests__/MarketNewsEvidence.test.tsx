@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
@@ -14,6 +14,7 @@ function status(phase: NewsPipelineStatusData["phase"], raw = 6, admitted = 2): 
   const hasRaw = phase !== "queued" && phase !== "fetching";
   const hasEvidence = phase === "evidence_saved" || phase === "trusted_published";
   const published = phase === "trusted_published";
+  const displayedTrustedSnapshotId = published ? started.raw_snapshot_id : "trusted-previous";
   return {
     loaded: true, run_id: started.run_id, raw_snapshot_id: started.raw_snapshot_id,
     evidence_snapshot_id: hasEvidence ? "evidence-market-news" : null,
@@ -24,8 +25,8 @@ function status(phase: NewsPipelineStatusData["phase"], raw = 6, admitted = 2): 
     has_pending_evidence_message: published && raw > 0 && admitted === 0,
     created_at: "2026-08-20T09:00:00+00:00", updated_at: "2026-08-20T09:00:01+00:00",
     redacted_error: null, recovery_status: "ready", recovery_error: null, compatibility_error: null,
-    displayed_trusted_snapshot_id: published ? started.raw_snapshot_id : marketNewsResponse.snapshot_id,
-    displayed_trusted: { snapshot_id: published ? started.raw_snapshot_id : marketNewsResponse.snapshot_id, published_at: "2026-08-20T09:00:01+00:00", event_count: published ? admitted : 1 },
+    displayed_trusted_snapshot_id: displayedTrustedSnapshotId,
+    displayed_trusted: { snapshot_id: displayedTrustedSnapshotId, published_at: "2026-08-20T09:00:01+00:00", event_count: published ? admitted : 1 },
   };
 }
 
@@ -69,7 +70,7 @@ describe("MarketNews trusted evidence admission", () => {
     const next = { ...verified, event_id: "33333333333333333333", title: "新可信快照事件" };
     const events = vi.spyOn(api, "marketNewsEvents")
       .mockResolvedValueOnce({ ...marketNewsResponse, events: [verified], focus_events: [verified], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } })
-      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: started.raw_snapshot_id, events: [next], focus_events: [next], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
+      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: "next-query-hash", raw_snapshot_id: started.raw_snapshot_id, trusted_snapshot_id: started.raw_snapshot_id, events: [next], focus_events: [next], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("trusted_published"));
 
@@ -86,7 +87,7 @@ describe("MarketNews trusted evidence admission", () => {
     const user = userEvent.setup();
     vi.spyOn(api, "marketNewsEvents")
       .mockResolvedValueOnce({ ...marketNewsResponse, events: [verified], focus_events: [verified], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } })
-      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: started.raw_snapshot_id, events: [], focus_events: [], empty_reason: "no_events", empty_message: null, filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
+      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: "empty-query-hash", raw_snapshot_id: started.raw_snapshot_id, trusted_snapshot_id: started.raw_snapshot_id, events: [], focus_events: [], empty_reason: "no_events", empty_message: null, filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("trusted_published", 6, 0));
 
@@ -96,5 +97,79 @@ describe("MarketNews trusted evidence admission", () => {
 
     expect(await screen.findByText("本次已抓取 6 条资讯，目前尚无完成核验的内容。待核验资讯可在证据中心查看。")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: verified.title })).not.toBeInTheDocument();
+  });
+
+  it("rejects a terminal trusted GET from another lineage and keeps the previous cards", async () => {
+    const user = userEvent.setup();
+    const stale = { ...verified, event_id: "44444444444444444444", title: "错误血缘中的旧卡片" };
+    vi.spyOn(api, "marketNewsEvents")
+      .mockResolvedValueOnce({ ...marketNewsResponse, raw_snapshot_id: "trusted-old", trusted_snapshot_id: "trusted-old", events: [verified], focus_events: [verified], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } })
+      .mockResolvedValueOnce({ ...marketNewsResponse, snapshot_id: "stale-query-hash", raw_snapshot_id: "raw-other", trusted_snapshot_id: "raw-other", events: [stale], focus_events: [stale], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("trusted_published", 6, 0));
+
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: verified.title });
+    await user.click(screen.getByRole("button", { name: "刷新资讯" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("最新可信快照已发布，但当前筛选加载失败");
+    expect(screen.getByRole("heading", { name: verified.title })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: stale.title })).not.toBeInTheDocument();
+  });
+
+  it("starts only one Market News controller on two synchronous clicks", async () => {
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [verified], focus_events: [verified], filters: { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] } });
+    let resolveKickoff!: (value: typeof started) => void;
+    const kickoff = vi.spyOn(api, "marketNewsRefresh").mockImplementation(() => new Promise((resolve) => { resolveKickoff = resolve; }));
+    vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(status("trusted_published"));
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: verified.title });
+    const button = screen.getByRole("button", { name: "刷新资讯" });
+
+    act(() => {
+      button.click();
+      button.click();
+    });
+
+    expect(kickoff).toHaveBeenCalledTimes(1);
+    await act(async () => resolveKickoff(started));
+  });
+
+  it("shapes exact market-news lineage while preserving the query snapshot hash", async () => {
+    const query = { ...marketNewsResponse.filters, tag_ids: ["semiconductor"] };
+    const payload = {
+      ...marketNewsResponse,
+      snapshot_id: "query-result-hash",
+      raw_snapshot_id: started.raw_snapshot_id,
+      trusted_snapshot_id: started.raw_snapshot_id,
+      evidence_snapshot_id: "evidence-market-news",
+      data_status: "trusted",
+      filters: query,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: payload }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(api.marketNewsEvents(query)).resolves.toMatchObject({
+      snapshot_id: "query-result-hash",
+      raw_snapshot_id: started.raw_snapshot_id,
+      trusted_snapshot_id: started.raw_snapshot_id,
+    });
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: {
+      ...payload,
+      trusted_snapshot_id: "raw-other",
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
+
+    const missingLineage = { ...payload } as Record<string, unknown>;
+    delete missingLineage.raw_snapshot_id;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: missingLineage }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    await expect(api.marketNewsEvents(query)).rejects.toMatchObject({ status: 502 });
   });
 });

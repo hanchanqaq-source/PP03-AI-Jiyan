@@ -127,7 +127,7 @@ export interface MarketNewsTranslationResponse {
   limit: number;
 }
 
-export type MarketNewsSourceState = "all_success" | "partial_failure" | "cached" | "stale_cache" | "all_failed" | "empty";
+export type MarketNewsSourceState = "all_success" | "partial_failure" | "cached" | "stale_cache" | "all_failed" | "empty" | "pipeline_pending" | "trusted";
 
 export interface MarketNewsSourceStatus {
   source_id: string;
@@ -192,8 +192,10 @@ export interface MarketNewsResponse {
   events: MarketNewsEvent[];
   focus_events: MarketNewsEvent[];
   impact_summary: MarketNewsImpactSummary | null;
-  snapshot_id: string;
-  evidence_snapshot_id?: string;
+  snapshot_id: string | null;
+  raw_snapshot_id: string | null;
+  trusted_snapshot_id: string | null;
+  evidence_snapshot_id: string | null;
   generated_at: string | null;
   data_status: string;
   source_summary: {
@@ -204,10 +206,10 @@ export interface MarketNewsResponse {
     refresh_failed: boolean;
     source_statuses: MarketNewsSourceStatus[];
   };
-  portfolio_status: "ready" | "empty" | "error";
+  portfolio_status: "ready" | "empty" | "error" | "public_relationships" | "unavailable";
   ai_status: "available" | "unavailable";
-  empty_reason: "no_tags" | "no_holdings" | "portfolio_error" | "no_events" | null;
-  empty_message?: string | null;
+  empty_reason: "no_tags" | "no_holdings" | "portfolio_error" | "portfolio_unavailable" | "no_events" | "no_trusted_snapshot" | null;
+  empty_message: string | null;
   filters: MarketNewsQuery;
   filter_options: { modes: MarketNewsMode[]; categories: MarketNewsCategoryFilter[]; days: number[]; sorts: MarketNewsSort[] };
 }

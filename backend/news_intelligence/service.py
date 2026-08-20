@@ -695,6 +695,8 @@ class MarketNewsService:
             },
             "portfolio_status": portfolio_status,
             "snapshot_id": snapshot_id,
+            "raw_snapshot_id": None,
+            "trusted_snapshot_id": None,
             "evidence_snapshot_id": evidence_snapshot_id,
             "ai_status": "unavailable",
             "empty_reason": empty_reason,

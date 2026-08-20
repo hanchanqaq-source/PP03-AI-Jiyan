@@ -122,6 +122,31 @@ describe("NewsPipelineStatus", () => {
     expect(terminal?.phase).toBe("trusted_published");
   });
 
+  it.each([
+    ["phase regression", pipelineStatus("raw_saved", { updated_at: "2026-08-20T09:00:02+00:00" })],
+    ["count regression", pipelineStatus("evidence_saved", {
+      counts: { ...pipelineStatus("evidence_saved").counts!, raw_event_count: 7, pending_count: 0 },
+      admitted_count: 5,
+    })],
+    ["evidence identity mutation", pipelineStatus("evidence_saved", { evidence_snapshot_id: "evidence-stage-other" })],
+    ["displayed pointer mutation before publication", pipelineStatus("verifying", {
+      displayed_trusted_snapshot_id: "trusted-other",
+      displayed_trusted: { snapshot_id: "trusted-other", published_at: "2026-08-20T09:00:02+00:00", event_count: 6 },
+    })],
+  ])("rejects poll sequence %s before notifying consumers", async (_label, invalidNext) => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus")
+      .mockResolvedValueOnce(pipelineStatus("evidence_saved"))
+      .mockResolvedValueOnce(invalidNext);
+    const onStatus = vi.fn();
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0, onStatus })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(onStatus).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects a selected status from another run before notifying consumers", async () => {
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus").mockResolvedValue(pipelineStatus("trusted_published", {
@@ -352,5 +377,63 @@ describe("NewsPipelineStatus", () => {
 
     expect(screen.getByText("确定性核验失败；继续显示上一份可信快照。")).toBeInTheDocument();
     expect(screen.queryByText("verification_failed")).not.toBeInTheDocument();
+  });
+
+  it("renders radar compatibility failure as a nonfatal trusted warning", () => {
+    render(<NewsPipelineStatus status={pipelineStatus("trusted_published", {
+      redacted_error: "radar_compatibility_failed",
+      compatibility_error: "radar_compatibility_failed",
+    })} />);
+
+    expect(screen.getByText("资讯雷达兼容更新未完成；可信资讯快照仍可使用。")).toBeInTheDocument();
+    expect(screen.queryByText("运行失败")).not.toBeInTheDocument();
+  });
+
+  it("labels the backend displayed pointer as current and the selected run identity separately", () => {
+    render(<NewsPipelineStatus status={pipelineStatus("trusted_published", {
+      displayed_trusted_snapshot_id: "raw-current-newer",
+      displayed_trusted: {
+        snapshot_id: "raw-current-newer",
+        published_at: "2026-08-20T10:00:00+00:00",
+        event_count: 9,
+      },
+    })} />);
+
+    const region = screen.getByRole("status", { name: "资讯流水线状态" });
+    expect(region).toHaveTextContent("本轮可信快照：raw-stage-1");
+    expect(region).toHaveTextContent("当前可信快照：raw-current-newer");
+  });
+
+  it.each([
+    ["collection_failed", {
+      redacted_error: "collection_failed",
+      counts: { ...pipelineStatus("failed").counts!, raw_event_count: 1 },
+    }],
+    ["verification_failed with evidence", {
+      redacted_error: "verification_failed",
+      evidence_snapshot_id: "evidence-illegal",
+      counts: pipelineStatus("evidence_saved").counts,
+      admitted_count: pipelineStatus("evidence_saved").admitted_count,
+    }],
+    ["evidence_persistence_failed with evidence totals", {
+      redacted_error: "evidence_persistence_failed",
+      counts: pipelineStatus("evidence_saved").counts,
+      admitted_count: pipelineStatus("evidence_saved").admitted_count,
+    }],
+    ["publication_failed without evidence", {
+      redacted_error: "publication_failed",
+      evidence_snapshot_id: null,
+    }],
+  ])("rejects impossible failure durability: %s", async (_label, overrides) => {
+    const failed = pipelineStatus("failed", overrides as Partial<NewsPipelineStatusData>);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: {
+      ...failed,
+      ...failed.counts,
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
   });
 });
