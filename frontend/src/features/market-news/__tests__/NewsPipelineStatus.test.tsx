@@ -64,7 +64,7 @@ describe("NewsPipelineStatus", () => {
   it("renders every independent count and snapshot identity", () => {
     render(<NewsPipelineStatus status={pipelineStatus("evidence_saved")} />);
 
-    const region = screen.getByRole("status", { name: "资讯流水线状态" });
+    const region = screen.getByRole("region", { name: "资讯流水线状态" });
     expect(region).toHaveTextContent("已抓取8");
     expect(region).toHaveTextContent("已核验3");
     expect(region).toHaveTextContent("多源印证2");
@@ -83,6 +83,16 @@ describe("NewsPipelineStatus", () => {
 
     expect(screen.getByText("新资讯已抓取，核验处理中；当前显示上一份可信快照。")).toBeInTheDocument();
     expect(screen.getByText("确定性核验", { selector: "span" })).toHaveAttribute("aria-current", "step");
+  });
+
+  it("uses a distinct first-run message when verification has no previous trusted snapshot", () => {
+    render(<NewsPipelineStatus status={pipelineStatus("verifying", {
+      displayed_trusted_snapshot_id: null,
+      displayed_trusted: null,
+    })} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("当前尚无可显示的可信快照");
+    expect(screen.queryByText(/当前显示上一份可信快照/)).not.toBeInTheDocument();
   });
 
   it("explains positive raw count with zero admitted events", () => {
@@ -137,6 +147,52 @@ describe("NewsPipelineStatus", () => {
     vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
     vi.spyOn(api, "newsPipelineStatus")
       .mockResolvedValueOnce(pipelineStatus("evidence_saved"))
+      .mockResolvedValueOnce(invalidNext);
+    const onStatus = vi.fn();
+
+    await expect(runNewsPipelineRefresh({ pollIntervalMs: 0, onStatus })).rejects.toMatchObject({
+      message: "资讯流水线响应无效",
+      status: 502,
+    });
+    expect(onStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["materialized raw counts increase", pipelineStatus("verifying", {
+      counts: { ...pipelineStatus("verifying").counts!, raw_event_count: 9 },
+    })],
+    ["materialized raw failure count decreases", pipelineStatus("verifying", {
+      counts: { ...pipelineStatus("verifying").counts!, failed_source_count: 3 },
+    })],
+    ["evidence facts are recomputed", pipelineStatus("trusted_published", {
+      counts: {
+        raw_event_count: 9,
+        verified_count: 4,
+        corroborated_count: 2,
+        pending_count: 1,
+        conflicting_count: 1,
+        corrected_count: 0,
+        disproved_count: 1,
+        failed_source_count: 4,
+      },
+      admitted_count: 6,
+      displayed_trusted: {
+        snapshot_id: started.raw_snapshot_id,
+        published_at: "2026-08-20T09:00:02+00:00",
+        event_count: 6,
+      },
+    })],
+    ["displayed snapshot metadata mutates", pipelineStatus("verifying", {
+      displayed_trusted: {
+        snapshot_id: "trusted-old",
+        published_at: "2026-08-20T09:00:02+00:00",
+        event_count: 7,
+      },
+    })],
+  ])("freezes materialized poll facts: %s", async (_label, invalidNext) => {
+    vi.spyOn(api, "marketNewsRefresh").mockResolvedValue(started);
+    vi.spyOn(api, "newsPipelineStatus")
+      .mockResolvedValueOnce(pipelineStatus("raw_saved"))
       .mockResolvedValueOnce(invalidNext);
     const onStatus = vi.fn();
 
@@ -379,6 +435,26 @@ describe("NewsPipelineStatus", () => {
     expect(screen.queryByText("verification_failed")).not.toBeInTheDocument();
   });
 
+  it("accepts the producer's raw-saved storage failure without inventing evidence", async () => {
+    const failed = pipelineStatus("failed", {
+      evidence_snapshot_id: null,
+      trusted_snapshot_id: null,
+      redacted_error: "storage_error",
+      admitted_count: 0,
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: {
+      ...failed,
+      ...failed.counts,
+    } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(api.newsPipelineStatus(started.run_id)).resolves.toMatchObject({
+      phase: "failed",
+      redacted_error: "storage_error",
+      counts: { raw_event_count: 8, failed_source_count: 4 },
+      evidence_snapshot_id: null,
+    });
+  });
+
   it("renders radar compatibility failure as a nonfatal trusted warning", () => {
     render(<NewsPipelineStatus status={pipelineStatus("trusted_published", {
       redacted_error: "radar_compatibility_failed",
@@ -399,9 +475,27 @@ describe("NewsPipelineStatus", () => {
       },
     })} />);
 
-    const region = screen.getByRole("status", { name: "资讯流水线状态" });
+    const region = screen.getByRole("region", { name: "资讯流水线状态" });
     expect(region).toHaveTextContent("本轮可信快照：raw-stage-1");
     expect(region).toHaveTextContent("当前可信快照：raw-current-newer");
+  });
+
+  it("keeps frequently changing counts and IDs out of the live region", () => {
+    render(<NewsPipelineStatus status={pipelineStatus("evidence_saved")} />);
+
+    const panel = screen.getByRole("region", { name: "资讯流水线状态" });
+    const live = screen.getByRole("status");
+    expect(panel).toHaveTextContent("已抓取8");
+    expect(live).toHaveTextContent("核验处理中");
+    expect(live).not.toHaveTextContent("已抓取8");
+    expect(live).not.toHaveTextContent("raw-stage-1");
+  });
+
+  it("announces failed and interrupted copy as an alert", () => {
+    render(<NewsPipelineStatus status={pipelineStatus("failed", { redacted_error: "verification_failed" })} />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("确定性核验失败");
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
   it.each([

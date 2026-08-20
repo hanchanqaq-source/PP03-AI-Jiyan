@@ -120,8 +120,29 @@ describe("EvidenceCenter real verification workspace", () => {
 
     render(<EvidenceCenter />);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("证据快照加载失败");
+    expect(
+      await screen.findByText("证据快照加载失败，请确认本地后端可用后重试。"),
+    ).toHaveAttribute("role", "alert");
     expect(screen.queryByText(row.title)).not.toBeInTheDocument();
+  });
+
+  it("aborts the sibling evidence request when either half of the atomic load fails", async () => {
+    let listSignal: AbortSignal | undefined;
+    let siblingAborted = false;
+    vi.mocked(api.evidenceSummary).mockRejectedValueOnce(new Error("summary failed"));
+    vi.mocked(api.evidenceEvents).mockImplementationOnce((_query, signal) => new Promise((_, reject) => {
+      listSignal = signal;
+      signal?.addEventListener("abort", () => {
+        siblingAborted = true;
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    }));
+
+    render(<EvidenceCenter />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("证据快照加载失败");
+    expect(listSignal?.aborted).toBe(true);
+    expect(siblingAborted).toBe(true);
   });
 
   it("reloads the exact current status filter when evidence becomes durable", async () => {
@@ -305,7 +326,9 @@ describe("EvidenceCenter real verification workspace", () => {
 
     await user.click(screen.getByRole("button", { name: "运行核验" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("证据快照加载失败");
+    expect(
+      await screen.findByText("证据快照加载失败，请确认本地后端可用后重试。"),
+    ).toHaveAttribute("role", "alert");
     expect((await screen.findAllByText("可信资讯发布失败；继续显示上一份可信快照。")).length).toBeGreaterThan(0);
     expect(screen.getByText(row.title)).toBeInTheDocument();
     expect(screen.queryByText(staleRow.title)).not.toBeInTheDocument();

@@ -285,7 +285,7 @@ describe("PP03 core pages", () => {
     expect(screen.getByText("刷新中")).toBeInTheDocument();
     rejectRefresh(new Error("offline"));
 
-    expect(await screen.findByText("资讯流水线状态连接失败；继续显示上一份可信快照。")).toBeInTheDocument();
+    expect(await screen.findByText("资讯流水线状态连接失败；当前尚无可显示的可信快照。")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: directEvent.title })).toBeInTheDocument();
   });
 

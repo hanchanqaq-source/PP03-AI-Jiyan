@@ -40,22 +40,25 @@ const TERMINAL_LABEL: Partial<Record<NewsPipelinePhase, string>> = {
 };
 
 const FAILURE_COPY: Record<NewsPipelineErrorCode, string> = {
-  collection_failed: "公开资讯抓取失败；继续显示上一份可信快照。",
-  verification_failed: "确定性核验失败；继续显示上一份可信快照。",
-  evidence_persistence_failed: "证据快照保存失败；继续显示上一份可信快照。",
-  evidence_compatibility_failed: "证据兼容发布未完成；继续显示上一份可信快照。",
-  publication_failed: "可信资讯发布失败；继续显示上一份可信快照。",
+  collection_failed: "公开资讯抓取失败",
+  verification_failed: "确定性核验失败",
+  evidence_persistence_failed: "证据快照保存失败",
+  evidence_compatibility_failed: "证据兼容发布未完成",
+  publication_failed: "可信资讯发布失败",
   radar_compatibility_failed: "资讯雷达兼容更新未完成；可信资讯快照仍可使用。",
-  pipeline_interrupted: "本轮资讯刷新在完成前中断；继续显示上一份可信快照。",
-  storage_error: "资讯快照存储暂时不可用；继续显示上一份可信快照。",
-  pipeline_error: "资讯流水线未完成；继续显示上一份可信快照。",
+  pipeline_interrupted: "本轮资讯刷新在完成前中断",
+  storage_error: "资讯快照存储暂时不可用",
+  pipeline_error: "资讯流水线未完成",
 };
 
 export function newsPipelineFailureMessage(status: NewsPipelineStatusData): string {
-  if (status.redacted_error) return FAILURE_COPY[status.redacted_error];
-  return status.phase === "interrupted"
+  const core = status.redacted_error ? FAILURE_COPY[status.redacted_error] : status.phase === "interrupted"
     ? FAILURE_COPY.pipeline_interrupted
     : FAILURE_COPY.pipeline_error;
+  if (status.redacted_error === "radar_compatibility_failed") return core;
+  return status.displayed_trusted_snapshot_id
+    ? `${core}；继续显示上一份可信快照。`
+    : `${core}；当前尚无可显示的可信快照。`;
 }
 
 export function isNewsPipelineActive(phase: NewsPipelineStatusData["phase"]): phase is NewsPipelinePhase {
@@ -118,12 +121,32 @@ function validatePollSequence(
     throw new ApiError("资讯流水线响应无效", 502);
   }
   if (previous.counts && next.counts) {
-    for (const key of Object.keys(previous.counts) as Array<keyof typeof previous.counts>) {
-      if (next.counts[key] < previous.counts[key]) throw new ApiError("资讯流水线响应无效", 502);
+    const rawMaterialized = previous.phase !== "queued" && previous.phase !== "fetching";
+    if (rawMaterialized && (
+      next.counts.raw_event_count !== previous.counts.raw_event_count
+      || next.counts.failed_source_count !== previous.counts.failed_source_count
+    )) throw new ApiError("资讯流水线响应无效", 502);
+    if (previous.evidence_snapshot_id !== null) {
+      const evidenceKeys: Array<keyof typeof previous.counts> = [
+        "verified_count", "corroborated_count", "pending_count", "conflicting_count",
+        "corrected_count", "disproved_count",
+      ];
+      if (evidenceKeys.some((key) => next.counts![key] !== previous.counts![key])
+        || next.admitted_count !== previous.admitted_count) throw new ApiError("资讯流水线响应无效", 502);
     }
+    if (previous.trusted_snapshot_id !== null && (
+      next.trusted_snapshot_id !== previous.trusted_snapshot_id
+      || next.admitted_count !== previous.admitted_count
+    )) throw new ApiError("资讯流水线响应无效", 502);
   }
   if (next.phase !== "trusted_published"
     && next.displayed_trusted_snapshot_id !== previous.displayed_trusted_snapshot_id) {
+    throw new ApiError("资讯流水线响应无效", 502);
+  }
+  if (previous.displayed_trusted_snapshot_id !== null
+    && next.displayed_trusted_snapshot_id === previous.displayed_trusted_snapshot_id
+    && (next.displayed_trusted?.published_at !== previous.displayed_trusted?.published_at
+      || next.displayed_trusted?.event_count !== previous.displayed_trusted?.event_count)) {
     throw new ApiError("资讯流水线响应无效", 502);
   }
 }
@@ -186,8 +209,15 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
     || (status.phase === "trusted_published" && (counts?.raw_event_count ?? 0) > 0 && status.admitted_count === 0),
   );
   const currentTrustedId = status.displayed_trusted_snapshot_id;
+  const inVerificationCopy = currentTrustedId
+    ? "新资讯已抓取，核验处理中；当前显示上一份可信快照。"
+    : "新资讯已抓取，核验处理中；当前尚无可显示的可信快照。";
+  const pendingCopy = `本次已抓取 ${counts?.raw_event_count ?? 0} 条资讯，目前尚无完成核验的内容。待核验资讯可在证据中心查看。`;
+  const ordinaryAnnouncement = status.phase
+    ? `资讯流水线阶段：${STAGES.find((stage) => stage.phase === status.phase)?.label || TERMINAL_LABEL[status.phase] || "状态更新"}`
+    : "资讯流水线状态未载入";
 
-  return <section role="status" aria-label="资讯流水线状态" className="mb-4 overflow-hidden rounded-xl border border-border/65 bg-gradient-to-r from-slate-950/55 via-background/55 to-primary/5">
+  return <section aria-label="资讯流水线状态" className="mb-4 overflow-hidden rounded-xl border border-border/65 bg-gradient-to-r from-slate-950/55 via-background/55 to-primary/5">
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/45 px-3 py-2.5">
       <p className="mr-1 text-xs font-semibold tracking-wide text-foreground">资讯流水线</p>
       <ol className="flex min-w-0 flex-1 flex-wrap items-center gap-1" aria-label="流水线阶段">
@@ -229,9 +259,12 @@ export function NewsPipelineStatus({ status }: { status: NewsPipelineStatusData 
       <SnapshotId label="当前可信快照" value={currentTrustedId} />
     </div>
 
-    {inVerification && <p className="border-t border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">新资讯已抓取，核验处理中；当前显示上一份可信快照。</p>}
-    {pendingEvidence && <p className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">本次已抓取 {counts?.raw_event_count ?? 0} 条资讯，目前尚无完成核验的内容。待核验资讯可在证据中心查看。</p>}
-    {status.phase === "trusted_published" && status.redacted_error === "radar_compatibility_failed" && <p className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{FAILURE_COPY.radar_compatibility_failed}</p>}
-    {(status.phase === "failed" || status.phase === "interrupted") && <p className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">{newsPipelineFailureMessage(status)}</p>}
+    {inVerification && <p role="status" className="border-t border-primary/20 bg-primary/5 px-3 py-2 text-xs text-primary">{inVerificationCopy}</p>}
+    {pendingEvidence && <p role="status" className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{pendingCopy}</p>}
+    {status.phase === "trusted_published" && status.redacted_error === "radar_compatibility_failed" && <p role="status" className="border-t border-warning/25 bg-warning/5 px-3 py-2 text-xs text-warning">{FAILURE_COPY.radar_compatibility_failed}</p>}
+    {(status.phase === "failed" || status.phase === "interrupted") && <p role="alert" className="border-t border-destructive/25 bg-destructive/5 px-3 py-2 text-xs text-destructive">{newsPipelineFailureMessage(status)}</p>}
+    {!inVerification && !pendingEvidence && status.redacted_error !== "radar_compatibility_failed"
+      && status.phase !== "failed" && status.phase !== "interrupted"
+      && <p role="status" className="sr-only">{ordinaryAnnouncement}</p>}
   </section>;
 }

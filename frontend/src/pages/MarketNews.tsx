@@ -60,6 +60,8 @@ const STATUS_LABELS: Record<string, string> = {
   stale: "过期缓存",
   partial: "部分来源可用",
   source_failure: "来源失败",
+  trusted: "可信资讯快照",
+  pipeline_pending: "核验处理中",
 };
 
 const SOURCE_STATE_LABELS: Record<string, string> = {
@@ -69,6 +71,8 @@ const SOURCE_STATE_LABELS: Record<string, string> = {
   stale_cache: "使用过期缓存",
   all_failed: "全部来源失败",
   empty: "等待来源",
+  trusted: "可信快照来源",
+  pipeline_pending: "核验处理中",
 };
 
 const MARKET_NEWS_CACHE_LIMIT = 12;
@@ -118,8 +122,11 @@ function responseMatchesTerminal(
 ): boolean {
   return terminal.phase === "trusted_published"
     && terminal.trusted_snapshot_id !== null
+    && terminal.evidence_snapshot_id !== null
     && response.raw_snapshot_id === terminal.raw_snapshot_id
-    && response.trusted_snapshot_id === terminal.trusted_snapshot_id;
+    && response.evidence_snapshot_id === terminal.evidence_snapshot_id
+    && response.trusted_snapshot_id === terminal.trusted_snapshot_id
+    && response.data_status === "trusted";
 }
 
 function sourceLanguage(event: MarketNewsEvent): string {
@@ -367,12 +374,14 @@ export function MarketNews() {
     setQueryError(null);
     setPipelineStatus(null);
     let failureStage: "pipeline" | "filter" = "pipeline";
+    const lastPipelineStatus = { current: null as NewsPipelineStatusData | null };
     try {
       const terminal = await runNewsPipelineRefresh({
         query,
         signal: controller.signal,
         onStatus: (next) => {
           if (pipelineCycle !== pipelineCycleRef.current || activeQueryKeyRef.current !== queryKey) return;
+          lastPipelineStatus.current = next;
           setPipelineStatus(next);
         },
       });
@@ -397,7 +406,9 @@ export function MarketNews() {
       setQueryError({
         queryKey,
         message: failureStage === "pipeline"
-          ? "资讯流水线状态连接失败；继续显示上一份可信快照。"
+          ? lastPipelineStatus.current?.displayed_trusted_snapshot_id
+            ? "资讯流水线状态连接失败；继续显示上一份可信快照。"
+            : "资讯流水线状态连接失败；当前尚无可显示的可信快照。"
           : sameQueryCache
             ? "最新可信快照已发布，但当前筛选加载失败；继续显示该筛选上次成功结果。"
             : "最新可信快照已发布，但当前筛选加载失败，请稍后重试。",

@@ -73,12 +73,16 @@ function InvestmentNewsPanel() {
     refreshAbortRef.current = controller;
     setRefreshing(true); setErr(null);
     setPipelineStatus(null);
+    const lastPipelineStatus = { current: null as NewsPipelineStatusData | null };
     try {
       const terminal = await runNewsPipelineRefresh({
         signal: controller.signal,
         kickoff: (signal) => api.radarRefresh(signal),
         onStatus: (next) => {
-          if (cycle === refreshCycleRef.current) setPipelineStatus(next);
+          if (cycle === refreshCycleRef.current) {
+            lastPipelineStatus.current = next;
+            setPipelineStatus(next);
+          }
         },
       });
       if (!terminal || cycle !== refreshCycleRef.current || controller.signal.aborted) return;
@@ -97,7 +101,9 @@ function InvestmentNewsPanel() {
       }
     } catch (e) {
       if (cycle === refreshCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
-        setErr("资讯流水线状态连接失败；继续显示上一份可信快照。");
+        setErr(lastPipelineStatus.current?.displayed_trusted_snapshot_id
+          ? "资讯流水线状态连接失败；继续显示上一份可信快照。"
+          : "资讯流水线状态连接失败；当前尚无可显示的可信快照。");
       }
     } finally {
       if (cycle === refreshCycleRef.current) {

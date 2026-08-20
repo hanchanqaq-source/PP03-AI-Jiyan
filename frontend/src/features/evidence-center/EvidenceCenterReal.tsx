@@ -106,7 +106,9 @@ export function EvidenceCenter() {
       }
       return { loaded: true, snapshotId: nextSummary.snapshot_id };
     } catch (error) {
-      if (requestId !== requestRef.current || controller.signal.aborted || isAbortError(error)) return { loaded: false, snapshotId: null };
+      const alreadyAborted = controller.signal.aborted;
+      controller.abort();
+      if (requestId !== requestRef.current || alreadyAborted || isAbortError(error)) return { loaded: false, snapshotId: null };
       setError(failureMessage);
       return { loaded: false, snapshotId: null };
     } finally {
@@ -197,7 +199,9 @@ export function EvidenceCenter() {
     }
     catch (error) {
       if (pipelineCycle === pipelineCycleRef.current && !controller.signal.aborted && !isAbortError(error)) {
-        setNotice("核验流水线状态连接失败；继续显示上次成功快照。");
+        setNotice(summary?.loaded
+          ? "核验流水线状态连接失败；继续显示上次成功快照。"
+          : "核验流水线状态连接失败；当前尚无可显示的成功快照。");
       }
     }
     finally {
