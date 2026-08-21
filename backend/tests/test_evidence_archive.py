@@ -7363,3 +7363,217 @@ def test_archive_allows_benign_public_url_path_material(tmp_path, safe_path):
     ),))))
 
     assert archive.get("a" * 20)["primary_evidence"][0]["canonical_url"] == public_url
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    (
+        "http://224.0.0.1/proof",
+        "http://239.255.255.250/proof",
+        "https://[ff02::1]/proof",
+        "https://[ff0e::1]/proof",
+        "https://[fec0::1]/proof",
+        "https://[::]/proof",
+    ),
+)
+def test_archive_rejects_non_public_unicast_literal_hosts_before_storage(
+    tmp_path,
+    unsafe_url,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="URL"):
+        archive.upsert(snapshot(event(
+            primary_evidence=(evidence_item("unsafe", canonical_url=unsafe_url),),
+        )))
+
+    assert not archive.archive_root.exists()
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    (
+        "https://8.8.8.8/proof",
+        "https://[2606:4700:4700::1111]/proof",
+        "https://official.example.com/proof",
+    ),
+)
+def test_archive_keeps_public_unicast_and_benign_hosts(public_url):
+    assert archive_module._archive_public_url(public_url) == public_url
+
+
+def _archive_projection_bytes(archive: EvidenceArchive) -> dict[str, bytes]:
+    if not archive.archive_root.exists():
+        return {}
+    return {
+        path.relative_to(archive.archive_root).as_posix(): path.read_bytes()
+        for path in sorted(archive.archive_root.rglob("*"))
+        if path.is_file() and path != archive.lock_path
+    }
+
+
+@pytest.mark.parametrize(
+    ("dimension", "constant_name"),
+    (
+        ("bytes", "_MAX_SCAN_BYTES"),
+        ("rows", "_MAX_SCAN_ROWS"),
+        ("nodes", "_MAX_SCAN_NODES"),
+        ("files", "_MAX_SCAN_FILES"),
+    ),
+)
+def test_archive_preflights_complete_target_scan_budget_before_prepared_state(
+    tmp_path,
+    monkeypatch,
+    dimension,
+    constant_name,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    before = _archive_projection_bytes(archive)
+    before_rows = archive.query(days=90)
+
+    initial_budget = archive_module._new_scan_budget()
+    remaining = dict(initial_budget)
+    diagnostics = archive._diagnostics()
+    state = archive._read_authority_state(
+        NOW,
+        diagnostics=diagnostics,
+        budget=remaining,
+    )
+    assert state is not None
+    archive._validate_finalized_authority(
+        state,
+        now=NOW,
+        diagnostics=diagnostics,
+        budget=remaining,
+    )
+    base_consumption = initial_budget[dimension] - remaining[dimension]
+    assert base_consumption > 0
+
+    original_limit = getattr(archive_module, constant_name)
+    monkeypatch.setattr(archive_module, constant_name, base_consumption)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+    monkeypatch.setattr(archive_module, constant_name, original_limit)
+    assert archive.query(days=90) == before_rows
+
+
+@pytest.mark.parametrize(
+    ("dimension", "constant_name"),
+    (
+        ("bytes", "_MAX_CAS_BYTES"),
+        ("files", "_MAX_CAS_FILES"),
+    ),
+)
+def test_archive_preflights_scaled_cas_work_before_first_state_write(
+    tmp_path,
+    monkeypatch,
+    dimension,
+    constant_name,
+):
+    selected = _two_bucket_snapshot()
+    probe = EvidenceArchive(tmp_path / "probe", now=lambda: NOW)
+    _leave_inline_state_before_bucket(probe, monkeypatch, selected)
+    prepared_size = probe.state_path.stat().st_size
+
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    limit = prepared_size * 4 if dimension == "bytes" else 4
+    monkeypatch.setattr(archive_module, constant_name, limit)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(selected)
+
+    assert writes == []
+    assert not archive.state_path.exists()
+    assert not archive.index_path.exists()
+    assert not list(archive.archive_root.glob("*.jsonl"))
+
+
+def test_archive_default_cas_budget_commits_2400_events_across_ninety_buckets(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    summary = "公开摘要" + "证据" * 300
+    selected = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="w" * 20,
+        generated_at=NOW,
+        events=tuple(
+            event(
+                f"{number:020x}",
+                published_at=NOW - timedelta(days=number % 90),
+                summary=summary,
+            )
+            for number in range(2_400)
+        ),
+    )
+
+    archive.upsert(selected)
+
+    state = json.loads(archive.state_path.read_text(encoding="utf-8"))
+    assert state["phase"] == "finalized"
+    assert archive.count() == 2_400
+    assert len(list(archive.archive_root.glob("*.jsonl"))) == 90
+
+
+@pytest.mark.parametrize("corrupt_kind", ("malformed_json", "future_schema"))
+def test_archive_rejects_corrupt_only_target_bucket_before_prepared_state(
+    tmp_path,
+    monkeypatch,
+    corrupt_kind,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target = archive.archive_root / "2026-08-19.jsonl"
+    if corrupt_kind == "malformed_json":
+        payload = b'{"schema_version":2,"broken":}\n'
+    else:
+        source = json.loads(
+            (archive.archive_root / "2026-08-20.jsonl").read_text(encoding="utf-8")
+        )
+        source["event_id"] = "z" * 20
+        source["schema_version"] = 99
+        payload = (
+            json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+    target.write_bytes(payload)
+    before = _archive_projection_bytes(archive)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, encoded: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, encoded, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]

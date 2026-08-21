@@ -666,7 +666,19 @@ def _public_host(host: str) -> tuple[str, bool]:
             or address in _IPV4_COMPATIBLE_NETWORK
         ):
             raise ValueError("invalid archive evidence URL")
-    if not address.is_global:
+    if (
+        address.is_multicast
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_private
+        or address.is_reserved
+        or (
+            isinstance(address, ipaddress.IPv6Address)
+            and address.is_site_local
+        )
+        or not address.is_global
+    ):
         raise ValueError("invalid archive evidence URL")
     return address.compressed.casefold(), isinstance(address, ipaddress.IPv6Address)
 
@@ -2721,6 +2733,59 @@ class EvidenceArchive:
         except (KeyError, OSError, TypeError):
             return False
 
+    def _read_record_metadata_is_current(
+        self,
+        path: Path,
+        record: dict[str, object] | None,
+    ) -> bool:
+        if record is None:
+            return not self._entry_present(path)
+        descriptor: int | None = None
+        identity: tuple[int, int] | None = None
+        try:
+            expected = self._read_record(
+                metadata=record["metadata"],
+                descriptor_metadata=record["descriptor_metadata"],
+                payload_digest=record["payload_digest"],
+                semantic_digest=record["semantic_digest"],
+            )
+            before = self._safe_file(path)
+            if before is None or _file_signature(before) != expected["metadata"]:
+                return False
+            self._verify_parent(path)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino)
+            final_path = path.stat(follow_symlinks=False)
+            final_descriptor = os.fstat(descriptor)
+            return (
+                identity == expected["metadata"][:2]
+                and _file_signature(opened) == expected["descriptor_metadata"]
+                and _file_signature(final_descriptor) == expected["descriptor_metadata"]
+                and _file_signature(final_path) == expected["metadata"]
+                and stat.S_ISREG(opened.st_mode)
+                and stat.S_ISREG(final_descriptor.st_mode)
+                and stat.S_ISREG(final_path.st_mode)
+                and opened.st_nlink == 1
+                and final_descriptor.st_nlink == 1
+                and final_path.st_nlink == 1
+                and not getattr(opened, "st_reparse_tag", 0)
+                and not getattr(final_descriptor, "st_reparse_tag", 0)
+                and not getattr(final_path, "st_reparse_tag", 0)
+            )
+        except (KeyError, OSError, TypeError):
+            return False
+        finally:
+            if descriptor is not None:
+                if identity is None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                else:
+                    _close_owned_descriptor(descriptor, identity)
+
     def _bind_written_record(
         self,
         path: Path,
@@ -2774,6 +2839,127 @@ class EvidenceArchive:
             budget=budget,
         )
 
+    def _index_record_metadata_is_current(
+        self,
+        record: dict[str, Any] | None,
+    ) -> bool:
+        if record is None:
+            return not self._entry_present(self.index_path)
+        try:
+            return self._read_record_metadata_is_current(
+                self.index_path,
+                record["read_record"],
+            )
+        except (KeyError, OSError, TypeError):
+            return False
+
+    def _record_content_size(
+        self,
+        record: dict[str, object] | None,
+    ) -> int | None:
+        if record is None:
+            return None
+        expected = self._read_record(
+            metadata=record["metadata"],
+            descriptor_metadata=record["descriptor_metadata"],
+            payload_digest=record["payload_digest"],
+            semantic_digest=record["semantic_digest"],
+        )
+        size = expected["metadata"][2]
+        if (
+            type(size) is not int
+            or size < 0
+            or expected["descriptor_metadata"][2] != size
+        ):
+            raise OSError("storage_corrupt")
+        return size
+
+    def _index_record_content_size(
+        self,
+        record: dict[str, Any] | None,
+    ) -> int | None:
+        if record is None:
+            return None
+        try:
+            return self._record_content_size(record["read_record"])
+        except (KeyError, TypeError):
+            raise OSError("storage_corrupt") from None
+
+    def _preflight_cas_transaction(
+        self,
+        *,
+        state_record: dict[str, object] | None,
+        prepared_payload: bytes | None,
+        index_record: dict[str, Any] | None,
+        index_payload: bytes,
+        index_needs_write: bool,
+        bucket_records: dict[str, dict[str, object] | None],
+        bucket_payloads: dict[str, bytes],
+        write_names: Iterator[str] | list[str] | set[str] | tuple[str, ...],
+        journal_record: dict[str, object] | None | object,
+        cas_budget: dict[str, int],
+    ) -> dict[str, int]:
+        required = {"bytes": 0, "files": 0}
+
+        def add_size(size: int | None, multiplier: int = 1) -> None:
+            if size is None:
+                return
+            if type(size) is not int or size < 0 or multiplier < 1:
+                raise OSError("storage_corrupt")
+            required["bytes"] += size * multiplier
+            required["files"] += multiplier
+
+        def add_full_assertion(
+            state_size: int | None,
+            index_size: int | None,
+            bucket_sizes: dict[str, int | None],
+        ) -> None:
+            add_size(state_size, 2)
+            add_size(index_size, 2)
+            for size in bucket_sizes.values():
+                add_size(size, 2)
+            if journal_record is not _UNBOUND_READ_RECORD:
+                add_size(
+                    self._record_content_size(journal_record),
+                    3,
+                )
+
+        state_size = self._record_content_size(state_record)
+        index_size = self._index_record_content_size(index_record)
+        bucket_sizes = {
+            name: self._record_content_size(record)
+            for name, record in sorted(bucket_records.items())
+        }
+        selected_writes = self._bounded_bucket_candidates(write_names)
+        if any(name not in bucket_sizes or name not in bucket_payloads for name in selected_writes):
+            raise OSError("storage_corrupt")
+
+        add_full_assertion(state_size, index_size, bucket_sizes)
+        if prepared_payload is not None:
+            add_size(len(prepared_payload))
+            state_size = len(prepared_payload)
+            add_full_assertion(state_size, index_size, bucket_sizes)
+        for name in sorted(selected_writes):
+            # The stage authority and index receive two no-follow metadata
+            # checks here.  Only the target content is rehashed immediately
+            # beside its mutation; complete content barriers surround the
+            # bucket phase and both publication phases.
+            add_size(bucket_sizes[name], 2)
+            add_size(len(bucket_payloads[name]))
+            bucket_sizes[name] = len(bucket_payloads[name])
+        add_full_assertion(state_size, index_size, bucket_sizes)
+        if index_needs_write:
+            add_size(len(index_payload))
+            index_size = len(index_payload)
+        add_full_assertion(state_size, index_size, bucket_sizes)
+        if any(
+            type(cas_budget.get(key)) is not int
+            or required[key] > cas_budget[key]
+            for key in ("bytes", "files")
+        ):
+            raise OSError("storage_corrupt")
+        return required
+
     def _assert_prewrite_authority_is_current(
         self,
         *,
@@ -2783,6 +2969,7 @@ class EvidenceArchive:
         journal_record: dict[str, object] | None | object = _UNBOUND_READ_RECORD,
         bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] | None = None,
         cas_budget: dict[str, int] | None = None,
+        metadata_only_static: bool = False,
     ) -> None:
         budget = _new_cas_budget() if cas_budget is None else cas_budget
         requested_names = None if bucket_names is None else set(bucket_names)
@@ -2794,29 +2981,57 @@ class EvidenceArchive:
         if requested_names is not None and len(selected) != len(requested_names):
             raise OSError("storage_corrupt")
         for _round in range(2):
-            if not self._state_read_record_is_current(state_record, budget=budget):
+            state_current = (
+                self._read_record_metadata_is_current(self.state_path, state_record)
+                if metadata_only_static
+                else self._state_read_record_is_current(state_record, budget=budget)
+            )
+            if not state_current:
                 raise OSError("storage_corrupt")
-            if journal_record is not _UNBOUND_READ_RECORD and not self._read_record_is_current(
-                self.journal_path,
-                journal_record,
-                _MAX_JOURNAL_BYTES,
-                budget=budget,
-            ):
-                raise OSError("storage_corrupt")
-            if not self._index_record_is_current(index_record, budget=budget):
+            if journal_record is not _UNBOUND_READ_RECORD:
+                journal_current = (
+                    self._read_record_metadata_is_current(
+                        self.journal_path,
+                        journal_record,
+                    )
+                    if metadata_only_static
+                    else self._read_record_is_current(
+                        self.journal_path,
+                        journal_record,
+                        _MAX_JOURNAL_BYTES,
+                        budget=budget,
+                    )
+                )
+                if not journal_current:
+                    raise OSError("storage_corrupt")
+            index_current = (
+                self._index_record_metadata_is_current(index_record)
+                if metadata_only_static
+                else self._index_record_is_current(index_record, budget=budget)
+            )
+            if not index_current:
                 raise OSError("storage_corrupt")
             if not self._bucket_mutation_records_are_current(selected, budget=budget):
                 raise OSError("storage_corrupt")
         # Keep legacy takeover bound immediately beside the following write.
         # A non-cooperating process can still race the eventual replace syscall;
         # the next guard/final validation detects that bounded filesystem edge.
-        if journal_record is not _UNBOUND_READ_RECORD and not self._read_record_is_current(
-            self.journal_path,
-            journal_record,
-            _MAX_JOURNAL_BYTES,
-            budget=budget,
-        ):
-            raise OSError("storage_corrupt")
+        if journal_record is not _UNBOUND_READ_RECORD:
+            journal_current = (
+                self._read_record_metadata_is_current(
+                    self.journal_path,
+                    journal_record,
+                )
+                if metadata_only_static
+                else self._read_record_is_current(
+                    self.journal_path,
+                    journal_record,
+                    _MAX_JOURNAL_BYTES,
+                    budget=budget,
+                )
+            )
+            if not journal_current:
+                raise OSError("storage_corrupt")
 
     def _atomic_write(self, path: Path, payload: bytes, maximum: int) -> tuple[int, int]:
         if len(payload) > maximum:
@@ -2918,9 +3133,27 @@ class EvidenceArchive:
         observed_digests: dict[str, str] | None = None,
         expected_digests: set[str] | None = None,
         observed_records: dict[str, dict[str, object] | None] | None = None,
+        observed_costs: dict[str, dict[str, int]] | None = None,
     ) -> list[dict[str, Any]]:
         if not _valid_bucket_name(name):
             raise ValueError("invalid archive bucket name")
+        starting_budget = None if budget is None else dict(budget)
+
+        def bind_scan_cost() -> None:
+            if observed_costs is None:
+                return
+            cost = (
+                {"bytes": 0, "rows": 0, "nodes": 0, "files": 0}
+                if starting_budget is None or budget is None
+                else {
+                    key: starting_budget[key] - budget[key]
+                    for key in ("bytes", "rows", "nodes", "files")
+                }
+            )
+            if name in observed_costs and observed_costs[name] != cost:
+                raise OSError("storage_corrupt")
+            observed_costs[name] = cost
+
         path = self.archive_root / name
         maximum = _MAX_BUCKET_BYTES
         if budget is not None:
@@ -2945,6 +3178,7 @@ class EvidenceArchive:
                     observed_digests[name] = _MISSING_DIGEST
                 if observed_records is not None:
                     self._bind_read_record(observed_records, name, None)
+            bind_scan_cost()
             return []
         if len(observed_metadata) != 1 or len(observed_descriptor_metadata) != 1:
             raise OSError("storage_corrupt")
@@ -3100,6 +3334,7 @@ class EvidenceArchive:
                     semantic_digest=resolved_digest,
                 ),
             )
+        bind_scan_cost()
         return rows
 
     def _bucket_names(
@@ -3467,6 +3702,196 @@ class EvidenceArchive:
             raise ValueError("archive state is too large")
         self._parse_authority_state(document, now=_utc(self._now(), "archive clock"))
         return payload
+
+    @staticmethod
+    def _consume_scan_cost(
+        budget: dict[str, int],
+        cost: dict[str, int],
+    ) -> None:
+        for key in ("bytes", "rows", "nodes", "files"):
+            amount = cost.get(key)
+            if (
+                type(amount) is not int
+                or amount < 0
+                or type(budget.get(key)) is not int
+                or amount > budget[key]
+            ):
+                raise OSError("storage_corrupt")
+        for key in ("bytes", "rows", "nodes", "files"):
+            budget[key] -= cost[key]
+
+    def _document_scan_cost(
+        self,
+        payload: bytes,
+        *,
+        maximum: int,
+        row_count: int,
+    ) -> dict[str, int]:
+        if type(payload) is not bytes or len(payload) > maximum:
+            raise OSError("storage_corrupt")
+        try:
+            document = self._parse_json(payload)
+            _document_bytes, nodes = _json_metrics(
+                document,
+                maximum_bytes=maximum,
+                maximum_nodes=_MAX_SCAN_NODES,
+            )
+        except (
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            RecursionError,
+            json.JSONDecodeError,
+        ):
+            raise OSError("storage_corrupt") from None
+        if type(row_count) is not int or row_count < 0:
+            raise OSError("storage_corrupt")
+        return {
+            "bytes": len(payload),
+            "rows": row_count,
+            "nodes": nodes,
+            "files": 1,
+        }
+
+    def _canonical_bucket_scan_cost(
+        self,
+        name: str,
+        rows: list[dict[str, Any]],
+        payload: bytes,
+    ) -> dict[str, int]:
+        if self._bucket_payload(name, rows) != payload:
+            raise OSError("storage_corrupt")
+        nodes = 0
+        try:
+            for row in rows:
+                _row_bytes, row_nodes = _json_metrics(
+                    row,
+                    maximum_bytes=_MAX_ROW_BYTES,
+                    maximum_nodes=_MAX_SCAN_NODES - nodes,
+                )
+                nodes += row_nodes
+        except ValueError:
+            raise OSError("storage_corrupt") from None
+        return {
+            "bytes": len(payload),
+            "rows": len(rows),
+            "nodes": nodes,
+            "files": 1,
+        }
+
+    def _preflight_target_finalized_scan(
+        self,
+        *,
+        finalized_payload: bytes,
+        index_payload: bytes,
+        target_index: dict[str, str],
+        scan_bucket_records: dict[str, dict[str, object] | None],
+        scan_bucket_costs: dict[str, dict[str, int]],
+        scan_bucket_rows: dict[str, list[dict[str, Any]]],
+        bucket_payloads: dict[str, bytes],
+        written_names: Iterator[str] | list[str] | set[str] | tuple[str, ...],
+        now: datetime,
+        budget: dict[str, int],
+    ) -> dict[str, int]:
+        remaining = dict(budget)
+        try:
+            finalized = self._parse_authority_state(
+                self._parse_json(finalized_payload),
+                now=now,
+            )
+        except (
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            RecursionError,
+            json.JSONDecodeError,
+        ):
+            raise OSError("storage_corrupt") from None
+        if finalized["legacy"] or finalized["phase"] != "finalized":
+            raise OSError("storage_corrupt")
+        self._consume_scan_cost(
+            remaining,
+            self._document_scan_cost(
+                finalized_payload,
+                maximum=_MAX_STATE_BYTES,
+                row_count=0,
+            ),
+        )
+        expected_index_payload = self._index_payload(target_index)
+        if expected_index_payload != index_payload:
+            raise OSError("storage_corrupt")
+        self._consume_scan_cost(
+            remaining,
+            {
+                "bytes": len(index_payload),
+                "rows": len(target_index),
+                "nodes": 5 + 2 * len(target_index),
+                "files": 1,
+            },
+        )
+
+        selected_writes = self._bounded_bucket_candidates(written_names)
+        active_cutoff = _shift_days(now, -90)
+        active_upper = _shift_datetime(now, _MAX_CLOCK_SKEW)
+        manifest_names = {
+            name
+            for name in finalized["target_bucket_digests"]
+            if _bucket_name_in_window(name, active_cutoff, active_upper)
+        }
+        discovered_names = {
+            name
+            for name, record in scan_bucket_records.items()
+            if record is not None
+            and _bucket_name_in_window(name, active_cutoff, active_upper)
+        }
+        discovered_names.update(
+            name
+            for name in selected_writes
+            if _bucket_name_in_window(name, active_cutoff, active_upper)
+        )
+        scan_names = self._bounded_bucket_candidates(
+            manifest_names,
+            discovered_names,
+        )
+        for name in sorted(scan_names):
+            if name in selected_writes:
+                try:
+                    rows = scan_bucket_rows[name]
+                    payload = bucket_payloads[name]
+                except KeyError:
+                    raise OSError("storage_corrupt") from None
+                cost = self._canonical_bucket_scan_cost(name, rows, payload)
+            else:
+                try:
+                    cost = scan_bucket_costs[name]
+                except KeyError:
+                    raise OSError("storage_corrupt") from None
+            self._consume_scan_cost(remaining, cost)
+        return {
+            key: budget[key] - remaining[key]
+            for key in ("bytes", "rows", "nodes", "files")
+        }
+
+    def _preflight_archive_directory_entries(
+        self,
+        planned_paths: Iterator[Path] | list[Path] | set[Path] | tuple[Path, ...],
+    ) -> None:
+        current_names: set[str] = set()
+        try:
+            with os.scandir(self.archive_root) as entries:
+                for entry in entries:
+                    current_names.add(entry.name)
+                    if len(current_names) > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                        raise OSError("storage_corrupt")
+        except OSError:
+            raise OSError("storage_corrupt") from None
+        planned_names = {
+            path.name
+            for path in planned_paths
+            if path.parent == self.archive_root
+        }
+        if len(current_names | planned_names) > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+            raise OSError("storage_corrupt")
 
     @staticmethod
     def _bucket_digest_map(value: object) -> dict[str, str]:
@@ -4214,6 +4639,7 @@ class EvidenceArchive:
         strict_rows: bool = True,
         expected_digests: dict[str, set[str]] | None = None,
         observed_records: dict[str, dict[str, object] | None] | None = None,
+        observed_costs: dict[str, dict[str, int]] | None = None,
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
         dict[str, str],
@@ -4243,6 +4669,7 @@ class EvidenceArchive:
                     else expected_digests.get(name)
                 ),
                 observed_records=observed_records,
+                observed_costs=observed_costs,
             )
             bucket_rows[name] = rows
             for row in rows:
@@ -4261,6 +4688,7 @@ class EvidenceArchive:
         budget: dict[str, int],
         observed_index_record: list[dict[str, Any]] | None = None,
         observed_bucket_records: dict[str, dict[str, object] | None] | None = None,
+        observed_bucket_costs: dict[str, dict[str, int]] | None = None,
         prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
     ) -> tuple[
         dict[str, list[dict[str, Any]]],
@@ -4314,6 +4742,7 @@ class EvidenceArchive:
                 strict_rows=False,
                 validation_now=now,
                 observed_records=observed_bucket_records,
+                observed_costs=observed_bucket_costs,
             )
             if any(
                 active_cutoff <= _event_time(row) <= active_upper
@@ -4331,6 +4760,7 @@ class EvidenceArchive:
                 for name, digest in active_manifest.items()
             },
             observed_records=observed_bucket_records,
+            observed_costs=observed_bucket_costs,
         )
         if observed != active_manifest:
             self._last_diagnostics = diagnostics
@@ -4352,6 +4782,7 @@ class EvidenceArchive:
                 strict_rows=False,
                 validation_now=now,
                 observed_records=observed_bucket_records,
+                observed_costs=observed_bucket_costs,
             )
             if any(active_cutoff <= _event_time(row) <= active_upper for row in prospective_rows):
                 raise OSError("storage_corrupt")
@@ -4368,6 +4799,7 @@ class EvidenceArchive:
         preloaded_observed: dict[str, str] | None = None,
         preloaded_locations: dict[str, set[str]] | None = None,
         preloaded_bucket_records: dict[str, dict[str, object] | None] | None = None,
+        preloaded_bucket_costs: dict[str, dict[str, int]] | None = None,
         physical_index_record: dict[str, Any] | None,
         journal_record: dict[str, object] | None | object = _UNBOUND_READ_RECORD,
         cas_budget: dict[str, int] | None = None,
@@ -4384,6 +4816,7 @@ class EvidenceArchive:
             preloaded_observed is not None,
             preloaded_locations is not None,
             preloaded_bucket_records is not None,
+            preloaded_bucket_costs is not None,
         )
         if any(supplied) and not all(supplied):
             raise OSError("storage_corrupt")
@@ -4391,6 +4824,10 @@ class EvidenceArchive:
             all_bucket_rows = dict(preloaded_bucket_rows or {})
             all_observed = dict(preloaded_observed or {})
             all_bucket_records = dict(preloaded_bucket_records or {})
+            all_bucket_costs = {
+                name: dict(cost)
+                for name, cost in (preloaded_bucket_costs or {}).items()
+            }
             calculated_locations: dict[str, set[str]] = {}
             for name, rows in all_bucket_rows.items():
                 for row in rows:
@@ -4399,6 +4836,7 @@ class EvidenceArchive:
                 raise OSError("storage_corrupt")
         else:
             all_bucket_records: dict[str, dict[str, object] | None] = {}
+            all_bucket_costs: dict[str, dict[str, int]] = {}
             all_bucket_rows, all_observed, _all_existing, _all_locations = self._read_all_buckets(
                 now=now,
                 diagnostics=diagnostics,
@@ -4414,6 +4852,7 @@ class EvidenceArchive:
                     for name in required
                 },
                 observed_records=all_bucket_records,
+                observed_costs=all_bucket_costs,
             )
         discovered = {
             name
@@ -4503,6 +4942,8 @@ class EvidenceArchive:
             raise OSError("storage_corrupt")
         target_bucket_rows = dict(bucket_rows)
         target_bucket_rows.update(planned_rows)
+        scan_bucket_rows = dict(all_bucket_rows)
+        scan_bucket_rows.update(planned_rows)
         self._validate_index_projection(
             state["target_index"],
             target_bucket_rows,
@@ -4535,10 +4976,72 @@ class EvidenceArchive:
                 name: all_bucket_records[name]
                 for name in sorted(mutation_names)
             },
+            "scan_bucket_records": all_bucket_records,
+            "scan_bucket_costs": all_bucket_costs,
+            "scan_bucket_rows": scan_bucket_rows,
             "journal_record": journal_record,
             "cas_budget": _new_cas_budget() if cas_budget is None else cas_budget,
             "mutation_bytes": mutation_bytes,
         }
+
+    def _preflight_recovery_plan(
+        self,
+        state: dict[str, Any],
+        recovery_plan: dict[str, Any],
+        *,
+        now: datetime,
+        budget: dict[str, int],
+        state_record: dict[str, object] | None,
+        prepared_payload: bytes | None,
+    ) -> set[str]:
+        try:
+            write_names = {
+                name
+                for name in recovery_plan["affected"]
+                if recovery_plan["observed"][name]
+                != state["target_bucket_digests"][name]
+            }
+            actual_index_digest = recovery_plan["actual_index_digest"]
+            index_needs_write = actual_index_digest != state["target_index_digest"]
+            self._preflight_target_finalized_scan(
+                finalized_payload=recovery_plan["finalized_payload"],
+                index_payload=recovery_plan["index_payload"],
+                target_index=state["target_index"],
+                scan_bucket_records=recovery_plan["scan_bucket_records"],
+                scan_bucket_costs=recovery_plan["scan_bucket_costs"],
+                scan_bucket_rows=recovery_plan["scan_bucket_rows"],
+                bucket_payloads=recovery_plan["bucket_payloads"],
+                written_names=write_names,
+                now=now,
+                budget=dict(budget),
+            )
+            self._preflight_cas_transaction(
+                state_record=state_record,
+                prepared_payload=prepared_payload,
+                index_record=recovery_plan["physical_index_record"],
+                index_payload=recovery_plan["index_payload"],
+                index_needs_write=index_needs_write,
+                bucket_records=recovery_plan["bucket_records"],
+                bucket_payloads=recovery_plan["bucket_payloads"],
+                write_names=write_names,
+                journal_record=recovery_plan["journal_record"],
+                cas_budget=recovery_plan["cas_budget"],
+            )
+            self._preflight_archive_directory_entries([
+                self.state_path,
+                *(
+                    [self.index_path]
+                    if index_needs_write
+                    else []
+                ),
+                *(
+                    self.archive_root / name
+                    for name in sorted(write_names)
+                ),
+            ])
+            return write_names
+        except (KeyError, TypeError):
+            raise OSError("storage_corrupt") from None
 
     def _recover_prepared_authority(
         self,
@@ -4576,6 +5079,14 @@ class EvidenceArchive:
         except KeyError:
             raise OSError("storage_corrupt") from None
         index_record = recovery_plan["physical_index_record"]
+        write_names = self._preflight_recovery_plan(
+            state,
+            recovery_plan,
+            now=now,
+            budget=budget,
+            state_record=state_record,
+            prepared_payload=None,
+        )
         self._assert_prewrite_authority_is_current(
             state_record=state_record,
             index_record=index_record,
@@ -4584,7 +5095,7 @@ class EvidenceArchive:
             cas_budget=cas_budget,
         )
         for name in sorted(affected):
-            if observed[name] != state["target_bucket_digests"][name]:
+            if name in write_names:
                 self._assert_prewrite_authority_is_current(
                     state_record=state_record,
                     index_record=index_record,
@@ -4592,6 +5103,7 @@ class EvidenceArchive:
                     journal_record=journal_record,
                     bucket_names=(name,),
                     cas_budget=cas_budget,
+                    metadata_only_static=True,
                 )
                 self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
                 bucket_records[name] = self._bind_written_record(
@@ -4710,6 +5222,14 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
+        self._preflight_recovery_plan(
+            prepared,
+            recovery_plan,
+            now=now,
+            budget=budget,
+            state_record=None,
+            prepared_payload=prepared_payload,
+        )
         self._assert_prewrite_authority_is_current(
             state_record=None,
             index_record=recovery_plan["physical_index_record"],
@@ -4747,12 +5267,18 @@ class EvidenceArchive:
         diagnostics: dict[str, int],
         budget: dict[str, int],
         observed_bucket_records: dict[str, dict[str, object] | None] | None = None,
+        observed_bucket_costs: dict[str, dict[str, int]] | None = None,
         observed_journal_record: list[dict[str, object] | None] | None = None,
         prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         bucket_read_records = (
             observed_bucket_records
             if observed_bucket_records is not None
+            else {}
+        )
+        bucket_scan_costs = (
+            observed_bucket_costs
+            if observed_bucket_costs is not None
             else {}
         )
         try:
@@ -4848,6 +5374,7 @@ class EvidenceArchive:
                     for name in journal["target_bucket_digests"]
                 },
                 observed_records=bucket_read_records,
+                observed_costs=bucket_scan_costs,
             )
             self._validate_journal_bucket_state(journal, journal_observed)
             if journal["native_schema_version"] == _PREVIOUS_JOURNAL_SCHEMA_VERSION:
@@ -4885,11 +5412,20 @@ class EvidenceArchive:
                 preloaded_observed=journal_observed,
                 preloaded_locations=journal_locations,
                 preloaded_bucket_records=bucket_read_records,
+                preloaded_bucket_costs=bucket_scan_costs,
                 physical_index_record=physical_index_record,
                 journal_record=journal_record,
             )
             if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
                 raise OSError("storage_corrupt")
+            self._preflight_recovery_plan(
+                prepared,
+                recovery_plan,
+                now=now,
+                budget=budget,
+                state_record=state_record,
+                prepared_payload=prepared_payload,
+            )
             self._assert_prewrite_authority_is_current(
                 state_record=state_record,
                 index_record=recovery_plan["physical_index_record"],
@@ -4951,6 +5487,7 @@ class EvidenceArchive:
                 else None
             ),
             observed_records=bucket_read_records,
+            observed_costs=bucket_scan_costs,
         )
         cutoff = _shift_days(now, -90)
         authority_upper = _shift_datetime(now, _MAX_CLOCK_SKEW)
@@ -5101,11 +5638,20 @@ class EvidenceArchive:
             preloaded_observed=observed,
             preloaded_locations=locations,
             preloaded_bucket_records=bucket_read_records,
+            preloaded_bucket_costs=bucket_scan_costs,
             physical_index_record=physical_index_record,
             journal_record=journal_record,
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
+        self._preflight_recovery_plan(
+            prepared,
+            recovery_plan,
+            now=now,
+            budget=budget,
+            state_record=state_record,
+            prepared_payload=prepared_payload,
+        )
         self._assert_prewrite_authority_is_current(
             state_record=state_record,
             index_record=recovery_plan["physical_index_record"],
@@ -5155,6 +5701,7 @@ class EvidenceArchive:
             diagnostics = self._diagnostics()
             budget = _new_scan_budget()
             bucket_read_records: dict[str, dict[str, object] | None] = {}
+            bucket_scan_costs: dict[str, dict[str, int]] = {}
             takeover_journal_record: dict[str, object] | None | object = _UNBOUND_READ_RECORD
             state = self._read_authority_state(
                 archived_at,
@@ -5170,6 +5717,7 @@ class EvidenceArchive:
                     diagnostics=diagnostics,
                     budget=budget,
                     observed_bucket_records=bucket_read_records,
+                    observed_bucket_costs=bucket_scan_costs,
                     observed_journal_record=migration_journal_records,
                     prospective_bucket_names=incoming_target_names,
                 )
@@ -5179,6 +5727,7 @@ class EvidenceArchive:
                     takeover_journal_record = migration_journal_records[0]
                 if state is not None or previous_state is not None:
                     bucket_read_records = {}
+                    bucket_scan_costs = {}
             if state is not None and state["phase"] == "prepared":
                 self._recover_prepared_authority(
                     state,
@@ -5194,6 +5743,7 @@ class EvidenceArchive:
                     budget=budget,
                 )
                 bucket_read_records = {}
+                bucket_scan_costs = {}
 
             if state is None:
                 if self._entry_present(self.index_path) or self._bucket_names(diagnostics=diagnostics):
@@ -5218,6 +5768,7 @@ class EvidenceArchive:
                     budget=budget,
                     observed_index_record=observed_index_records,
                     observed_bucket_records=bucket_read_records,
+                    observed_bucket_costs=bucket_scan_costs,
                     prospective_bucket_names=incoming_target_names,
                 )
                 if len(observed_index_records) != 1:
@@ -5242,10 +5793,22 @@ class EvidenceArchive:
                             strict_rows=False,
                             validation_now=archived_at,
                             observed_records=bucket_read_records,
+                            observed_costs=bucket_scan_costs,
                         )
                         if prospective_rows:
                             raise OSError("storage_corrupt")
                 record = bucket_read_records[name]
+                if (
+                    name not in observed_bucket_digests
+                    and record is not None
+                    and record["payload_digest"] != self._payload_digest(b"")
+                ):
+                    # A tolerated unmanifested corrupt-only file has no
+                    # canonical base projection.  Encoding its raw digest as
+                    # the prepared base would make crash recovery parse those
+                    # same bytes strictly and strand the transaction.  Reject
+                    # the target before the prepared authority is published.
+                    raise OSError("storage_corrupt")
                 observed_bucket_digests.setdefault(
                     name,
                     _MISSING_DIGEST if record is None else str(record["semantic_digest"]),
@@ -5362,6 +5925,39 @@ class EvidenceArchive:
                 if state is None
                 else _UNBOUND_READ_RECORD
             )
+            write_order = sorted(target_names) + sorted(affected - target_names)
+            self._preflight_target_finalized_scan(
+                finalized_payload=finalized_payload,
+                index_payload=index_payload,
+                target_index=planned_index,
+                scan_bucket_records=bucket_read_records,
+                scan_bucket_costs=bucket_scan_costs,
+                scan_bucket_rows=target_bucket_rows,
+                bucket_payloads=bucket_payloads,
+                written_names=write_order,
+                now=archived_at,
+                budget=_new_scan_budget(),
+            )
+            self._preflight_cas_transaction(
+                state_record=expected_state_record,
+                prepared_payload=prepared_payload,
+                index_record=expected_index_record,
+                index_payload=index_payload,
+                index_needs_write=True,
+                bucket_records=bucket_records,
+                bucket_payloads=bucket_payloads,
+                write_names=write_order,
+                journal_record=journal_record,
+                cas_budget=cas_budget,
+            )
+            self._preflight_archive_directory_entries([
+                self.state_path,
+                self.index_path,
+                *(
+                    self.archive_root / name
+                    for name in write_order
+                ),
+            ])
             self._assert_prewrite_authority_is_current(
                 state_record=expected_state_record,
                 index_record=expected_index_record,
@@ -5382,7 +5978,6 @@ class EvidenceArchive:
                 journal_record=journal_record,
                 cas_budget=cas_budget,
             )
-            write_order = sorted(target_names) + sorted(affected - target_names)
             for name in write_order:
                 self._assert_prewrite_authority_is_current(
                     state_record=prepared["_read_record"],
@@ -5391,6 +5986,7 @@ class EvidenceArchive:
                     journal_record=journal_record,
                     bucket_names=(name,),
                     cas_budget=cas_budget,
+                    metadata_only_static=True,
                 )
                 self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
                 bucket_records[name] = self._bind_written_record(
