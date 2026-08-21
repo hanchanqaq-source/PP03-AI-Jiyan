@@ -86,9 +86,19 @@ _ARCHIVE_KEYS = _EVENT_KEYS | {
 }
 _LEGACY_ARCHIVE_KEYS = _ARCHIVE_KEYS - {"content_digest"}
 _LINEAGE_KEYS = {"evidence_snapshot_id", "raw_snapshot_id", "generated_at", "content_digest"}
+_RECOVERED_LINEAGE_KEYS = _LINEAGE_KEYS | {"recovery"}
 _LEGACY_LINEAGE_KEYS = _LINEAGE_KEYS - {"content_digest"}
 _MIGRATED_LINEAGE_KEYS = _LINEAGE_KEYS | {"legacy_v1", "legacy_projection_digest"}
 _UNVERIFIABLE_MIGRATED_LINEAGE_KEYS = _MIGRATED_LINEAGE_KEYS | {"legacy_unverifiable"}
+_RECOVERY_PROVENANCE_KEYS = {"source", "status", "recovered_at", "source_snapshot_id"}
+_RECOVERY_SOURCES = {
+    "radar_cache",
+    "evidence_current",
+    "evidence_history",
+    "legacy_snapshot",
+    "public_refetch",
+}
+_RECOVERY_STATUSES = {"cache_recovered", "public_refetched"}
 _INDEX_KEYS = {"schema_version", "events"}
 _LEGACY_JOURNAL_KEYS = {"schema_version", "rows"}
 _PREVIOUS_JOURNAL_KEYS = {
@@ -342,15 +352,55 @@ def _file_mtime_utc(metadata: tuple[int, int, int, int, int, int, int, int]) -> 
         return None
 
 
-def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[str, str]:
+def _recovery_provenance_from_document(value: object) -> dict[str, str]:
+    if type(value) is not dict or set(value) != _RECOVERY_PROVENANCE_KEYS:
+        raise ValueError("invalid archive recovery provenance")
+    source = _bounded_text(value["source"], "recovery source")
+    status = _bounded_text(value["status"], "recovery status")
+    recovered_at = _metadata_time(value["recovered_at"], "recovered_at").isoformat()
+    source_snapshot_id = _bounded_text(value["source_snapshot_id"], "source_snapshot_id")
+    if (
+        source not in _RECOVERY_SOURCES
+        or status not in _RECOVERY_STATUSES
+        or (status == "public_refetched") != (source == "public_refetch")
+    ):
+        raise ValueError("invalid archive recovery provenance")
+    return {
+        "source": source,
+        "status": status,
+        "recovered_at": recovered_at,
+        "source_snapshot_id": source_snapshot_id,
+    }
+
+
+def _recovery_provenance_from_snapshot(snapshot: EvidenceSnapshot) -> dict[str, str] | None:
+    metadata = snapshot.recovery_metadata
+    names = {"source", "recovered_at", "recovery_status", "source_snapshot_id"}
+    if not any(name in metadata for name in names):
+        return None
+    if not names <= set(metadata):
+        raise ValueError("invalid archive recovery provenance")
+    return _recovery_provenance_from_document({
+        "source": metadata["source"],
+        "status": metadata["recovery_status"],
+        "recovered_at": metadata["recovered_at"],
+        "source_snapshot_id": metadata["source_snapshot_id"],
+    })
+
+
+def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[str, Any]:
     if _CONTENT_DIGEST.fullmatch(content_digest) is None:
         raise ValueError("invalid archive lineage digest")
-    return {
+    lineage: dict[str, Any] = {
         "evidence_snapshot_id": _bounded_text(snapshot.snapshot_id, "evidence_snapshot_id"),
         "raw_snapshot_id": _bounded_text(snapshot.raw_snapshot_id, "raw_snapshot_id"),
         "generated_at": _timestamp(snapshot.generated_at, "snapshot generated_at"),
         "content_digest": content_digest,
     }
+    recovery = _recovery_provenance_from_snapshot(snapshot)
+    if recovery is not None:
+        lineage["recovery"] = recovery
+    return lineage
 
 
 def _lineage_from_document(
@@ -363,6 +413,7 @@ def _lineage_from_document(
     if type(value) is not dict:
         raise ValueError("invalid archive lineage schema")
     keys = set(value)
+    recovered = not legacy and keys == _RECOVERED_LINEAGE_KEYS
     migrated = not legacy and frozenset(keys) in {
         frozenset(_MIGRATED_LINEAGE_KEYS),
         frozenset(_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS),
@@ -370,6 +421,7 @@ def _lineage_from_document(
     if (legacy and keys != _LEGACY_LINEAGE_KEYS) or (
         not legacy
         and keys != _LINEAGE_KEYS
+        and keys != _RECOVERED_LINEAGE_KEYS
         and keys != _MIGRATED_LINEAGE_KEYS
         and keys != _UNVERIFIABLE_MIGRATED_LINEAGE_KEYS
     ):
@@ -389,6 +441,8 @@ def _lineage_from_document(
         "generated_at": generated_at,
         "content_digest": lineage_digest,
     }
+    if recovered:
+        lineage["recovery"] = _recovery_provenance_from_document(value["recovery"])
     if legacy or migrated:
         projection_digest = legacy_projection_digest if legacy else value["legacy_projection_digest"]
         if (
@@ -1624,6 +1678,14 @@ def _validate_temporal_row(row: dict[str, Any], now: datetime) -> None:
         or any(value > maximum or value > generated_at for value in lineage_times)
     ):
         raise ValueError("invalid archive time order")
+    for lineage in row["snapshot_history"]:
+        recovery = lineage.get("recovery")
+        if recovery is None:
+            continue
+        recovered_at = _metadata_time(recovery["recovered_at"], "recovered_at")
+        lineage_generated_at = _metadata_time(lineage["generated_at"], "lineage generated_at")
+        if recovered_at < lineage_generated_at or recovered_at > maximum:
+            raise ValueError("invalid archive recovery time")
 
 
 def _archive_document(snapshot: EvidenceSnapshot, row: dict[str, Any], archived_at: datetime) -> dict[str, Any]:
@@ -2034,6 +2096,24 @@ def _merge_archive_rows(
             continue
         if previous_lineage["content_digest"] != row["content_digest"]:
             raise ValueError("archive lineage content mismatch")
+        previous_recovery = previous_lineage.get("recovery")
+        incoming_recovery = row.get("recovery")
+        if previous_recovery is not None and incoming_recovery is not None:
+            stable_keys = {"source", "status", "source_snapshot_id"}
+            if (
+                {key: previous_recovery[key] for key in stable_keys}
+                != {key: incoming_recovery[key] for key in stable_keys}
+            ):
+                raise ValueError("archive lineage recovery mismatch")
+            if _metadata_time(
+                incoming_recovery["recovered_at"],
+                "recovered_at",
+            ) < _metadata_time(previous_recovery["recovered_at"], "recovered_at"):
+                histories_by_identity[identity] = row
+                previous_lineage = row
+        if previous_recovery is None and incoming_recovery is not None:
+            histories_by_identity[identity] = row
+            previous_lineage = row
         previous_legacy = previous_lineage.get("legacy_v1") is True
         incoming_legacy = row.get("legacy_v1") is True
         if previous_legacy and not incoming_legacy:

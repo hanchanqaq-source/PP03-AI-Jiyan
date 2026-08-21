@@ -153,6 +153,39 @@ def test_archive_api_filters_status_and_preserves_disproof_history_and_lineage(t
     }]
 
 
+def test_archive_api_persists_and_exposes_only_closed_recovery_provenance(tmp_path, monkeypatch):
+    recovered_event = event("c" * 20, days_old=2)
+    snapshot_id = "s" * 20
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(EvidenceSnapshot(
+        snapshot_id=snapshot_id,
+        raw_snapshot_id="r" * 20,
+        generated_at=recovered_event.verified_at,
+        events=(recovered_event,),
+        recovery_metadata={
+            "source": "evidence_current",
+            "recovered_at": NOW.isoformat(),
+            "recovery_status": "cache_recovered",
+            "source_snapshot_id": snapshot_id,
+        },
+    ))
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: archive)
+
+    response = client.get("/api/news/archive?days=90")
+
+    assert response.status_code == 200
+    provenance = response.json()["data"]["provenance"]
+    assert provenance[0]["recovery"] == [{
+        "source": "evidence_current",
+        "status": "cache_recovered",
+        "recovered_at": NOW.isoformat(),
+        "source_snapshot_id": snapshot_id,
+    }]
+    assert set(provenance[0]["recovery"][0]) == {
+        "source", "status", "recovered_at", "source_snapshot_id",
+    }
+
+
 def test_archive_api_returns_excerpt_only_and_never_a_full_article_body(tmp_path, monkeypatch):
     archive = archive_with_events(tmp_path, event("a" * 20, days_old=1, excerpt="x" * 10_000))
     monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: archive)

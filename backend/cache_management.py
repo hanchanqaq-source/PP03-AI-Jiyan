@@ -516,6 +516,11 @@ class CacheManager:
             if candidate["kind"] == "translation":
                 translation_keys.add(candidate["key"])
                 continue
+            # EvidenceArchive owns its state/index/bucket authority under a
+            # separate cross-process lock.  Cache cleanup may report expired
+            # buckets, but it must not unlink behind that authority.
+            if category == "evidence_archive":
+                continue
             path = candidate["path"]
             root = candidate["root"]
             if not self._contained(path, root) or not self._file_candidate_still_expired(candidate):

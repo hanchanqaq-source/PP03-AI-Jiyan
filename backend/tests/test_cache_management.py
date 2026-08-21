@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import threading
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,26 @@ import pytest
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 17, 4, 0, tzinfo=UTC)
+
+
+def _cleanup_archive_candidate_in_child(data_dir, acceptance_root, logs_root, start, results):
+    from cache_management import CacheManager
+
+    if not start.wait(10):
+        raise RuntimeError("cleanup start timeout")
+    result = CacheManager(
+        data_dir=data_dir,
+        acceptance_root=acceptance_root,
+        logs_root=logs_root,
+        now=lambda: NOW,
+    ).cleanup_expired(manual=True)
+    results.put(result["released_bytes"])
+
+
+def _replace_archive_bucket_in_child(bucket, replacement, start):
+    if not start.wait(10):
+        raise RuntimeError("replacement start timeout")
+    os.replace(replacement, bucket)
 
 
 def write_fund_cache(root: Path, name: str, key: str, expires_at: datetime, size: int = 0) -> Path:
@@ -280,7 +301,7 @@ def test_source_health_history_counts_toward_limit_and_only_expired_history_is_r
     assert "source_health" in result["deleted_categories"]
 
 
-def test_evidence_archive_counts_bytes_and_only_whole_days_older_than_ninety_are_candidates(tmp_path):
+def test_evidence_archive_counts_bytes_and_only_reports_whole_days_older_than_ninety_as_candidates(tmp_path):
     subject = manager(tmp_path, max_bytes=1)
     data_dir = tmp_path / "data"
     archive_root = data_dir / "evidence-verification" / "v1" / "archive"
@@ -321,10 +342,11 @@ def test_evidence_archive_counts_bytes_and_only_whole_days_older_than_ninety_are
     assert status["categories"]["evidence_archive"]["file_count"] == 5
     assert status["categories"]["evidence_archive"]["expired_count"] == 1
     assert status["categories"]["evidence_archive"]["reclaimable_bytes"] == len("old-archive")
-    assert not old_bucket.exists()
+    assert old_bucket.read_text(encoding="utf-8") == "old-archive"
     for path, content in protected.items():
         assert path.read_bytes() == content
-    assert "evidence_archive" in result["deleted_categories"]
+    assert "evidence_archive" not in result["deleted_categories"]
+    assert result["released_bytes"] == 0
 
 
 def test_evidence_archive_cleanup_revalidates_bucket_replaced_after_scan(tmp_path, monkeypatch):
@@ -447,14 +469,13 @@ def test_evidence_archive_cleanup_preserves_bucket_when_unlink_fails(tmp_path, m
     assert "evidence_archive" not in result["deleted_categories"]
 
 
-def test_concurrent_evidence_archive_cleanup_releases_one_bucket_once(tmp_path):
+def test_concurrent_evidence_archive_cleanup_never_bypasses_archive_authority(tmp_path):
     subjects = (manager(tmp_path), manager(tmp_path))
     archive_root = tmp_path / "data" / "evidence-verification" / "v1" / "archive"
     archive_root.mkdir(parents=True)
     old_date = NOW.date() - timedelta(days=91)
     bucket = archive_root / f"{old_date.isoformat()}.jsonl"
     bucket.write_text("one-cleanup-only", encoding="utf-8")
-    expected_size = bucket.stat().st_size
     barrier = threading.Barrier(3)
     results: list[dict] = []
     failures: list[BaseException] = []
@@ -475,5 +496,66 @@ def test_concurrent_evidence_archive_cleanup_releases_one_bucket_once(tmp_path):
 
     assert not failures
     assert all(not worker.is_alive() for worker in workers)
-    assert not bucket.exists()
-    assert sum(result["released_bytes"] for result in results) == expected_size
+    assert bucket.read_text(encoding="utf-8") == "one-cleanup-only"
+    assert sum(result["released_bytes"] for result in results) == 0
+
+
+def test_evidence_archive_cleanup_never_calls_path_unlink_for_an_archive_candidate(tmp_path, monkeypatch):
+    subject = manager(tmp_path)
+    archive_root = tmp_path / "data" / "evidence-verification" / "v1" / "archive"
+    archive_root.mkdir(parents=True)
+    bucket = archive_root / f"{(NOW.date() - timedelta(days=91)).isoformat()}.jsonl"
+    bucket.write_text("archive-authority-owned", encoding="utf-8")
+    original_unlink = Path.unlink
+
+    def reject_archive_unlink(path, *args, **kwargs):
+        if path == bucket:
+            raise AssertionError("cache cleanup bypassed the archive writer lock")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_archive_unlink)
+
+    result = subject.cleanup_expired(manual=True)
+
+    assert bucket.read_text(encoding="utf-8") == "archive-authority-owned"
+    assert result["released_bytes"] == 0
+
+
+def test_multiprocess_cleanup_and_bucket_replacement_preserve_archive_authority(tmp_path):
+    data_dir = tmp_path / "data"
+    acceptance_root = tmp_path / "repo" / ".tmp" / "acceptance"
+    logs_root = data_dir / "logs"
+    archive_root = data_dir / "evidence-verification" / "v1" / "archive"
+    archive_root.mkdir(parents=True)
+    bucket = archive_root / f"{(NOW.date() - timedelta(days=91)).isoformat()}.jsonl"
+    replacement = archive_root / "replacement.tmp"
+    bucket.write_text("old-authority", encoding="utf-8")
+    replacement.write_text("new-authority", encoding="utf-8")
+
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_cleanup_archive_candidate_in_child,
+            args=(str(data_dir), str(acceptance_root), str(logs_root), start, results),
+        )
+        for _ in range(2)
+    ]
+    processes.append(context.Process(
+        target=_replace_archive_bucket_in_child,
+        args=(str(bucket), str(replacement), start),
+    ))
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(20)
+
+    try:
+        assert [process.exitcode for process in processes] == [0, 0, 0]
+        assert sorted(results.get(timeout=5) for _ in range(2)) == [0, 0]
+        assert bucket.read_text(encoding="utf-8") == "new-authority"
+    finally:
+        results.close()
+        results.join_thread()

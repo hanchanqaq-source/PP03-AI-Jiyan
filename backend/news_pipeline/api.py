@@ -21,6 +21,25 @@ ArchiveStatus = Literal[
 ]
 
 
+def _archive_provenance(event: dict[str, object]) -> dict[str, object]:
+    provenance: dict[str, object] = {
+        "event_id": event["event_id"],
+        "evidence_snapshot_id": event["evidence_snapshot_id"],
+        "raw_snapshot_id": event["raw_snapshot_id"],
+        "snapshot_history": event["snapshot_history"],
+    }
+    history = event["snapshot_history"]
+    if isinstance(history, list):
+        recovery = [
+            lineage["recovery"]
+            for lineage in history
+            if isinstance(lineage, dict) and isinstance(lineage.get("recovery"), dict)
+        ]
+        if recovery:
+            provenance["recovery"] = recovery
+    return provenance
+
+
 def _start_pipeline() -> dict[str, object]:
     try:
         run = get_service().start()
@@ -92,13 +111,5 @@ def news_archive(
         "total": len(events),
         "filters": {"days": days, "verification_status": verification_status},
         "diagnostics": archive.last_diagnostics,
-        "provenance": [
-            {
-                "event_id": event["event_id"],
-                "evidence_snapshot_id": event["evidence_snapshot_id"],
-                "raw_snapshot_id": event["raw_snapshot_id"],
-                "snapshot_history": event["snapshot_history"],
-            }
-            for event in events
-        ],
+        "provenance": [_archive_provenance(event) for event in events],
     }}
