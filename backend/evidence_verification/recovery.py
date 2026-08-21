@@ -12,7 +12,12 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-from .archive import EvidenceArchive, _archive_document, _archive_public_url
+from .archive import (
+    ArchiveRawAuthorityError,
+    EvidenceArchive,
+    _archive_document,
+    _archive_public_url,
+)
 from .models import (
     EvidenceEvent,
     EvidenceItem,
@@ -604,6 +609,8 @@ class HistoryRecovery:
         self._evidence_current = (
             Path(evidence_current) if evidence_current is not None else self.root / "current.json"
         )
+        self._radar_present = bool(self._present_input_paths((self._radar_cache,)))
+        self._current_present = bool(self._present_input_paths((self._evidence_current,)))
         self._evidence_history, self._history_input_error = self._bounded_input_paths(evidence_history)
         self._legacy_snapshots, self._legacy_input_error = self._bounded_input_paths(legacy_snapshots)
         self._explicit_history_present = self._present_input_paths(self._evidence_history)
@@ -851,7 +858,16 @@ class HistoryRecovery:
         if not events:
             self._add_reason(reasons, "missing_required_fields")
             return
+        source_event_ids = [
+            _canonical_event_id(row.get("event_id")) if type(row) is dict else None
+            for row in events
+        ]
+        valid_source_ids = [event_id for event_id in source_event_ids if event_id is not None]
+        if len(valid_source_ids) != len(set(valid_source_ids)):
+            self._add_reason(reasons, "ambiguous_record", len(set(valid_source_ids)) or 1)
+            return
         parsed: list[EvidenceSnapshot] = []
+        invalid_rows = 0
 
         def append_parsed() -> None:
             binding = tuple(sorted(
@@ -872,8 +888,12 @@ class HistoryRecovery:
             snapshot = self._parse_snapshot(single)
             if snapshot is None:
                 self._add_reason(reasons, "missing_required_fields")
+                invalid_rows += 1
                 continue
             parsed.append(snapshot)
+        if invalid_rows:
+            self._add_reason(reasons, "ambiguous_record", len(parsed))
+            return
         append_parsed()
 
     def _radar_candidates(
@@ -989,8 +1009,8 @@ class HistoryRecovery:
             self._add_reason(reasons, legacy_error)
 
         def requested() -> Iterator[tuple[str, Path, bool]]:
-            yield "radar", self._radar_cache, False
-            yield "current", self._evidence_current, False
+            yield "radar", self._radar_cache, self._radar_present
+            yield "current", self._evidence_current, self._current_present
             for path in history:
                 try:
                     explicit_present = os.path.normcase(str(Path(os.path.abspath(path)))) in self._explicit_history_present
@@ -1180,6 +1200,12 @@ class HistoryRecovery:
                 for transition in current_event.status_history
             )
             if (
+                current_history == previous_history
+                and previous_event.verification_status == current_event.verification_status
+                and current.snapshot.generated_at > previous.snapshot.generated_at
+            ):
+                continue
+            if (
                 not previous_history
                 or len(current_history) <= len(previous_history)
                 or current_history[:len(previous_history)] != previous_history
@@ -1252,111 +1278,38 @@ class HistoryRecovery:
         return frozenset(parts)
 
 
-    def _raw_authority_conflicts_with_archive(
-        self,
-        snapshots: tuple[EvidenceSnapshot, ...],
-        *,
-        now: datetime,
-        raw_event_sets: dict[str, tuple[tuple[str, str], ...]] | None = None,
-        archive_rows: tuple[object, ...] | None = None,
-    ) -> bool:
-        if not snapshots:
-            return True
-        event_id = snapshots[0].events[0].event_id
-        expected: dict[str, tuple[str, str, str]] = {}
-        for snapshot in snapshots:
-            lineage = _archive_document(
-                snapshot,
-                event_document(snapshot.events[0]),
-                now,
-            )["snapshot_history"][0]
-            binding = (
-                lineage["evidence_snapshot_id"],
-                lineage["generated_at"],
-                lineage["content_digest"],
-            )
-            previous = expected.get(lineage["raw_snapshot_id"])
-            if previous is not None and previous != binding:
-                return True
-            expected[lineage["raw_snapshot_id"]] = binding
-        if archive_rows is not None:
-            archived_rows = archive_rows
-        else:
-            archived = self.archive.get(event_id)
-            archived_rows = [] if archived is None else [archived]
-        if not archived_rows:
-            return False
-        observed: dict[str, tuple[str, str, dict[str, str]]] = {}
-        for archived in archived_rows:
-            if type(archived) is not dict or type(archived.get("event_id")) is not str:
-                raise ValueError("invalid archive acknowledgement")
-            history = archived.get("snapshot_history")
-            if type(history) is not list:
-                continue
-            for lineage in history:
-                if type(lineage) is not dict or type(lineage.get("raw_snapshot_id")) is not str:
-                    continue
-                raw_snapshot_id = lineage["raw_snapshot_id"]
-                header = (
-                    lineage.get("evidence_snapshot_id"),
-                    lineage.get("generated_at"),
-                )
-                previous = observed.get(raw_snapshot_id)
-                if previous is None:
-                    observed[raw_snapshot_id] = (
-                        header[0],
-                        header[1],
-                        {archived["event_id"]: lineage.get("content_digest")},
-                    )
-                    continue
-                if previous[:2] != header:
-                    return True
-                previous_digest = previous[2].get(archived["event_id"])
-                if previous_digest is not None and previous_digest != lineage.get("content_digest"):
-                    return True
-                previous[2][archived["event_id"]] = lineage.get("content_digest")
-        for raw_snapshot_id, binding in expected.items():
-            previous = observed.get(raw_snapshot_id)
-            if previous is None:
-                continue
-            if previous[:2] != binding[:2]:
-                return True
-            expected_ids = {
-                selected_event_id
-                for selected_event_id, _fingerprint in (
-                    (raw_event_sets or {}).get(raw_snapshot_id, ())
-                )
-            }
-            if expected_ids and set(previous[2]) != expected_ids:
-                return True
-            expected_digest = previous[2].get(event_id)
-            if expected_digest is not None and expected_digest != binding[2]:
-                return True
-        return False
-
-
     def _archive_many(
         self,
         snapshots: tuple[EvidenceSnapshot, ...],
         *,
         now: datetime,
-    ) -> str | None:
+        expected_raw_event_sets: dict[str, tuple[str, ...]],
+    ) -> dict[str, str]:
         if not snapshots:
-            return "archive_rejected"
-        event_id = snapshots[0].events[0].event_id
+            return {}
+        event_ids = {snapshot.events[0].event_id for snapshot in snapshots if snapshot.events}
+
+        def fail_all(reason: str) -> dict[str, str]:
+            return {event_id: reason for event_id in event_ids}
+
         if any(
-            len(snapshot.events) != 1 or snapshot.events[0].event_id != event_id
+            len(snapshot.events) != 1
             for snapshot in snapshots
         ):
-            return "archive_rejected"
+            return fail_all("archive_rejected")
+        expected_by_event: dict[
+            str,
+            list[tuple[dict[str, object], set[tuple[object, ...]]]],
+        ] = {}
         try:
             operation_archive = (
                 EvidenceArchive(self.archive.root, now=lambda: now)
                 if type(self.archive) is EvidenceArchive
                 else self.archive
             )
-            expected = [
-                (
+            for snapshot in snapshots:
+                event_id = snapshot.events[0].event_id
+                expected_by_event.setdefault(event_id, []).append((
                     _archive_document(snapshot, event_document(snapshot.events[0]), now)[
                         "snapshot_history"
                     ][0],
@@ -1364,101 +1317,148 @@ class HistoryRecovery:
                         self._transition_identity(transition)
                         for transition in snapshot.events[0].status_history
                     },
-                )
-                for snapshot in snapshots
-            ]
+                ))
             batch_upsert = getattr(operation_archive, "upsert_many", None)
             if callable(batch_upsert):
-                batch_upsert(snapshots)
+                rejected_value = batch_upsert(
+                    snapshots,
+                    expected_raw_event_sets=expected_raw_event_sets,
+                    continue_on_raw_conflict=True,
+                )
+                if rejected_value is None:
+                    rejected_event_ids: frozenset[str] = frozenset()
+                elif (
+                    type(rejected_value) is frozenset
+                    and rejected_value <= event_ids
+                    and all(type(event_id) is str for event_id in rejected_value)
+                ):
+                    rejected_event_ids = rejected_value
+                else:
+                    return fail_all("archive_rejected")
             elif len(snapshots) == 1:
                 operation_archive.upsert(snapshots[0])
+                rejected_event_ids = frozenset()
             else:
-                return "archive_rejected"
-            archived = operation_archive.get(event_id)
+                return fail_all("archive_rejected")
+            query = getattr(operation_archive, "query", None)
+            if callable(query):
+                rows = query(90)
+                if type(rows) is not list:
+                    return fail_all("archive_rejected")
+                archived_rows = {
+                    row.get("event_id"): row
+                    for row in rows
+                    if (
+                        type(row) is dict
+                        and row.get("event_id") in event_ids - rejected_event_ids
+                    )
+                }
+            else:
+                get = getattr(operation_archive, "get", None)
+                if not callable(get):
+                    return fail_all("archive_rejected")
+                archived_rows = {
+                    event_id: get(event_id)
+                    for event_id in event_ids - rejected_event_ids
+                }
+        except ArchiveRawAuthorityError:
+            return fail_all("ambiguous_record")
         except Exception:
-            return "archive_rejected"
-        if type(archived) is not dict or archived.get("event_id") != event_id:
-            return "archive_rejected"
-        history = archived.get("snapshot_history")
-        if type(history) is not list:
-            return "archive_rejected"
-        archived_by_identity = {
-            (
-                lineage.get("evidence_snapshot_id"),
-                lineage.get("raw_snapshot_id"),
-                lineage.get("generated_at"),
-                lineage.get("content_digest"),
-            ): lineage
-            for lineage in history
-            if type(lineage) is dict
+            return fail_all("archive_rejected")
+        errors = {
+            event_id: "ambiguous_record"
+            for event_id in rejected_event_ids
         }
-        missing: list[dict[str, object]] = []
-        for lineage, _transitions in expected:
-            identity = (
-                lineage["evidence_snapshot_id"],
-                lineage["raw_snapshot_id"],
-                lineage["generated_at"],
-                lineage["content_digest"],
-            )
-            persisted = archived_by_identity.get(identity)
-            if persisted is None:
-                missing.append(lineage)
+        cutoff = now - timedelta(days=90)
+        for event_id, expected in expected_by_event.items():
+            if event_id in errors:
                 continue
-            expected_recovery = lineage.get("recovery")
-            persisted_recovery = persisted.get("recovery")
-            if type(expected_recovery) is not dict or type(persisted_recovery) is not dict:
-                return "archive_rejected"
-            if (
-                expected_recovery.get("status") != persisted_recovery.get("status")
-                or expected_recovery.get("source_snapshot_id")
-                != persisted_recovery.get("source_snapshot_id")
-                or not self._source_parts(expected_recovery.get("source"))
-                <= self._source_parts(persisted_recovery.get("source"))
-            ):
-                return "archive_rejected"
-            persisted_at = _aware_time(persisted_recovery.get("recovered_at"))
-            generated_at = _aware_time(persisted.get("generated_at"))
-            if (
-                persisted_at is None
-                or generated_at is None
-                or persisted_at < generated_at
-                or persisted_at > now
-            ):
-                return "archive_rejected"
-        if missing:
-            cutoff = now - timedelta(days=90)
+            archived = archived_rows.get(event_id)
+            if type(archived) is not dict or archived.get("event_id") != event_id:
+                errors[event_id] = "archive_rejected"
+                continue
+            history = archived.get("snapshot_history")
+            if type(history) is not list:
+                errors[event_id] = "archive_rejected"
+                continue
+            archived_by_identity = {
+                (
+                    lineage.get("evidence_snapshot_id"),
+                    lineage.get("raw_snapshot_id"),
+                    lineage.get("generated_at"),
+                    lineage.get("content_digest"),
+                ): lineage
+                for lineage in history
+                if type(lineage) is dict
+            }
+            for lineage, _transitions in expected:
+                identity = (
+                    lineage["evidence_snapshot_id"],
+                    lineage["raw_snapshot_id"],
+                    lineage["generated_at"],
+                    lineage["content_digest"],
+                )
+                persisted = archived_by_identity.get(identity)
+                if persisted is None:
+                    generated = _aware_time(lineage.get("generated_at"))
+                    errors[event_id] = (
+                        "recovery_out_of_window"
+                        if generated is None or generated < cutoff or generated > now
+                        else "archive_rejected"
+                    )
+                    break
+                expected_recovery = lineage.get("recovery")
+                persisted_recovery = persisted.get("recovery")
+                if type(expected_recovery) is not dict or type(persisted_recovery) is not dict:
+                    errors[event_id] = "archive_rejected"
+                    break
+                if (
+                    expected_recovery.get("status") != persisted_recovery.get("status")
+                    or expected_recovery.get("source_snapshot_id")
+                    != persisted_recovery.get("source_snapshot_id")
+                    or not self._source_parts(expected_recovery.get("source"))
+                    <= self._source_parts(persisted_recovery.get("source"))
+                ):
+                    errors[event_id] = "archive_rejected"
+                    break
+                persisted_at = _aware_time(persisted_recovery.get("recovered_at"))
+                generated_at = _aware_time(persisted.get("generated_at"))
+                if (
+                    persisted_at is None
+                    or generated_at is None
+                    or persisted_at < generated_at
+                    or persisted_at > now
+                ):
+                    errors[event_id] = "archive_rejected"
+                    break
+            if event_id in errors:
+                continue
+            persisted_transitions = archived.get("status_history")
+            if type(persisted_transitions) is not list:
+                errors[event_id] = "archive_rejected"
+                continue
+            persisted_transition_identities = {
+                (
+                    row.get("from_status"),
+                    row.get("to_status"),
+                    _aware_time(row.get("changed_at")),
+                    row.get("reason"),
+                )
+                for row in persisted_transitions
+                if type(row) is dict
+            }
             if any(
-                (generated := _aware_time(lineage.get("generated_at"))) is None
-                or generated < cutoff
-                or generated > now
-                for lineage in missing
+                not expected_transitions <= persisted_transition_identities
+                for _lineage, expected_transitions in expected
             ):
-                return "recovery_out_of_window"
-            return "archive_rejected"
-        persisted_transitions = archived.get("status_history")
-        if type(persisted_transitions) is not list:
-            return "archive_rejected"
-        persisted_transition_identities = {
-            (
-                row.get("from_status"),
-                row.get("to_status"),
-                _aware_time(row.get("changed_at")),
-                row.get("reason"),
-            )
-            for row in persisted_transitions
-            if type(row) is dict
-        }
-        for _lineage, expected_transitions in expected:
-            if not expected_transitions <= persisted_transition_identities:
-                return "archive_rejected"
-        return None
+                errors[event_id] = "archive_rejected"
+        return errors
 
     def import_records(self) -> RecoveryReport:
         scanned = self.scan()
         reasons = dict(scanned.reasons)
         cache_ids: set[str] = set()
         refetched_ids: set[str] = set()
-        cache_terminal_ids: set[str] = set()
         try:
             now = self._now_utc()
         except (TypeError, ValueError):
@@ -1469,23 +1469,6 @@ class HistoryRecovery:
                 opened_paths=scanned.opened_paths,
             )
 
-        archive_rows: tuple[object, ...] | None = None
-        archive_query_failed = False
-        query_archive = (
-            EvidenceArchive(self.archive.root, now=lambda: now)
-            if type(self.archive) is EvidenceArchive
-            else self.archive
-        )
-        query = getattr(query_archive, "query", None)
-        if callable(query):
-            try:
-                rows = query(90)
-                if type(rows) is not list:
-                    raise ValueError("invalid archive query")
-                archive_rows = tuple(rows)
-            except Exception:
-                archive_query_failed = True
-
         cache_groups: dict[str, list[_CacheRecord]] = {}
         for record in scanned._snapshots:
             event = record.snapshot.events[0]
@@ -1495,48 +1478,26 @@ class HistoryRecovery:
             refetch_groups.setdefault(candidate.event_id, []).append(candidate)
 
         blocked: set[str] = set()
-        raw_bindings: dict[
-            str,
-            tuple[str, datetime, tuple[tuple[str, str], ...]],
-        ] = {}
-        raw_events: dict[str, set[str]] = {}
-        conflicting_raw_ids: set[str] = set()
-        for records in cache_groups.values():
-            for record in records:
-                raw_snapshot_id = record.snapshot.raw_snapshot_id
-                binding = (
-                    record.snapshot.snapshot_id,
-                    record.snapshot.generated_at.astimezone(timezone.utc),
-                    record.raw_event_set,
-                )
-                previous = raw_bindings.get(raw_snapshot_id)
-                if previous is not None and previous != binding:
-                    conflicting_raw_ids.add(raw_snapshot_id)
-                raw_bindings[raw_snapshot_id] = binding
-                raw_events.setdefault(raw_snapshot_id, set()).update(
-                    event_id for event_id, _fingerprint in record.raw_event_set
-                )
-        for raw_snapshot_id in conflicting_raw_ids:
-            for event_id in raw_events.get(raw_snapshot_id, set()):
-                if event_id not in blocked:
-                    self._add_reason(reasons, "ambiguous_record")
+
+        def block(event_ids: Iterable[str], reason: str) -> None:
+            for event_id in sorted(set(event_ids)):
+                if event_id in blocked:
+                    continue
                 blocked.add(event_id)
+                self._add_reason(reasons, reason)
+
         selected_cache: dict[str, tuple[_CacheRecord, ...]] = {}
         selected_refetch: dict[str, _RefetchCandidate] = {}
         for event_id, records in cache_groups.items():
             resolved = self._resolve_cache_records(records)
             if resolved is None:
-                if event_id not in blocked:
-                    self._add_reason(reasons, "ambiguous_record")
-                blocked.add(event_id)
+                block((event_id,), "ambiguous_record")
             else:
                 selected_cache[event_id] = resolved
         for event_id, candidates in refetch_groups.items():
             identities = {self._candidate_identity(candidate) for candidate in candidates}
             if len(identities) != 1:
-                if event_id not in blocked:
-                    self._add_reason(reasons, "ambiguous_record")
-                blocked.add(event_id)
+                block((event_id,), "ambiguous_record")
             else:
                 selected_refetch[event_id] = candidates[0]
         for event_id in set(selected_cache) & set(selected_refetch):
@@ -1546,15 +1507,19 @@ class HistoryRecovery:
                 selected_refetch[event_id],
                 selected_cache[event_id][-1].snapshot.events[0],
             ):
-                blocked.add(event_id)
-                self._add_reason(reasons, "ambiguous_record")
+                block((event_id,), "ambiguous_record")
 
-        for event_id, records in selected_cache.items():
+        units: dict[
+            str,
+            tuple[str, tuple[EvidenceSnapshot, ...], tuple[_CacheRecord, ...] | None],
+        ] = {}
+        invalid_refetch_raw_events: dict[str, set[str]] = {}
+        cache_terminal_ids = set(selected_cache)
+        for event_id, records in sorted(selected_cache.items()):
             if event_id in blocked:
                 continue
-            cache_terminal_ids.add(event_id)
             if any(not self._in_window(record.snapshot.events[0], now) for record in records):
-                self._add_reason(reasons, "outside_retention_window")
+                block((event_id,), "outside_retention_window")
                 continue
             recovered = tuple(
                 self._recovery_snapshot(
@@ -1565,39 +1530,19 @@ class HistoryRecovery:
                 )
                 for record in records
             )
-            if archive_query_failed:
-                self._add_reason(reasons, "archive_rejected")
-                continue
-            try:
-                raw_conflict = self._raw_authority_conflicts_with_archive(
-                    recovered,
-                    now=now,
-                    raw_event_sets={
-                        record.snapshot.raw_snapshot_id: record.raw_event_set
-                        for record in records
-                    },
-                    archive_rows=archive_rows,
-                )
-            except Exception:
-                self._add_reason(reasons, "archive_rejected")
-                continue
-            if raw_conflict:
-                self._add_reason(reasons, "ambiguous_record")
-                continue
-            archive_error = self._archive_many(recovered, now=now)
-            if archive_error is not None:
-                self._add_reason(reasons, archive_error)
-                continue
-            cache_ids.add(event_id)
+            units[event_id] = ("cache", recovered, records)
 
-        for event_id, candidate in selected_refetch.items():
+        # Public dependencies are fully bounded and materialized before the
+        # first archive mutation.  This keeps raw-snapshot validation global
+        # across cache and refetch results instead of event-by-event.
+        for event_id, candidate in sorted(selected_refetch.items()):
             if event_id in blocked or event_id in cache_terminal_ids:
                 continue
             if not (now - timedelta(days=90) <= candidate.published_at <= now):
-                self._add_reason(reasons, "outside_retention_window")
+                block((event_id,), "outside_retention_window")
                 continue
             if self._public_refetcher is None:
-                self._add_reason(reasons, "public_refetch_unavailable")
+                block((event_id,), "public_refetch_unavailable")
                 continue
             try:
                 value = self._public_refetcher(candidate.public_link)
@@ -1606,9 +1551,13 @@ class HistoryRecovery:
                     raise ValueError("invalid refetch")
                 event = snapshot.events[0]
                 if not self._candidate_matches_event(candidate, event) or not self._in_window(event, now):
+                    invalid_refetch_raw_events.setdefault(
+                        snapshot.raw_snapshot_id,
+                        set(),
+                    ).update((candidate.event_id, event.event_id))
                     raise ValueError("invalid refetch identity")
             except Exception:
-                self._add_reason(reasons, "public_refetch_failed")
+                block((event_id,), "public_refetch_failed")
                 continue
             recovered = self._recovery_snapshot(
                 snapshot,
@@ -1616,32 +1565,188 @@ class HistoryRecovery:
                 status="public_refetched",
                 recovered_at=now,
             )
-            if archive_query_failed:
-                self._add_reason(reasons, "archive_rejected")
-                continue
-            try:
-                raw_conflict = self._raw_authority_conflicts_with_archive(
-                    (recovered,),
-                    now=now,
-                    raw_event_sets={
-                        recovered.raw_snapshot_id: ((
-                            recovered.events[0].event_id,
-                            self._event_fingerprint(recovered.events[0]),
-                        ),),
-                    },
-                    archive_rows=archive_rows,
+            units[event_id] = ("public", (recovered,), None)
+
+        raw_headers: dict[str, tuple[str, datetime]] = {}
+        raw_complete: dict[str, dict[str, str]] = {}
+        raw_partial: dict[str, dict[str, str]] = {}
+        raw_to_events: dict[str, set[str]] = {
+            raw_snapshot_id: set(event_ids)
+            for raw_snapshot_id, event_ids in invalid_refetch_raw_events.items()
+        }
+        unit_raw_ids: dict[str, set[str]] = {event_id: set() for event_id in units}
+        conflicting_raw_ids: set[str] = set(invalid_refetch_raw_events)
+
+        def bind_raw(
+            unit_event_id: str,
+            selected: EvidenceSnapshot,
+            manifest_items: tuple[tuple[str, str], ...],
+            *,
+            complete: bool,
+        ) -> None:
+            raw_snapshot_id = selected.raw_snapshot_id
+            header = (
+                selected.snapshot_id,
+                selected.generated_at.astimezone(timezone.utc),
+            )
+            unit_raw_ids[unit_event_id].add(raw_snapshot_id)
+            manifest: dict[str, str] = {}
+            for event_id, fingerprint in manifest_items:
+                if event_id in manifest and manifest[event_id] != fingerprint:
+                    conflicting_raw_ids.add(raw_snapshot_id)
+                elif event_id in manifest:
+                    conflicting_raw_ids.add(raw_snapshot_id)
+                manifest[event_id] = fingerprint
+            raw_to_events.setdefault(raw_snapshot_id, set()).update(manifest)
+            raw_to_events[raw_snapshot_id].add(unit_event_id)
+            previous_header = raw_headers.get(raw_snapshot_id)
+            if previous_header is not None and previous_header != header:
+                conflicting_raw_ids.add(raw_snapshot_id)
+            else:
+                raw_headers[raw_snapshot_id] = header
+            target = raw_complete if complete else raw_partial
+            previous_manifest = target.get(raw_snapshot_id)
+            if complete:
+                if previous_manifest is not None and previous_manifest != manifest:
+                    conflicting_raw_ids.add(raw_snapshot_id)
+                else:
+                    target[raw_snapshot_id] = manifest
+            else:
+                combined = {} if previous_manifest is None else dict(previous_manifest)
+                for event_id, fingerprint in manifest.items():
+                    prior = combined.get(event_id)
+                    if prior is not None and prior != fingerprint:
+                        conflicting_raw_ids.add(raw_snapshot_id)
+                    combined[event_id] = fingerprint
+                target[raw_snapshot_id] = combined
+
+        for event_id, (kind, snapshots, records) in units.items():
+            if kind == "cache":
+                if records is None or len(records) != len(snapshots):
+                    block((event_id,), "archive_rejected")
+                    continue
+                for selected, record in zip(snapshots, records):
+                    bind_raw(
+                        event_id,
+                        selected,
+                        record.raw_event_set,
+                        complete=True,
+                    )
+            else:
+                selected = snapshots[0]
+                selected_event = selected.events[0]
+                bind_raw(
+                    event_id,
+                    selected,
+                    ((selected_event.event_id, self._event_fingerprint(selected_event)),),
+                    complete=False,
                 )
-            except Exception:
-                self._add_reason(reasons, "archive_rejected")
+
+        raw_expected: dict[str, tuple[str, ...]] = {}
+        for raw_snapshot_id in set(raw_complete) | set(raw_partial):
+            complete = raw_complete.get(raw_snapshot_id)
+            partial = raw_partial.get(raw_snapshot_id, {})
+            if complete is not None:
+                for event_id, fingerprint in partial.items():
+                    if complete.get(event_id) != fingerprint:
+                        conflicting_raw_ids.add(raw_snapshot_id)
+                manifest = complete
+            else:
+                manifest = partial
+            if not manifest:
+                conflicting_raw_ids.add(raw_snapshot_id)
                 continue
-            if raw_conflict:
-                self._add_reason(reasons, "ambiguous_record")
+            raw_expected[raw_snapshot_id] = tuple(sorted(manifest))
+
+        parent = {event_id: event_id for event_id in units}
+
+        def find(event_id: str) -> str:
+            while parent[event_id] != event_id:
+                parent[event_id] = parent[parent[event_id]]
+                event_id = parent[event_id]
+            return event_id
+
+        def union(first: str, second: str) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[max(first_root, second_root)] = min(first_root, second_root)
+
+        raw_owner: dict[str, str] = {}
+        for event_id, raw_ids in unit_raw_ids.items():
+            for raw_snapshot_id in raw_ids:
+                owner = raw_owner.get(raw_snapshot_id)
+                if owner is None:
+                    raw_owner[raw_snapshot_id] = event_id
+                else:
+                    union(owner, event_id)
+
+        conflicting_roots = {
+            find(event_id)
+            for raw_snapshot_id in conflicting_raw_ids
+            for event_id in raw_to_events.get(raw_snapshot_id, set())
+            if event_id in parent
+        }
+        for event_id in units:
+            if find(event_id) in conflicting_roots:
+                block((event_id,), "ambiguous_record")
+
+        components: dict[str, list[str]] = {}
+        for event_id in units:
+            if event_id not in blocked:
+                components.setdefault(find(event_id), []).append(event_id)
+        eligible_components: list[list[str]] = []
+        batch_snapshots: list[EvidenceSnapshot] = []
+        batch_expected_raw_event_sets: dict[str, tuple[str, ...]] = {}
+        for component_event_ids in sorted(components.values(), key=lambda value: tuple(sorted(value))):
+            component_event_ids.sort()
+            component_snapshots = tuple(
+                selected
+                for event_id in component_event_ids
+                for selected in units[event_id][1]
+            )
+            component_raw_ids = {
+                selected.raw_snapshot_id for selected in component_snapshots
+            }
+            if any(raw_snapshot_id not in raw_expected for raw_snapshot_id in component_raw_ids):
+                block(component_event_ids, "ambiguous_record")
                 continue
-            archive_error = self._archive_many((recovered,), now=now)
-            if archive_error is not None:
-                self._add_reason(reasons, archive_error)
+            eligible_components.append(component_event_ids)
+            batch_snapshots.extend(component_snapshots)
+            batch_expected_raw_event_sets.update({
+                raw_snapshot_id: raw_expected[raw_snapshot_id]
+                for raw_snapshot_id in sorted(component_raw_ids)
+            })
+
+        archive_errors = self._archive_many(
+            tuple(batch_snapshots),
+            now=now,
+            expected_raw_event_sets=batch_expected_raw_event_sets,
+        ) if batch_snapshots else {}
+        error_priority = (
+            "ambiguous_record",
+            "recovery_out_of_window",
+            "archive_rejected",
+        )
+        for component_event_ids in eligible_components:
+            component_errors = {
+                archive_errors[event_id]
+                for event_id in component_event_ids
+                if event_id in archive_errors
+            }
+            if component_errors:
+                reason = next(
+                    selected
+                    for selected in error_priority
+                    if selected in component_errors
+                )
+                block(component_event_ids, reason)
                 continue
-            refetched_ids.add(event_id)
+            for event_id in component_event_ids:
+                if units[event_id][0] == "cache":
+                    cache_ids.add(event_id)
+                else:
+                    refetched_ids.add(event_id)
         return RecoveryReport(
             cache_recovered=len(cache_ids),
             public_refetched=len(refetched_ids),

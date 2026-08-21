@@ -102,6 +102,10 @@ _RECOVERY_SOURCE_ORDER = {
     source: index for index, source in enumerate(_CACHE_RECOVERY_SOURCE_ORDER)
 }
 _RECOVERY_STATUSES = {"cache_recovered", "public_refetched"}
+
+
+class ArchiveRawAuthorityError(ValueError):
+    """One raw snapshot identity was bound to incompatible evidence truth."""
 _INDEX_KEYS = {"schema_version", "events"}
 _LEGACY_JOURNAL_KEYS = {"schema_version", "rows"}
 _PREVIOUS_JOURNAL_KEYS = {
@@ -1161,12 +1165,23 @@ def _input_metrics(
     return encoded_bytes, 1
 
 
-def _preflight_snapshot_input(snapshot: EvidenceSnapshot) -> None:
+def _preflight_snapshot_input(
+    snapshot: EvidenceSnapshot,
+    *,
+    batch_budget: dict[str, int] | None = None,
+) -> None:
     if type(snapshot) is not EvidenceSnapshot or type(snapshot.events) is not tuple:
         raise ValueError("invalid archive snapshot input")
+    event_ids: set[str] = set()
     resources = 0
     for selected in snapshot.events:
         try:
+            event_id = selected.event_id
+            if type(event_id) is not str:
+                raise TypeError
+            if event_id in event_ids:
+                raise ValueError("archive snapshot contains duplicate event identities")
+            event_ids.add(event_id)
             resources += (
                 1
                 + len(selected.related_tags)
@@ -1177,14 +1192,178 @@ def _preflight_snapshot_input(snapshot: EvidenceSnapshot) -> None:
                 + len(selected.syndicated_copies)
                 + len(selected.contradicting_evidence)
             )
+        except ValueError:
+            raise
         except (AttributeError, TypeError):
             raise ValueError("invalid archive snapshot input") from None
-        if resources > _MAX_SNAPSHOT_RESOURCES:
+        if resources > _MAX_SNAPSHOT_RESOURCES or (
+            batch_budget is not None
+            and batch_budget["resources"] + resources > _MAX_SNAPSHOT_RESOURCES
+        ):
             raise ValueError("archive snapshot resource budget exceeded")
-    _input_metrics(
-        snapshot,
-        maximum_bytes=_MAX_SNAPSHOT_BYTES,
-        maximum_nodes=_MAX_SNAPSHOT_NODES,
+    if batch_budget is None:
+        maximum_bytes = _MAX_SNAPSHOT_BYTES
+        maximum_nodes = _MAX_SNAPSHOT_NODES
+    else:
+        maximum_bytes = _MAX_SNAPSHOT_BYTES - batch_budget["encoded_bytes"]
+        maximum_nodes = _MAX_SNAPSHOT_NODES - batch_budget["nodes"]
+    try:
+        encoded_bytes, nodes = _input_metrics(
+            snapshot,
+            maximum_bytes=maximum_bytes,
+            maximum_nodes=maximum_nodes,
+        )
+    except ValueError as error:
+        if "budget" in str(error):
+            raise ValueError("archive snapshot budget exceeded") from None
+        raise
+    if batch_budget is not None:
+        batch_budget["encoded_bytes"] += encoded_bytes + 1
+        batch_budget["nodes"] += nodes
+        batch_budget["resources"] += resources
+        if (
+            batch_budget["encoded_bytes"] > _MAX_SNAPSHOT_BYTES
+            or batch_budget["nodes"] > _MAX_SNAPSHOT_NODES
+            or batch_budget["resources"] > _MAX_SNAPSHOT_RESOURCES
+        ):
+            raise ValueError("archive snapshot budget exceeded")
+
+
+def _normalize_expected_raw_event_sets(
+    value: object,
+    incoming_raw_ids: set[str],
+) -> dict[str, frozenset[str]]:
+    if value is None:
+        return {}
+    if type(value) is not dict or len(value) > _MAX_BATCH_SNAPSHOTS:
+        raise ValueError("invalid expected raw event sets")
+    normalized: dict[str, frozenset[str]] = {}
+    for raw_snapshot_id, event_values in value.items():
+        if type(raw_snapshot_id) is not str or raw_snapshot_id not in incoming_raw_ids:
+            raise ValueError("invalid expected raw event sets")
+        if type(event_values) not in {tuple, list, set, frozenset}:
+            raise ValueError("invalid expected raw event sets")
+        if not event_values or len(event_values) > _MAX_INDEX_EVENTS:
+            raise ValueError("invalid expected raw event sets")
+        event_ids: set[str] = set()
+        for event_id in event_values:
+            if type(event_id) is not str or not event_id or len(event_id) > 128:
+                raise ValueError("invalid expected raw event sets")
+            if event_id in event_ids:
+                raise ValueError("invalid expected raw event sets")
+            event_ids.add(event_id)
+        normalized[raw_snapshot_id] = frozenset(event_ids)
+    if set(normalized) != incoming_raw_ids:
+        raise ValueError("invalid expected raw event sets")
+    return normalized
+
+
+def _archive_raw_authority_map(
+    rows: dict[str, dict[str, Any]],
+) -> dict[str, tuple[tuple[str, str], dict[str, str]]]:
+    authority: dict[str, tuple[tuple[str, str], dict[str, str]]] = {}
+    for event_id, row in rows.items():
+        history = row.get("snapshot_history")
+        if type(history) is not list:
+            raise OSError("storage_corrupt")
+        for lineage in history:
+            if type(lineage) is not dict:
+                raise OSError("storage_corrupt")
+            raw_snapshot_id = lineage.get("raw_snapshot_id")
+            evidence_snapshot_id = lineage.get("evidence_snapshot_id")
+            generated_at = lineage.get("generated_at")
+            content_digest = lineage.get("content_digest")
+            if not all(
+                type(item) is str and item
+                for item in (
+                    raw_snapshot_id,
+                    evidence_snapshot_id,
+                    generated_at,
+                    content_digest,
+                )
+            ):
+                raise OSError("storage_corrupt")
+            header = (evidence_snapshot_id, generated_at)
+            previous = authority.get(raw_snapshot_id)
+            if previous is None:
+                previous = (header, {})
+                authority[raw_snapshot_id] = previous
+            elif previous[0] != header:
+                raise OSError("storage_corrupt")
+            previous_digest = previous[1].get(event_id)
+            if previous_digest is not None and previous_digest != content_digest:
+                raise OSError("storage_corrupt")
+            previous[1][event_id] = content_digest
+    return authority
+
+
+def _raw_authority_conflicts(
+    existing_rows: dict[str, dict[str, Any]],
+    incoming: dict[str, tuple[tuple[str, str], dict[str, str]]],
+    expected_event_sets: dict[str, frozenset[str]],
+) -> dict[str, str]:
+    existing = _archive_raw_authority_map(existing_rows)
+    conflicts: dict[str, str] = {}
+    for raw_snapshot_id, (incoming_header, incoming_events) in incoming.items():
+        previous = existing.get(raw_snapshot_id)
+        if previous is None:
+            combined = dict(incoming_events)
+        else:
+            if previous[0] != incoming_header:
+                conflicts[raw_snapshot_id] = "ambiguous archive raw snapshot identity"
+                continue
+            combined = dict(previous[1])
+            for event_id, content_digest in incoming_events.items():
+                previous_digest = combined.get(event_id)
+                if previous_digest is not None and previous_digest != content_digest:
+                    conflicts[raw_snapshot_id] = "archive lineage content mismatch"
+                    break
+                combined[event_id] = content_digest
+            if raw_snapshot_id in conflicts:
+                continue
+        expected = expected_event_sets.get(raw_snapshot_id)
+        if expected is not None:
+            if set(combined) != set(expected):
+                conflicts[raw_snapshot_id] = "ambiguous archive raw snapshot event set"
+        elif previous is not None and set(combined) != set(previous[1]):
+            conflicts[raw_snapshot_id] = "ambiguous archive raw snapshot event set"
+    return conflicts
+
+
+def _raw_conflict_component_events(
+    incoming: dict[str, tuple[tuple[str, str], dict[str, str]]],
+    conflicting_raw_ids: set[str],
+) -> frozenset[str]:
+    if not conflicting_raw_ids:
+        return frozenset()
+    parent = {raw_snapshot_id: raw_snapshot_id for raw_snapshot_id in incoming}
+
+    def find(raw_snapshot_id: str) -> str:
+        while parent[raw_snapshot_id] != raw_snapshot_id:
+            parent[raw_snapshot_id] = parent[parent[raw_snapshot_id]]
+            raw_snapshot_id = parent[raw_snapshot_id]
+        return raw_snapshot_id
+
+    def union(first: str, second: str) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[max(first_root, second_root)] = min(first_root, second_root)
+
+    event_owner: dict[str, str] = {}
+    for raw_snapshot_id, (_header, events) in incoming.items():
+        for event_id in events:
+            owner = event_owner.get(event_id)
+            if owner is None:
+                event_owner[event_id] = raw_snapshot_id
+            else:
+                union(owner, raw_snapshot_id)
+    conflicting_roots = {find(raw_snapshot_id) for raw_snapshot_id in conflicting_raw_ids}
+    return frozenset(
+        event_id
+        for raw_snapshot_id, (_header, events) in incoming.items()
+        if find(raw_snapshot_id) in conflicting_roots
+        for event_id in events
     )
 
 
@@ -5943,18 +6122,22 @@ class EvidenceArchive:
         self.upsert_many((snapshot,))
 
 
-    def upsert_many(self, snapshots: object) -> None:
+    def upsert_many(
+        self,
+        snapshots: object,
+        *,
+        expected_raw_event_sets: object = None,
+        continue_on_raw_conflict: bool = False,
+    ) -> frozenset[str] | None:
+        if type(continue_on_raw_conflict) is not bool:
+            raise ValueError("invalid raw conflict policy")
         try:
             iterator = iter(snapshots)
         except Exception:
             raise ValueError("invalid archive snapshot batch") from None
 
-        archived_at: datetime | None = None
-        incoming: list[dict[str, Any]] = []
-        incoming_budget = {"encoded_bytes": 0, "nodes": 1, "resources": 0}
-        incoming_target_names: set[str] = set()
-        batch_raw_authority: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {}
-        selected_count = 0
+        selected_snapshots: list[EvidenceSnapshot] = []
+        raw_input_budget = {"encoded_bytes": 2, "nodes": 1, "resources": 0}
         while True:
             try:
                 selected = next(iterator)
@@ -5962,41 +6145,51 @@ class EvidenceArchive:
                 break
             except Exception:
                 raise ValueError("invalid archive snapshot batch") from None
-            if selected_count == _MAX_BATCH_SNAPSHOTS:
+            if len(selected_snapshots) == _MAX_BATCH_SNAPSHOTS:
                 raise ValueError("archive snapshot batch is too large")
-            _preflight_snapshot_input(selected)
+            _preflight_snapshot_input(selected, batch_budget=raw_input_budget)
+            selected_snapshots.append(selected)
+        if not selected_snapshots:
+            raise ValueError("archive snapshot batch is empty")
+
+        archived_at = _utc(self._now(), "archive clock")
+        incoming: list[dict[str, Any]] = []
+        incoming_budget = {"encoded_bytes": 0, "nodes": 1, "resources": 0}
+        incoming_target_names: set[str] = set()
+        incoming_raw_authority: dict[
+            str,
+            tuple[tuple[str, str], dict[str, str]],
+        ] = {}
+        for selected in selected_snapshots:
             document = validated_snapshot_document(selected)
-            event_ids = [row["event_id"] for row in document["events"]]
-            if len(event_ids) != len(set(event_ids)):
-                raise ValueError("archive snapshot contains duplicate event identities")
-            if archived_at is None:
-                archived_at = _utc(self._now(), "archive clock")
             snapshot_rows = [
                 _archive_document(selected, event, archived_at)
                 for event in document["events"]
             ]
-            binding = (
+            header = (
                 selected.snapshot_id,
                 _timestamp(selected.generated_at, "snapshot generated_at"),
-                tuple(sorted(
-                    (row["event_id"], row["content_digest"])
-                    for row in snapshot_rows
-                )),
             )
-            previous_binding = batch_raw_authority.get(selected.raw_snapshot_id)
-            if previous_binding is not None and previous_binding != binding:
-                raise ValueError("ambiguous archive raw snapshot identity")
-            batch_raw_authority[selected.raw_snapshot_id] = binding
+            previous_binding = incoming_raw_authority.get(selected.raw_snapshot_id)
+            if previous_binding is None:
+                previous_binding = (header, {})
+                incoming_raw_authority[selected.raw_snapshot_id] = previous_binding
+            elif previous_binding[0] != header:
+                raise ArchiveRawAuthorityError("ambiguous archive raw snapshot identity")
             for row in snapshot_rows:
+                if row["event_id"] in previous_binding[1]:
+                    raise ValueError("archive snapshot contains duplicate event identities")
+                previous_binding[1][row["event_id"]] = row["content_digest"]
                 _validate_temporal_row(row, archived_at)
                 _charge_snapshot_budget(row, incoming_budget)
                 incoming_target_names.add(_bucket_name(row))
                 if len(incoming_target_names) > _MAX_ARCHIVE_FILES:
                     raise ValueError("archive snapshot has too many bucket candidates")
             incoming.extend(snapshot_rows)
-            selected_count += 1
-        if archived_at is None:
-            raise ValueError("archive snapshot batch is empty")
+        normalized_expected_raw_event_sets = _normalize_expected_raw_event_sets(
+            expected_raw_event_sets,
+            set(incoming_raw_authority),
+        )
 
         with CACHE_IO_LOCK, self._process_lock():
             diagnostics = self._diagnostics()
@@ -6080,6 +6273,27 @@ class EvidenceArchive:
                 base_index_record = observed_index_records[0]
                 base_generation = state["generation"]
                 base_index_digest = state["target_index_digest"]
+
+            raw_conflicts = _raw_authority_conflicts(
+                existing,
+                incoming_raw_authority,
+                normalized_expected_raw_event_sets,
+            )
+            rejected_event_ids = _raw_conflict_component_events(
+                incoming_raw_authority,
+                set(raw_conflicts),
+            )
+            if raw_conflicts and not continue_on_raw_conflict:
+                first_raw_id = min(raw_conflicts)
+                raise ArchiveRawAuthorityError(raw_conflicts[first_raw_id])
+            if rejected_event_ids:
+                incoming = [
+                    row for row in incoming
+                    if row["event_id"] not in rejected_event_ids
+                ]
+                incoming_target_names = {_bucket_name(row) for row in incoming}
+                if not incoming:
+                    return rejected_event_ids
 
             for name in sorted(incoming_target_names):
                 if name not in bucket_read_records:
@@ -6336,6 +6550,7 @@ class EvidenceArchive:
                 diagnostics=verification_diagnostics,
                 budget=verification_budget,
             )
+        return rejected_event_ids if continue_on_raw_conflict else None
 
 
     def _query_unlocked(self, days: int, status: str | None) -> list[dict[str, Any]]:

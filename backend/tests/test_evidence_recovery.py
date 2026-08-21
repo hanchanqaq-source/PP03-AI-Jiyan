@@ -345,7 +345,7 @@ def test_recovery_normalizes_archive_failure_as_unrecoverable(tmp_path):
     assert "private" not in json.dumps(report.to_dict(), ensure_ascii=False)
 
 
-def test_recovery_imports_each_valid_snapshot_event_when_a_sibling_is_invalid(tmp_path):
+def test_recovery_rejects_a_whole_raw_snapshot_when_one_sibling_is_invalid(tmp_path):
     from evidence_verification.recovery import HistoryRecovery
 
     root = tmp_path / "evidence"
@@ -368,11 +368,14 @@ def test_recovery_imports_each_valid_snapshot_event_when_a_sibling_is_invalid(tm
         now=lambda: NOW,
     ).import_records()
 
-    assert report.cache_recovered == 1
+    assert report.cache_recovered == 0
     assert report.public_refetched == 0
-    assert report.unrecoverable == 1
-    assert report.reasons == {"missing_required_fields": 1}
-    assert [row["event_id"] for row in archive.query(90)] == [good.event_id]
+    assert report.unrecoverable == 2
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "missing_required_fields": 1,
+    }
+    assert archive.query(90) == []
 
 
 def test_recovery_does_not_refetch_an_event_already_restored_from_cache(tmp_path):
@@ -673,7 +676,7 @@ def test_invalid_embedded_radar_snapshots_cannot_bypass_the_total_row_budget(tmp
     }
 
 
-def test_recovery_archive_rejection_is_counted_per_event_without_losing_siblings(tmp_path):
+def test_recovery_archive_rejection_is_atomic_for_one_raw_sibling_group(tmp_path):
     from evidence_verification.recovery import HistoryRecovery
 
     good_id = "a" * 20
@@ -712,16 +715,10 @@ def test_recovery_archive_rejection_is_counted_per_event_without_losing_siblings
         now=lambda: NOW,
     ).import_records()
 
-    assert report.cache_recovered == 1
-    assert report.unrecoverable == 1
-    assert report.reasons == {"archive_rejected": 1}
-    assert set(archive.rows) == {good_id}
-    assert archive.rows[good_id]["snapshot_history"][0]["recovery"] == {
-        "source": "evidence_current",
-        "recovered_at": NOW.isoformat(),
-        "status": "cache_recovered",
-        "source_snapshot_id": "s" * 20,
-    }
+    assert report.cache_recovered == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {"archive_rejected": 2}
+    assert archive.rows == {}
 
 
 def test_recovery_rejects_conflicting_cache_records_for_one_event_id_as_ambiguous(tmp_path):
@@ -895,7 +892,7 @@ def test_discovered_history_entry_disappearance_is_not_reported_as_empty(
     assert report.unrecoverable == 1
 
 
-def test_recovery_rejects_every_noncanonical_event_id_per_event(tmp_path):
+def test_recovery_rejects_the_raw_group_when_siblings_have_noncanonical_event_ids(tmp_path):
     from evidence_verification.recovery import HistoryRecovery
 
     root = tmp_path / "evidence"
@@ -925,11 +922,14 @@ def test_recovery_rejects_every_noncanonical_event_id_per_event(tmp_path):
         now=lambda: NOW,
     ).import_records()
 
-    assert report.cache_recovered == 1
+    assert report.cache_recovered == 0
     assert report.public_refetched == 0
-    assert report.unrecoverable == len(invalid_ids)
-    assert report.reasons == {"missing_required_fields": len(invalid_ids)}
-    assert [row["event_id"] for row in archive.query(90)] == [originals[-1].event_id]
+    assert report.unrecoverable == len(originals)
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "missing_required_fields": len(invalid_ids),
+    }
+    assert archive.query(90) == []
 
 
 def test_recovery_preserves_causal_verified_to_disproved_lineages(tmp_path):
@@ -1815,3 +1815,465 @@ def test_explicit_supplied_recovery_file_disappearance_is_closed(tmp_path, kind)
     assert report.opened_paths == ()
     assert report.reasons == {expected: 1}
     assert report.unrecoverable == 1
+
+
+@pytest.mark.parametrize("kind", ("radar", "current"))
+def test_explicit_primary_recovery_file_disappearance_is_closed(tmp_path, kind):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    if kind == "radar":
+        path = write_json(root / "radar.json", {"industries": []})
+        recovery = HistoryRecovery(root, radar_cache=path, now=lambda: NOW)
+    else:
+        path = write_json(
+            root / "current.json",
+            snapshot_document(evidence_snapshot(evidence_event())),
+        )
+        recovery = HistoryRecovery(root, evidence_current=path, now=lambda: NOW)
+    path.unlink()
+
+    report = recovery.scan()
+
+    assert report.opened_paths == ()
+    assert report.reasons == {f"{kind}_entry_disappeared": 1}
+    assert report.unrecoverable == 1
+
+
+def test_recovery_materializes_all_public_refetches_before_any_archive_write(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    first = evidence_event(
+        "a" * 20,
+        published_at=NOW - timedelta(days=2),
+        link="https://publisher.example.com/a",
+    )
+    second = evidence_event(
+        "b" * 20,
+        published_at=NOW - timedelta(days=2),
+        link="https://publisher.example.com/b",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": first.event_id,
+                "title": first.title,
+                "original_url": first.primary_evidence[0].canonical_url,
+                "published_at": first.published_at.isoformat(),
+                "verification_status": first.verification_status.value,
+            },
+            {
+                "event_id": second.event_id,
+                "title": second.title,
+                "original_url": second.primary_evidence[0].canonical_url,
+                "published_at": second.published_at.isoformat(),
+                "verification_status": second.verification_status.value,
+            },
+        ]}],
+    })
+    observed_archive_counts: list[int] = []
+
+    def refetch(url):
+        observed_archive_counts.append(archive.count())
+        if url.endswith("/a"):
+            return evidence_snapshot(
+                first,
+                snapshot_id="s" * 20,
+                raw_snapshot_id="r" * 20,
+            )
+        raise RuntimeError("provider detail")
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert observed_archive_counts == [0, 0]
+    assert report.public_refetched == 1
+    assert report.unrecoverable == 1
+    assert report.reasons == {"public_refetch_failed": 1}
+
+
+def test_recovery_rejects_a_conflicting_refetch_raw_group_but_commits_an_independent_group(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    events = {
+        key: evidence_event(
+            key * 20,
+            published_at=NOW - timedelta(days=2),
+            link=f"https://publisher.example.com/{key}",
+        )
+        for key in ("a", "b", "c")
+    }
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": selected.event_id,
+                "title": selected.title,
+                "original_url": selected.primary_evidence[0].canonical_url,
+                "published_at": selected.published_at.isoformat(),
+                "verification_status": selected.verification_status.value,
+            }
+            for selected in events.values()
+        ]}],
+    })
+
+    def refetch(url):
+        key = url.rsplit("/", 1)[-1]
+        return evidence_snapshot(
+            events[key],
+            snapshot_id={"a": "s", "b": "t", "c": "u"}[key] * 20,
+            raw_snapshot_id=("r" if key in {"a", "b"} else "v") * 20,
+        )
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 1
+    assert report.unrecoverable == 2
+    assert report.reasons == {"ambiguous_record": 2}
+    assert [row["event_id"] for row in archive.query(90)] == ["c" * 20]
+
+
+def test_recovery_preflights_a_tampered_refetch_raw_id_before_writing_its_sibling(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    events = {
+        key: evidence_event(
+            key * 20,
+            published_at=NOW - timedelta(days=2),
+            link=f"https://publisher.example.com/{key}",
+        )
+        for key in ("a", "b")
+    }
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": selected.event_id,
+                "title": selected.title,
+                "original_url": selected.primary_evidence[0].canonical_url,
+                "published_at": selected.published_at.isoformat(),
+                "verification_status": selected.verification_status.value,
+            }
+            for selected in events.values()
+        ]}],
+    })
+
+    def refetch(url):
+        key = url.rsplit("/", 1)[-1]
+        selected = events[key]
+        if key == "b":
+            selected = replace(selected, title="篡改后的标题")
+        return evidence_snapshot(
+            selected,
+            snapshot_id="s" * 20,
+            raw_snapshot_id="r" * 20,
+        )
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 1,
+    }
+    assert archive.query(90) == []
+
+
+def test_recovery_rejects_an_existing_raw_group_tamper_before_writing_any_sibling(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    first = evidence_event("a" * 20, published_at=NOW - timedelta(days=2))
+    second = evidence_event("b" * 20, published_at=NOW - timedelta(days=2))
+    original = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW - timedelta(days=1),
+        events=(first, second),
+    )
+    archive.upsert(original)
+    state_before = archive.state_path.read_bytes()
+    tampered = replace(second, summary="篡改后的公开摘要")
+    current = write_json(
+        root / "current.json",
+        snapshot_document(replace(original, events=(first, tampered))),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {"ambiguous_record": 2}
+    assert archive.state_path.read_bytes() == state_before
+    assert archive.get(second.event_id)["summary"] == second.summary
+
+
+def test_recovery_completes_a_legal_preexisting_raw_sibling_and_retries_idempotently(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    first = evidence_event("a" * 20, published_at=NOW - timedelta(days=2))
+    second = evidence_event("b" * 20, published_at=NOW - timedelta(days=2))
+    complete = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW - timedelta(days=1),
+        events=(first, second),
+    )
+    archive.upsert(replace(complete, events=(first,)))
+    current = write_json(root / "current.json", snapshot_document(complete))
+
+    first_report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+    retry_report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert (first_report.cache_recovered, first_report.unrecoverable) == (2, 0)
+    assert (retry_report.cache_recovered, retry_report.unrecoverable) == (2, 0)
+    assert {row["event_id"] for row in archive.query(90)} == {"a" * 20, "b" * 20}
+
+
+def test_recovery_builds_archive_raw_authority_once_while_an_independent_group_continues(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.archive as archive_module
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    first = evidence_event("a" * 20, published_at=NOW - timedelta(days=2))
+    second = evidence_event("b" * 20, published_at=NOW - timedelta(days=2))
+    original = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW - timedelta(days=1),
+        events=(first, second),
+    )
+    archive.upsert(original)
+    tampered = replace(second, summary="篡改后的公开摘要")
+    current = write_json(
+        root / "current.json",
+        snapshot_document(replace(original, events=(first, tampered))),
+    )
+    independent = evidence_snapshot(
+        evidence_event("c" * 20, published_at=NOW - timedelta(days=2)),
+        snapshot_id="u" * 20,
+        raw_snapshot_id="v" * 20,
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-independent.json",
+        snapshot_document(independent),
+    )
+    real_raw_map = archive_module._archive_raw_authority_map
+    raw_map_calls = 0
+
+    def observe_raw_map(rows):
+        nonlocal raw_map_calls
+        raw_map_calls += 1
+        return real_raw_map(rows)
+
+    monkeypatch.setattr(archive_module, "_archive_raw_authority_map", observe_raw_map)
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert raw_map_calls == 1
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 2
+    assert report.reasons == {"ambiguous_record": 2}
+    assert {row["event_id"] for row in archive.query(90)} == {
+        "a" * 20,
+        "b" * 20,
+        "c" * 20,
+    }
+    assert archive.get(second.event_id)["summary"] == second.summary
+
+
+def test_recovery_allows_a_newer_same_status_snapshot_to_update_real_content(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    first_time = NOW - timedelta(days=2)
+    second_time = NOW - timedelta(days=1)
+    original = evidence_event("a" * 20, published_at=first_time)
+    updated_evidence = replace(
+        original.primary_evidence[0],
+        evidence_id="evidence-update-a",
+        canonical_url="https://official.example.com/update-a",
+        published_at=second_time,
+        title="后续正式公告证据",
+        excerpt="后续公开证据摘要",
+    )
+    updated = replace(
+        original,
+        title="后续正式公告标题",
+        summary="后续正式公告摘要",
+        verified_at=second_time,
+        evidence_as_of=second_time,
+        primary_evidence=(updated_evidence,),
+    )
+    first = EvidenceSnapshot("s" * 20, first_time, (original,), "r" * 20)
+    second = EvidenceSnapshot("t" * 20, second_time, (updated,), "u" * 20)
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-first.json",
+        snapshot_document(first),
+    )
+    current = write_json(root / "current.json", snapshot_document(second))
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 0
+    archived = archive.get(original.event_id)
+    assert archived["title"] == updated.title
+    assert archived["summary"] == updated.summary
+    evidence_by_id = {
+        item["evidence_id"]: item for item in archived["primary_evidence"]
+    }
+    assert set(evidence_by_id) == {
+        original.primary_evidence[0].evidence_id,
+        updated_evidence.evidence_id,
+    }
+    assert evidence_by_id[updated_evidence.evidence_id]["canonical_url"] == (
+        updated_evidence.canonical_url
+    )
+    assert len(archived["status_history"]) == 1
+    assert len(archived["snapshot_history"]) == 2
+
+
+def test_recovery_rejects_duplicate_event_identity_inside_one_source_snapshot(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    duplicate = evidence_event("a" * 20)
+    current = write_json(
+        root / "current.json",
+        snapshot_document(EvidenceSnapshot(
+            snapshot_id="s" * 20,
+            raw_snapshot_id="r" * 20,
+            generated_at=NOW - timedelta(days=1),
+            events=(duplicate, duplicate),
+        )),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.unrecoverable == 1
+    assert report.reasons == {"ambiguous_record": 1}
+    assert archive.count() == 0
+
+
+def test_recovery_raw_group_fault_reports_and_persists_all_or_old_then_retries(
+    tmp_path,
+    monkeypatch,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    selected = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW - timedelta(days=1),
+        events=(evidence_event("a" * 20), evidence_event("b" * 20)),
+    )
+    current = write_json(root / "current.json", snapshot_document(selected))
+    real_write = EvidenceArchive._atomic_write
+    writes = 0
+
+    def fail_once(self, path, payload, maximum):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("simulated recovery interruption")
+        return real_write(self, path, payload, maximum)
+
+    monkeypatch.setattr(EvidenceArchive, "_atomic_write", fail_once)
+    first = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert (first.cache_recovered, first.unrecoverable) in {(0, 2), (2, 0)}
+    assert {row["event_id"] for row in archive.query(90)} in (
+        set(),
+        {"a" * 20, "b" * 20},
+    )
+
+    monkeypatch.setattr(EvidenceArchive, "_atomic_write", real_write)
+    retry = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert retry.cache_recovered == 2
+    assert retry.unrecoverable == 0
+    assert {row["event_id"] for row in archive.query(90)} == {"a" * 20, "b" * 20}

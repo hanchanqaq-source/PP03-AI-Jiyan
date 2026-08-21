@@ -238,6 +238,16 @@ def test_archive_batch_commits_multi_event_multi_bucket_and_retry_idempotently(t
 def test_archive_batch_is_serialized_across_concurrent_writers(tmp_path):
     verified, disproved = _causal_recovery_snapshots("a" * 20)
     other_verified, other_disproved = _causal_recovery_snapshots("b" * 20)
+    other_verified = replace(
+        other_verified,
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+    )
+    other_disproved = replace(
+        other_disproved,
+        snapshot_id="7" * 20,
+        raw_snapshot_id="8" * 20,
+    )
     first = EvidenceArchive(tmp_path, now=lambda: NOW)
     second = EvidenceArchive(tmp_path, now=lambda: NOW)
 
@@ -279,6 +289,213 @@ def test_archive_batch_stops_consuming_input_at_the_combined_snapshot_budget(
 
     assert consumed < 10
     assert archive.count() == 0
+
+
+def test_archive_batch_rejects_the_combined_raw_title_budget_before_projection(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.storage as storage_module
+
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    trusted_text_calls = 0
+    real_trusted_text = storage_module.trusted_event_text
+
+    def observe_trusted_text(selected, value):
+        nonlocal trusted_text_calls
+        trusted_text_calls += 1
+        return real_trusted_text(selected, value)
+
+    monkeypatch.setattr(storage_module, "trusted_event_text", observe_trusted_text)
+    selected = tuple(
+        snapshot(
+            event(f"{index:020x}", title="x" * 8_000),
+            snapshot_id=f"s{index:019d}",
+            raw_snapshot_id=f"r{index:019d}",
+        )
+        for index in range(2_500)
+    )
+
+    with pytest.raises(ValueError, match="archive snapshot budget exceeded"):
+        archive.upsert_many(selected)
+
+    assert trusted_text_calls == 0
+    assert not archive.state_path.exists()
+
+
+def test_archive_rejects_duplicate_source_event_before_projection(tmp_path, monkeypatch):
+    import evidence_verification.storage as storage_module
+
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    duplicate = event("a" * 20)
+    selected = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW,
+        events=(duplicate, duplicate),
+    )
+    trusted_text_calls = 0
+    real_trusted_text = storage_module.trusted_event_text
+
+    def observe_trusted_text(event_value, text):
+        nonlocal trusted_text_calls
+        trusted_text_calls += 1
+        return real_trusted_text(event_value, text)
+
+    monkeypatch.setattr(storage_module, "trusted_event_text", observe_trusted_text)
+
+    with pytest.raises(ValueError, match="duplicate event identities"):
+        archive.upsert_many((selected,))
+
+    assert trusted_text_calls == 0
+    assert not archive.state_path.exists()
+
+
+def test_archive_expected_raw_event_set_completes_a_legal_missing_sibling(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    first = snapshot(
+        event("a" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    second = snapshot(
+        event("b" * 20),
+        snapshot_id=first.snapshot_id,
+        raw_snapshot_id=first.raw_snapshot_id,
+        generated_at=first.generated_at,
+    )
+    archive.upsert(first)
+
+    archive.upsert_many(
+        (second,),
+        expected_raw_event_sets={first.raw_snapshot_id: ("a" * 20, "b" * 20)},
+    )
+
+    assert {row["event_id"] for row in archive.query(90)} == {"a" * 20, "b" * 20}
+
+
+def test_archive_raw_conflict_with_existing_projection_has_zero_transaction_writes(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    first = event("a" * 20)
+    second = event("b" * 20)
+    original = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW,
+        events=(first, second),
+    )
+    archive.upsert(original)
+    state_before = archive.state_path.read_bytes()
+    tampered = snapshot(
+        replace(second, summary="篡改后的摘要"),
+        snapshot_id=original.snapshot_id,
+        raw_snapshot_id=original.raw_snapshot_id,
+        generated_at=original.generated_at,
+    )
+    writes = 0
+    real_write = archive._atomic_write
+
+    def observe_write(path, payload, maximum):
+        nonlocal writes
+        writes += 1
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", observe_write)
+
+    with pytest.raises(ValueError, match="lineage"):
+        archive.upsert_many(
+            (tampered,),
+            expected_raw_event_sets={original.raw_snapshot_id: ("a" * 20, "b" * 20)},
+        )
+
+    assert writes == 0
+    assert archive.state_path.read_bytes() == state_before
+    assert archive.get(second.event_id)["summary"] == second.summary
+
+
+def test_archive_serializes_competing_evidence_identities_for_one_raw_snapshot(tmp_path):
+    first = EvidenceArchive(tmp_path, now=lambda: NOW)
+    second = EvidenceArchive(tmp_path, now=lambda: NOW)
+    candidate_a = snapshot(
+        event("a" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    candidate_b = snapshot(
+        event("b" * 20),
+        snapshot_id="t" * 20,
+        raw_snapshot_id=candidate_a.raw_snapshot_id,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(first.upsert, candidate_a),
+            executor.submit(second.upsert, candidate_b),
+        )
+        outcomes = []
+        for future in futures:
+            try:
+                future.result(timeout=30)
+            except ValueError:
+                outcomes.append("rejected")
+            else:
+                outcomes.append("committed")
+
+    assert sorted(outcomes) == ["committed", "rejected"]
+    assert len(EvidenceArchive(tmp_path, now=lambda: NOW).query(90)) == 1
+
+
+def test_archive_serializes_competing_raw_authorities_across_real_processes(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    processes = [
+        context.Process(
+            target=_competing_raw_upsert_in_child,
+            args=(str(tmp_path), event_id, snapshot_id, start),
+        )
+        for event_id, snapshot_id in (
+            ("a" * 20, "s" * 20),
+            ("b" * 20, "t" * 20),
+        )
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(30)
+
+    assert sorted(process.exitcode for process in processes) == [0, 79]
+    assert len(EvidenceArchive(tmp_path, now=lambda: NOW).query(90)) == 1
+
+
+def test_archive_real_process_crash_keeps_raw_siblings_all_or_old_and_retryable(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_crash_raw_sibling_batch_before_index_replace,
+        args=(str(tmp_path),),
+    )
+    process.start()
+    process.join(30)
+
+    assert process.exitcode == 74
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    observed = {row["event_id"] for row in archive.query(90)}
+    assert observed in (set(), {"a" * 20, "b" * 20})
+
+    selected = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW,
+        events=(event("a" * 20), event("b" * 20)),
+    )
+    archive.upsert_many(
+        (selected,),
+        expected_raw_event_sets={selected.raw_snapshot_id: ("a" * 20, "b" * 20)},
+    )
+    assert {row["event_id"] for row in archive.query(90)} == {"a" * 20, "b" * 20}
 
 
 def _legacy_v1_row(row: dict[str, object]) -> dict[str, object]:
@@ -490,7 +707,51 @@ def _write_historical_v1_finalized_archive(
 
 
 def _upsert_in_child(root: str, event_id: str) -> None:
-    EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(event(event_id)))
+    raw_snapshot_id = ("1" if event_id.startswith("1") else "2") * 20
+    EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(
+        event(event_id),
+        snapshot_id=event_id,
+        raw_snapshot_id=raw_snapshot_id,
+    ))
+
+
+def _competing_raw_upsert_in_child(
+    root: str,
+    event_id: str,
+    snapshot_id: str,
+    start: object,
+) -> None:
+    start.wait(20)
+    try:
+        EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(
+            event(event_id),
+            snapshot_id=snapshot_id,
+            raw_snapshot_id="r" * 20,
+        ))
+    except ValueError:
+        os._exit(79)
+
+
+def _crash_raw_sibling_batch_before_index_replace(root: str) -> None:
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    real_replace = archive_module._replace_durable
+
+    def exit_before_index_replace(source: Path, destination: Path) -> None:
+        if destination == archive.index_path:
+            os._exit(74)
+        real_replace(source, destination)
+
+    archive_module._replace_durable = exit_before_index_replace
+    selected = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW,
+        events=(event("a" * 20), event("b" * 20)),
+    )
+    archive.upsert_many(
+        (selected,),
+        expected_raw_event_sets={selected.raw_snapshot_id: ("a" * 20, "b" * 20)},
+    )
 
 
 def _crash_after_archive_temp_fsync(root: str) -> None:
@@ -722,18 +983,22 @@ def test_archive_atomic_rewrite_failure_preserves_previous_bucket(tmp_path, monk
 
     monkeypatch.setattr(archive_module, "_replace_durable", fail_bucket)
     with pytest.raises(OSError, match="storage_error"):
-        archive.upsert(snapshot(event(
-            status=VerificationStatus.DISPROVED,
-            history=(
-                StatusTransition(None, VerificationStatus.VERIFIED, NOW, "reason-verified"),
-                StatusTransition(
-                    VerificationStatus.VERIFIED,
-                    VerificationStatus.DISPROVED,
-                    NOW,
-                    "reason-disproved",
+        archive.upsert(snapshot(
+            event(
+                status=VerificationStatus.DISPROVED,
+                history=(
+                    StatusTransition(None, VerificationStatus.VERIFIED, NOW, "reason-verified"),
+                    StatusTransition(
+                        VerificationStatus.VERIFIED,
+                        VerificationStatus.DISPROVED,
+                        NOW,
+                        "reason-disproved",
+                    ),
                 ),
             ),
-        ), snapshot_id="f" * 20))
+            snapshot_id="f" * 20,
+            raw_snapshot_id="q" * 20,
+        ))
 
     assert bucket.read_bytes() == before
 
