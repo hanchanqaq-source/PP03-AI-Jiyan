@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -2980,3 +2980,279 @@ def test_recovery_invalid_raw_group_does_not_consume_combined_cap_for_independen
         "missing_required_fields": 1,
     }
     assert {row["event_id"] for row in archive.query(90)} == {"b" * 20}
+
+
+@pytest.mark.parametrize("successful_offsets", (0, 4))
+def test_public_refetch_malformed_timezone_keeps_raw_marker_and_closes_cache_sibling(
+    tmp_path,
+    successful_offsets,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    class ExplosiveTimezone(tzinfo):
+        calls = 0
+
+        def utcoffset(self, _value):
+            self.calls += 1
+            if self.calls > successful_offsets:
+                raise RuntimeError("private timezone detail")
+            return timedelta(0)
+
+        def dst(self, _value):
+            return timedelta(0)
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    generated_at = NOW - timedelta(days=1)
+    cached = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=generated_at,
+        events=(evidence_event("b" * 20),),
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(cached),
+    )
+    candidate = evidence_event(
+        "a" * 20,
+        link="https://publisher.example.com/a",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+    malformed_time = datetime(2026, 8, 20, 9, 0, tzinfo=ExplosiveTimezone())
+
+    def refetch(_url):
+        return EvidenceSnapshot(
+            snapshot_id=cached.snapshot_id,
+            raw_snapshot_id=cached.raw_snapshot_id,
+            generated_at=malformed_time,
+            events=(candidate,),
+        )
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 1,
+    }
+    assert "private timezone detail" not in repr(report.to_dict())
+    assert archive.query(90) == []
+
+
+def test_public_refetch_surrogate_text_keeps_raw_marker_and_closes_cache_sibling(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    cached = evidence_snapshot(
+        evidence_event("b" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(cached),
+    )
+    candidate = evidence_event(
+        "a" * 20,
+        link="https://publisher.example.com/a",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+    invalid = replace(candidate, summary="\ud800")
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        public_refetcher=lambda _url: EvidenceSnapshot(
+            snapshot_id=cached.snapshot_id,
+            raw_snapshot_id=cached.raw_snapshot_id,
+            generated_at=cached.generated_at,
+            events=(invalid,),
+        ),
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 1,
+    }
+    assert "\ud800" not in repr(report.to_dict())
+    assert archive.query(90) == []
+
+
+@pytest.mark.parametrize("source", ("current", "radar", "history"))
+def test_recovery_surrogate_cache_text_is_per_event_closed_and_blocks_raw_sibling(
+    tmp_path,
+    source,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    invalid_source = evidence_snapshot(
+        replace(evidence_event("b" * 20), summary="\ud800"),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    valid_sibling = replace(invalid_source, events=(evidence_event("a" * 20),))
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(valid_sibling),
+    )
+    invalid_document = snapshot_document(invalid_source)
+    supplied: dict[str, object] = {}
+    if source == "current":
+        current = root / "current.json"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.write_text(json.dumps(invalid_document), encoding="utf-8")
+        supplied["evidence_current"] = current
+    elif source == "radar":
+        radar = root / "radar.json"
+        radar.parent.mkdir(parents=True, exist_ok=True)
+        radar.write_text(json.dumps({
+            "industries": [{"items": [{"evidence_snapshot": invalid_document}]}],
+        }), encoding="utf-8")
+        supplied["radar_cache"] = radar
+    else:
+        history = root / "history" / "2026-08-20.jsonl"
+        history.parent.mkdir(parents=True, exist_ok=True)
+        history.write_text(
+            json.dumps({"snapshot": invalid_document}) + "\n",
+            encoding="utf-8",
+        )
+        supplied["evidence_history"] = (history,)
+
+    report = HistoryRecovery(
+        root,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+        **supplied,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "missing_required_fields": 1,
+    }
+    assert "\ud800" not in repr(report.to_dict())
+    assert archive.query(90) == []
+
+
+def test_recovery_static_gate_rejects_surrogate_title_before_callback_or_cache_write(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(evidence_event("a" * 20))),
+    )
+    candidate = evidence_event(
+        "b" * 20,
+        link="https://publisher.example.com/b",
+    )
+    radar = root / "radar.json"
+    radar.write_text(json.dumps({
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": "\ud800",
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    }), encoding="utf-8")
+    calls = 0
+
+    def refetch(_url):
+        nonlocal calls
+        calls += 1
+        return evidence_snapshot(candidate)
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == 0
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {
+        "archive_rejected": 1,
+        "public_refetch_failed": 1,
+    }
+    assert "\ud800" not in repr(report.to_dict())
+    assert archive.query(90) == []
+
+
+def test_public_refetch_accepts_valid_unicode_within_utf8_budget(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    link = "https://publisher.example.com/unicode"
+    selected = replace(
+        evidence_event("a" * 20, link=link),
+        title="公开事件 🌏",
+        summary="合法中文摘要与 emoji ✅",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": selected.event_id,
+            "title": selected.title,
+            "original_url": link,
+            "published_at": selected.published_at.isoformat(),
+            "verification_status": selected.verification_status.value,
+        }]}],
+    })
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=lambda _url: evidence_snapshot(selected),
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 1
+    assert report.unrecoverable == 0
+    assert archive.get(selected.event_id)["title"] == selected.title

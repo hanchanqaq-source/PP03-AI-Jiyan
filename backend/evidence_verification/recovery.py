@@ -79,6 +79,10 @@ class _RefetchLimitExceeded(ValueError):
     pass
 
 
+class _RecoveryInputInvalid(ValueError):
+    pass
+
+
 def _new_refetch_budget() -> dict[str, int | bool]:
     return {
         "events": _MAX_BATCH_SNAPSHOTS,
@@ -195,12 +199,19 @@ def _event_links(event: EvidenceEvent) -> tuple[str, ...]:
 def _refetch_text(value: str, budget: dict[str, int | bool]) -> str:
     if type(value) is not str or len(value) > _MAX_REFETCH_TEXT_CHARS:
         raise _RefetchLimitExceeded("invalid public refetch text")
-    encoded = value.encode("utf-8")
+    encoded = _refetch_utf8(value)
     if len(encoded) > int(budget["text_bytes"]):
         budget["exhausted"] = True
         raise _RefetchLimitExceeded("public refetch text limit exceeded")
     budget["text_bytes"] = int(budget["text_bytes"]) - len(encoded)
     return value
+
+
+def _refetch_utf8(value: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise _RefetchLimitExceeded("invalid public refetch text") from error
 
 
 def _refetch_node(budget: dict[str, int | bool]) -> None:
@@ -479,53 +490,105 @@ def _normalized_refetch_event(
 
 def _shallow_refetch_marker(value: object) -> _RawGroupMarker | None:
     if type(value) is EvidenceSnapshot:
-        events = value.events
-        shallow_events = (
-            [
-                {
-                    "event_id": (
-                        event.event_id
-                        if type(event) is EvidenceEvent
-                        else None
+        marker = _raw_group_marker_from_document(
+            {
+                "snapshot_id": value.snapshot_id,
+                "raw_snapshot_id": value.raw_snapshot_id,
+                "events": [],
+            },
+            invalid=True,
+            allow_empty=True,
+        )
+        if marker is None:
+            return None
+        try:
+            events = value.events
+            if type(events) not in {tuple, list}:
+                return marker
+            shallow_events = events[:_MAX_REFETCH_EVENTS + 1]
+            event_ids = tuple(
+                event_id
+                for event in shallow_events
+                for event_id in (
+                    _canonical_event_id(event.event_id)
+                    if type(event) is EvidenceEvent
+                    else None,
+                )
+                if event_id is not None
+            )
+            generated_at = value.generated_at
+            if type(generated_at) is not datetime:
+                return replace(
+                    marker,
+                    declared_event_ids=tuple(sorted(set(event_ids))),
+                )
+            try:
+                if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+                    return replace(
+                        marker,
+                        declared_event_ids=tuple(sorted(set(event_ids))),
                     )
-                }
-                for event in events[:_MAX_REFETCH_EVENTS + 1]
-            ]
-            if type(events) in {tuple, list}
-            else None
-        )
-        document = {
-            "snapshot_id": value.snapshot_id,
-            "raw_snapshot_id": value.raw_snapshot_id,
-            "generated_at": (
-                value.generated_at.isoformat()
-                if type(value.generated_at) is datetime
-                else None
-            ),
-            "events": shallow_events,
-        }
-        return _raw_group_marker_from_document(
-            document,
-            invalid=shallow_events is None,
-            allow_empty=True,
-        )
+                normalized_time = generated_at.astimezone(timezone.utc)
+            except Exception:
+                return replace(
+                    marker,
+                    declared_event_ids=tuple(sorted(set(event_ids))),
+                )
+            invalid = (
+                len(shallow_events) != 1
+                or len(event_ids) != len(shallow_events)
+                or len(event_ids) != len(set(event_ids))
+            )
+            return replace(
+                marker,
+                generated_at=normalized_time,
+                declared_event_ids=tuple(sorted(set(event_ids))),
+                invalid=invalid,
+            )
+        except Exception:
+            return marker
     if type(value) is dict:
-        events = value.get("events")
-        shallow = {
-            "snapshot_id": value.get("snapshot_id"),
-            "raw_snapshot_id": value.get("raw_snapshot_id"),
-            "generated_at": value.get("generated_at"),
-            "events": (
-                events[:_MAX_REFETCH_EVENTS + 1]
-                if type(events) is list
-                else None
-            ),
-        }
-        return _raw_group_marker_from_document(
-            shallow,
-            invalid=type(events) is not list,
+        marker = _raw_group_marker_from_document(
+            {
+                "snapshot_id": value.get("snapshot_id"),
+                "raw_snapshot_id": value.get("raw_snapshot_id"),
+                "events": [],
+            },
+            invalid=True,
             allow_empty=True,
         )
+        if marker is None:
+            return None
+        try:
+            events = value.get("events")
+            if type(events) is not list:
+                return marker
+            shallow_events = events[:_MAX_REFETCH_EVENTS + 1]
+            event_ids = tuple(
+                event_id
+                for row in shallow_events
+                for event_id in (
+                    _canonical_event_id(row.get("event_id"))
+                    if type(row) is dict
+                    else None,
+                )
+                if event_id is not None
+            )
+            generated_at = _aware_time(value.get("generated_at"))
+            invalid = (
+                generated_at is None
+                or len(shallow_events) != 1
+                or len(event_ids) != len(shallow_events)
+                or len(event_ids) != len(set(event_ids))
+            )
+            return replace(
+                marker,
+                generated_at=generated_at,
+                declared_event_ids=tuple(sorted(set(event_ids))),
+                invalid=invalid,
+            )
+        except Exception:
+            return marker
     return None
 
 
@@ -582,12 +645,12 @@ def _bounded_refetch_snapshot(
                 generated_at=generated_at,
                 events=(_normalized_refetch_event(event_values[0], budget),),
             )
-            encoded = json.dumps(
+            encoded = _refetch_utf8(json.dumps(
                 _raw_input_canonical(normalized),
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
-            ).encode("utf-8")
+            ))
             _take_refetch_document_bytes(encoded, budget)
             return normalized if _snapshot_is_complete(normalized) else None, marker
         if type(value) is not dict or "events" not in value:
@@ -612,18 +675,22 @@ def _bounded_refetch_snapshot(
             else:
                 root[key] = item
         materialized = _materialize_refetch_json(root, budget)
-        encoded = json.dumps(
+        encoded = _refetch_utf8(json.dumps(
             materialized,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
+        ))
         _take_refetch_document_bytes(encoded, budget)
         marker = _raw_group_marker_from_document(materialized, invalid=False) or marker
         return HistoryRecovery._parse_snapshot(materialized), marker
     except _RefetchLimitExceeded as error:
         error.raw_marker = marker
         raise
+    except Exception as error:
+        closed = _RefetchLimitExceeded("invalid public refetch value")
+        closed.raw_marker = marker
+        raise closed from error
 
 
 def _preflight_refetch_candidates(
@@ -644,12 +711,12 @@ def _preflight_refetch_candidates(
         _refetch_node(budget)
         for value in values:
             _validated_refetch_text(value, budget)
-        encoded = json.dumps(
+        encoded = _refetch_utf8(json.dumps(
             document,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
+        ))
         _take_refetch_document_bytes(encoded, budget)
 
     try:
@@ -722,7 +789,10 @@ def _snapshot_is_complete(snapshot: EvidenceSnapshot) -> bool:
 
 
 def _event_fingerprint(event: EvidenceEvent) -> str:
-    return _raw_input_event_digest(event)
+    try:
+        return _raw_input_event_digest(event)
+    except UnicodeEncodeError as error:
+        raise _RecoveryInputInvalid("invalid recovery text") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -1124,17 +1194,17 @@ class HistoryRecovery:
             self._add_reason(reasons, "ambiguous_record", len(set(valid_source_ids)) or 1)
             record_marker(invalid=True)
             return
-        parsed: list[EvidenceSnapshot] = []
+        parsed: list[tuple[EvidenceSnapshot, str]] = []
         invalid_rows = 0
 
         def append_parsed() -> None:
             binding = tuple(sorted(
-                (snapshot.events[0].event_id, _event_fingerprint(snapshot.events[0]))
-                for snapshot in parsed
+                (snapshot.events[0].event_id, fingerprint)
+                for snapshot, fingerprint in parsed
             ))
             records.extend(
                 _CacheRecord(snapshot=snapshot, source=source, raw_event_set=binding)
-                for snapshot in parsed
+                for snapshot, _fingerprint in parsed
             )
 
         for index, row in enumerate(events):
@@ -1148,7 +1218,13 @@ class HistoryRecovery:
                 self._add_reason(reasons, "missing_required_fields")
                 invalid_rows += 1
                 continue
-            parsed.append(snapshot)
+            try:
+                fingerprint = _event_fingerprint(snapshot.events[0])
+            except _RecoveryInputInvalid:
+                self._add_reason(reasons, "missing_required_fields")
+                invalid_rows += 1
+                continue
+            parsed.append((snapshot, fingerprint))
         if invalid_rows:
             self._add_reason(reasons, "ambiguous_record", len(parsed))
             record_marker(invalid=True)
