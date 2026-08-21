@@ -502,8 +502,10 @@ def _legacy_v1_row(row: dict[str, object]) -> dict[str, object]:
     legacy = json.loads(json.dumps(row, ensure_ascii=False))
     legacy["schema_version"] = 1
     legacy.pop("content_digest")
+    legacy.pop("raw_input_digest")
     for lineage in legacy["snapshot_history"]:
         lineage.pop("content_digest")
+        lineage.pop("raw_input_digest")
     return legacy
 
 
@@ -808,7 +810,11 @@ def test_archive_deduplicates_by_event_id_and_preserves_disproof_history_and_lin
     assert rows[0]["evidence_snapshot_id"] == "3" * 20
     assert rows[0]["raw_snapshot_id"] == "4" * 20
     assert [
-        {key: value for key, value in lineage.items() if key != "content_digest"}
+        {
+            key: value
+            for key, value in lineage.items()
+            if key not in {"content_digest", "raw_input_digest"}
+        }
         for lineage in rows[0]["snapshot_history"]
     ] == [
         {
@@ -1349,6 +1355,7 @@ def test_archive_preserves_more_than_256_lineages_within_the_window(tmp_path):
             "raw_snapshot_id": f"{number + 1000:020x}",
             "generated_at": (initial_time + timedelta(minutes=number)).isoformat(),
             "content_digest": f"{number:064x}",
+            "raw_input_digest": f"{number + 256:064x}",
         }
         for number in range(256)
     ]
@@ -1358,6 +1365,7 @@ def test_archive_preserves_more_than_256_lineages_within_the_window(tmp_path):
     row["raw_snapshot_id"] = latest["raw_snapshot_id"]
     row["snapshot_generated_at"] = latest["generated_at"]
     row["last_updated_at"] = latest["generated_at"]
+    row["raw_input_digest"] = latest["raw_input_digest"]
     bucket.write_text(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     _refresh_finalized_bucket_manifest(archive)
 
@@ -2305,7 +2313,7 @@ def test_archive_merge_preserves_historical_key_field_evidence_references(tmp_pa
     assert set(amount["evidence_ids"]) == {"old-proof", "new-proof"}
 
 
-def test_archive_reads_v1_bucket_and_rewrites_it_as_strict_v2_on_next_upsert(tmp_path):
+def test_archive_reads_v1_bucket_rewrites_v3_and_fails_closed_on_exact_retry(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     original = snapshot(event(primary_evidence=(evidence_item("legacy-proof"),)))
     archive.upsert(original)
@@ -2319,15 +2327,17 @@ def test_archive_reads_v1_bucket_and_rewrites_it_as_strict_v2_on_next_upsert(tmp
 
     recovered = archive.query(days=90)
     assert len(recovered) == 1
-    assert recovered[0]["schema_version"] == 2
+    assert recovered[0]["schema_version"] == 3
     assert len(recovered[0]["content_digest"]) == 64
     assert all(len(lineage["content_digest"]) == 64 for lineage in recovered[0]["snapshot_history"])
     assert all(lineage["legacy_v1"] is True for lineage in recovered[0]["snapshot_history"])
 
-    archive.upsert(original)
+    with pytest.raises(archive_module.ArchiveRawAuthorityError, match="lineage"):
+        archive.upsert(original)
     persisted = json.loads(bucket.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 2
+    assert persisted["schema_version"] == 3
     assert len(persisted["content_digest"]) == 64
+    assert len(persisted["raw_input_digest"]) == 64
 
 
 def test_archive_v1_compatibility_requires_an_exact_integer_schema_version(tmp_path):
@@ -2368,7 +2378,7 @@ def test_archive_reads_strict_v1_rows_from_committed_journal(tmp_path):
 
     recovered = archive.query(days=90)
     assert len(recovered) == 1
-    assert recovered[0]["schema_version"] == 2
+    assert recovered[0]["schema_version"] == 3
     assert len(recovered[0]["content_digest"]) == 64
 
 
@@ -2414,7 +2424,7 @@ def test_archive_rejects_unknown_future_bucket_schema_instead_of_hiding_history(
     archive.upsert(snapshot(event()))
     bucket = archive.archive_root / "2026-08-20.jsonl"
     row = json.loads(bucket.read_text(encoding="utf-8"))
-    row["schema_version"] = 3
+    row["schema_version"] = 4
     bucket.write_text(
         json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
@@ -9000,3 +9010,340 @@ def test_archive_first_v1_journal_uses_a_new_budget_after_recovery_phase(
 
     assert [row["event_id"] for row in archive.query(days=90)] == ["j" * 20]
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
+
+
+def test_archive_raw_authority_binds_exact_untruncated_input_and_retry_is_idempotent(
+    tmp_path,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(hours=1))
+    shared_prefix = "公开摘要" + ("x" * 1_200)
+    first = snapshot(event(summary=shared_prefix + "A"))
+    changed_tail = snapshot(event(summary=shared_prefix + "B"))
+
+    archive.upsert(first)
+    archive.upsert(first)
+    state_before = archive.state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="lineage|raw snapshot"):
+        archive.upsert(changed_tail)
+
+    assert archive.state_path.read_bytes() == state_before
+    row = archive.get(first.events[0].event_id)
+    assert row is not None
+    assert row["summary"] == shared_prefix[:1_200]
+    assert "raw_input_digest" in row
+    assert len(row["raw_input_digest"]) == 64
+    assert row["snapshot_history"][0]["raw_input_digest"] == row["raw_input_digest"]
+    raw_text = b"".join(
+        path.read_bytes()
+        for path in archive.archive_root.iterdir()
+        if path.is_file()
+    )
+    assert (shared_prefix + "A").encode("utf-8") not in raw_text
+
+
+def test_archive_raw_input_digest_covers_every_authoritative_event_field_group():
+    proof = evidence_item(
+        "proof",
+        canonical_url="https://official.example.com/proof?utm_source=first",
+        excerpt="evidence body A",
+    )
+    amount = KeyField(
+        "amount",
+        "12亿元",
+        "1200000000",
+        FieldVerificationStatus.VERIFIED,
+        ("proof",),
+        "official amount",
+    )
+    base = event(primary_evidence=(proof,), key_fields=(amount,))
+    transition = base.status_history[0]
+    changed = {
+        "title": replace(base, title=("t" * 500) + "tail-B"),
+        "summary": replace(base, summary=("s" * 1_200) + "tail-B"),
+        "core_claim": replace(base, core_claim=("c" * 1_200) + "tail-B"),
+        "url": replace(
+            base,
+            primary_evidence=(replace(
+                proof,
+                canonical_url="https://official.example.com/proof?utm_source=second",
+            ),),
+        ),
+        "evidence": replace(
+            base,
+            primary_evidence=(replace(proof, excerpt="evidence body B"),),
+        ),
+        "status": replace(base, verification_status=VerificationStatus.DISPROVED),
+        "status_history": replace(
+            base,
+            status_history=(replace(transition, reason="different transition truth"),),
+        ),
+        "key_fields": replace(
+            base,
+            key_fields=(replace(amount, raw_value="12.00000001亿元"),),
+        ),
+    }
+
+    original_digest = archive_module._raw_input_event_digest(base)
+    assert len(original_digest) == 64
+    assert {
+        field_name
+        for field_name, value in changed.items()
+        if archive_module._raw_input_event_digest(value) == original_digest
+    } == set()
+
+
+def test_archive_current_schema_requires_top_and_lineage_raw_input_digests(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(snapshot(event()))
+    row = json.loads(next(archive.archive_root.glob("*.jsonl")).read_text(encoding="utf-8"))
+
+    missing_top = json.loads(json.dumps(row))
+    missing_top.pop("raw_input_digest")
+    with pytest.raises(ValueError, match="schema"):
+        archive_module._archive_from_document(missing_top)
+
+    missing_lineage = json.loads(json.dumps(row))
+    missing_lineage["snapshot_history"][0].pop("raw_input_digest")
+    with pytest.raises(ValueError, match="lineage schema"):
+        archive_module._archive_from_document(missing_lineage)
+
+
+def _component_isolation_case(tmp_path):
+    operation_now = NOW + timedelta(hours=3)
+    archive = EvidenceArchive(tmp_path, now=lambda: operation_now)
+    old_time = NOW
+    new_time = NOW + timedelta(hours=1)
+    original_evidence = evidence_item(
+        "shared-evidence",
+        canonical_url="https://official.example.com/original",
+        published_at=old_time,
+    )
+    original = replace(
+        event("a" * 20, primary_evidence=(original_evidence,)),
+        verified_at=old_time,
+        evidence_as_of=old_time,
+        status_history=(StatusTransition(
+            None,
+            VerificationStatus.VERIFIED,
+            old_time,
+            "reason-verified",
+        ),),
+    )
+    archive.upsert(snapshot(
+        original,
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+        generated_at=old_time,
+    ))
+
+    conflicting_evidence = replace(
+        original_evidence,
+        canonical_url="https://official.example.com/conflicting-alias",
+        published_at=new_time,
+    )
+    conflicting = replace(
+        original,
+        primary_evidence=(conflicting_evidence,),
+        verified_at=new_time,
+        evidence_as_of=new_time,
+    )
+    sibling = replace(
+        event("b" * 20),
+        verified_at=new_time,
+        evidence_as_of=new_time,
+        status_history=(StatusTransition(
+            None,
+            VerificationStatus.VERIFIED,
+            new_time,
+            "reason-verified",
+        ),),
+    )
+    conflicted_component = EvidenceSnapshot(
+        snapshot_id="3" * 20,
+        raw_snapshot_id="4" * 20,
+        generated_at=new_time,
+        events=(conflicting, sibling),
+    )
+    independent = snapshot(
+        replace(
+            event("c" * 20),
+            verified_at=new_time,
+            evidence_as_of=new_time,
+            status_history=(StatusTransition(
+                None,
+                VerificationStatus.VERIFIED,
+                new_time,
+                "reason-verified",
+            ),),
+        ),
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+        generated_at=new_time,
+    )
+    return archive, conflicted_component, independent
+
+
+def test_archive_component_merge_conflict_rejects_only_its_connected_raw_component(
+    tmp_path,
+):
+    archive, conflicted_component, independent = _component_isolation_case(tmp_path)
+
+    outcome = archive.upsert_many(
+        (conflicted_component, independent),
+        expected_raw_event_sets={
+            conflicted_component.raw_snapshot_id: ("a" * 20, "b" * 20),
+            independent.raw_snapshot_id: ("c" * 20,),
+        },
+        continue_on_raw_conflict=True,
+    )
+
+    assert type(outcome).__name__ == "ArchiveBatchOutcome"
+    assert outcome.accepted_event_ids == frozenset({"c" * 20})
+    assert outcome.rejected_event_ids == frozenset({"a" * 20, "b" * 20})
+    assert outcome.reasons_by_event == {
+        "a" * 20: "component_conflict",
+        "b" * 20: "component_conflict",
+    }
+    rows = {row["event_id"]: row for row in archive.query(90)}
+    assert set(rows) == {"a" * 20, "c" * 20}
+    assert rows["a" * 20]["primary_evidence"][0]["canonical_url"].endswith(
+        "/original"
+    )
+
+
+@pytest.mark.parametrize("failed_write", (1, 3, 4))
+def test_archive_component_isolation_fault_keeps_rejected_component_old_and_retryable(
+    tmp_path,
+    monkeypatch,
+    failed_write,
+):
+    archive, conflicted_component, independent = _component_isolation_case(tmp_path)
+    real_write = archive._atomic_write
+    writes = 0
+
+    def fail_selected_write(path, payload, maximum):
+        nonlocal writes
+        writes += 1
+        if writes == failed_write:
+            raise OSError("simulated isolated component write failure")
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", fail_selected_write)
+    with pytest.raises(OSError):
+        archive.upsert_many(
+            (conflicted_component, independent),
+            expected_raw_event_sets={
+                conflicted_component.raw_snapshot_id: ("a" * 20, "b" * 20),
+                independent.raw_snapshot_id: ("c" * 20,),
+            },
+            continue_on_raw_conflict=True,
+        )
+
+    observed = {
+        row["event_id"]: row
+        for row in EvidenceArchive(
+            tmp_path,
+            now=lambda: NOW + timedelta(hours=3),
+        ).query(90)
+    }
+    assert set(observed) in ({"a" * 20}, {"a" * 20, "c" * 20})
+    assert "b" * 20 not in observed
+    assert observed["a" * 20]["primary_evidence"][0]["canonical_url"].endswith(
+        "/original"
+    )
+
+    monkeypatch.setattr(archive, "_atomic_write", real_write)
+    outcome = archive.upsert_many(
+        (conflicted_component, independent),
+        expected_raw_event_sets={
+            conflicted_component.raw_snapshot_id: ("a" * 20, "b" * 20),
+            independent.raw_snapshot_id: ("c" * 20,),
+        },
+        continue_on_raw_conflict=True,
+    )
+    assert outcome.accepted_event_ids == frozenset({"c" * 20})
+    assert outcome.rejected_event_ids == frozenset({"a" * 20, "b" * 20})
+    assert {
+        row["event_id"]
+        for row in EvidenceArchive(
+            tmp_path,
+            now=lambda: NOW + timedelta(hours=3),
+        ).query(90)
+    } == {"a" * 20, "c" * 20}
+
+
+def test_archive_component_isolation_is_serialized_and_idempotent_across_writers(
+    tmp_path,
+):
+    first, conflicted_component, independent = _component_isolation_case(tmp_path)
+    second = EvidenceArchive(
+        tmp_path,
+        now=lambda: NOW + timedelta(hours=3),
+    )
+    kwargs = {
+        "expected_raw_event_sets": {
+            conflicted_component.raw_snapshot_id: ("a" * 20, "b" * 20),
+            independent.raw_snapshot_id: ("c" * 20,),
+        },
+        "continue_on_raw_conflict": True,
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(
+            future.result(timeout=30)
+            for future in (
+                executor.submit(
+                    first.upsert_many,
+                    (conflicted_component, independent),
+                    **kwargs,
+                ),
+                executor.submit(
+                    second.upsert_many,
+                    (conflicted_component, independent),
+                    **kwargs,
+                ),
+            )
+        )
+
+    assert all(
+        outcome.accepted_event_ids == frozenset({"c" * 20})
+        and outcome.rejected_event_ids == frozenset({"a" * 20, "b" * 20})
+        for outcome in outcomes
+    )
+    rows = {
+        row["event_id"]: row
+        for row in EvidenceArchive(
+            tmp_path,
+            now=lambda: NOW + timedelta(hours=3),
+        ).query(90)
+    }
+    assert set(rows) == {"a" * 20, "c" * 20}
+    assert rows["a" * 20]["primary_evidence"][0]["canonical_url"].endswith(
+        "/original"
+    )
+
+
+def test_archive_previous_schema_without_raw_digest_is_readable_but_cannot_authorize_retry(
+    tmp_path,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(hours=1))
+    selected = snapshot(event(summary="legacy exact input"))
+    archive.upsert(selected)
+    bucket = next(archive.archive_root.glob("*.jsonl"))
+    row = json.loads(bucket.read_text(encoding="utf-8"))
+    row["schema_version"] = 2
+    row.pop("raw_input_digest")
+    for lineage in row["snapshot_history"]:
+        lineage.pop("raw_input_digest")
+    bucket.write_text(
+        json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _refresh_finalized_bucket_manifest(archive)
+
+    assert archive.get(selected.events[0].event_id) is not None
+    state_before = archive.state_path.read_bytes()
+    with pytest.raises(ValueError, match="lineage|raw snapshot"):
+        archive.upsert(selected)
+    assert archive.state_path.read_bytes() == state_before

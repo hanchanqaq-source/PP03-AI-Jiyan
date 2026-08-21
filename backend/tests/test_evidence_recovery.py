@@ -2277,3 +2277,334 @@ def test_recovery_raw_group_fault_reports_and_persists_all_or_old_then_retries(
     assert retry.cache_recovered == 2
     assert retry.unrecoverable == 0
     assert {row["event_id"] for row in archive.query(90)} == {"a" * 20, "b" * 20}
+
+
+def test_recovery_rejects_more_public_candidates_than_the_archive_batch_before_callbacks(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    candidate_count = 5_001
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": f"{index:020x}",
+                "title": f"event-{index}",
+                "original_url": f"https://publisher.example.com/{index}",
+                "published_at": (NOW - timedelta(days=1)).isoformat(),
+                "verification_status": "verified",
+            }
+            for index in range(candidate_count)
+        ]}],
+    })
+    calls = 0
+
+    def refetch(_url):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("callback must not be entered")
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=EvidenceArchive(root, now=lambda: NOW),
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {"public_refetch_failed": candidate_count}
+    assert report.unrecoverable == candidate_count
+
+
+def test_recovery_rejects_aggregate_public_candidate_input_budget_before_callbacks(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    candidate_count = 40
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": f"{index:020x}",
+                "title": "x" * 8_192,
+                "original_url": f"https://publisher.example.com/{index}",
+                "published_at": (NOW - timedelta(days=1)).isoformat(),
+                "verification_status": "verified",
+            }
+            for index in range(candidate_count)
+        ]}],
+    })
+    calls = 0
+
+    def refetch(_url):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("callback must not be entered")
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=EvidenceArchive(root, now=lambda: NOW),
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {"public_refetch_failed": candidate_count}
+    assert report.unrecoverable == candidate_count
+
+
+def test_recovery_public_refetch_budget_stops_callbacks_and_rejects_the_related_raw_group(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    selected = {
+        key: evidence_event(
+            key * 20,
+            link=f"https://publisher.example.com/{key}",
+        )
+        for key in ("a", "b", "c")
+    }
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": event.event_id,
+                "title": event.title,
+                "original_url": event.primary_evidence[0].canonical_url,
+                "published_at": event.published_at.isoformat(),
+                "verification_status": event.verification_status.value,
+            }
+            for event in selected.values()
+        ]}],
+    })
+    large_evidence = selected["a"].primary_evidence + tuple(
+        replace(
+            selected["a"].primary_evidence[0],
+            evidence_id=f"large-{index}",
+            canonical_url=f"https://official.example.com/large-{index}",
+            excerpt="x" * 8_000,
+        )
+        for index in range(31)
+    )
+    calls: list[str] = []
+
+    def refetch(url):
+        key = url.rsplit("/", 1)[-1]
+        calls.append(key)
+        selected_event = selected[key]
+        if key == "a":
+            selected_event = replace(selected_event, primary_evidence=large_evidence)
+        elif key == "b":
+            selected_event = replace(
+                selected_event,
+                summary="y" * 8_192,
+                core_claim="z" * 2_000,
+            )
+        return evidence_snapshot(
+            selected_event,
+            snapshot_id=("s" if key in {"a", "b"} else "u") * 20,
+            raw_snapshot_id=("r" if key in {"a", "b"} else "v") * 20,
+        )
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == ["a", "b"]
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 3
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 2,
+    }
+    assert archive.query(90) == []
+
+
+@pytest.mark.parametrize("invalid_shape", ("empty_title", "missing_title", "duplicate_id"))
+def test_recovery_invalid_current_raw_marker_blocks_legacy_sibling_but_not_independent(
+    tmp_path,
+    invalid_shape,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    first = evidence_event("a" * 20)
+    invalid = evidence_event("b" * 20)
+    source = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW - timedelta(days=1),
+        events=(first, invalid),
+    )
+    current_document = snapshot_document(source)
+    if invalid_shape == "empty_title":
+        current_document["events"][1]["title"] = ""
+    elif invalid_shape == "missing_title":
+        current_document["events"][1].pop("title")
+    else:
+        current_document["events"][1]["event_id"] = first.event_id
+    current = write_json(root / "current.json", current_document)
+    legacy_sibling = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(replace(source, events=(first,))),
+    )
+    independent = evidence_snapshot(
+        evidence_event("c" * 20),
+        snapshot_id="u" * 20,
+        raw_snapshot_id="v" * 20,
+    )
+    legacy_independent = write_json(
+        root / "legacy-snapshots" / "evidence-independent.json",
+        snapshot_document(independent),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy_sibling, legacy_independent),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.public_refetched == 0
+    expected_reasons = {"ambiguous_record": 1}
+    if invalid_shape != "duplicate_id":
+        expected_reasons["missing_required_fields"] = 1
+    assert report.unrecoverable == sum(expected_reasons.values())
+    assert report.reasons == expected_reasons
+    assert {row["event_id"] for row in archive.query(90)} == {"c" * 20}
+
+
+def test_recovery_invalid_refetch_keeps_raw_marker_when_declared_events_have_no_ids(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    candidate = evidence_event(
+        "a" * 20,
+        link="https://publisher.example.com/a",
+    )
+    sibling = evidence_event("b" * 20)
+    generated_at = NOW - timedelta(days=1)
+    legacy_source = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=generated_at,
+        events=(sibling,),
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(legacy_source),
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+
+    def refetch(_url):
+        return EvidenceSnapshot(
+            snapshot_id=legacy_source.snapshot_id,
+            raw_snapshot_id=legacy_source.raw_snapshot_id,
+            generated_at=legacy_source.generated_at,
+            events=(object(), object(), candidate),
+        )
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 1,
+    }
+    assert archive.query(90) == []
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("event_id", "snapshot_id", "generated_at"),
+)
+def test_recovery_invalid_cache_keeps_verifiable_raw_marker_with_missing_fields(
+    tmp_path,
+    missing_field,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    generated_at = NOW - timedelta(days=1)
+    invalid_source = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=generated_at,
+        events=(evidence_event("b" * 20),),
+    )
+    invalid_document = snapshot_document(invalid_source)
+    if missing_field == "event_id":
+        invalid_document["events"][0].pop("event_id")
+    else:
+        invalid_document.pop(missing_field)
+    current = write_json(root / "current.json", invalid_document)
+    legacy_source = replace(
+        invalid_source,
+        events=(evidence_event("a" * 20),),
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(legacy_source),
+    )
+    independent = evidence_snapshot(
+        evidence_event("c" * 20),
+        snapshot_id="u" * 20,
+        raw_snapshot_id="v" * 20,
+    )
+    independent_path = write_json(
+        root / "legacy-snapshots" / "evidence-independent.json",
+        snapshot_document(independent),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy, independent_path),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "missing_required_fields": 1,
+    }
+    assert {row["event_id"] for row in archive.query(90)} == {"c" * 20}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 import errno
@@ -37,7 +37,8 @@ from .storage import (
     event_document,
     validated_snapshot_document,
 )
-_ARCHIVE_SCHEMA_VERSION = 2
+_ARCHIVE_SCHEMA_VERSION = 3
+_PREVIOUS_ARCHIVE_SCHEMA_VERSION = 2
 _LEGACY_ARCHIVE_SCHEMA_VERSION = 1
 _INDEX_SCHEMA_VERSION = 1
 _ALLOWED_DAYS = {1, 3, 7, 30, 90}
@@ -84,13 +85,30 @@ _ARCHIVE_KEYS = _EVENT_KEYS | {
     "last_updated_at",
     "snapshot_history",
     "content_digest",
+    "raw_input_digest",
 }
-_LEGACY_ARCHIVE_KEYS = _ARCHIVE_KEYS - {"content_digest"}
-_LINEAGE_KEYS = {"evidence_snapshot_id", "raw_snapshot_id", "generated_at", "content_digest"}
+_PREVIOUS_ARCHIVE_KEYS = _ARCHIVE_KEYS - {"raw_input_digest"}
+_LEGACY_ARCHIVE_KEYS = _PREVIOUS_ARCHIVE_KEYS - {"content_digest"}
+_LINEAGE_KEYS = {
+    "evidence_snapshot_id",
+    "raw_snapshot_id",
+    "generated_at",
+    "content_digest",
+    "raw_input_digest",
+}
 _RECOVERED_LINEAGE_KEYS = _LINEAGE_KEYS | {"recovery"}
-_LEGACY_LINEAGE_KEYS = _LINEAGE_KEYS - {"content_digest"}
+_PREVIOUS_LINEAGE_KEYS = _LINEAGE_KEYS - {"raw_input_digest"}
+_PREVIOUS_RECOVERED_LINEAGE_KEYS = _PREVIOUS_LINEAGE_KEYS | {"recovery"}
+_LEGACY_LINEAGE_KEYS = _PREVIOUS_LINEAGE_KEYS - {"content_digest"}
 _MIGRATED_LINEAGE_KEYS = _LINEAGE_KEYS | {"legacy_v1", "legacy_projection_digest"}
 _UNVERIFIABLE_MIGRATED_LINEAGE_KEYS = _MIGRATED_LINEAGE_KEYS | {"legacy_unverifiable"}
+_PREVIOUS_MIGRATED_LINEAGE_KEYS = _PREVIOUS_LINEAGE_KEYS | {
+    "legacy_v1",
+    "legacy_projection_digest",
+}
+_PREVIOUS_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS = _PREVIOUS_MIGRATED_LINEAGE_KEYS | {
+    "legacy_unverifiable",
+}
 _RECOVERY_PROVENANCE_KEYS = {"source", "status", "recovered_at", "source_snapshot_id"}
 _CACHE_RECOVERY_SOURCE_ORDER = (
     "evidence_current",
@@ -106,6 +124,30 @@ _RECOVERY_STATUSES = {"cache_recovered", "public_refetched"}
 
 class ArchiveRawAuthorityError(ValueError):
     """One raw snapshot identity was bound to incompatible evidence truth."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveBatchOutcome:
+    """Bounded lock-transaction outcome for independently connected components."""
+
+    accepted_event_ids: frozenset[str]
+    rejected_components: tuple[tuple[tuple[str, ...], str], ...]
+
+    @property
+    def rejected_event_ids(self) -> frozenset[str]:
+        return frozenset(
+            event_id
+            for event_ids, _reason in self.rejected_components
+            for event_id in event_ids
+        )
+
+    @property
+    def reasons_by_event(self) -> dict[str, str]:
+        return {
+            event_id: reason
+            for event_ids, reason in self.rejected_components
+            for event_id in event_ids
+        }
 _INDEX_KEYS = {"schema_version", "events"}
 _LEGACY_JOURNAL_KEYS = {"schema_version", "rows"}
 _PREVIOUS_JOURNAL_KEYS = {
@@ -422,14 +464,22 @@ def _recovery_provenance_from_snapshot(snapshot: EvidenceSnapshot) -> dict[str, 
     })
 
 
-def _lineage_document(snapshot: EvidenceSnapshot, content_digest: str) -> dict[str, Any]:
-    if _CONTENT_DIGEST.fullmatch(content_digest) is None:
+def _lineage_document(
+    snapshot: EvidenceSnapshot,
+    content_digest: str,
+    raw_input_digest: str,
+) -> dict[str, Any]:
+    if (
+        _CONTENT_DIGEST.fullmatch(content_digest) is None
+        or _CONTENT_DIGEST.fullmatch(raw_input_digest) is None
+    ):
         raise ValueError("invalid archive lineage digest")
     lineage: dict[str, Any] = {
         "evidence_snapshot_id": _bounded_text(snapshot.snapshot_id, "evidence_snapshot_id"),
         "raw_snapshot_id": _bounded_text(snapshot.raw_snapshot_id, "raw_snapshot_id"),
         "generated_at": _timestamp(snapshot.generated_at, "snapshot generated_at"),
         "content_digest": content_digest,
+        "raw_input_digest": raw_input_digest,
     }
     recovery = _recovery_provenance_from_snapshot(snapshot)
     if recovery is not None:
@@ -441,19 +491,32 @@ def _lineage_from_document(
     value: object,
     *,
     legacy: bool = False,
+    previous: bool = False,
     legacy_projection_digest: str | None = None,
     legacy_unverifiable: bool = False,
 ) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError("invalid archive lineage schema")
     keys = set(value)
-    recovered = not legacy and keys == _RECOVERED_LINEAGE_KEYS
-    migrated = not legacy and frozenset(keys) in {
+    recovered = not legacy and not previous and keys == _RECOVERED_LINEAGE_KEYS
+    previous_recovered = previous and keys == _PREVIOUS_RECOVERED_LINEAGE_KEYS
+    migrated = not legacy and not previous and frozenset(keys) in {
         frozenset(_MIGRATED_LINEAGE_KEYS),
         frozenset(_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS),
     }
+    previous_migrated = previous and frozenset(keys) in {
+        frozenset(_PREVIOUS_MIGRATED_LINEAGE_KEYS),
+        frozenset(_PREVIOUS_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS),
+    }
     if (legacy and keys != _LEGACY_LINEAGE_KEYS) or (
+        previous
+        and keys != _PREVIOUS_LINEAGE_KEYS
+        and keys != _PREVIOUS_RECOVERED_LINEAGE_KEYS
+        and keys != _PREVIOUS_MIGRATED_LINEAGE_KEYS
+        and keys != _PREVIOUS_UNVERIFIABLE_MIGRATED_LINEAGE_KEYS
+    ) or (
         not legacy
+        and not previous
         and keys != _LINEAGE_KEYS
         and keys != _RECOVERED_LINEAGE_KEYS
         and keys != _MIGRATED_LINEAGE_KEYS
@@ -469,15 +532,28 @@ def _lineage_from_document(
         lineage_digest = legacy_projection_digest
     else:
         lineage_digest = _bounded_text(value["content_digest"], "lineage content_digest", maximum=64)
+    if legacy or previous:
+        # Schema 1/2 never authenticated the exact pre-projection input.  A
+        # deterministic synthetic digest keeps those rows readable while
+        # making any new exact-input reuse of that raw authority fail closed.
+        marker = f"legacy-raw-input-v{1 if legacy else 2}:{lineage_digest}"
+        raw_input_digest = hashlib.sha256(marker.encode("ascii")).hexdigest()
+    else:
+        raw_input_digest = _bounded_text(
+            value["raw_input_digest"],
+            "lineage raw_input_digest",
+            maximum=64,
+        )
     lineage = {
         "evidence_snapshot_id": evidence_snapshot_id,
         "raw_snapshot_id": raw_snapshot_id,
         "generated_at": generated_at,
         "content_digest": lineage_digest,
+        "raw_input_digest": raw_input_digest,
     }
-    if recovered:
+    if recovered or previous_recovered:
         lineage["recovery"] = _recovery_provenance_from_document(value["recovery"])
-    if legacy or migrated:
+    if legacy or migrated or previous_migrated:
         projection_digest = legacy_projection_digest if legacy else value["legacy_projection_digest"]
         if (
             projection_digest != lineage["content_digest"]
@@ -491,7 +567,10 @@ def _lineage_from_document(
             if not legacy and value.get("legacy_unverifiable") is not True:
                 raise ValueError("invalid migrated archive lineage")
             lineage["legacy_unverifiable"] = True
-    if _CONTENT_DIGEST.fullmatch(lineage["content_digest"]) is None:
+    if (
+        _CONTENT_DIGEST.fullmatch(lineage["content_digest"]) is None
+        or _CONTENT_DIGEST.fullmatch(lineage["raw_input_digest"]) is None
+    ):
         raise ValueError("invalid archive lineage digest")
     return lineage
 
@@ -1165,11 +1244,58 @@ def _input_metrics(
     return encoded_bytes, 1
 
 
+def _raw_input_canonical(value: object, *, depth: int = 0) -> object:
+    """Canonicalize already-budgeted immutable input without display projection."""
+    if depth > 16:
+        raise ValueError("archive snapshot is too deep")
+    if isinstance(value, Enum):
+        return value.value
+    if type(value) is datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("archive snapshot timestamp must be timezone-aware")
+        return {"isoformat": value.isoformat(), "fold": value.fold}
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) in {tuple, list}:
+        return [
+            _raw_input_canonical(item, depth=depth + 1)
+            for item in value
+        ]
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise ValueError("archive snapshot object key is invalid")
+        return {
+            key: _raw_input_canonical(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _raw_input_canonical(
+                getattr(value, field.name),
+                depth=depth + 1,
+            )
+            for field in fields(value)
+        }
+    raise ValueError("archive snapshot input type is invalid")
+
+
+def _raw_input_event_digest(value: object) -> str:
+    payload = json.dumps(
+        _raw_input_canonical(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(payload) > _MAX_SNAPSHOT_BYTES:
+        raise ValueError("archive snapshot budget exceeded")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _preflight_snapshot_input(
     snapshot: EvidenceSnapshot,
     *,
     batch_budget: dict[str, int] | None = None,
-) -> None:
+) -> dict[str, str]:
     if type(snapshot) is not EvidenceSnapshot or type(snapshot.events) is not tuple:
         raise ValueError("invalid archive snapshot input")
     event_ids: set[str] = set()
@@ -1227,6 +1353,10 @@ def _preflight_snapshot_input(
             or batch_budget["resources"] > _MAX_SNAPSHOT_RESOURCES
         ):
             raise ValueError("archive snapshot budget exceeded")
+    return {
+        selected.event_id: _raw_input_event_digest(selected)
+        for selected in snapshot.events
+    }
 
 
 def _normalize_expected_raw_event_sets(
@@ -1272,14 +1402,14 @@ def _archive_raw_authority_map(
             raw_snapshot_id = lineage.get("raw_snapshot_id")
             evidence_snapshot_id = lineage.get("evidence_snapshot_id")
             generated_at = lineage.get("generated_at")
-            content_digest = lineage.get("content_digest")
+            raw_input_digest = lineage.get("raw_input_digest")
             if not all(
                 type(item) is str and item
                 for item in (
                     raw_snapshot_id,
                     evidence_snapshot_id,
                     generated_at,
-                    content_digest,
+                    raw_input_digest,
                 )
             ):
                 raise OSError("storage_corrupt")
@@ -1291,9 +1421,9 @@ def _archive_raw_authority_map(
             elif previous[0] != header:
                 raise OSError("storage_corrupt")
             previous_digest = previous[1].get(event_id)
-            if previous_digest is not None and previous_digest != content_digest:
+            if previous_digest is not None and previous_digest != raw_input_digest:
                 raise OSError("storage_corrupt")
-            previous[1][event_id] = content_digest
+            previous[1][event_id] = raw_input_digest
     return authority
 
 
@@ -1364,6 +1494,39 @@ def _raw_conflict_component_events(
         for raw_snapshot_id, (_header, events) in incoming.items()
         if find(raw_snapshot_id) in conflicting_roots
         for event_id in events
+    )
+
+
+def _raw_component_event_sets(
+    incoming: dict[str, tuple[tuple[str, str], dict[str, str]]],
+) -> tuple[frozenset[str], ...]:
+    if not incoming:
+        return ()
+    parent = {raw_snapshot_id: raw_snapshot_id for raw_snapshot_id in incoming}
+
+    def find(raw_snapshot_id: str) -> str:
+        while parent[raw_snapshot_id] != raw_snapshot_id:
+            parent[raw_snapshot_id] = parent[parent[raw_snapshot_id]]
+            raw_snapshot_id = parent[raw_snapshot_id]
+        return raw_snapshot_id
+
+    def union(first: str, second: str) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[max(first_root, second_root)] = min(first_root, second_root)
+
+    event_owner: dict[str, str] = {}
+    for raw_snapshot_id, (_header, events) in incoming.items():
+        for event_id in events:
+            owner = event_owner.setdefault(event_id, raw_snapshot_id)
+            union(owner, raw_snapshot_id)
+    grouped: dict[str, set[str]] = {}
+    for raw_snapshot_id, (_header, events) in incoming.items():
+        grouped.setdefault(find(raw_snapshot_id), set()).update(events)
+    return tuple(
+        frozenset(event_ids)
+        for _root, event_ids in sorted(grouped.items())
     )
 
 
@@ -1902,14 +2065,24 @@ def _validate_temporal_row(row: dict[str, Any], now: datetime) -> None:
             raise ValueError("invalid archive recovery time")
 
 
-def _archive_document(snapshot: EvidenceSnapshot, row: dict[str, Any], archived_at: datetime) -> dict[str, Any]:
+def _archive_document(
+    snapshot: EvidenceSnapshot,
+    row: dict[str, Any],
+    archived_at: datetime,
+    raw_input_digest: str | None = None,
+) -> dict[str, Any]:
+    if raw_input_digest is None:
+        matching = [event for event in snapshot.events if event.event_id == row.get("event_id")]
+        if len(matching) != 1:
+            raise ValueError("invalid archive raw input identity")
+        raw_input_digest = _raw_input_event_digest(matching[0])
     archived_event = _sanitize_archive_urls(row)
     archived_event["title"] = archived_event["title"][:500]
     archived_event["summary"] = archived_event["summary"][:1_200]
     archived_event["core_claim"] = archived_event["core_claim"][:1_200]
     _validate_evidence_references(archived_event)
     content_digest = _event_content_digest(archived_event)
-    lineage = _lineage_document(snapshot, content_digest)
+    lineage = _lineage_document(snapshot, content_digest, raw_input_digest)
     document = {
         "schema_version": _ARCHIVE_SCHEMA_VERSION,
         **archived_event,
@@ -1920,6 +2093,7 @@ def _archive_document(snapshot: EvidenceSnapshot, row: dict[str, Any], archived_
         "last_updated_at": lineage["generated_at"],
         "snapshot_history": [lineage],
         "content_digest": content_digest,
+        "raw_input_digest": raw_input_digest,
     }
     _exact_builtin(document)
     return document
@@ -1936,10 +2110,17 @@ def _archive_from_document(value: object) -> dict[str, Any]:
         if set(value) != _ARCHIVE_KEYS:
             raise ValueError("invalid archive row schema")
         legacy = False
+        previous = False
+    elif schema_version == _PREVIOUS_ARCHIVE_SCHEMA_VERSION:
+        if set(value) != _PREVIOUS_ARCHIVE_KEYS:
+            raise ValueError("invalid archive row schema")
+        legacy = False
+        previous = True
     elif schema_version == _LEGACY_ARCHIVE_SCHEMA_VERSION:
         if set(value) != _LEGACY_ARCHIVE_KEYS:
             raise ValueError("invalid archive row schema")
         legacy = True
+        previous = False
     else:
         if schema_version > _ARCHIVE_SCHEMA_VERSION:
             raise _ArchiveFutureSchemaError("unsupported archive row schema")
@@ -1956,6 +2137,17 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     )
     if _CONTENT_DIGEST.fullmatch(content_digest) is None or calculated_digest != content_digest:
         raise ValueError("archive content digest mismatch")
+    if legacy or previous:
+        marker = f"legacy-raw-input-v{1 if legacy else 2}:{content_digest}"
+        raw_input_digest = hashlib.sha256(marker.encode("ascii")).hexdigest()
+    else:
+        raw_input_digest = _bounded_text(
+            value["raw_input_digest"],
+            "archive raw_input_digest",
+            maximum=64,
+        )
+        if _CONTENT_DIGEST.fullmatch(raw_input_digest) is None:
+            raise ValueError("archive raw input digest mismatch")
     _validate_evidence_references(canonical_event)
     event_id = _bounded_text(value["event_id"], "event_id")
     evidence_snapshot_id = _bounded_text(value["evidence_snapshot_id"], "evidence_snapshot_id")
@@ -1970,16 +2162,20 @@ def _archive_from_document(value: object) -> dict[str, Any]:
         _lineage_from_document(
             item,
             legacy=legacy,
+            previous=previous,
             legacy_projection_digest=content_digest if legacy else None,
             legacy_unverifiable=legacy and len(history) > 1,
         )
         for item in history
     ]
-    identities: dict[tuple[str, str, str], str] = {}
+    identities: dict[tuple[str, str, str], tuple[str, str]] = {}
     for item in parsed_history:
         identity = (item["evidence_snapshot_id"], item["raw_snapshot_id"], item["generated_at"])
-        previous_digest = identities.setdefault(identity, item["content_digest"])
-        if previous_digest != item["content_digest"]:
+        previous_digests = identities.setdefault(
+            identity,
+            (item["content_digest"], item["raw_input_digest"]),
+        )
+        if previous_digests != (item["content_digest"], item["raw_input_digest"]):
             raise ValueError("archive lineage content mismatch")
     if len(identities) != len(parsed_history):
         raise ValueError("duplicate archive lineage")
@@ -1988,6 +2184,7 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     current_identity = (evidence_snapshot_id, raw_snapshot_id, generated_at.isoformat())
     if (
         current_identity not in identities
+        or identities[current_identity][1] != raw_input_digest
         or generated_at != max(_metadata_time(row["generated_at"], "lineage generated_at") for row in parsed_history)
         or last_updated_at != generated_at
     ):
@@ -2002,6 +2199,7 @@ def _archive_from_document(value: object) -> dict[str, Any]:
         "last_updated_at": last_updated_at.isoformat(),
         "snapshot_history": parsed_history,
         "content_digest": content_digest,
+        "raw_input_digest": raw_input_digest,
     }
     for collection_name in _EVIDENCE_COLLECTION_KEYS:
         for item in result[collection_name]:
@@ -2057,16 +2255,17 @@ def _mark_legacy_projection_unverifiable(
     return _validate_archive_projection(marked, validation_now=validation_now)
 
 
-def _lineage_order(row: dict[str, str]) -> tuple[datetime, str, str, str]:
+def _lineage_order(row: dict[str, str]) -> tuple[datetime, str, str, str, str]:
     return (
         _parse_datetime(row["generated_at"]),
         row["evidence_snapshot_id"],
         row["raw_snapshot_id"],
         row["content_digest"],
+        row["raw_input_digest"],
     )
 
 
-def _row_precedence(row: dict[str, Any]) -> tuple[datetime, int, str, str, str]:
+def _row_precedence(row: dict[str, Any]) -> tuple[datetime, int, str, str, str, str]:
     current_content = {key: row[key] for key in sorted(_EVENT_KEYS)}
     fingerprint = json.dumps(
         current_content,
@@ -2080,6 +2279,7 @@ def _row_precedence(row: dict[str, Any]) -> tuple[datetime, int, str, str, str]:
         row["evidence_snapshot_id"],
         row["raw_snapshot_id"],
         fingerprint,
+        row["raw_input_digest"],
     )
 
 
@@ -2308,7 +2508,10 @@ def _merge_archive_rows(
         if previous_lineage is None:
             histories_by_identity[identity] = row
             continue
-        if previous_lineage["content_digest"] != row["content_digest"]:
+        if (
+            previous_lineage["content_digest"] != row["content_digest"]
+            or previous_lineage["raw_input_digest"] != row["raw_input_digest"]
+        ):
             raise ValueError("archive lineage content mismatch")
         previous_recovery = previous_lineage.get("recovery")
         incoming_recovery = row.get("recovery")
@@ -6128,7 +6331,7 @@ class EvidenceArchive:
         *,
         expected_raw_event_sets: object = None,
         continue_on_raw_conflict: bool = False,
-    ) -> frozenset[str] | None:
+    ) -> ArchiveBatchOutcome | None:
         if type(continue_on_raw_conflict) is not bool:
             raise ValueError("invalid raw conflict policy")
         try:
@@ -6137,6 +6340,7 @@ class EvidenceArchive:
             raise ValueError("invalid archive snapshot batch") from None
 
         selected_snapshots: list[EvidenceSnapshot] = []
+        selected_raw_input_digests: list[dict[str, str]] = []
         raw_input_budget = {"encoded_bytes": 2, "nodes": 1, "resources": 0}
         while True:
             try:
@@ -6147,7 +6351,9 @@ class EvidenceArchive:
                 raise ValueError("invalid archive snapshot batch") from None
             if len(selected_snapshots) == _MAX_BATCH_SNAPSHOTS:
                 raise ValueError("archive snapshot batch is too large")
-            _preflight_snapshot_input(selected, batch_budget=raw_input_budget)
+            selected_raw_input_digests.append(
+                _preflight_snapshot_input(selected, batch_budget=raw_input_budget)
+            )
             selected_snapshots.append(selected)
         if not selected_snapshots:
             raise ValueError("archive snapshot batch is empty")
@@ -6160,10 +6366,19 @@ class EvidenceArchive:
             str,
             tuple[tuple[str, str], dict[str, str]],
         ] = {}
-        for selected in selected_snapshots:
+        for selected, raw_input_digests in zip(
+            selected_snapshots,
+            selected_raw_input_digests,
+            strict=True,
+        ):
             document = validated_snapshot_document(selected)
             snapshot_rows = [
-                _archive_document(selected, event, archived_at)
+                _archive_document(
+                    selected,
+                    event,
+                    archived_at,
+                    raw_input_digests[event["event_id"]],
+                )
                 for event in document["events"]
             ]
             header = (
@@ -6179,7 +6394,7 @@ class EvidenceArchive:
             for row in snapshot_rows:
                 if row["event_id"] in previous_binding[1]:
                     raise ValueError("archive snapshot contains duplicate event identities")
-                previous_binding[1][row["event_id"]] = row["content_digest"]
+                previous_binding[1][row["event_id"]] = row["raw_input_digest"]
                 _validate_temporal_row(row, archived_at)
                 _charge_snapshot_budget(row, incoming_budget)
                 incoming_target_names.add(_bucket_name(row))
@@ -6286,6 +6501,12 @@ class EvidenceArchive:
             if raw_conflicts and not continue_on_raw_conflict:
                 first_raw_id = min(raw_conflicts)
                 raise ArchiveRawAuthorityError(raw_conflicts[first_raw_id])
+            component_event_sets = _raw_component_event_sets(incoming_raw_authority)
+            rejected_component_reasons: dict[frozenset[str], str] = {
+                component: "raw_authority_conflict"
+                for component in component_event_sets
+                if component & rejected_event_ids
+            }
             if rejected_event_ids:
                 incoming = [
                     row for row in incoming
@@ -6293,7 +6514,16 @@ class EvidenceArchive:
                 ]
                 incoming_target_names = {_bucket_name(row) for row in incoming}
                 if not incoming:
-                    return rejected_event_ids
+                    return ArchiveBatchOutcome(
+                        accepted_event_ids=frozenset(),
+                        rejected_components=tuple(
+                            (tuple(sorted(component)), reason)
+                            for component, reason in sorted(
+                                rejected_component_reasons.items(),
+                                key=lambda item: tuple(sorted(item[0])),
+                            )
+                        ),
+                    )
 
             for name in sorted(incoming_target_names):
                 if name not in bucket_read_records:
@@ -6334,14 +6564,46 @@ class EvidenceArchive:
 
             cutoff = _shift_days(archived_at, -90)
             committed: dict[str, dict[str, Any]] = {}
+            rows_by_event: dict[str, list[dict[str, Any]]] = {}
             for row in incoming:
-                event_id = row["event_id"]
-                previous = committed.get(event_id, existing.get(event_id))
-                lineage_cutoff = cutoff if _event_time(row) >= cutoff else None
-                committed[event_id] = row if previous is None else _merge_archive_rows(
-                    previous,
-                    row,
-                    lineage_cutoff=lineage_cutoff,
+                rows_by_event.setdefault(row["event_id"], []).append(row)
+            for component in component_event_sets:
+                if component in rejected_component_reasons:
+                    continue
+                component_committed: dict[str, dict[str, Any]] = {}
+                try:
+                    for event_id in sorted(component):
+                        for row in rows_by_event.get(event_id, ()):
+                            previous = component_committed.get(
+                                event_id,
+                                existing.get(event_id),
+                            )
+                            lineage_cutoff = cutoff if _event_time(row) >= cutoff else None
+                            component_committed[event_id] = (
+                                row
+                                if previous is None
+                                else _merge_archive_rows(
+                                    previous,
+                                    row,
+                                    lineage_cutoff=lineage_cutoff,
+                                )
+                            )
+                except ValueError:
+                    if not continue_on_raw_conflict:
+                        raise
+                    rejected_component_reasons[component] = "component_conflict"
+                    continue
+                committed.update(component_committed)
+            if not committed and incoming:
+                return ArchiveBatchOutcome(
+                    accepted_event_ids=frozenset(),
+                    rejected_components=tuple(
+                        (tuple(sorted(component)), reason)
+                        for component, reason in sorted(
+                            rejected_component_reasons.items(),
+                            key=lambda item: tuple(sorted(item[0])),
+                        )
+                    ),
                 )
             _ensure_snapshot_budget(list(committed.values()))
 
@@ -6550,7 +6812,18 @@ class EvidenceArchive:
                 diagnostics=verification_diagnostics,
                 budget=verification_budget,
             )
-        return rejected_event_ids if continue_on_raw_conflict else None
+        if continue_on_raw_conflict:
+            return ArchiveBatchOutcome(
+                accepted_event_ids=frozenset(committed),
+                rejected_components=tuple(
+                    (tuple(sorted(component)), reason)
+                    for component, reason in sorted(
+                        rejected_component_reasons.items(),
+                        key=lambda item: tuple(sorted(item[0])),
+                    )
+                ),
+            )
+        return None
 
 
     def _query_unlocked(self, days: int, status: str | None) -> list[dict[str, Any]]:
