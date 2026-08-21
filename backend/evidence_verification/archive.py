@@ -31,6 +31,7 @@ from .storage import (
     _reject_json_number,
     _replace_durable,
     _safe_directory,
+    _sync_directory,
     _strict_json_int,
     _strict_json_object,
     event_document,
@@ -48,6 +49,8 @@ _MAX_ROW_BYTES = 1_048_576
 _MAX_BUCKET_ROWS = 4_096
 _MAX_ARCHIVE_FILES = 512
 _MAX_ARCHIVE_DIRECTORY_ENTRIES = _MAX_ARCHIVE_FILES + 4
+_MAX_OWNED_TEMP_FILES = 4
+_MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES = _MAX_ARCHIVE_DIRECTORY_ENTRIES + _MAX_OWNED_TEMP_FILES
 _MAX_SCAN_FILES = _MAX_ARCHIVE_FILES + 3
 _MAX_INDEX_EVENTS = 65_536
 _MAX_ARCHIVE_SCAN_BYTES = 64 * 1_048_576
@@ -214,6 +217,10 @@ _IPV4_COMPATIBLE_NETWORK = ipaddress.IPv6Network("::/96")
 _UNRESERVED_PATH_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
 _UNBOUND_READ_RECORD = object()
+_OWNED_TEMP_NAME = re.compile(
+    r"^\.(?P<target>state\.json|index\.json|\d{4}-\d{2}-\d{2}\.jsonl)\."
+    r"(?P<nonce>[a-z0-9_]{8})\.tmp$"
+)
 
 
 def _new_scan_budget() -> dict[str, int]:
@@ -281,6 +288,18 @@ def _valid_bucket_name(value: object) -> bool:
         return date.fromisoformat(match.group(1)).isoformat() == match.group(1)
     except ValueError:
         return False
+
+
+def _owned_temp_target_name(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    match = _OWNED_TEMP_NAME.fullmatch(value)
+    if match is None:
+        return None
+    target = match.group("target")
+    if target in {"state.json", "index.json"} or _valid_bucket_name(target):
+        return target
+    return None
 
 
 def _bucket_date(value: str) -> date:
@@ -2214,6 +2233,70 @@ class EvidenceArchive:
                     raise OSError("storage_error") from None
         self._verify_directory_chain(self.archive_root)
 
+    @staticmethod
+    def _safe_regular_metadata(metadata: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and not getattr(metadata, "st_reparse_tag", 0)
+            and metadata.st_nlink == 1
+        )
+
+    def _cleanup_owned_archive_temps(self) -> None:
+        owned: list[tuple[Path, tuple[int, int, int, int, int, int, int, int]]] = []
+        ordinary_count = 0
+        scanned_count = 0
+        try:
+            with os.scandir(self.archive_root) as entries:
+                for entry in entries:
+                    scanned_count += 1
+                    if scanned_count > _MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES:
+                        raise OSError("storage_corrupt")
+                    path = self.archive_root / entry.name
+                    if _owned_temp_target_name(entry.name) is None:
+                        ordinary_count += 1
+                        if ordinary_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                            raise OSError("storage_corrupt")
+                        continue
+                    try:
+                        metadata = path.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        raise OSError("storage_corrupt") from None
+                    if not self._safe_regular_metadata(metadata):
+                        raise OSError("storage_corrupt")
+                    owned.append((path, _file_signature(metadata)))
+                    if len(owned) > _MAX_OWNED_TEMP_FILES:
+                        raise OSError("storage_corrupt")
+        except OSError:
+            raise OSError("storage_corrupt") from None
+
+        removed = False
+        for path, expected_signature in owned:
+            try:
+                current = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise OSError("storage_error") from None
+            if (
+                not self._safe_regular_metadata(current)
+                or _file_signature(current) != expected_signature
+            ):
+                raise OSError("storage_corrupt")
+            try:
+                path.unlink()
+            except OSError:
+                raise OSError("storage_error") from None
+            if self._entry_present(path):
+                raise OSError("storage_error")
+            removed = True
+        if removed:
+            try:
+                _sync_directory(self.archive_root)
+            except OSError:
+                raise OSError("storage_error") from None
+
     def _lock_path_binds_handle(self, handle: io.FileIO) -> bool:
         try:
             opened = os.fstat(handle.fileno())
@@ -2335,6 +2418,7 @@ class EvidenceArchive:
                 time.sleep(0.01)
             if os.name != "nt" and not self._lock_path_binds_handle(handle):
                 raise OSError("storage_error")
+            self._cleanup_owned_archive_temps()
             yield
         finally:
             if acquired:
@@ -2382,24 +2466,41 @@ class EvidenceArchive:
             raise OSError("storage_error") from None
 
     def _authority_present_without_lock(self) -> bool:
+        authority_present = False
         for path in (self.state_path, self.index_path):
             if self._entry_present(path):
-                return True
-        entry_count = 0
+                authority_present = True
+        ordinary_count = 0
+        owned_temp_count = 0
+        scanned_count = 0
         try:
             with os.scandir(self.archive_root) as entries:
                 for entry in entries:
-                    entry_count += 1
-                    if entry_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                    scanned_count += 1
+                    if scanned_count > _MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES:
                         raise OSError("storage_corrupt")
-                    if (
-                        _valid_bucket_name(entry.name)
-                        and self._safe_file(self.archive_root / entry.name) is not None
-                    ):
-                        return True
+                    path = self.archive_root / entry.name
+                    try:
+                        metadata = path.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        raise OSError("storage_corrupt") from None
+                    if _owned_temp_target_name(entry.name) is not None:
+                        if not self._safe_regular_metadata(metadata):
+                            raise OSError("storage_corrupt")
+                        owned_temp_count += 1
+                        if owned_temp_count > _MAX_OWNED_TEMP_FILES:
+                            raise OSError("storage_corrupt")
+                        continue
+                    ordinary_count += 1
+                    if ordinary_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                        raise OSError("storage_corrupt")
+                    if _valid_bucket_name(entry.name) and self._safe_regular_metadata(metadata):
+                        authority_present = True
         except OSError:
             raise OSError("storage_corrupt") from None
-        return False
+        return authority_present
 
     @contextmanager
     def _reader_process_lock(self) -> Iterator[bool]:
@@ -2430,6 +2531,7 @@ class EvidenceArchive:
                 time.sleep(0.01)
             if os.name != "nt" and not self._lock_path_binds_handle(handle):
                 raise OSError("storage_error")
+            self._cleanup_owned_archive_temps()
             yield True
         finally:
             if acquired:
@@ -3875,9 +3977,13 @@ class EvidenceArchive:
     def _preflight_archive_directory_entries(
         self,
         planned_paths: Iterator[Path] | list[Path] | set[Path] | tuple[Path, ...],
-    ) -> None:
+    ) -> dict[str, object]:
         current_names: set[str] = set()
         safe_bucket_names: set[str] = set()
+        bucket_records: dict[
+            str,
+            tuple[str, tuple[int, int, int, int, int, int, int, int] | None],
+        ] = {}
         try:
             with os.scandir(self.archive_root) as entries:
                 for entry in entries:
@@ -3895,14 +4001,13 @@ class EvidenceArchive:
                         raise OSError("storage_corrupt")
                     if not _valid_bucket_name(entry.name):
                         continue
-                    if (
-                        not stat.S_ISREG(metadata.st_mode)
-                        or getattr(metadata, "st_reparse_tag", 0)
-                        or metadata.st_nlink != 1
-                    ):
+                    signature = _file_signature(metadata)
+                    if not self._safe_regular_metadata(metadata):
                         # Surviving non-regular, reparse and multi-link canonical
                         # entries are unsafe and never consume valid bucket capacity.
+                        bucket_records[entry.name] = ("unsafe", signature)
                         continue
+                    bucket_records[entry.name] = ("safe", signature)
                     safe_bucket_names.add(entry.name)
                     if len(safe_bucket_names) > _MAX_ARCHIVE_FILES:
                         raise OSError("storage_corrupt")
@@ -3918,7 +4023,48 @@ class EvidenceArchive:
         planned_bucket_names = {
             name for name in planned_names if _valid_bucket_name(name)
         }
+        for name in sorted(planned_bucket_names - set(bucket_records)):
+            path = self.archive_root / name
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                bucket_records[name] = ("absent", None)
+                continue
+            except OSError:
+                raise OSError("storage_corrupt") from None
+            signature = _file_signature(metadata)
+            if self._safe_regular_metadata(metadata):
+                bucket_records[name] = ("safe", signature)
+                safe_bucket_names.add(name)
+            else:
+                bucket_records[name] = ("unsafe", signature)
         if len(safe_bucket_names | planned_bucket_names) > _MAX_ARCHIVE_FILES:
+            raise OSError("storage_corrupt")
+        return {
+            "planned_names": tuple(sorted(planned_names)),
+            "bucket_records": dict(sorted(bucket_records.items())),
+        }
+
+    def _assert_archive_directory_capacity_is_current(
+        self,
+        record: dict[str, object],
+    ) -> None:
+        try:
+            planned_names = record["planned_names"]
+            bucket_records = record["bucket_records"]
+            if (
+                type(planned_names) is not tuple
+                or any(type(name) is not str for name in planned_names)
+                or type(bucket_records) is not dict
+            ):
+                raise TypeError
+        except (KeyError, TypeError):
+            raise OSError("storage_corrupt") from None
+        current = self._preflight_archive_directory_entries([
+            self.archive_root / name
+            for name in planned_names
+        ])
+        if current != record:
             raise OSError("storage_corrupt")
 
     @staticmethod
@@ -5021,7 +5167,7 @@ class EvidenceArchive:
         state_record: dict[str, object] | None,
         prepared_payload: bytes | None,
         prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
-    ) -> set[str]:
+    ) -> tuple[set[str], dict[str, object]]:
         try:
             write_names = {
                 name
@@ -5035,7 +5181,7 @@ class EvidenceArchive:
                 state["target_bucket_digests"],
                 prospective_bucket_names,
             )
-            self._preflight_archive_directory_entries([
+            directory_record = self._preflight_archive_directory_entries([
                 self.state_path,
                 *(
                     [self.index_path]
@@ -5071,7 +5217,7 @@ class EvidenceArchive:
                 journal_record=recovery_plan["journal_record"],
                 cas_budget=recovery_plan["cas_budget"],
             )
-            return write_names
+            return write_names, directory_record
         except (KeyError, TypeError):
             raise OSError("storage_corrupt") from None
 
@@ -5112,7 +5258,7 @@ class EvidenceArchive:
         except KeyError:
             raise OSError("storage_corrupt") from None
         index_record = recovery_plan["physical_index_record"]
-        write_names = self._preflight_recovery_plan(
+        write_names, directory_record = self._preflight_recovery_plan(
             state,
             recovery_plan,
             now=now,
@@ -5127,6 +5273,7 @@ class EvidenceArchive:
             journal_record=journal_record,
             cas_budget=cas_budget,
         )
+        self._assert_archive_directory_capacity_is_current(directory_record)
         for name in sorted(affected):
             if name in write_names:
                 self._assert_prewrite_authority_is_current(
@@ -5256,7 +5403,7 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
-        self._preflight_recovery_plan(
+        _write_names, directory_record = self._preflight_recovery_plan(
             prepared,
             recovery_plan,
             now=now,
@@ -5271,6 +5418,7 @@ class EvidenceArchive:
             journal_record=journal_record,
             cas_budget=recovery_plan["cas_budget"],
         )
+        self._assert_archive_directory_capacity_is_current(directory_record)
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         self._bind_written_state_record(
             prepared,
@@ -5287,7 +5435,7 @@ class EvidenceArchive:
         recovered = self._read_authority_state(
             now,
             diagnostics=diagnostics,
-            budget=budget,
+            budget=_new_scan_budget(),
         )
         if recovered is None or recovered["legacy"] or recovered["phase"] != "finalized":
             raise OSError("storage_corrupt")
@@ -5453,7 +5601,7 @@ class EvidenceArchive:
             )
             if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
                 raise OSError("storage_corrupt")
-            self._preflight_recovery_plan(
+            _write_names, directory_record = self._preflight_recovery_plan(
                 prepared,
                 recovery_plan,
                 now=now,
@@ -5468,6 +5616,7 @@ class EvidenceArchive:
                 journal_record=journal_record,
                 cas_budget=recovery_plan["cas_budget"],
             )
+            self._assert_archive_directory_capacity_is_current(directory_record)
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
             self._bind_written_state_record(
                 prepared,
@@ -5484,7 +5633,7 @@ class EvidenceArchive:
             return self._read_authority_state(
                 now,
                 diagnostics=diagnostics,
-                budget=budget,
+                budget=_new_scan_budget(),
             )
 
         if (
@@ -5679,7 +5828,7 @@ class EvidenceArchive:
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
-        self._preflight_recovery_plan(
+        _write_names, directory_record = self._preflight_recovery_plan(
             prepared,
             recovery_plan,
             now=now,
@@ -5694,6 +5843,7 @@ class EvidenceArchive:
             journal_record=journal_record,
             cas_budget=recovery_plan["cas_budget"],
         )
+        self._assert_archive_directory_capacity_is_current(directory_record)
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
         self._bind_written_state_record(
             prepared,
@@ -5710,7 +5860,7 @@ class EvidenceArchive:
         return self._read_authority_state(
             now,
             diagnostics=diagnostics,
-            budget=budget,
+            budget=_new_scan_budget(),
         )
 
 
@@ -5988,7 +6138,7 @@ class EvidenceArchive:
                 journal_record=journal_record,
                 cas_budget=cas_budget,
             )
-            self._preflight_archive_directory_entries([
+            directory_record = self._preflight_archive_directory_entries([
                 self.state_path,
                 self.index_path,
                 *(
@@ -6003,6 +6153,7 @@ class EvidenceArchive:
                 journal_record=journal_record,
                 cas_budget=cas_budget,
             )
+            self._assert_archive_directory_capacity_is_current(directory_record)
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
             self._bind_written_state_record(
                 prepared,

@@ -316,6 +316,19 @@ def _upsert_in_child(root: str, event_id: str) -> None:
     EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(event(event_id)))
 
 
+def _crash_after_archive_temp_fsync(root: str) -> None:
+    def exit_before_replace(_source: Path, _destination: Path) -> None:
+        os._exit(73)
+
+    archive_module._replace_durable = exit_before_replace
+    EvidenceArchive(root, now=lambda: NOW).upsert(snapshot(
+        event("c" * 20),
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+    ))
+    os._exit(74)
+
+
 def _hold_archive_lock(root: str, ready, seconds: float) -> None:
     archive = EvidenceArchive(root, now=lambda: NOW)
     with archive._process_lock():
@@ -7968,3 +7981,251 @@ def test_archive_native_legacy_journal_recovery_allows_511_to_512_bucket_union(
     assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
     assert archive.journal_path.read_bytes() == journal_bytes
     assert len(archive._bucket_names()) == archive_module._MAX_ARCHIVE_FILES
+
+
+def test_archive_capacity_commit_barrier_rejects_hardlink_becoming_safe_at_513(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    unsafe_name = "1999-12-31.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES - 1,
+        excluded_names={target_name, unsafe_name},
+    )
+    outside = tmp_path / "outside-capacity.jsonl"
+    outside.write_bytes(b"")
+    unsafe_bucket = archive.archive_root / unsafe_name
+    os.link(outside, unsafe_bucket)
+    state_before = archive.state_path.read_bytes()
+    index_before = archive.index_path.read_bytes()
+    before_rows = archive.query(days=90)
+    writes: list[Path] = []
+    real_assert = archive._assert_prewrite_authority_is_current
+    real_write = archive._atomic_write
+    transitioned = False
+
+    def make_hardlink_safe_after_authority_check(*args, **kwargs):
+        nonlocal transitioned
+        result = real_assert(*args, **kwargs)
+        if not transitioned:
+            outside.unlink()
+            transitioned = True
+        return result
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(
+        archive,
+        "_assert_prewrite_authority_is_current",
+        make_hardlink_safe_after_authority_check,
+    )
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert transitioned is True
+    assert writes == []
+    assert archive.state_path.read_bytes() == state_before
+    assert archive.index_path.read_bytes() == index_before
+    monkeypatch.setattr(archive, "_assert_prewrite_authority_is_current", real_assert)
+    monkeypatch.setattr(archive, "_atomic_write", real_write)
+    unsafe_bucket.unlink()
+    assert archive.query(days=90) == before_rows
+
+
+@pytest.mark.parametrize("transition", ("safe_to_unsafe", "disappear", "appear"))
+def test_archive_rebinds_every_canonical_candidate_beside_first_native_mutation(
+    tmp_path,
+    monkeypatch,
+    transition,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    current_bucket = archive.archive_root / "2026-08-20.jsonl"
+    target_time = NOW - timedelta(days=1) if transition == "appear" else NOW
+    target_bucket = archive.archive_root / f"{target_time.date().isoformat()}.jsonl"
+    current_bytes = current_bucket.read_bytes()
+    state_before = archive.state_path.read_bytes()
+    index_before = archive.index_path.read_bytes()
+    before_rows = archive.query(days=90)
+    outside = tmp_path / f"classification-{transition}.jsonl"
+    writes: list[Path] = []
+    real_assert = archive._assert_prewrite_authority_is_current
+    real_write = archive._atomic_write
+    transitioned = False
+
+    def change_classification_after_authority_check(*args, **kwargs):
+        nonlocal transitioned
+        result = real_assert(*args, **kwargs)
+        if not transitioned:
+            if transition == "safe_to_unsafe":
+                os.link(current_bucket, outside)
+            elif transition == "disappear":
+                current_bucket.unlink()
+            else:
+                assert not target_bucket.exists()
+                target_bucket.write_bytes(b"")
+            transitioned = True
+        return result
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(
+        archive,
+        "_assert_prewrite_authority_is_current",
+        change_classification_after_authority_check,
+    )
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20, published_at=target_time),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert transitioned is True
+    assert writes == []
+    assert archive.state_path.read_bytes() == state_before
+    assert archive.index_path.read_bytes() == index_before
+    if transition == "safe_to_unsafe":
+        outside.unlink()
+    elif transition == "disappear":
+        current_bucket.write_bytes(current_bytes)
+    else:
+        target_bucket.unlink()
+    monkeypatch.setattr(archive, "_assert_prewrite_authority_is_current", real_assert)
+    monkeypatch.setattr(archive, "_atomic_write", real_write)
+    assert archive.query(days=90) == before_rows
+
+
+def test_archive_query_cleans_real_crash_owned_temp_before_enforcing_normal_entry_cap(
+    tmp_path,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+    foreign_journal = b'{"schema_version":4,"owner":"foreign"}\n'
+    archive.journal_path.write_bytes(foreign_journal)
+    assert len(list(archive.archive_root.iterdir())) == archive_module._MAX_ARCHIVE_DIRECTORY_ENTRIES
+
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_crash_after_archive_temp_fsync,
+        args=(str(archive.root),),
+    )
+    process.start()
+    process.join(30)
+
+    assert process.exitcode == 73
+    owned_temps = list(archive.archive_root.glob(".state.json.*.tmp"))
+    assert len(owned_temps) == 1
+    assert len(list(archive.archive_root.iterdir())) == archive_module._MAX_ARCHIVE_DIRECTORY_ENTRIES + 1
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert not owned_temps[0].exists()
+    assert archive.journal_path.read_bytes() == foreign_journal
+
+
+def test_archive_unknown_temp_over_normal_entry_cap_fails_closed_without_deletion(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+    archive.journal_path.write_bytes(b'{"schema_version":4,"owner":"foreign"}\n')
+    unknown_temp = archive.archive_root / ".state.json.foreign.tmp"
+    unknown_bytes = b"foreign-temp-must-survive"
+    unknown_temp.write_bytes(unknown_bytes)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert unknown_temp.read_bytes() == unknown_bytes
+
+
+def test_archive_owned_looking_hardlinked_temp_fails_closed_without_deletion(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+    archive.journal_path.write_bytes(b'{"schema_version":4,"owner":"foreign"}\n')
+    outside = tmp_path / "foreign-owned-looking-temp"
+    outside_bytes = b"foreign-hardlink-must-survive"
+    outside.write_bytes(outside_bytes)
+    owned_looking = archive.archive_root / ".state.json.abcdefgh.tmp"
+    os.link(outside, owned_looking)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert owned_looking.read_bytes() == outside_bytes
+    assert outside.read_bytes() == outside_bytes
+    assert owned_looking.stat().st_nlink == 2
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_archive_native_legacy_migration_uses_fresh_postcommit_budget_at_512_buckets(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(event("b" * 20), snapshot_id="1" * 20, raw_snapshot_id="2" * 20),
+    )
+    journal_bytes = _rewrite_pending_journal_as_native_schema(archive, schema_version)
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
+    assert archive.journal_path.read_bytes() == journal_bytes
+
+
+def test_archive_v1_general_migration_uses_fresh_postcommit_budget_at_512_buckets(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    _write_historical_v1_finalized_archive(archive, (snapshot(event("a" * 20)),))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+    foreign_journal = b'{"schema_version":1,"owner":"foreign"}\n'
+    archive.journal_path.write_bytes(foreign_journal)
+
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
+    assert archive.journal_path.read_bytes() == foreign_journal
+
+
+def test_archive_first_v1_journal_uses_a_new_budget_after_recovery_phase(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    journal = _journal_only_document(archive, snapshot(event("j" * 20)), 1)
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    real_recover = archive._recover_prepared_authority
+
+    def exhaust_finished_phase_budget(*args, **kwargs):
+        result = real_recover(*args, **kwargs)
+        kwargs["budget"]["files"] = 0
+        return result
+
+    monkeypatch.setattr(archive, "_recover_prepared_authority", exhaust_finished_phase_budget)
+
+    assert [row["event_id"] for row in archive.query(days=90)] == ["j" * 20]
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
