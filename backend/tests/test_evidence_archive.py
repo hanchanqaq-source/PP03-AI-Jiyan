@@ -7577,3 +7577,394 @@ def test_archive_rejects_corrupt_only_target_bucket_before_prepared_state(
     assert writes == []
     assert _archive_projection_bytes(archive) == before
     assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+
+
+def _fill_safe_canonical_bucket_capacity(
+    archive: EvidenceArchive,
+    total: int,
+    *,
+    excluded_names: set[str] | None = None,
+) -> list[Path]:
+    excluded = set() if excluded_names is None else set(excluded_names)
+    existing = {path.name for path in archive.archive_root.glob("*.jsonl")}
+    created: list[Path] = []
+    cursor = datetime(2000, 1, 1, tzinfo=timezone.utc).date()
+    while len(existing) < total:
+        name = f"{cursor.isoformat()}.jsonl"
+        cursor += timedelta(days=1)
+        if name in excluded or name in existing:
+            continue
+        path = archive.archive_root / name
+        path.write_bytes(b"")
+        existing.add(name)
+        created.append(path)
+    assert len(existing) == total
+    return created
+
+
+def test_archive_rejects_512_to_513_bucket_union_before_any_native_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES,
+        excluded_names={target_name},
+    )
+    before = _archive_projection_bytes(archive)
+    before_rows = archive.query(days=90)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+    monkeypatch.setattr(archive, "_atomic_write", real_write)
+    assert archive.query(days=90) == before_rows
+
+
+def test_archive_allows_511_to_512_bucket_union(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES - 1,
+        excluded_names={target_name},
+    )
+
+    archive.upsert(snapshot(
+        event("b" * 20, published_at=NOW - timedelta(days=1)),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+
+    assert len(archive._bucket_names()) == archive_module._MAX_ARCHIVE_FILES
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+
+
+def test_archive_same_bucket_update_does_not_consume_another_capacity_slot(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+
+    assert len(archive._bucket_names()) == archive_module._MAX_ARCHIVE_FILES
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+
+
+def test_archive_expired_physical_bucket_still_consumes_capacity_until_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    clock = [NOW - timedelta(days=100)]
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: clock[0])
+    old_time = clock[0]
+    archive.upsert(snapshot(
+        _timed_event("a" * 20, old_time),
+        generated_at=old_time,
+    ))
+    target_name = "2026-08-20.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES,
+        excluded_names={target_name},
+    )
+    clock[0] = NOW
+    before = _archive_projection_bytes(archive)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+    monkeypatch.setattr(archive, "_atomic_write", real_write)
+    assert archive.query(days=90) == []
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "hardlink",
+        pytest.param("symlink", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX symlink case")),
+    ),
+)
+def test_archive_bucket_capacity_ignores_unrelated_unsafe_canonical_entry(
+    tmp_path,
+    kind,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    unsafe_name = "1999-12-31.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES - 1,
+        excluded_names={target_name, unsafe_name},
+    )
+    outside = tmp_path / "outside.jsonl"
+    outside_bytes = b'{"outside":"foreign"}\n'
+    outside.write_bytes(outside_bytes)
+    _install_unsafe_bucket_entry(archive.archive_root / unsafe_name, outside, kind)
+
+    archive.upsert(snapshot(
+        event("b" * 20, published_at=NOW - timedelta(days=1)),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+
+    diagnostics = archive._diagnostics()
+    assert len(archive._bucket_names(diagnostics=diagnostics)) == archive_module._MAX_ARCHIVE_FILES
+    assert diagnostics["skipped_files"] == 1
+    assert outside.read_bytes() == outside_bytes
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+
+
+def test_archive_bucket_capacity_preflight_treats_disappeared_candidate_as_absent(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    disappearing_name = "1999-12-31.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES - 1,
+        excluded_names={target_name, disappearing_name},
+    )
+    archive.journal_path.write_bytes(b'{"owner":"foreign"}\n')
+    disappearing = archive.archive_root / disappearing_name
+    disappearing.write_bytes(b"")
+    real_stat = Path.stat
+    removed = False
+
+    def disappear_before_nofollow_stat(path: Path, *args, **kwargs):
+        nonlocal removed
+        if path == disappearing and not removed:
+            removed = True
+            path.unlink()
+            raise FileNotFoundError(str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", disappear_before_nofollow_stat)
+
+    archive._preflight_archive_directory_entries([
+        archive.state_path,
+        archive.index_path,
+        archive.archive_root / target_name,
+    ])
+
+    assert removed is True
+    assert not disappearing.exists()
+
+
+def test_archive_prepared_recovery_rejects_513th_bucket_before_any_write(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ),
+    )
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES,
+        excluded_names={target_name},
+    )
+    before = _archive_projection_bytes(archive)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+
+
+def test_archive_prepared_recovery_allows_511_to_512_bucket_union(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ),
+    )
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES - 1,
+        excluded_names={target_name},
+    )
+
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+    assert len(archive._bucket_names()) == archive_module._MAX_ARCHIVE_FILES
+
+
+def test_archive_v1_general_migration_counts_prospective_bucket_before_state_write(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(archive, (snapshot(event("a" * 20)),))
+    target_name = "2026-08-19.jsonl"
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES,
+        excluded_names={target_name},
+    )
+    before = _archive_projection_bytes(archive)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+    assert archive.state_path.read_bytes() == legacy["state_bytes"]
+
+
+def test_archive_v1_general_migration_is_queryable_with_512_existing_buckets(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    _write_historical_v1_finalized_archive(archive, (snapshot(event("a" * 20)),))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert len(archive._bucket_names()) == archive_module._MAX_ARCHIVE_FILES
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_archive_native_legacy_journal_recovery_rejects_513th_bucket_before_state_write(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ),
+    )
+    journal_bytes = _rewrite_pending_journal_as_native_schema(archive, schema_version)
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES,
+        excluded_names={target_name},
+    )
+    before = _archive_projection_bytes(archive)
+    writes: list[Path] = []
+    real_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert _archive_projection_bytes(archive) == before
+    assert archive.journal_path.read_bytes() == journal_bytes
+
+
+@pytest.mark.parametrize("schema_version", (2, 3))
+def test_archive_native_legacy_journal_recovery_allows_511_to_512_bucket_union(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    target_name = "2026-08-19.jsonl"
+    _leave_inline_state_before_bucket(
+        archive,
+        monkeypatch,
+        snapshot(
+            event("b" * 20, published_at=NOW - timedelta(days=1)),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ),
+    )
+    journal_bytes = _rewrite_pending_journal_as_native_schema(archive, schema_version)
+    _fill_safe_canonical_bucket_capacity(
+        archive,
+        archive_module._MAX_ARCHIVE_FILES - 1,
+        excluded_names={target_name},
+    )
+
+    assert {row["event_id"] for row in archive.query(days=90)} == {"a" * 20, "b" * 20}
+    assert archive.journal_path.read_bytes() == journal_bytes
+    assert len(archive._bucket_names()) == archive_module._MAX_ARCHIVE_FILES

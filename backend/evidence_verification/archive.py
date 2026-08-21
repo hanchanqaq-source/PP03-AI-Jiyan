@@ -48,7 +48,7 @@ _MAX_ROW_BYTES = 1_048_576
 _MAX_BUCKET_ROWS = 4_096
 _MAX_ARCHIVE_FILES = 512
 _MAX_ARCHIVE_DIRECTORY_ENTRIES = _MAX_ARCHIVE_FILES + 4
-_MAX_SCAN_FILES = _MAX_ARCHIVE_FILES + 2
+_MAX_SCAN_FILES = _MAX_ARCHIVE_FILES + 3
 _MAX_INDEX_EVENTS = 65_536
 _MAX_ARCHIVE_SCAN_BYTES = 64 * 1_048_576
 _MAX_JOURNAL_BYTES = 32 * 1_048_576
@@ -3877,11 +3877,34 @@ class EvidenceArchive:
         planned_paths: Iterator[Path] | list[Path] | set[Path] | tuple[Path, ...],
     ) -> None:
         current_names: set[str] = set()
+        safe_bucket_names: set[str] = set()
         try:
             with os.scandir(self.archive_root) as entries:
                 for entry in entries:
+                    path = self.archive_root / entry.name
+                    try:
+                        metadata = path.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        # A candidate that disappeared before the no-follow stat
+                        # is absent, not a live directory or bucket entry.
+                        continue
+                    except OSError:
+                        raise OSError("storage_corrupt") from None
                     current_names.add(entry.name)
                     if len(current_names) > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+                        raise OSError("storage_corrupt")
+                    if not _valid_bucket_name(entry.name):
+                        continue
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or getattr(metadata, "st_reparse_tag", 0)
+                        or metadata.st_nlink != 1
+                    ):
+                        # Surviving non-regular, reparse and multi-link canonical
+                        # entries are unsafe and never consume valid bucket capacity.
+                        continue
+                    safe_bucket_names.add(entry.name)
+                    if len(safe_bucket_names) > _MAX_ARCHIVE_FILES:
                         raise OSError("storage_corrupt")
         except OSError:
             raise OSError("storage_corrupt") from None
@@ -3891,6 +3914,11 @@ class EvidenceArchive:
             if path.parent == self.archive_root
         }
         if len(current_names | planned_names) > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
+            raise OSError("storage_corrupt")
+        planned_bucket_names = {
+            name for name in planned_names if _valid_bucket_name(name)
+        }
+        if len(safe_bucket_names | planned_bucket_names) > _MAX_ARCHIVE_FILES:
             raise OSError("storage_corrupt")
 
     @staticmethod
@@ -4990,9 +5018,9 @@ class EvidenceArchive:
         recovery_plan: dict[str, Any],
         *,
         now: datetime,
-        budget: dict[str, int],
         state_record: dict[str, object] | None,
         prepared_payload: bytes | None,
+        prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
     ) -> set[str]:
         try:
             write_names = {
@@ -5003,6 +5031,22 @@ class EvidenceArchive:
             }
             actual_index_digest = recovery_plan["actual_index_digest"]
             index_needs_write = actual_index_digest != state["target_index_digest"]
+            planned_bucket_names = self._bounded_bucket_candidates(
+                state["target_bucket_digests"],
+                prospective_bucket_names,
+            )
+            self._preflight_archive_directory_entries([
+                self.state_path,
+                *(
+                    [self.index_path]
+                    if index_needs_write
+                    else []
+                ),
+                *(
+                    self.archive_root / name
+                    for name in sorted(planned_bucket_names)
+                ),
+            ])
             self._preflight_target_finalized_scan(
                 finalized_payload=recovery_plan["finalized_payload"],
                 index_payload=recovery_plan["index_payload"],
@@ -5013,7 +5057,7 @@ class EvidenceArchive:
                 bucket_payloads=recovery_plan["bucket_payloads"],
                 written_names=write_names,
                 now=now,
-                budget=dict(budget),
+                budget=_new_scan_budget(),
             )
             self._preflight_cas_transaction(
                 state_record=state_record,
@@ -5027,18 +5071,6 @@ class EvidenceArchive:
                 journal_record=recovery_plan["journal_record"],
                 cas_budget=recovery_plan["cas_budget"],
             )
-            self._preflight_archive_directory_entries([
-                self.state_path,
-                *(
-                    [self.index_path]
-                    if index_needs_write
-                    else []
-                ),
-                *(
-                    self.archive_root / name
-                    for name in sorted(write_names)
-                ),
-            ])
             return write_names
         except (KeyError, TypeError):
             raise OSError("storage_corrupt") from None
@@ -5051,6 +5083,7 @@ class EvidenceArchive:
         diagnostics: dict[str, int],
         budget: dict[str, int],
         plan: dict[str, Any] | None = None,
+        prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
     ) -> None:
         if plan is None:
             physical_index_record = self._read_index_record(
@@ -5083,9 +5116,9 @@ class EvidenceArchive:
             state,
             recovery_plan,
             now=now,
-            budget=budget,
             state_record=state_record,
             prepared_payload=None,
+            prospective_bucket_names=prospective_bucket_names,
         )
         self._assert_prewrite_authority_is_current(
             state_record=state_record,
@@ -5173,6 +5206,7 @@ class EvidenceArchive:
         budget: dict[str, int],
         physical_index_record: dict[str, Any] | None,
         journal_record: dict[str, object],
+        prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
     ) -> dict[str, Any]:
         if not journal["legacy"]:
             raise OSError("storage_corrupt")
@@ -5226,9 +5260,9 @@ class EvidenceArchive:
             prepared,
             recovery_plan,
             now=now,
-            budget=budget,
             state_record=None,
             prepared_payload=prepared_payload,
+            prospective_bucket_names=prospective_bucket_names,
         )
         self._assert_prewrite_authority_is_current(
             state_record=None,
@@ -5349,6 +5383,7 @@ class EvidenceArchive:
                 budget=budget,
                 physical_index_record=physical_index_record,
                 journal_record=journal_record,
+                prospective_bucket_names=prospective_bucket_names,
             )
         if state_document is not None and state_document["phase"] == "prepared" and journal is None:
             raise OSError("storage_corrupt")
@@ -5422,9 +5457,9 @@ class EvidenceArchive:
                 prepared,
                 recovery_plan,
                 now=now,
-                budget=budget,
                 state_record=state_record,
                 prepared_payload=prepared_payload,
+                prospective_bucket_names=prospective_bucket_names,
             )
             self._assert_prewrite_authority_is_current(
                 state_record=state_record,
@@ -5648,9 +5683,9 @@ class EvidenceArchive:
             prepared,
             recovery_plan,
             now=now,
-            budget=budget,
             state_record=state_record,
             prepared_payload=prepared_payload,
+            prospective_bucket_names=prospective_bucket_names,
         )
         self._assert_prewrite_authority_is_current(
             state_record=state_record,
@@ -5728,12 +5763,15 @@ class EvidenceArchive:
                 if state is not None or previous_state is not None:
                     bucket_read_records = {}
                     bucket_scan_costs = {}
+                    diagnostics = self._diagnostics()
+                    budget = _new_scan_budget()
             if state is not None and state["phase"] == "prepared":
                 self._recover_prepared_authority(
                     state,
                     now=archived_at,
                     diagnostics=diagnostics,
                     budget=budget,
+                    prospective_bucket_names=incoming_target_names,
                 )
                 diagnostics = self._diagnostics()
                 budget = _new_scan_budget()
@@ -5955,7 +5993,7 @@ class EvidenceArchive:
                 self.index_path,
                 *(
                     self.archive_root / name
-                    for name in write_order
+                    for name in sorted(target_bucket_digests)
                 ),
             ])
             self._assert_prewrite_authority_is_current(
@@ -6045,6 +6083,8 @@ class EvidenceArchive:
                 diagnostics=diagnostics,
                 budget=budget,
             )
+            if state is not None:
+                budget = _new_scan_budget()
         if state is None:
             self._last_diagnostics = diagnostics
             return []
