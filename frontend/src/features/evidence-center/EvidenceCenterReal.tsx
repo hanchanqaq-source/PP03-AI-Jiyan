@@ -8,7 +8,7 @@ import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWork
 import { api, isAbortError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { EvidenceDrawer, STATUS_LABEL, StatusBadge } from "./EvidenceDrawer";
-import type { EvidenceEventDetail, EvidenceEventList, EvidenceEventQuery, EvidenceEventSummary, EvidenceSummaryData, VerificationStatus } from "./types";
+import type { EvidenceArchiveEvent, EvidenceArchiveList, EvidenceArchiveQuery, EvidenceEventDetail, EvidenceEventList, EvidenceEventQuery, EvidenceEventSummary, EvidenceHistoryDays, EvidenceSummaryData, VerificationStatus } from "./types";
 
 type Tab = "verification" | "health" | "corrections";
 type Filter = "all" | VerificationStatus;
@@ -17,6 +17,7 @@ type SnapshotLoadResult = { loaded: boolean; snapshotId: string | null };
 
 const tabs: Array<{ value: Tab; label: string }> = [{ value: "verification", label: "资讯核验" }, { value: "health", label: "数据源健康" }, { value: "corrections", label: "更正记录" }];
 const filters: Array<{ value: Filter; label: string }> = [{ value: "all", label: "全部" }, ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value: value as VerificationStatus, label }))];
+const historyDays: EvidenceHistoryDays[] = [1, 3, 7, 30, 90];
 const statusPriority: Record<VerificationStatus, number> = { conflicting: 0, disproved: 1, corrected: 2, unverified: 3, corroborated: 4, verified: 5 };
 const holdingPriority: Record<string, number> = { direct_holding: 0, industry_relation: 1, watch_tag: 2, none: 3 };
 const categoryLabel: Record<string, string> = { policy: "政策", industry: "产业", company: "公司", fund_notice: "基金公告", deep_content: "深度内容" };
@@ -30,6 +31,18 @@ function snapshotLabel(snapshotId: string | null): string {
   return snapshotId.toLowerCase().startsWith("acceptance")
     ? "隔离验收快照"
     : `核验快照 ${snapshotId.slice(0, 8)}`;
+}
+
+function shortArchiveId(value: string): string {
+  return value.slice(0, 8);
+}
+
+function recoveryStatusLabel(status: "cache_recovered" | "public_refetched"): string {
+  return status === "cache_recovered" ? "缓存恢复" : "公开来源重取";
+}
+
+function latestRecovery(event: EvidenceArchiveEvent) {
+  return [...event.snapshot_history].reverse().find((lineage) => lineage.recovery)?.recovery ?? null;
 }
 
 export function EvidenceCenter() {
@@ -47,6 +60,13 @@ export function EvidenceCenter() {
   const [detail, setDetail] = useState<EvidenceEventDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [focusHistory, setFocusHistory] = useState(false);
+  const [archiveEvents, setArchiveEvents] = useState<EvidenceArchiveEvent[]>([]);
+  const [archiveTotal, setArchiveTotal] = useState(0);
+  const [archiveDays, setArchiveDays] = useState<EvidenceHistoryDays>(7);
+  const [archiveFilter, setArchiveFilter] = useState<Filter>("all");
+  const [archiveLoading, setArchiveLoading] = useState(true);
+  const [archiveLoaded, setArchiveLoaded] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const requestRef = useRef(0);
   const evidenceLoadAbortRef = useRef<AbortController | null>(null);
@@ -55,6 +75,10 @@ export function EvidenceCenter() {
   const pipelineAbortRef = useRef<AbortController | null>(null);
   const refreshInFlightRef = useRef(false);
   const committedSummaryRef = useRef<EvidenceSummaryData | null>(summary);
+  const archiveRequestRef = useRef(0);
+  const archiveAbortRef = useRef<AbortController | null>(null);
+  const archiveDaysRef = useRef<EvidenceHistoryDays>(7);
+  const archiveFilterRef = useRef<Filter>("all");
   committedSummaryRef.current = summary;
 
   const queryForFilter = useCallback((nextFilter: Filter): EvidenceEventQuery => ({
@@ -121,12 +145,59 @@ export function EvidenceCenter() {
     }
   }, [queryForFilter, responseMatchesQuery]);
 
+  const loadHistory = useCallback(async (
+    nextDays: EvidenceHistoryDays,
+    nextFilter: Filter,
+  ): Promise<boolean> => {
+    const requestId = ++archiveRequestRef.current;
+    archiveAbortRef.current?.abort();
+    const controller = new AbortController();
+    archiveAbortRef.current = controller;
+    const query: EvidenceArchiveQuery = {
+      days: nextDays,
+      ...(nextFilter === "all" ? {} : { verification_status: nextFilter }),
+    };
+    setArchiveLoading(true);
+    setArchiveError(null);
+    try {
+      const result: EvidenceArchiveList = await api.newsArchive(query, controller.signal);
+      if (requestId !== archiveRequestRef.current || controller.signal.aborted) return false;
+      if (result.filters.days !== nextDays
+        || result.filters.verification_status !== (query.verification_status ?? null)
+        || result.total !== result.events.length) {
+        throw new Error("archive response mismatch");
+      }
+      setArchiveEvents(result.events);
+      setArchiveTotal(result.total);
+      setArchiveLoaded(true);
+      archiveDaysRef.current = nextDays;
+      archiveFilterRef.current = nextFilter;
+      setArchiveDays(nextDays);
+      setArchiveFilter(nextFilter);
+      return true;
+    } catch (error) {
+      const alreadyAborted = controller.signal.aborted;
+      controller.abort();
+      if (requestId !== archiveRequestRef.current || alreadyAborted || isAbortError(error)) return false;
+      setArchiveError("证据历史加载失败，请稍后重试。");
+      return false;
+    } finally {
+      if (requestId === archiveRequestRef.current) {
+        archiveAbortRef.current = null;
+        setArchiveLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => { void loadSnapshot(filterRef.current, null, "证据快照加载失败，请确认本地后端可用后重试。", true); }, [loadSnapshot]);
+  useEffect(() => { void loadHistory(archiveDaysRef.current, archiveFilterRef.current); }, [loadHistory]);
   useEffect(() => () => {
     requestRef.current += 1;
     evidenceLoadAbortRef.current?.abort();
     pipelineCycleRef.current += 1;
     pipelineAbortRef.current?.abort();
+    archiveRequestRef.current += 1;
+    archiveAbortRef.current?.abort();
   }, []);
   useEffect(() => {
     const eventId = new URLSearchParams(window.location.search).get("event_id");
@@ -149,10 +220,20 @@ export function EvidenceCenter() {
     try { setDetail(await api.evidenceEvent(eventId)); } catch { setNotice("证据详情加载失败，请稍后重试。" ); setDetailLoading(false); return; }
     setDetailLoading(false);
   };
+  const openArchivedEvent = (event: EvidenceArchiveEvent, trigger?: HTMLButtonElement | null) => {
+    triggerRef.current = trigger || null;
+    setFocusHistory(false);
+    setDetailLoading(false);
+    setDetail(event);
+  };
   const closeEvent = () => { setDetail(null); setDetailLoading(false); setFocusHistory(false); triggerRef.current?.focus(); };
   const changeFilter = async (next: Filter) => {
     if (next === filterRef.current && !error) return;
     await loadSnapshot(next, null, "证据列表筛选失败，请稍后重试。", true);
+  };
+  const changeArchiveQuery = async (nextDays: EvidenceHistoryDays, nextFilter: Filter) => {
+    if (nextDays === archiveDaysRef.current && nextFilter === archiveFilterRef.current && !archiveError) return;
+    await loadHistory(nextDays, nextFilter);
   };
   const refresh = async () => {
     if (refreshInFlightRef.current || refreshing) return;
@@ -180,6 +261,7 @@ export function EvidenceCenter() {
             );
             if (result.loaded && result.snapshotId === durableEvidenceId) {
               loadedEvidenceSnapshotId = durableEvidenceId;
+              await loadHistory(archiveDaysRef.current, archiveFilterRef.current);
             }
           }
         },
@@ -193,6 +275,7 @@ export function EvidenceCenter() {
         );
         if (result.loaded && result.snapshotId === terminal.evidence_snapshot_id) {
           loadedEvidenceSnapshotId = terminal.evidence_snapshot_id;
+          await loadHistory(archiveDaysRef.current, archiveFilterRef.current);
         }
       }
       if (terminal.phase === "trusted_published") {
@@ -233,6 +316,26 @@ export function EvidenceCenter() {
     <div role="tablist" aria-label="证据中心内容" className="mt-5 flex flex-wrap gap-1 border-b border-border/55">{tabs.map((item) => <button key={item.value} role="tab" aria-selected={tab === item.value} onClick={() => setTab(item.value)} className={cn("rounded-t-lg px-3 py-2 text-sm", tab === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}</div>
 
     {tab === "verification" && <div className="mt-4 grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(280px,3fr)]"><main className="min-w-0"><div className="flex flex-wrap items-center gap-2 rounded-xl border border-border/55 bg-muted/10 p-3"><span className="mr-1 text-xs text-muted-foreground">筛选：</span>{filters.map((item) => <button key={item.value} onClick={() => void changeFilter(item.value)} aria-pressed={filter === item.value} className={cn("rounded-lg px-2.5 py-1 text-xs", filter === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}<label className="ml-auto text-xs text-muted-foreground">排序方式<select aria-label="排序方式" value={sort} onChange={(event) => setSort(event.target.value as Sort)} className="ml-2 rounded-lg border border-border bg-background px-2 py-1.5 text-foreground"><option value="latest">最新核验</option><option value="status">核验状态</option><option value="holding_relevance">持仓关联</option></select></label></div><div className="mt-3 space-y-3">{visibleEvents.map((event) => <article key={event.event_id} className="rounded-xl border border-border/60 bg-background/45 p-4"><div className="flex flex-wrap items-start justify-between gap-2"><div><StatusBadge status={event.verification_status} /><h2 className="mt-2 font-semibold">{event.title}</h2><p className="mt-1 text-xs text-muted-foreground">发布时间：{event.published_at ? new Date(event.published_at).toLocaleString("zh-CN", { hour12: false }) : "未知"} · {categoryLabel[event.category] || event.category}</p></div><p className="text-xs text-muted-foreground">最后核验：{new Date(event.verified_at).toLocaleString("zh-CN", { hour12: false })}</p></div><p className="mt-3 text-sm">核心主张：{event.core_claim}</p><p className="mt-2 text-xs text-muted-foreground">{event.verification_reason}</p><div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border/45 pt-3"><p className="text-xs text-muted-foreground">一手证据：{event.primary_evidence_count} · 独立来源：{event.independent_evidence_count} · 转载来源：{event.syndicated_copy_count} · 冲突来源：{event.contradicting_evidence_count}</p><button onClick={(buttonEvent) => void openEvent(event.event_id, buttonEvent.currentTarget)} aria-label="查看证据" className="rounded-lg border border-primary/45 px-3 py-1.5 text-xs font-medium text-primary">查看证据</button></div></article>)}{!loading && visibleEvents.length === 0 && <p className="rounded-xl border border-border/60 p-6 text-center text-sm text-muted-foreground">当前筛选没有核验记录。</p>}</div></main><aside className="space-y-3"><section className="rounded-xl border border-border/60 bg-muted/10 p-4"><h2 className="font-semibold">可信准入</h2><p className="mt-2 text-xs text-muted-foreground">主资讯流仅接收“已核验”和“多源印证”。其余状态留在证据中心。</p><p className="mt-3 text-sm">已准入：{summary?.admitted_count ?? "—"}</p><p className="mt-1 text-sm">隔离待查：{summary?.isolated_count ?? "—"}</p></section><section className="rounded-xl border border-border/60 bg-muted/10 p-4"><h2 className="font-semibold">数据源健康</h2><p className="mt-2 text-xs text-muted-foreground">来源可访问不等于具体消息已被证实。</p><SourceHealthSummary onOpenDetails={() => setTab("health")} /><button onClick={() => setTab("health")} className="mt-3 rounded-lg border border-border px-3 py-1.5 text-xs">查看健康详情</button></section><section className="rounded-xl border border-border/60 bg-muted/10 p-4"><h2 className="font-semibold">更正与冲突</h2><p className="mt-2 text-xs text-muted-foreground">状态迁移来自当前真实快照，不使用演示记录。</p><button onClick={() => setTab("corrections")} className="mt-3 rounded-lg border border-border px-3 py-1.5 text-xs">查看 {corrections.length} 条记录</button></section></aside></div>}
+
+    {tab === "verification" && <section aria-label="证据历史" aria-busy={archiveLoading} className="mt-5 rounded-2xl border border-border/60 bg-gradient-to-b from-slate-950/35 to-background/45 p-4 sm:p-5">
+      <div className="flex flex-col gap-3 border-b border-border/45 pb-4 lg:flex-row lg:items-end lg:justify-between">
+        <div><p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-primary">Evidence archive</p><h2 className="mt-1 text-lg font-semibold">证据历史</h2><p className="mt-1 max-w-2xl text-xs text-muted-foreground">当前核验概览与历史记录分别计数；历史状态按归档事实显示，不代表已进入可信资讯流。</p></div>
+        <p className="text-sm font-medium">历史记录：{archiveLoaded ? archiveTotal : "—"}</p>
+      </div>
+      <div className="mt-4 grid gap-3 lg:grid-cols-[auto_minmax(0,1fr)]">
+        <div role="group" aria-label="历史时间范围" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5">{historyDays.map((days) => <button key={days} type="button" aria-pressed={archiveDays === days} onClick={() => void changeArchiveQuery(days, archiveFilterRef.current)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveDays === days ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{days}天</button>)}</div>
+        <div role="group" aria-label="历史核验状态" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5 lg:justify-end">{filters.map((item) => <button key={item.value} type="button" aria-label={`历史筛选：${item.label}`} aria-pressed={archiveFilter === item.value} onClick={() => void changeArchiveQuery(archiveDaysRef.current, item.value)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveFilter === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}</div>
+      </div>
+      {archiveError && <p role="alert" className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{archiveError} {archiveLoaded && "继续显示上次成功查询。"}</p>}
+      {archiveLoading && <p className="mt-3 text-xs text-muted-foreground"><Loader2 aria-hidden="true" className="mr-1.5 inline h-3.5 w-3.5 animate-spin" /><span>正在载入证据历史…</span>{archiveLoaded && <span> 继续显示最近一次成功查询。</span>}</p>}
+      <div className="mt-4 grid gap-3 xl:grid-cols-2">{archiveEvents.map((event) => { const recovery = latestRecovery(event); return <article key={`${event.event_id}-${event.evidence_snapshot_id}`} className="rounded-xl border border-border/60 bg-background/55 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-2"><div><StatusBadge status={event.verification_status} /><h3 className="mt-2 font-semibold">{event.title}</h3></div><p className="text-xs text-muted-foreground">归档：{new Date(event.archived_at).toLocaleString("zh-CN", { hour12: false })}</p></div>
+        <p className="mt-3 text-sm">核心主张：{event.core_claim}</p><p className="mt-2 text-xs text-muted-foreground">{event.verification_reason}</p>
+        <div className="mt-3 grid gap-1 rounded-lg bg-muted/15 p-3 text-[11px] text-muted-foreground sm:grid-cols-2"><p>证据快照 {shortArchiveId(event.evidence_snapshot_id)}</p><p>原始快照 {shortArchiveId(event.raw_snapshot_id)}</p><p>快照沿革：{event.snapshot_history.length}</p><p>{recovery ? recoveryStatusLabel(recovery.status) : "原生归档"}</p></div>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border/45 pt-3"><p className="text-xs text-muted-foreground">一手证据：{event.primary_evidence.length} · 独立来源：{event.independent_evidence.length} · 转载来源：{event.syndicated_copies.length} · 冲突来源：{event.contradicting_evidence.length}</p><button type="button" onClick={(buttonEvent) => openArchivedEvent(event, buttonEvent.currentTarget)} aria-label={`查看历史证据 ${event.title}`} className="rounded-lg border border-primary/45 px-3 py-1.5 text-xs font-medium text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">查看历史证据</button></div>
+      </article>; })}</div>
+      {archiveLoaded && !archiveLoading && archiveEvents.length === 0 && <p className="mt-4 rounded-xl border border-border/60 p-6 text-center text-sm text-muted-foreground">所选时间和状态下暂无历史证据。</p>}
+    </section>}
 
     {tab === "health" && <section className="mt-4"><div className="rounded-xl border border-border/60 bg-background/45 p-4"><h2 className="font-semibold">数据源健康</h2><p className="mt-2 text-sm text-muted-foreground">数据源健康表示来源能否访问、能否解析、是否新鲜；内容核验表示具体消息是否存在证据。前者不等于后者。</p></div><SourceHealthWorkspace /></section>}
 

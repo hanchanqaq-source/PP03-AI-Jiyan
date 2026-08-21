@@ -1,5 +1,6 @@
 export type VerificationStatus = "verified" | "corroborated" | "unverified" | "conflicting" | "corrected" | "disproved";
 export type FieldVerificationStatus = "verified" | "corroborated" | "unverified" | "conflicting";
+export type EvidenceHistoryDays = 1 | 3 | 7 | 30 | 90;
 
 export interface EvidenceTransition {
   from_status: VerificationStatus | null;
@@ -97,4 +98,67 @@ export interface EvidenceEventQuery {
   category?: string;
   days?: 1 | 3 | 7 | 30;
   holding_relevance?: string;
+}
+
+export interface EvidenceRecoveryProvenance {
+  source: string;
+  status: "cache_recovered" | "public_refetched";
+  recovered_at: string;
+  source_snapshot_id: string;
+}
+
+export interface EvidenceArchiveLineage {
+  evidence_snapshot_id: string;
+  raw_snapshot_id: string;
+  generated_at: string;
+  content_digest: string;
+  raw_input_digest: string;
+  recovery?: EvidenceRecoveryProvenance;
+  legacy_v1?: true;
+  legacy_projection_digest?: string;
+  legacy_unverifiable?: true;
+}
+
+export interface EvidenceArchiveEvent extends EvidenceEventDetail {
+  schema_version: 3;
+  evidence_snapshot_id: string;
+  raw_snapshot_id: string;
+  snapshot_generated_at: string;
+  archived_at: string;
+  last_updated_at: string;
+  snapshot_history: EvidenceArchiveLineage[];
+  content_digest: string;
+  raw_input_digest: string;
+}
+
+export interface EvidenceArchiveDiagnostics {
+  scanned_files: number;
+  skipped_files: number;
+  scanned_rows: number;
+  skipped_corrupt_rows: number;
+  duplicate_rows: number;
+}
+
+export interface EvidenceArchiveProvenance {
+  event_id: string;
+  evidence_snapshot_id: string;
+  raw_snapshot_id: string;
+  snapshot_history: EvidenceArchiveLineage[];
+  recovery: EvidenceRecoveryProvenance[];
+}
+
+export interface EvidenceArchiveQuery {
+  days: EvidenceHistoryDays;
+  verification_status?: VerificationStatus;
+}
+
+export interface EvidenceArchiveList {
+  events: EvidenceArchiveEvent[];
+  total: number;
+  filters: {
+    days: EvidenceHistoryDays;
+    verification_status: VerificationStatus | null;
+  };
+  diagnostics: EvidenceArchiveDiagnostics;
+  provenance: EvidenceArchiveProvenance[];
 }

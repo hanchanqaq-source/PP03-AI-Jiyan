@@ -45,10 +45,21 @@ import type {
   SourceFamilyView,
 } from "@/features/source-catalog/types";
 import type {
+  EvidenceArchiveEvent,
+  EvidenceArchiveLineage,
+  EvidenceArchiveList,
+  EvidenceArchiveProvenance,
+  EvidenceArchiveQuery,
+  EvidenceField,
+  EvidenceItem,
+  EvidenceRecoveryProvenance,
+  EvidenceTransition,
   EvidenceEventDetail,
   EvidenceEventList,
   EvidenceEventQuery,
   EvidenceSummaryData,
+  FieldVerificationStatus,
+  VerificationStatus,
 } from "@/features/evidence-center/types";
 
 export type {
@@ -1390,6 +1401,379 @@ function adapterAction(value: unknown): AdapterActionResponse {
   return result;
 }
 
+const ARCHIVE_RESPONSE_KEYS = new Set(["events", "total", "filters", "diagnostics", "provenance"]);
+const ARCHIVE_FILTER_KEYS = new Set(["days", "verification_status"]);
+const ARCHIVE_DIAGNOSTIC_KEYS = new Set([
+  "scanned_files", "skipped_files", "scanned_rows", "skipped_corrupt_rows", "duplicate_rows",
+]);
+const ARCHIVE_EVENT_KEYS = new Set([
+  "event_id", "title", "summary", "category", "related_tags", "published_at", "core_claim",
+  "verification_status", "verification_reason", "verified_at", "evidence_as_of", "key_fields",
+  "primary_evidence", "independent_evidence", "syndicated_copies", "contradicting_evidence",
+  "status_history", "holding_relevance", "schema_version", "evidence_snapshot_id", "raw_snapshot_id",
+  "snapshot_generated_at", "archived_at", "last_updated_at", "snapshot_history", "content_digest",
+  "raw_input_digest",
+]);
+const ARCHIVE_TAG_KEYS = new Set(["id", "name"]);
+const ARCHIVE_FIELD_KEYS = new Set([
+  "field_name", "raw_value", "normalized_value", "verification_status", "evidence_ids", "reason",
+]);
+const ARCHIVE_EVIDENCE_KEYS = new Set([
+  "evidence_id", "content_source", "collector_source", "canonical_url", "published_at", "source_role",
+  "origin_cluster", "supports_claim", "supports_fields", "contradicts_claim", "is_official", "title", "excerpt",
+]);
+const ARCHIVE_TRANSITION_KEYS = new Set(["from_status", "to_status", "changed_at", "reason"]);
+const ARCHIVE_LINEAGE_KEYS = new Set([
+  "evidence_snapshot_id", "raw_snapshot_id", "generated_at", "content_digest", "raw_input_digest",
+  "recovery", "legacy_v1", "legacy_projection_digest", "legacy_unverifiable",
+]);
+const ARCHIVE_LINEAGE_BASE_KEYS = new Set([
+  "evidence_snapshot_id", "raw_snapshot_id", "generated_at", "content_digest", "raw_input_digest",
+]);
+const ARCHIVE_RECOVERY_KEYS = new Set(["source", "status", "recovered_at", "source_snapshot_id"]);
+const ARCHIVE_PROVENANCE_KEYS = new Set([
+  "event_id", "evidence_snapshot_id", "raw_snapshot_id", "snapshot_history", "recovery",
+]);
+const ARCHIVE_PROVENANCE_REQUIRED_KEYS = new Set([
+  "event_id", "evidence_snapshot_id", "raw_snapshot_id", "snapshot_history",
+]);
+const ARCHIVE_STATUSES = new Set<VerificationStatus>([
+  "verified", "corroborated", "unverified", "conflicting", "corrected", "disproved",
+]);
+const ARCHIVE_FIELD_STATUSES = new Set<FieldVerificationStatus>([
+  "verified", "corroborated", "unverified", "conflicting",
+]);
+const ARCHIVE_SOURCE_ROLES = new Set<EvidenceItem["source_role"]>(["primary", "independent", "syndicated"]);
+const ARCHIVE_DAYS = new Set([1, 3, 7, 30, 90]);
+const ARCHIVE_RECOVERY_CACHE_SOURCES = ["evidence_current", "evidence_history", "legacy_snapshot", "radar_cache"];
+const ARCHIVE_MAX_EVENTS = 4_096;
+const ARCHIVE_MAX_COLLECTION = 5_000;
+const ARCHIVE_MAX_TEXT = 8_192;
+const ARCHIVE_MAX_DIAGNOSTIC = 1_000_000;
+
+function archiveError(): never {
+  throw new ApiError("证据历史响应无效", 502);
+}
+
+function archiveExactRecord(value: unknown, keys: Set<string>): Record<string, unknown> {
+  const row = marketNewsRecord(value, keys);
+  if (Object.keys(row).length !== keys.size) marketNewsError();
+  return row;
+}
+
+function archiveText(value: unknown, maximum = ARCHIVE_MAX_TEXT): string {
+  return marketNewsBoundedText(value, maximum);
+}
+
+function archiveId(value: unknown): string {
+  return marketNewsCanonicalId(value, 128);
+}
+
+function archiveEventId(value: unknown): string {
+  const eventId = archiveText(value, 20);
+  if (!/^[a-f0-9]{20}$/.test(eventId)) marketNewsError();
+  return eventId;
+}
+
+function archiveDigest(value: unknown): string {
+  const digest = archiveText(value, 64);
+  if (!/^[a-f0-9]{64}$/.test(digest)) marketNewsError();
+  return digest;
+}
+
+function archiveCount(value: unknown, maximum = ARCHIVE_MAX_DIAGNOSTIC): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > maximum) marketNewsError();
+  return value;
+}
+
+function archiveArray<T>(value: unknown, maximum: number, shape: (item: unknown) => T): T[] {
+  if (!Array.isArray(value) || value.length > maximum) marketNewsError();
+  return value.map(shape);
+}
+
+function archiveStatus(value: unknown): VerificationStatus {
+  if (typeof value !== "string" || !ARCHIVE_STATUSES.has(value as VerificationStatus)) marketNewsError();
+  return value as VerificationStatus;
+}
+
+function archiveFieldStatus(value: unknown): FieldVerificationStatus {
+  if (typeof value !== "string" || !ARCHIVE_FIELD_STATUSES.has(value as FieldVerificationStatus)) marketNewsError();
+  return value as FieldVerificationStatus;
+}
+
+function archiveBoolean(value: unknown): boolean {
+  return marketNewsBoolean(value);
+}
+
+function archiveTimestamp(value: unknown): string {
+  return marketNewsTimestamp(value);
+}
+
+function archiveNullableTimestamp(value: unknown): string | null {
+  return value === null ? null : archiveTimestamp(value);
+}
+
+function shapeArchiveTag(value: unknown): { id: string; name: string } {
+  const row = archiveExactRecord(value, ARCHIVE_TAG_KEYS);
+  return { id: archiveId(row.id), name: archiveText(row.name) };
+}
+
+function shapeArchiveField(value: unknown): EvidenceField {
+  const row = archiveExactRecord(value, ARCHIVE_FIELD_KEYS);
+  return {
+    field_name: archiveText(row.field_name),
+    raw_value: archiveText(row.raw_value),
+    normalized_value: archiveText(row.normalized_value),
+    verification_status: archiveFieldStatus(row.verification_status),
+    evidence_ids: archiveArray(row.evidence_ids, ARCHIVE_MAX_COLLECTION, archiveId),
+    reason: archiveText(row.reason),
+  };
+}
+
+function shapeArchiveEvidence(value: unknown): EvidenceItem {
+  const row = archiveExactRecord(value, ARCHIVE_EVIDENCE_KEYS);
+  const sourceRole = archiveText(row.source_role, 16) as EvidenceItem["source_role"];
+  if (!ARCHIVE_SOURCE_ROLES.has(sourceRole)) marketNewsError();
+  return {
+    evidence_id: archiveId(row.evidence_id),
+    content_source: archiveText(row.content_source),
+    collector_source: archiveText(row.collector_source),
+    canonical_url: marketNewsPublicUrl(row.canonical_url),
+    published_at: archiveNullableTimestamp(row.published_at),
+    source_role: sourceRole,
+    origin_cluster: archiveText(row.origin_cluster),
+    supports_claim: archiveBoolean(row.supports_claim),
+    supports_fields: archiveArray(row.supports_fields, ARCHIVE_MAX_COLLECTION, (item) => archiveText(item)),
+    contradicts_claim: archiveBoolean(row.contradicts_claim),
+    is_official: archiveBoolean(row.is_official),
+    title: archiveText(row.title),
+    excerpt: archiveText(row.excerpt),
+  };
+}
+
+function shapeArchiveTransition(value: unknown): EvidenceTransition {
+  const row = archiveExactRecord(value, ARCHIVE_TRANSITION_KEYS);
+  return {
+    from_status: row.from_status === null ? null : archiveStatus(row.from_status),
+    to_status: archiveStatus(row.to_status),
+    changed_at: archiveTimestamp(row.changed_at),
+    reason: archiveText(row.reason),
+  };
+}
+
+function shapeArchiveRecovery(value: unknown): EvidenceRecoveryProvenance {
+  const row = archiveExactRecord(value, ARCHIVE_RECOVERY_KEYS);
+  const source = archiveText(row.source, 128);
+  const status = archiveText(row.status, 32);
+  if (status !== "cache_recovered" && status !== "public_refetched") marketNewsError();
+  if (status === "public_refetched") {
+    if (source !== "public_refetch") marketNewsError();
+  } else {
+    const parts = source.split("+");
+    const canonical = ARCHIVE_RECOVERY_CACHE_SOURCES.filter((item) => parts.includes(item));
+    if (parts.length < 1 || new Set(parts).size !== parts.length
+      || parts.some((item) => !ARCHIVE_RECOVERY_CACHE_SOURCES.includes(item))
+      || canonical.join("+") !== source) marketNewsError();
+  }
+  return {
+    source,
+    status,
+    recovered_at: archiveTimestamp(row.recovered_at),
+    source_snapshot_id: archiveId(row.source_snapshot_id),
+  };
+}
+
+function shapeArchiveLineage(value: unknown): EvidenceArchiveLineage {
+  const row = marketNewsRecord(value, ARCHIVE_LINEAGE_KEYS);
+  if ([...ARCHIVE_LINEAGE_BASE_KEYS].some((key) => !(key in row))) marketNewsError();
+  const extras = Object.keys(row).filter((key) => !ARCHIVE_LINEAGE_BASE_KEYS.has(key));
+  const recovered = extras.includes("recovery");
+  const legacy = extras.includes("legacy_v1") || extras.includes("legacy_projection_digest") || extras.includes("legacy_unverifiable");
+  if ((recovered && (extras.length !== 1 || legacy))
+    || (legacy && (!extras.includes("legacy_v1") || !extras.includes("legacy_projection_digest")
+      || extras.some((key) => !["legacy_v1", "legacy_projection_digest", "legacy_unverifiable"].includes(key))))
+    || (!recovered && !legacy && extras.length !== 0)) marketNewsError();
+
+  const lineage: EvidenceArchiveLineage = {
+    evidence_snapshot_id: archiveId(row.evidence_snapshot_id),
+    raw_snapshot_id: archiveId(row.raw_snapshot_id),
+    generated_at: archiveTimestamp(row.generated_at),
+    content_digest: archiveDigest(row.content_digest),
+    raw_input_digest: archiveDigest(row.raw_input_digest),
+  };
+  if (recovered) lineage.recovery = shapeArchiveRecovery(row.recovery);
+  if (legacy) {
+    if (row.legacy_v1 !== true || ("legacy_unverifiable" in row && row.legacy_unverifiable !== true)) marketNewsError();
+    lineage.legacy_v1 = true;
+    lineage.legacy_projection_digest = archiveDigest(row.legacy_projection_digest);
+    if (row.legacy_unverifiable === true) lineage.legacy_unverifiable = true;
+  }
+  return lineage;
+}
+
+function compareArchiveLineage(left: EvidenceArchiveLineage, right: EvidenceArchiveLineage): number {
+  const timeDifference = Date.parse(left.generated_at) - Date.parse(right.generated_at);
+  if (timeDifference !== 0) return timeDifference;
+  for (const key of ["evidence_snapshot_id", "raw_snapshot_id", "content_digest", "raw_input_digest"] as const) {
+    const compared = left[key].localeCompare(right[key]);
+    if (compared !== 0) return compared;
+  }
+  return 0;
+}
+
+function archiveLineages(value: unknown): EvidenceArchiveLineage[] {
+  const history = archiveArray(value, ARCHIVE_MAX_COLLECTION, shapeArchiveLineage);
+  if (history.length < 1) marketNewsError();
+  const identities = new Set<string>();
+  history.forEach((lineage, index) => {
+    const identity = [lineage.evidence_snapshot_id, lineage.raw_snapshot_id, lineage.generated_at,
+      lineage.content_digest, lineage.raw_input_digest].join("\u0000");
+    if (identities.has(identity) || (index > 0 && compareArchiveLineage(history[index - 1], lineage) >= 0)) marketNewsError();
+    identities.add(identity);
+  });
+  return history;
+}
+
+function shapeArchiveEvent(value: unknown): EvidenceArchiveEvent {
+  const row = archiveExactRecord(value, ARCHIVE_EVENT_KEYS);
+  if (row.schema_version !== 3) marketNewsError();
+  const verificationStatus = archiveStatus(row.verification_status);
+  const tags = archiveArray(row.related_tags, ARCHIVE_MAX_COLLECTION, shapeArchiveTag);
+  const keyFields = archiveArray(row.key_fields, ARCHIVE_MAX_COLLECTION, shapeArchiveField);
+  const primaryEvidence = archiveArray(row.primary_evidence, ARCHIVE_MAX_COLLECTION, shapeArchiveEvidence);
+  const independentEvidence = archiveArray(row.independent_evidence, ARCHIVE_MAX_COLLECTION, shapeArchiveEvidence);
+  const syndicatedCopies = archiveArray(row.syndicated_copies, ARCHIVE_MAX_COLLECTION, shapeArchiveEvidence);
+  const contradictingEvidence = archiveArray(row.contradicting_evidence, ARCHIVE_MAX_COLLECTION, shapeArchiveEvidence);
+  const statusHistory = archiveArray(row.status_history, ARCHIVE_MAX_COLLECTION, shapeArchiveTransition);
+  const snapshotHistory = archiveLineages(row.snapshot_history);
+  const evidenceSnapshotId = archiveId(row.evidence_snapshot_id);
+  const rawSnapshotId = archiveId(row.raw_snapshot_id);
+  const snapshotGeneratedAt = archiveTimestamp(row.snapshot_generated_at);
+  const contentDigest = archiveDigest(row.content_digest);
+  const rawInputDigest = archiveDigest(row.raw_input_digest);
+
+  const currentLineage = snapshotHistory.find((lineage) => lineage.evidence_snapshot_id === evidenceSnapshotId
+    && lineage.raw_snapshot_id === rawSnapshotId && lineage.generated_at === snapshotGeneratedAt);
+  if (!currentLineage || currentLineage.raw_input_digest !== rawInputDigest
+    || snapshotHistory[snapshotHistory.length - 1] !== currentLineage
+    || archiveTimestamp(row.last_updated_at) !== snapshotGeneratedAt) marketNewsError();
+
+  statusHistory.forEach((transition, index) => {
+    if ((index > 0 && (transition.from_status !== statusHistory[index - 1].to_status
+      || Date.parse(transition.changed_at) < Date.parse(statusHistory[index - 1].changed_at)))) marketNewsError();
+  });
+  if (statusHistory.length > 0 && statusHistory[statusHistory.length - 1].to_status !== verificationStatus) marketNewsError();
+
+  const allEvidence = [...primaryEvidence, ...independentEvidence, ...syndicatedCopies, ...contradictingEvidence];
+  const evidenceIds = new Set(allEvidence.map((item) => item.evidence_id));
+  if (evidenceIds.size !== allEvidence.length
+    || primaryEvidence.some((item) => item.source_role !== "primary")
+    || independentEvidence.some((item) => item.source_role !== "independent")
+    || syndicatedCopies.some((item) => item.source_role !== "syndicated")) marketNewsError();
+  const fieldNames = new Set(keyFields.map((field) => field.field_name));
+  if (keyFields.some((field) => field.evidence_ids.some((evidenceId) => !evidenceIds.has(evidenceId)))
+    || allEvidence.some((item) => item.supports_fields.some((fieldName) => !fieldNames.has(fieldName)))) marketNewsError();
+
+  return {
+    event_id: archiveEventId(row.event_id),
+    title: archiveText(row.title),
+    summary: archiveText(row.summary),
+    category: archiveText(row.category, 128),
+    related_tags: tags,
+    published_at: archiveNullableTimestamp(row.published_at),
+    core_claim: archiveText(row.core_claim),
+    verification_status: verificationStatus,
+    verification_reason: archiveText(row.verification_reason),
+    verified_at: archiveTimestamp(row.verified_at),
+    evidence_as_of: archiveTimestamp(row.evidence_as_of),
+    key_fields: keyFields,
+    primary_evidence: primaryEvidence,
+    independent_evidence: independentEvidence,
+    syndicated_copies: syndicatedCopies,
+    contradicting_evidence: contradictingEvidence,
+    status_history: statusHistory,
+    holding_relevance: archiveText(row.holding_relevance, 128),
+    verified_key_fields: keyFields.filter((field) => field.verification_status === "verified" || field.verification_status === "corroborated"),
+    pending_key_field_count: keyFields.filter((field) => field.verification_status === "unverified").length,
+    conflicting_key_field_count: keyFields.filter((field) => field.verification_status === "conflicting").length,
+    primary_evidence_count: primaryEvidence.length,
+    independent_evidence_count: independentEvidence.length,
+    syndicated_copy_count: syndicatedCopies.length,
+    contradicting_evidence_count: contradictingEvidence.length,
+    status_change_count: statusHistory.length,
+    latest_transition: statusHistory[statusHistory.length - 1] ?? null,
+    schema_version: 3,
+    evidence_snapshot_id: evidenceSnapshotId,
+    raw_snapshot_id: rawSnapshotId,
+    snapshot_generated_at: snapshotGeneratedAt,
+    archived_at: archiveTimestamp(row.archived_at),
+    last_updated_at: snapshotGeneratedAt,
+    snapshot_history: snapshotHistory,
+    content_digest: contentDigest,
+    raw_input_digest: rawInputDigest,
+  };
+}
+
+function shapeArchiveProvenance(value: unknown): EvidenceArchiveProvenance {
+  const row = marketNewsRecord(value, ARCHIVE_PROVENANCE_KEYS);
+  if ([...ARCHIVE_PROVENANCE_REQUIRED_KEYS].some((key) => !(key in row))) marketNewsError();
+  return {
+    event_id: archiveEventId(row.event_id),
+    evidence_snapshot_id: archiveId(row.evidence_snapshot_id),
+    raw_snapshot_id: archiveId(row.raw_snapshot_id),
+    snapshot_history: archiveLineages(row.snapshot_history),
+    recovery: row.recovery === undefined
+      ? []
+      : archiveArray(row.recovery, ARCHIVE_MAX_COLLECTION, shapeArchiveRecovery),
+  };
+}
+
+function shapeNewsArchiveInternal(value: unknown, query: EvidenceArchiveQuery): EvidenceArchiveList {
+  validateMarketNewsDocumentBudget(value);
+  const row = archiveExactRecord(value, ARCHIVE_RESPONSE_KEYS);
+  const events = archiveArray(row.events, ARCHIVE_MAX_EVENTS, shapeArchiveEvent);
+  const provenance = archiveArray(row.provenance, ARCHIVE_MAX_EVENTS, shapeArchiveProvenance);
+  const filters = archiveExactRecord(row.filters, ARCHIVE_FILTER_KEYS);
+  const days = archiveCount(filters.days, 90);
+  const verificationStatus = filters.verification_status === null ? null : archiveStatus(filters.verification_status);
+  if (!ARCHIVE_DAYS.has(days) || days !== query.days || verificationStatus !== (query.verification_status ?? null)) marketNewsError();
+
+  const diagnosticsRow = archiveExactRecord(row.diagnostics, ARCHIVE_DIAGNOSTIC_KEYS);
+  const diagnostics = {
+    scanned_files: archiveCount(diagnosticsRow.scanned_files),
+    skipped_files: archiveCount(diagnosticsRow.skipped_files),
+    scanned_rows: archiveCount(diagnosticsRow.scanned_rows),
+    skipped_corrupt_rows: archiveCount(diagnosticsRow.skipped_corrupt_rows),
+    duplicate_rows: archiveCount(diagnosticsRow.duplicate_rows),
+  };
+  if (archiveCount(row.total, ARCHIVE_MAX_EVENTS) !== events.length || provenance.length !== events.length) marketNewsError();
+
+  events.forEach((event, index) => {
+    const fact = provenance[index];
+    const expectedRecovery = event.snapshot_history.flatMap((lineage) => lineage.recovery ? [lineage.recovery] : []);
+    if (fact.event_id !== event.event_id || fact.evidence_snapshot_id !== event.evidence_snapshot_id
+      || fact.raw_snapshot_id !== event.raw_snapshot_id
+      || !marketNewsDeepEqual(fact.snapshot_history, event.snapshot_history)
+      || !marketNewsDeepEqual(fact.recovery, expectedRecovery)) marketNewsError();
+  });
+
+  return {
+    events,
+    total: events.length,
+    filters: { days: days as EvidenceArchiveList["filters"]["days"], verification_status: verificationStatus },
+    diagnostics,
+    provenance,
+  };
+}
+
+function shapeNewsArchive(value: unknown, query: EvidenceArchiveQuery): EvidenceArchiveList {
+  try {
+    return shapeNewsArchiveInternal(value, query);
+  } catch {
+    return archiveError();
+  }
+}
+
 function marketNewsPath(path: string, query: MarketNewsQuery): string {
   const params = new URLSearchParams({
     mode: query.mode,
@@ -1409,6 +1793,12 @@ function evidenceEventsPath(query: EvidenceEventQuery): string {
   params.set("days", String(query.days ?? 7));
   if (query.holding_relevance) params.set("holding_relevance", query.holding_relevance);
   return `/evidence/events?${params.toString()}`;
+}
+
+function newsArchivePath(query: EvidenceArchiveQuery): string {
+  const params = new URLSearchParams({ days: String(query.days) });
+  if (query.verification_status) params.set("verification_status", query.verification_status);
+  return `/news/archive?${params.toString()}`;
 }
 
 export interface Quote {
@@ -1610,6 +2000,7 @@ export const api = {
   evidenceSummary: (signal?: AbortSignal) => get<EvidenceSummaryData>("/evidence/summary", signal),
   evidenceEvents: (query: EvidenceEventQuery = {}, signal?: AbortSignal) => get<EvidenceEventList>(evidenceEventsPath(query), signal),
   evidenceEvent: (eventId: string) => get<EvidenceEventDetail>(`/evidence/events/${encodeURIComponent(eventId)}`),
+  newsArchive: (query: EvidenceArchiveQuery, signal?: AbortSignal) => get<unknown>(newsArchivePath(query), signal).then((value) => shapeNewsArchive(value, query)),
   evidenceRefresh: (signal?: AbortSignal) => request<unknown>("/evidence/refresh", "POST", undefined, signal).then(shapeNewsPipelineStarted),
   cacheStatus: () => get<CacheStatus>("/cache/status"),
   cacheCleanupExpired: () => request<CacheCleanupResult>("/cache/cleanup-expired", "POST"),
