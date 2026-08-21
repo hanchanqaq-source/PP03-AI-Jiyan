@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import errno
 import json
 import multiprocessing
 import os
@@ -3591,6 +3592,8 @@ def test_archive_scandir_stops_after_bounded_total_entries_before_sorting(tmp_pa
     archive._prepare()
     yielded = 0
     total = archive_module._MAX_ARCHIVE_FILES + 100
+    nofollow_stats = 0
+    real_stat = Path.stat
 
     class ForeignEntry:
         def __init__(self, number: int) -> None:
@@ -3609,12 +3612,22 @@ def test_archive_scandir_stops_after_bounded_total_entries_before_sorting(tmp_pa
                 yielded += 1
                 yield ForeignEntry(number)
 
+    def count_nofollow_stat(path: Path, *args, **kwargs):
+        nonlocal nofollow_stats
+        if path.parent == archive.archive_root and path.name.startswith("foreign-"):
+            nofollow_stats += 1
+        return real_stat(path, *args, **kwargs)
+
     monkeypatch.setattr(archive_module.os, "scandir", lambda _path: ManyForeignEntries())
+    monkeypatch.setattr(Path, "stat", count_nofollow_stat)
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive._bucket_names()
 
-    assert yielded <= archive_module._MAX_ARCHIVE_FILES + 8
+    # One sentinel entry may be fetched to prove the bounded scan is over-cap,
+    # but no more than the configured 520 candidates may reach no-follow stat.
+    assert yielded <= archive_module._MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES + 1
+    assert nofollow_stats <= archive_module._MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES
 
 
 def test_archive_state_cutoff_overflow_is_normalized_to_storage_corrupt(tmp_path):
@@ -8438,6 +8451,89 @@ def test_archive_v1_general_migration_uses_fresh_postcommit_budget_at_512_bucket
     assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
     assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "finalized"
     assert archive.journal_path.read_bytes() == foreign_journal
+
+
+@pytest.mark.parametrize("operation", ("query", "upsert"))
+@pytest.mark.parametrize("candidate_kind", ("ordinary", "temp_artifact"))
+def test_archive_public_operation_treats_517th_candidate_vanishing_before_stat_as_absent(
+    tmp_path,
+    monkeypatch,
+    operation,
+    candidate_kind,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+    archive.journal_path.write_bytes(b'{"schema_version":4,"owner":"foreign"}\n')
+    candidate_name = (
+        "foreign-vanishing-entry"
+        if candidate_kind == "ordinary"
+        else ".state.json.abcdefgh.tmp"
+    )
+    candidate = archive.archive_root / candidate_name
+    candidate.write_bytes(b"vanishing")
+    assert len(list(archive.archive_root.iterdir())) == (
+        archive_module._MAX_ARCHIVE_DIRECTORY_ENTRIES + 1
+    )
+
+    real_scandir = os.scandir
+    real_stat = Path.stat
+    vanished = False
+    candidate_stat_calls = 0
+
+    class BareEnoentError(OSError):
+        pass
+
+    class CandidateLastEntries:
+        def __enter__(self):
+            with real_scandir(archive.archive_root) as entries:
+                names = [entry.name for entry in entries]
+            self._names = sorted(name for name in names if name != candidate_name)
+            if candidate_name in names:
+                self._names.append(candidate_name)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def __iter__(self):
+            return iter(SimpleNamespace(name=name) for name in self._names)
+
+    def candidate_last_scandir(path):
+        if Path(path) == archive.archive_root:
+            return CandidateLastEntries()
+        return real_scandir(path)
+
+    def vanish_before_nofollow_stat(path: Path, *args, **kwargs):
+        nonlocal vanished, candidate_stat_calls
+        if path == candidate and not vanished:
+            candidate_stat_calls += 1
+            vanished = True
+            candidate.unlink()
+            if candidate_kind == "ordinary":
+                raise FileNotFoundError(str(candidate))
+            raise BareEnoentError(errno.ENOENT, "vanished", str(candidate))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(archive_module.os, "scandir", candidate_last_scandir)
+    monkeypatch.setattr(Path, "stat", vanish_before_nofollow_stat)
+
+    if operation == "query":
+        assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    else:
+        archive.upsert(snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+        assert {row["event_id"] for row in archive.query(days=90)} == {
+            "a" * 20,
+            "b" * 20,
+        }
+
+    assert vanished is True
+    assert candidate_stat_calls == 1
+    assert not candidate.exists()
 
 
 def test_archive_first_v1_journal_uses_a_new_budget_after_recovery_phase(

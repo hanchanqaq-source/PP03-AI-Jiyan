@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
+import errno
 import hashlib
 import io
 import ipaddress
@@ -2257,6 +2258,13 @@ class EvidenceArchive:
                     scanned_count += 1
                     if scanned_count > _MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES:
                         raise OSError("storage_corrupt")
+                    path = self.archive_root / entry.name
+                    try:
+                        metadata = path.stat(follow_symlinks=False)
+                    except OSError as error:
+                        if isinstance(error, FileNotFoundError) or error.errno == errno.ENOENT:
+                            continue
+                        raise OSError("storage_corrupt") from None
                     temp_target = _atomic_temp_target_name(entry.name)
                     if temp_target is None:
                         if _looks_like_temp_artifact_name(entry.name):
@@ -2264,13 +2272,6 @@ class EvidenceArchive:
                         ordinary_count += 1
                         if ordinary_count > _MAX_ARCHIVE_DIRECTORY_ENTRIES:
                             raise OSError("storage_corrupt")
-                    path = self.archive_root / entry.name
-                    try:
-                        metadata = path.stat(follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        raise OSError("storage_corrupt") from None
                     if temp_target is not None:
                         if not self._safe_regular_metadata(metadata):
                             raise OSError("storage_corrupt")
