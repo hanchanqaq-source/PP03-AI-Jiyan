@@ -59,6 +59,7 @@ _MAX_STATE_BYTES = 48 * 1_048_576
 _MAX_SNAPSHOT_BYTES = 16 * 1_048_576
 _MAX_SNAPSHOT_NODES = 200_000
 _MAX_SNAPSHOT_RESOURCES = 50_000
+_MAX_BATCH_SNAPSHOTS = 5_000
 _MAX_SCAN_BYTES = _MAX_ARCHIVE_SCAN_BYTES + _MAX_JOURNAL_BYTES + _MAX_STATE_BYTES
 _MAX_SCAN_ROWS = _MAX_INDEX_EVENTS * 2
 _MAX_ARCHIVE_SCAN_NODES = _MAX_INDEX_EVENTS * 128
@@ -1017,32 +1018,37 @@ def _row_resources(row: dict[str, Any]) -> int:
     )
 
 
+def _charge_snapshot_budget(row: dict[str, Any], budget: dict[str, int]) -> None:
+    try:
+        row_bytes, row_nodes = _json_metrics(
+            row,
+            maximum_bytes=min(
+                _MAX_ROW_BYTES,
+                _MAX_SNAPSHOT_BYTES - budget["encoded_bytes"],
+            ),
+            maximum_nodes=_MAX_SNAPSHOT_NODES - budget["nodes"],
+        )
+    except ValueError as error:
+        if "budget" in str(error):
+            raise ValueError("archive snapshot budget exceeded") from None
+        raise
+    if row_bytes > _MAX_ROW_BYTES:
+        raise ValueError("archive snapshot row budget exceeded")
+    budget["encoded_bytes"] += row_bytes + 1
+    budget["nodes"] += row_nodes
+    budget["resources"] += _row_resources(row)
+    if (
+        budget["encoded_bytes"] > _MAX_SNAPSHOT_BYTES
+        or budget["nodes"] > _MAX_SNAPSHOT_NODES
+        or budget["resources"] > _MAX_SNAPSHOT_RESOURCES
+    ):
+        raise ValueError("archive snapshot budget exceeded")
+
+
 def _ensure_snapshot_budget(rows: list[dict[str, Any]]) -> None:
-    encoded_bytes = 0
-    nodes = 1
-    resources = 0
+    budget = {"encoded_bytes": 0, "nodes": 1, "resources": 0}
     for row in rows:
-        try:
-            row_bytes, row_nodes = _json_metrics(
-                row,
-                maximum_bytes=min(_MAX_ROW_BYTES, _MAX_SNAPSHOT_BYTES - encoded_bytes),
-                maximum_nodes=_MAX_SNAPSHOT_NODES - nodes,
-            )
-        except ValueError as error:
-            if "budget" in str(error):
-                raise ValueError("archive snapshot budget exceeded") from None
-            raise
-        if row_bytes > _MAX_ROW_BYTES:
-            raise ValueError("archive snapshot row budget exceeded")
-        encoded_bytes += row_bytes + 1
-        nodes += row_nodes
-        resources += _row_resources(row)
-        if (
-            encoded_bytes > _MAX_SNAPSHOT_BYTES
-            or nodes > _MAX_SNAPSHOT_NODES
-            or resources > _MAX_SNAPSHOT_RESOURCES
-        ):
-            raise ValueError("archive snapshot budget exceeded")
+        _charge_snapshot_budget(row, budget)
 
 
 def _input_metrics(
@@ -5934,22 +5940,63 @@ class EvidenceArchive:
 
 
     def upsert(self, snapshot: EvidenceSnapshot) -> None:
-        _preflight_snapshot_input(snapshot)
-        document = validated_snapshot_document(snapshot)
-        archived_at = _utc(self._now(), "archive clock")
-        incoming = [
-            _archive_document(snapshot, event, archived_at)
-            for event in document["events"]
-        ]
-        for row in incoming:
-            _validate_temporal_row(row, archived_at)
-        incoming_ids = [row["event_id"] for row in incoming]
-        if len(incoming_ids) != len(set(incoming_ids)):
-            raise ValueError("archive snapshot contains duplicate event identities")
-        incoming_target_names = {_bucket_name(row) for row in incoming}
-        if len(incoming_target_names) > _MAX_ARCHIVE_FILES:
-            raise ValueError("archive snapshot has too many bucket candidates")
-        _ensure_snapshot_budget(incoming)
+        self.upsert_many((snapshot,))
+
+
+    def upsert_many(self, snapshots: object) -> None:
+        try:
+            iterator = iter(snapshots)
+        except Exception:
+            raise ValueError("invalid archive snapshot batch") from None
+
+        archived_at: datetime | None = None
+        incoming: list[dict[str, Any]] = []
+        incoming_budget = {"encoded_bytes": 0, "nodes": 1, "resources": 0}
+        incoming_target_names: set[str] = set()
+        batch_raw_authority: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {}
+        selected_count = 0
+        while True:
+            try:
+                selected = next(iterator)
+            except StopIteration:
+                break
+            except Exception:
+                raise ValueError("invalid archive snapshot batch") from None
+            if selected_count == _MAX_BATCH_SNAPSHOTS:
+                raise ValueError("archive snapshot batch is too large")
+            _preflight_snapshot_input(selected)
+            document = validated_snapshot_document(selected)
+            event_ids = [row["event_id"] for row in document["events"]]
+            if len(event_ids) != len(set(event_ids)):
+                raise ValueError("archive snapshot contains duplicate event identities")
+            if archived_at is None:
+                archived_at = _utc(self._now(), "archive clock")
+            snapshot_rows = [
+                _archive_document(selected, event, archived_at)
+                for event in document["events"]
+            ]
+            binding = (
+                selected.snapshot_id,
+                _timestamp(selected.generated_at, "snapshot generated_at"),
+                tuple(sorted(
+                    (row["event_id"], row["content_digest"])
+                    for row in snapshot_rows
+                )),
+            )
+            previous_binding = batch_raw_authority.get(selected.raw_snapshot_id)
+            if previous_binding is not None and previous_binding != binding:
+                raise ValueError("ambiguous archive raw snapshot identity")
+            batch_raw_authority[selected.raw_snapshot_id] = binding
+            for row in snapshot_rows:
+                _validate_temporal_row(row, archived_at)
+                _charge_snapshot_budget(row, incoming_budget)
+                incoming_target_names.add(_bucket_name(row))
+                if len(incoming_target_names) > _MAX_ARCHIVE_FILES:
+                    raise ValueError("archive snapshot has too many bucket candidates")
+            incoming.extend(snapshot_rows)
+            selected_count += 1
+        if archived_at is None:
+            raise ValueError("archive snapshot batch is empty")
 
         with CACHE_IO_LOCK, self._process_lock():
             diagnostics = self._diagnostics()
@@ -6075,7 +6122,7 @@ class EvidenceArchive:
             committed: dict[str, dict[str, Any]] = {}
             for row in incoming:
                 event_id = row["event_id"]
-                previous = existing.get(event_id)
+                previous = committed.get(event_id, existing.get(event_id))
                 lineage_cutoff = cutoff if _event_time(row) >= cutoff else None
                 committed[event_id] = row if previous is None else _merge_archive_rows(
                     previous,

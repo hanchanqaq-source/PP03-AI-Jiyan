@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import time
 import tracemalloc
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -103,6 +104,181 @@ def snapshot(
         generated_at=generated_at,
         events=(selected,),
     )
+
+
+def _causal_recovery_snapshots(
+    event_id: str = "a" * 20,
+) -> tuple[EvidenceSnapshot, EvidenceSnapshot]:
+    verified_at = NOW - timedelta(hours=2)
+    disproved_at = NOW - timedelta(hours=1)
+    verified_transition = StatusTransition(
+        None,
+        VerificationStatus.VERIFIED,
+        verified_at,
+        "official-support",
+    )
+    disproved_transition = StatusTransition(
+        VerificationStatus.VERIFIED,
+        VerificationStatus.DISPROVED,
+        disproved_at,
+        "official-disproof",
+    )
+    base_evidence = evidence_item(f"evidence-{event_id}", published_at=verified_at)
+    verified = replace(
+        event(
+            event_id,
+            status=VerificationStatus.VERIFIED,
+            published_at=verified_at,
+            history=(verified_transition,),
+            primary_evidence=(base_evidence,),
+        ),
+        verified_at=verified_at,
+        evidence_as_of=verified_at,
+    )
+    disproved = replace(
+        verified,
+        verification_status=VerificationStatus.DISPROVED,
+        verification_reason="official-disproof",
+        verified_at=disproved_at,
+        evidence_as_of=disproved_at,
+        status_history=(verified_transition, disproved_transition),
+    )
+    return (
+        snapshot(
+            verified,
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+            generated_at=verified_at,
+        ),
+        snapshot(
+            disproved,
+            snapshot_id="3" * 20,
+            raw_snapshot_id="4" * 20,
+            generated_at=disproved_at,
+        ),
+    )
+
+
+@pytest.mark.parametrize("failed_write", (1, 2, 3, 4, 5))
+def test_archive_batch_fault_never_exposes_only_the_older_causal_lineage(
+    tmp_path,
+    monkeypatch,
+    failed_write,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    verified, disproved = _causal_recovery_snapshots()
+    other_event = replace(
+        disproved.events[0],
+        event_id="b" * 20,
+        published_at=NOW - timedelta(days=2),
+        primary_evidence=(evidence_item("other", published_at=NOW - timedelta(days=2)),),
+    )
+    other = snapshot(
+        other_event,
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+        generated_at=disproved.generated_at,
+    )
+    real_write = archive._atomic_write
+    writes = 0
+
+    def fail_selected_write(path, payload, maximum):
+        nonlocal writes
+        writes += 1
+        if writes == failed_write:
+            raise OSError("simulated batch write failure")
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", fail_selected_write)
+
+    with pytest.raises(OSError):
+        archive.upsert_many((verified, disproved, other))
+
+    recovered = {
+        row["event_id"]: row
+        for row in EvidenceArchive(tmp_path, now=lambda: NOW).query(90)
+    }
+    assert not recovered or set(recovered) == {"a" * 20, "b" * 20}
+    if recovered:
+        assert recovered["a" * 20]["verification_status"] == "disproved"
+        assert len(recovered["a" * 20]["snapshot_history"]) == 2
+        assert [row["to_status"] for row in recovered["a" * 20]["status_history"]] == [
+            "verified",
+            "disproved",
+        ]
+        assert len(recovered["b" * 20]["snapshot_history"]) == 1
+
+
+def test_archive_batch_commits_multi_event_multi_bucket_and_retry_idempotently(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    first, second = _causal_recovery_snapshots("a" * 20)
+    other_event = replace(
+        second.events[0],
+        event_id="b" * 20,
+        published_at=NOW - timedelta(days=2),
+        primary_evidence=(evidence_item("other", published_at=NOW - timedelta(days=2)),),
+    )
+    other = snapshot(
+        other_event,
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+        generated_at=second.generated_at,
+    )
+
+    archive.upsert_many((first, second, other))
+    archive.upsert_many((first, second, other))
+
+    rows = {row["event_id"]: row for row in archive.query(90)}
+    assert set(rows) == {"a" * 20, "b" * 20}
+    assert rows["a" * 20]["verification_status"] == "disproved"
+    assert len(rows["a" * 20]["snapshot_history"]) == 2
+    assert len(rows["b" * 20]["snapshot_history"]) == 1
+
+
+def test_archive_batch_is_serialized_across_concurrent_writers(tmp_path):
+    verified, disproved = _causal_recovery_snapshots("a" * 20)
+    other_verified, other_disproved = _causal_recovery_snapshots("b" * 20)
+    first = EvidenceArchive(tmp_path, now=lambda: NOW)
+    second = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(first.upsert_many, (verified, disproved)),
+            executor.submit(second.upsert_many, (other_verified, other_disproved)),
+        )
+        for future in futures:
+            future.result(timeout=30)
+
+    rows = {row["event_id"]: row for row in EvidenceArchive(tmp_path, now=lambda: NOW).query(90)}
+    assert set(rows) == {"a" * 20, "b" * 20}
+    assert {row["verification_status"] for row in rows.values()} == {"disproved"}
+    assert {len(row["snapshot_history"]) for row in rows.values()} == {2}
+
+
+def test_archive_batch_stops_consuming_input_at_the_combined_snapshot_budget(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    monkeypatch.setattr(archive_module, "_MAX_SNAPSHOT_BYTES", 8_000)
+    consumed = 0
+
+    def selected_snapshots():
+        nonlocal consumed
+        for index in range(10):
+            consumed += 1
+            yield snapshot(
+                event(f"{index:020d}", title="x" * 4_000),
+                snapshot_id=f"s{index:019d}",
+                raw_snapshot_id=f"r{index:019d}",
+            )
+        raise RuntimeError("private generator detail")
+
+    with pytest.raises(ValueError, match="archive snapshot budget exceeded"):
+        archive.upsert_many(selected_snapshots())
+
+    assert consumed < 10
+    assert archive.count() == 0
 
 
 def _legacy_v1_row(row: dict[str, object]) -> dict[str, object]:
