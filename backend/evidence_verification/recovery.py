@@ -235,24 +235,28 @@ def _validated_refetch_text(value: object, budget: dict[str, int | bool]) -> str
     return _refetch_text(value, budget)
 
 
-def _frozen_refetch_time(value: object) -> datetime:
+def _frozen_utc_time(value: object) -> datetime:
     if type(value) is not datetime or value.tzinfo is None:
-        raise _RefetchLimitExceeded("invalid public refetch timestamp")
+        raise ValueError("invalid timestamp")
+    offset = value.utcoffset()
+    if type(offset) is not timedelta:
+        raise ValueError("invalid timestamp")
+    wall_time = datetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=timezone.utc,
+    )
+    return wall_time - offset
+
+
+def _frozen_refetch_time(value: object) -> datetime:
     try:
-        offset = value.utcoffset()
-        if type(offset) is not timedelta:
-            raise _RefetchLimitExceeded("invalid public refetch timestamp")
-        wall_time = datetime(
-            value.year,
-            value.month,
-            value.day,
-            value.hour,
-            value.minute,
-            value.second,
-            value.microsecond,
-            tzinfo=timezone.utc,
-        )
-        return wall_time - offset
+        return _frozen_utc_time(value)
     except Exception as error:
         raise _RefetchLimitExceeded("invalid public refetch timestamp") from error
 
@@ -1452,10 +1456,7 @@ class HistoryRecovery:
         )
 
     def _now_utc(self) -> datetime:
-        value = self._now()
-        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("invalid recovery clock")
-        return value.astimezone(timezone.utc)
+        return _frozen_utc_time(self._now())
 
     @staticmethod
     def _event_fingerprint(event: EvidenceEvent) -> str:
@@ -1862,7 +1863,7 @@ class HistoryRecovery:
         refetched_ids: set[str] = set()
         try:
             now = self._now_utc()
-        except (TypeError, ValueError):
+        except Exception:
             self._add_reason(reasons, "invalid_clock")
             return RecoveryReport(
                 unrecoverable=sum(reasons.values()),

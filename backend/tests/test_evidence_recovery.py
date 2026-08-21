@@ -3457,3 +3457,236 @@ def test_public_refetch_timestamp_conversion_failure_keeps_safe_raw_marker(
     }
     assert "private timezone detail" not in repr(report.to_dict())
     assert archive.query(90) == []
+
+
+class RecoveryClockWriteTrap:
+    def __init__(self):
+        self.calls = 0
+
+    def upsert_many(self, *_args, **_kwargs):
+        self.calls += 1
+        raise AssertionError("archive mutation must not run for an invalid clock")
+
+
+class RecoveryClockTimezone(tzinfo):
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.calls = 0
+
+    def utcoffset(self, _value):
+        self.calls += 1
+        if self.mode == "none":
+            return None
+        if self.mode == "wrong_type":
+            return object()
+        if self.mode == "too_large":
+            return timedelta(hours=24)
+        if self.mode == "raises":
+            raise RuntimeError("PRIVATE clock path=C:\\secret token=clock-token")
+        raise AssertionError("unknown test timezone mode")
+
+    def dst(self, _value):
+        return timedelta(0)
+
+
+class FoldAwareStatefulTimezone(tzinfo):
+    def __init__(self):
+        self.calls = 0
+
+    def utcoffset(self, value):
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("PRIVATE late fold timezone detail")
+        return timedelta(hours=9 if value.fold else 8)
+
+    def dst(self, _value):
+        return timedelta(0)
+
+
+def recovery_clock_radar(root: Path) -> Path:
+    return write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": "a" * 20,
+            "title": "公开事件",
+            "original_url": "https://publisher.example.com/a",
+            "published_at": (NOW - timedelta(days=1)).isoformat(),
+            "verification_status": "verified",
+        }]}],
+    })
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "callable_runtime_error",
+        "callable_os_error",
+        "not_datetime",
+        "naive",
+        "none_offset",
+        "wrong_offset_type",
+        "oversized_offset",
+        "offset_runtime_error",
+        "utc_overflow",
+    ),
+)
+def test_recovery_invalid_clock_is_closed_before_refetch_or_archive_mutation(tmp_path, case):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    radar = recovery_clock_radar(root)
+    callback_calls: list[str] = []
+    archive = RecoveryClockWriteTrap()
+    selected_timezone = None
+
+    if case == "callable_runtime_error":
+        def clock():
+            raise RuntimeError("PRIVATE clock path=C:\\secret token=clock-token")
+    elif case == "callable_os_error":
+        def clock():
+            raise OSError("PRIVATE clock path=C:\\secret token=clock-token")
+    elif case == "not_datetime":
+        clock = lambda: "PRIVATE clock path=C:\\secret token=clock-token"
+    elif case == "naive":
+        clock = lambda: datetime(2026, 8, 21, 9, 0)
+    elif case == "utc_overflow":
+        clock = lambda: datetime.min.replace(
+            tzinfo=timezone(timedelta(hours=1)),
+        )
+    else:
+        mode = {
+            "none_offset": "none",
+            "wrong_offset_type": "wrong_type",
+            "oversized_offset": "too_large",
+            "offset_runtime_error": "raises",
+        }[case]
+        selected_timezone = RecoveryClockTimezone(mode)
+        clock = lambda: datetime(2026, 8, 21, 17, 0, tzinfo=selected_timezone)
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=lambda url: callback_calls.append(url),
+        now=clock,
+    ).import_records()
+
+    assert report.to_dict() == {
+        "cache_recovered": 0,
+        "public_refetched": 0,
+        "unrecoverable": 1,
+        "reasons": {"invalid_clock": 1},
+    }
+    assert callback_calls == []
+    assert archive.calls == 0
+    assert "PRIVATE" not in repr(report)
+    assert "clock-token" not in repr(report.to_dict())
+    assert "C:\\secret" not in repr(report.to_dict())
+    if selected_timezone is not None:
+        assert selected_timezone.calls == 1
+
+
+@pytest.mark.parametrize("exception_type", (KeyboardInterrupt, SystemExit))
+def test_recovery_clock_does_not_swallow_process_control_exceptions(tmp_path, exception_type):
+    from evidence_verification.recovery import HistoryRecovery
+
+    def clock():
+        raise exception_type()
+
+    with pytest.raises(exception_type):
+        HistoryRecovery(tmp_path, now=clock).import_records()
+
+
+def test_recovery_clock_freezes_stateful_offset_before_late_archive_use(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(evidence_event())),
+    )
+    selected_timezone = StatefulOffsetTimezone(1)
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: datetime(2026, 8, 21, 17, 0, tzinfo=selected_timezone),
+    ).import_records()
+
+    assert report.to_dict() == {
+        "cache_recovered": 1,
+        "public_refetched": 0,
+        "unrecoverable": 0,
+        "reasons": {},
+    }
+    assert selected_timezone.calls == 1
+    recovery = archive.get("a" * 20)["snapshot_history"][0]["recovery"]
+    assert recovery["recovered_at"] == NOW.isoformat()
+    assert selected_timezone.calls == 1
+
+
+def test_recovery_clock_uses_fold_in_its_single_offset_sample(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(evidence_event())),
+    )
+    selected_timezone = FoldAwareStatefulTimezone()
+    folded_clock = datetime(
+        2026,
+        8,
+        21,
+        18,
+        0,
+        tzinfo=selected_timezone,
+        fold=1,
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: folded_clock,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 0
+    assert selected_timezone.calls == 1
+    recovery = archive.get("a" * 20)["snapshot_history"][0]["recovery"]
+    assert recovery["recovered_at"] == NOW.isoformat()
+    assert selected_timezone.calls == 1
+
+
+@pytest.mark.parametrize(
+    "clock_value",
+    (
+        NOW,
+        datetime(2026, 8, 21, 17, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 8, 21, 14, 45, tzinfo=timezone(timedelta(hours=5, minutes=45))),
+    ),
+)
+def test_recovery_clock_accepts_utc_fixed_and_non_hour_offsets(tmp_path, clock_value):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(evidence_event())),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: clock_value,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 0
+    recovery = archive.get("a" * 20)["snapshot_history"][0]["recovery"]
+    assert recovery["recovered_at"] == NOW.isoformat()
