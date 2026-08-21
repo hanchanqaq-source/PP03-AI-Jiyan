@@ -680,7 +680,8 @@ def test_recovery_archive_rejection_is_counted_per_event_without_losing_siblings
     bad_id = "b" * 20
 
     class SelectiveArchive:
-        def __init__(self):
+        def __init__(self, root):
+            self._archive = EvidenceArchive(root, now=lambda: NOW)
             self.rows: dict[str, dict] = {}
 
         def upsert(self, selected):
@@ -688,13 +689,11 @@ def test_recovery_archive_rejection_is_counted_per_event_without_losing_siblings
             event = selected.events[0]
             if event.event_id == bad_id:
                 raise OSError("private archive failure")
-            self.rows[event.event_id] = {
-                "event_id": event.event_id,
-                "recovery_metadata": dict(selected.recovery_metadata),
-            }
+            self._archive.upsert(selected)
+            self.rows[event.event_id] = self._archive.get(event.event_id)
 
         def get(self, event_id):
-            return self.rows.get(event_id)
+            return self._archive.get(event_id)
 
     root = tmp_path / "evidence"
     selected = EvidenceSnapshot(
@@ -704,7 +703,7 @@ def test_recovery_archive_rejection_is_counted_per_event_without_losing_siblings
         events=(evidence_event(good_id), evidence_event(bad_id)),
     )
     current = write_json(root / "current.json", snapshot_document(selected))
-    archive = SelectiveArchive()
+    archive = SelectiveArchive(root)
 
     report = HistoryRecovery(
         root,
@@ -717,10 +716,10 @@ def test_recovery_archive_rejection_is_counted_per_event_without_losing_siblings
     assert report.unrecoverable == 1
     assert report.reasons == {"archive_rejected": 1}
     assert set(archive.rows) == {good_id}
-    assert archive.rows[good_id]["recovery_metadata"] == {
+    assert archive.rows[good_id]["snapshot_history"][0]["recovery"] == {
         "source": "evidence_current",
         "recovered_at": NOW.isoformat(),
-        "recovery_status": "cache_recovered",
+        "status": "cache_recovered",
         "source_snapshot_id": "s" * 20,
     }
 
@@ -843,3 +842,537 @@ def test_default_history_discovery_reports_an_unsafe_directory(tmp_path):
     report = HistoryRecovery(root, now=lambda: NOW).scan()
 
     assert report.reasons == {"unsafe_directory": 1}
+
+
+def test_default_history_discovery_reports_directory_disappearance_after_chain_validation(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.recovery as recovery_module
+    from evidence_verification.recovery import HistoryRecovery
+
+    history = tmp_path / "history"
+    history.mkdir()
+    original_scandir = recovery_module.os.scandir
+
+    def disappearing_scandir(path):
+        if Path(path) == history:
+            raise FileNotFoundError("C:\\private\\history")
+        return original_scandir(path)
+
+    monkeypatch.setattr(recovery_module.os, "scandir", disappearing_scandir)
+
+    report = HistoryRecovery(tmp_path, now=lambda: NOW).scan()
+
+    assert report.reasons == {"directory_scan_failed": 1}
+    assert report.unrecoverable == 1
+    assert "private" not in json.dumps(report.to_dict(), ensure_ascii=False)
+
+
+def test_discovered_history_entry_disappearance_is_not_reported_as_empty(
+    tmp_path,
+    monkeypatch,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    history = tmp_path / "history"
+    candidate = history / "2026-08-20.jsonl"
+    candidate.parent.mkdir()
+    candidate.write_text("{}\n", encoding="utf-8")
+    original_safe_read = HistoryRecovery._safe_read
+
+    def disappearing_read(path, remaining):
+        if Path(path) == candidate:
+            candidate.unlink()
+        return original_safe_read(path, remaining)
+
+    monkeypatch.setattr(HistoryRecovery, "_safe_read", staticmethod(disappearing_read))
+
+    report = HistoryRecovery(tmp_path, now=lambda: NOW).scan()
+
+    assert report.opened_paths == ()
+    assert report.reasons == {"history_entry_disappeared": 1}
+    assert report.unrecoverable == 1
+
+
+def test_recovery_rejects_every_noncanonical_event_id_per_event(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    invalid_ids = (
+        "   ",
+        "a" * 19,
+        "A" * 20,
+        ("a" * 19) + "\n",
+        "g" * 20,
+    )
+    originals = tuple(evidence_event(f"{index:020x}") for index in range(len(invalid_ids) + 1))
+    document = snapshot_document(EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW - timedelta(days=1),
+        events=originals,
+    ))
+    for row, invalid_id in zip(document["events"][:len(invalid_ids)], invalid_ids, strict=True):
+        row["event_id"] = invalid_id
+    current = write_json(root / "current.json", document)
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.public_refetched == 0
+    assert report.unrecoverable == len(invalid_ids)
+    assert report.reasons == {"missing_required_fields": len(invalid_ids)}
+    assert [row["event_id"] for row in archive.query(90)] == [originals[-1].event_id]
+
+
+def test_recovery_preserves_causal_verified_to_disproved_lineages(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    event_id = "a" * 20
+    verified_at = NOW - timedelta(days=2, hours=1)
+    disproved_at = NOW - timedelta(days=2)
+    verified = evidence_event(event_id, published_at=verified_at)
+    disproved = replace(
+        verified,
+        verification_status=VerificationStatus.DISPROVED,
+        verification_reason="official-disproof",
+        verified_at=disproved_at,
+        evidence_as_of=disproved_at,
+        status_history=(
+            verified.status_history[0],
+            StatusTransition(
+                VerificationStatus.VERIFIED,
+                VerificationStatus.DISPROVED,
+                disproved_at,
+                "official-disproof",
+            ),
+        ),
+    )
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(verified, snapshot_id="s" * 20, raw_snapshot_id="r" * 20)),
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-disproved.json",
+        snapshot_document(evidence_snapshot(disproved, snapshot_id="t" * 20, raw_snapshot_id="q" * 20)),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.to_dict() == {
+        "cache_recovered": 1,
+        "public_refetched": 0,
+        "unrecoverable": 0,
+        "reasons": {},
+    }
+    archived = archive.get(event_id)
+    assert archived["verification_status"] == "disproved"
+    assert [row["to_status"] for row in archived["status_history"]] == ["verified", "disproved"]
+    assert len(archived["snapshot_history"]) == 2
+
+
+def test_recovery_preserves_same_truth_from_every_distinct_snapshot_lineage(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    selected = evidence_event("a" * 20)
+    current_snapshot = evidence_snapshot(
+        selected,
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    legacy_snapshot = EvidenceSnapshot(
+        snapshot_id="t" * 20,
+        raw_snapshot_id="q" * 20,
+        generated_at=selected.verified_at + timedelta(minutes=1),
+        events=(selected,),
+    )
+    current = write_json(root / "current.json", snapshot_document(current_snapshot))
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-copy.json",
+        snapshot_document(legacy_snapshot),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 0
+    archived = archive.get(selected.event_id)
+    assert {
+        (row["evidence_snapshot_id"], row["raw_snapshot_id"])
+        for row in archived["snapshot_history"]
+    } == {
+        (current_snapshot.snapshot_id, current_snapshot.raw_snapshot_id),
+        (legacy_snapshot.snapshot_id, legacy_snapshot.raw_snapshot_id),
+    }
+    assert [row["recovery"]["source"] for row in archived["snapshot_history"]] == [
+        "evidence_current",
+        "legacy_snapshot",
+    ]
+
+
+def test_duplicate_snapshot_sources_merge_provenance_and_remain_retry_idempotent(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    selected = evidence_snapshot(evidence_event("a" * 20))
+    current = write_json(root / "current.json", snapshot_document(selected))
+
+    first = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{"evidence_snapshot": snapshot_document(selected)}]}],
+    })
+    second = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+    current.unlink()
+    third = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert first.cache_recovered == second.cache_recovered == third.cache_recovered == 1
+    assert first.unrecoverable == second.unrecoverable == third.unrecoverable == 0
+    archived = archive.get(selected.events[0].event_id)
+    assert len(archived["snapshot_history"]) == 1
+    assert archived["snapshot_history"][0]["recovery"]["source"] == "evidence_current+radar_cache"
+
+
+def test_recovery_rejects_archive_ack_without_the_expected_lineage(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    class EventOnlyArchive:
+        def __init__(self):
+            self.event_id = None
+
+        def upsert(self, selected):
+            self.event_id = selected.events[0].event_id
+
+        def get(self, event_id):
+            return {"event_id": event_id} if event_id == self.event_id else None
+
+    root = tmp_path / "evidence"
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(evidence_event())),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=EventOnlyArchive(),
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.unrecoverable == 1
+    assert report.reasons == {"archive_rejected": 1}
+
+
+def test_recovery_uses_one_clock_sample_at_the_exact_retention_boundary(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    calls = 0
+
+    def advancing_clock():
+        nonlocal calls
+        calls += 1
+        return NOW if calls == 1 else NOW + timedelta(microseconds=calls - 1)
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=advancing_clock)
+    selected = evidence_snapshot(evidence_event(
+        "a" * 20,
+        published_at=NOW - timedelta(days=90),
+    ))
+    current = write_json(root / "current.json", snapshot_document(selected))
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        archive=archive,
+        now=advancing_clock,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 0
+    stable = EvidenceArchive(root, now=lambda: NOW).get(selected.events[0].event_id)
+    assert stable is not None
+    assert stable["snapshot_history"][0]["recovery"]["status"] == "cache_recovered"
+
+
+def test_public_refetch_materializes_forged_evidence_iterables_with_a_hard_bound(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    class ManyEvidence:
+        def __init__(self, item):
+            self.item = item
+            self.consumed = 0
+
+        def __iter__(self):
+            for _ in range(60_001):
+                self.consumed += 1
+                yield self.item
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    event_id = "b" * 20
+    link = "https://publisher.example.com/bounded"
+    published = NOW - timedelta(days=2)
+    base = replace(
+        evidence_event(event_id, published_at=published, link=link),
+        title="公开事件",
+    )
+    many = ManyEvidence(base.primary_evidence[0])
+    forged = replace(base, primary_evidence=many)
+    returned = evidence_snapshot(forged)
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": event_id,
+            "title": "公开事件",
+            "original_url": link,
+            "published_at": published.isoformat(),
+            "verification_status": "verified",
+        }]}],
+    })
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=lambda _url: returned,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert many.consumed <= 513
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 1
+    assert report.reasons == {"public_refetch_failed": 1}
+    assert archive.count() == 0
+
+
+def test_recovery_preserves_causal_corroborated_to_conflicting_lineages(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    event_id = "c" * 20
+    corroborated_at = NOW - timedelta(days=3, hours=1)
+    conflicting_at = NOW - timedelta(days=3)
+    corroborated = evidence_event(
+        event_id,
+        status=VerificationStatus.CORROBORATED,
+        published_at=corroborated_at,
+    )
+    conflicting = replace(
+        corroborated,
+        verification_status=VerificationStatus.CONFLICTING,
+        verification_reason="independent-conflict",
+        verified_at=conflicting_at,
+        evidence_as_of=conflicting_at,
+        status_history=(
+            corroborated.status_history[0],
+            StatusTransition(
+                VerificationStatus.CORROBORATED,
+                VerificationStatus.CONFLICTING,
+                conflicting_at,
+                "independent-conflict",
+            ),
+        ),
+    )
+    current = write_json(
+        root / "current.json",
+        snapshot_document(evidence_snapshot(
+            corroborated,
+            snapshot_id="s" * 20,
+            raw_snapshot_id="r" * 20,
+        )),
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-conflict.json",
+        snapshot_document(evidence_snapshot(
+            conflicting,
+            snapshot_id="t" * 20,
+            raw_snapshot_id="q" * 20,
+        )),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 0
+    archived = archive.get(event_id)
+    assert archived["verification_status"] == "conflicting"
+    assert [row["to_status"] for row in archived["status_history"]] == [
+        "corroborated",
+        "conflicting",
+    ]
+    assert len(archived["snapshot_history"]) == 2
+
+
+def test_recovery_rejects_same_lineage_content_conflict_as_one_terminal_event(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    selected = evidence_event("a" * 20)
+    first = evidence_snapshot(selected, snapshot_id="s" * 20, raw_snapshot_id="r" * 20)
+    second = evidence_snapshot(
+        replace(selected, title="冲突标题"),
+        snapshot_id=first.snapshot_id,
+        raw_snapshot_id=first.raw_snapshot_id,
+    )
+    current = write_json(root / "current.json", snapshot_document(first))
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-conflict.json",
+        snapshot_document(second),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 1
+    assert report.reasons == {"ambiguous_record": 1}
+    assert archive.count() == 0
+
+
+def test_public_refetch_bounds_forged_snapshot_events_iterable(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    class ManyEvents:
+        def __init__(self, selected):
+            self.selected = selected
+            self.consumed = 0
+
+        def __iter__(self):
+            for _ in range(60_001):
+                self.consumed += 1
+                yield self.selected
+
+    root = tmp_path / "evidence"
+    event_id = "b" * 20
+    link = "https://publisher.example.com/events-bound"
+    published = NOW - timedelta(days=2)
+    selected = replace(
+        evidence_event(event_id, published_at=published, link=link),
+        title="公开事件",
+    )
+    many = ManyEvents(selected)
+    returned = replace(evidence_snapshot(selected), events=many)
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": event_id,
+            "title": selected.title,
+            "original_url": link,
+            "published_at": published.isoformat(),
+            "verification_status": selected.verification_status.value,
+        }]}],
+    })
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        public_refetcher=lambda _url: returned,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert many.consumed <= 2
+    assert report.to_dict() == {
+        "cache_recovered": 0,
+        "public_refetched": 0,
+        "unrecoverable": 1,
+        "reasons": {"public_refetch_failed": 1},
+    }
+
+
+def test_public_refetch_closes_an_events_generator_exception_without_leakage(tmp_path):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    event_id = "b" * 20
+    link = "https://publisher.example.com/events-error"
+    published = NOW - timedelta(days=2)
+    selected = replace(
+        evidence_event(event_id, published_at=published, link=link),
+        title="公开事件",
+    )
+    document = snapshot_document(evidence_snapshot(selected))
+    event_row = document["events"][0]
+
+    def events():
+        yield event_row
+        raise OSError("C:\\private\\credential?api_key=secret")
+
+    document["events"] = events()
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": event_id,
+            "title": selected.title,
+            "original_url": link,
+            "published_at": published.isoformat(),
+            "verification_status": selected.verification_status.value,
+        }]}],
+    })
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        public_refetcher=lambda _url: document,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.to_dict() == {
+        "cache_recovered": 0,
+        "public_refetched": 0,
+        "unrecoverable": 1,
+        "reasons": {"public_refetch_failed": 1},
+    }
+    assert "private" not in json.dumps(report.to_dict(), ensure_ascii=False)

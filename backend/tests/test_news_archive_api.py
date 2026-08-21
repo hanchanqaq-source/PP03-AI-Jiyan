@@ -15,6 +15,7 @@ from evidence_verification.models import (
     StatusTransition,
     VerificationStatus,
 )
+from evidence_verification.storage import snapshot_document
 
 
 client = TestClient(app_module.app)
@@ -237,3 +238,67 @@ def test_archive_api_empty_read_does_not_create_storage(tmp_path, monkeypatch):
     assert response.json()["data"]["events"] == []
     assert response.json()["data"]["total"] == 0
     assert not archive.root.exists()
+
+
+def test_archive_api_exposes_every_recovered_lineage_and_merged_cache_source(tmp_path, monkeypatch):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    selected = event("a" * 20, days_old=2)
+    current_snapshot = EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=selected.verified_at,
+        events=(selected,),
+    )
+    legacy_snapshot = EvidenceSnapshot(
+        snapshot_id="t" * 20,
+        raw_snapshot_id="q" * 20,
+        generated_at=selected.verified_at,
+        events=(selected,),
+    )
+    current = root / "current.json"
+    current.parent.mkdir(parents=True)
+    current.write_text(json.dumps(snapshot_document(current_snapshot)), encoding="utf-8")
+    legacy = root / "legacy-snapshots" / "evidence-copy.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps(snapshot_document(legacy_snapshot)), encoding="utf-8")
+
+    first = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+    radar = root / "radar.json"
+    radar.write_text(json.dumps({
+        "industries": [{"items": [{"evidence_snapshot": snapshot_document(current_snapshot)}]}],
+    }), encoding="utf-8")
+    second = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: archive)
+
+    response = client.get("/api/news/archive?days=90")
+
+    assert first.to_dict() == {
+        "cache_recovered": 1,
+        "public_refetched": 0,
+        "unrecoverable": 0,
+        "reasons": {},
+    }
+    assert second.to_dict() == first.to_dict()
+    assert response.status_code == 200
+    provenance = response.json()["data"]["provenance"][0]
+    assert len(provenance["snapshot_history"]) == 2
+    assert {row["source"] for row in provenance["recovery"]} == {
+        "evidence_current+radar_cache",
+        "legacy_snapshot",
+    }

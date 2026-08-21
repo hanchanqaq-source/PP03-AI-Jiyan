@@ -91,12 +91,14 @@ _LEGACY_LINEAGE_KEYS = _LINEAGE_KEYS - {"content_digest"}
 _MIGRATED_LINEAGE_KEYS = _LINEAGE_KEYS | {"legacy_v1", "legacy_projection_digest"}
 _UNVERIFIABLE_MIGRATED_LINEAGE_KEYS = _MIGRATED_LINEAGE_KEYS | {"legacy_unverifiable"}
 _RECOVERY_PROVENANCE_KEYS = {"source", "status", "recovered_at", "source_snapshot_id"}
-_RECOVERY_SOURCES = {
-    "radar_cache",
+_CACHE_RECOVERY_SOURCE_ORDER = (
     "evidence_current",
     "evidence_history",
     "legacy_snapshot",
-    "public_refetch",
+    "radar_cache",
+)
+_RECOVERY_SOURCE_ORDER = {
+    source: index for index, source in enumerate(_CACHE_RECOVERY_SOURCE_ORDER)
 }
 _RECOVERY_STATUSES = {"cache_recovered", "public_refetched"}
 _INDEX_KEYS = {"schema_version", "events"}
@@ -352,16 +354,43 @@ def _file_mtime_utc(metadata: tuple[int, int, int, int, int, int, int, int]) -> 
         return None
 
 
+def _recovery_source_parts(value: object) -> tuple[str, ...]:
+    source = _bounded_text(value, "recovery source")
+    if source == "public_refetch":
+        return (source,)
+    parts = source.split("+")
+    if (
+        not parts
+        or len(parts) != len(set(parts))
+        or any(part not in _RECOVERY_SOURCE_ORDER for part in parts)
+        or parts != sorted(parts, key=lambda part: _RECOVERY_SOURCE_ORDER[part])
+    ):
+        raise ValueError("invalid archive recovery provenance")
+    return tuple(parts)
+
+
+def _merged_recovery_source(left: object, right: object) -> str:
+    left_parts = _recovery_source_parts(left)
+    right_parts = _recovery_source_parts(right)
+    if "public_refetch" in {*left_parts, *right_parts}:
+        if left_parts != right_parts:
+            raise ValueError("invalid archive recovery provenance")
+        return "public_refetch"
+    return "+".join(sorted(
+        {*left_parts, *right_parts},
+        key=lambda part: _RECOVERY_SOURCE_ORDER[part],
+    ))
+
+
 def _recovery_provenance_from_document(value: object) -> dict[str, str]:
     if type(value) is not dict or set(value) != _RECOVERY_PROVENANCE_KEYS:
         raise ValueError("invalid archive recovery provenance")
-    source = _bounded_text(value["source"], "recovery source")
+    source = "+".join(_recovery_source_parts(value["source"]))
     status = _bounded_text(value["status"], "recovery status")
     recovered_at = _metadata_time(value["recovered_at"], "recovered_at").isoformat()
     source_snapshot_id = _bounded_text(value["source_snapshot_id"], "source_snapshot_id")
     if (
-        source not in _RECOVERY_SOURCES
-        or status not in _RECOVERY_STATUSES
+        status not in _RECOVERY_STATUSES
         or (status == "public_refetched") != (source == "public_refetch")
     ):
         raise ValueError("invalid archive recovery provenance")
@@ -2099,18 +2128,26 @@ def _merge_archive_rows(
         previous_recovery = previous_lineage.get("recovery")
         incoming_recovery = row.get("recovery")
         if previous_recovery is not None and incoming_recovery is not None:
-            stable_keys = {"source", "status", "source_snapshot_id"}
+            stable_keys = {"status", "source_snapshot_id"}
             if (
                 {key: previous_recovery[key] for key in stable_keys}
                 != {key: incoming_recovery[key] for key in stable_keys}
             ):
                 raise ValueError("archive lineage recovery mismatch")
-            if _metadata_time(
-                incoming_recovery["recovered_at"],
-                "recovered_at",
-            ) < _metadata_time(previous_recovery["recovered_at"], "recovered_at"):
-                histories_by_identity[identity] = row
-                previous_lineage = row
+            previous_time = _metadata_time(previous_recovery["recovered_at"], "recovered_at")
+            incoming_time = _metadata_time(incoming_recovery["recovered_at"], "recovered_at")
+            selected_lineage = row if incoming_time < previous_time else previous_lineage
+            merged_recovery = dict(
+                incoming_recovery if incoming_time < previous_time else previous_recovery
+            )
+            merged_recovery["source"] = _merged_recovery_source(
+                previous_recovery["source"],
+                incoming_recovery["source"],
+            )
+            updated_lineage = dict(selected_lineage)
+            updated_lineage["recovery"] = merged_recovery
+            histories_by_identity[identity] = updated_lineage
+            previous_lineage = updated_lineage
         if previous_recovery is None and incoming_recovery is not None:
             histories_by_identity[identity] = row
             previous_lineage = row

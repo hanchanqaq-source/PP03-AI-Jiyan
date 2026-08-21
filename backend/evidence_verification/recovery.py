@@ -12,9 +12,16 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-from .archive import EvidenceArchive, _archive_public_url
-from .models import EvidenceEvent, EvidenceSnapshot, VerificationStatus
-from .storage import evidence_snapshot_from_document, event_document
+from .archive import EvidenceArchive, _archive_document, _archive_public_url
+from .models import (
+    EvidenceEvent,
+    EvidenceItem,
+    EvidenceSnapshot,
+    KeyField,
+    StatusTransition,
+    VerificationStatus,
+)
+from .storage import evidence_snapshot_from_document, event_document, snapshot_document
 
 
 _MAX_FILES = 128
@@ -26,11 +33,46 @@ _MAX_DIRECTORY_ENTRIES = 512
 _MAX_DIAGNOSTIC_COUNT = 1_000_000
 _HISTORY_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
 _LEGACY_NAME = re.compile(r"^evidence-[A-Za-z0-9._-]{1,80}\.json$")
+_EVENT_ID = re.compile(r"^[a-f0-9]{20}$")
 _KNOWN_STATUSES = frozenset(status.value for status in VerificationStatus)
+_CACHE_SOURCE_ORDER = {
+    "evidence_current": 0,
+    "evidence_history": 1,
+    "legacy_snapshot": 2,
+    "radar_cache": 3,
+}
+_STATUS_ORDER = {
+    VerificationStatus.UNVERIFIED.value: 0,
+    VerificationStatus.VERIFIED.value: 1,
+    VerificationStatus.CORROBORATED.value: 2,
+    VerificationStatus.CONFLICTING.value: 3,
+    VerificationStatus.CORRECTED.value: 4,
+    VerificationStatus.DISPROVED.value: 5,
+}
+_MAX_REFETCH_EVENTS = 1
+_MAX_REFETCH_ITEMS = 512
+_MAX_REFETCH_NODES = 4_096
+_MAX_REFETCH_TEXT_BYTES = 256 * 1_024
+_MAX_REFETCH_TEXT_CHARS = 8_192
+_MAX_REFETCH_DOCUMENT_BYTES = 512 * 1_024
+_MAX_REFETCH_DEPTH = 24
 
 
 class _NodeLimitExceeded(ValueError):
     pass
+
+
+class _RefetchLimitExceeded(ValueError):
+    pass
+
+
+def _canonical_event_id(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    normalized = value.strip()
+    if normalized != value or _EVENT_ID.fullmatch(normalized) is None:
+        return None
+    return normalized
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -126,8 +168,211 @@ def _event_links(event: EvidenceEvent) -> tuple[str, ...]:
     return tuple(links)
 
 
+def _refetch_text(value: str, budget: dict[str, int]) -> str:
+    if type(value) is not str or len(value) > _MAX_REFETCH_TEXT_CHARS:
+        raise _RefetchLimitExceeded("invalid public refetch text")
+    encoded = value.encode("utf-8")
+    if len(encoded) > budget["text_bytes"]:
+        raise _RefetchLimitExceeded("public refetch text limit exceeded")
+    budget["text_bytes"] -= len(encoded)
+    return value
+
+
+def _refetch_node(budget: dict[str, int]) -> None:
+    if budget["nodes"] <= 0:
+        raise _RefetchLimitExceeded("public refetch node limit exceeded")
+    budget["nodes"] -= 1
+
+
+def _refetch_item(budget: dict[str, int]) -> None:
+    if budget["items"] <= 0:
+        raise _RefetchLimitExceeded("public refetch item limit exceeded")
+    budget["items"] -= 1
+
+
+def _bounded_refetch_iterable(
+    value: object,
+    budget: dict[str, int],
+    *,
+    maximum: int,
+) -> list[object]:
+    if maximum < 0:
+        raise _RefetchLimitExceeded("invalid public refetch shape")
+    try:
+        iterator = iter(value)
+    except Exception as error:
+        raise _RefetchLimitExceeded("invalid public refetch iterable") from error
+    result: list[object] = []
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return result
+        except Exception as error:
+            raise _RefetchLimitExceeded("public refetch iterable failed") from error
+        if len(result) >= maximum:
+            raise _RefetchLimitExceeded("public refetch item limit exceeded")
+        _refetch_item(budget)
+        result.append(item)
+
+
+def _materialize_refetch_json(
+    value: object,
+    budget: dict[str, int],
+    *,
+    depth: int = 0,
+) -> object:
+    if depth > _MAX_REFETCH_DEPTH:
+        raise _RefetchLimitExceeded("public refetch depth limit exceeded")
+    _refetch_node(budget)
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is int:
+        if value < -(2**63) or value > 2**63 - 1:
+            raise _RefetchLimitExceeded("invalid public refetch number")
+        return value
+    if type(value) is float:
+        raise _RefetchLimitExceeded("invalid public refetch number")
+    if type(value) is str:
+        return _refetch_text(value, budget)
+    if type(value) is dict:
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            _refetch_item(budget)
+            if type(key) is not str or key in result:
+                raise _RefetchLimitExceeded("invalid public refetch object")
+            result[_refetch_text(key, budget)] = _materialize_refetch_json(
+                item,
+                budget,
+                depth=depth + 1,
+            )
+        return result
+    if type(value) in {bytes, bytearray, memoryview}:
+        raise _RefetchLimitExceeded("invalid public refetch value")
+    items = _bounded_refetch_iterable(value, budget, maximum=_MAX_REFETCH_ITEMS)
+    return [
+        _materialize_refetch_json(item, budget, depth=depth + 1)
+        for item in items
+    ]
+
+
+def _normalized_refetch_event(event: object, budget: dict[str, int]) -> EvidenceEvent:
+    if type(event) is not EvidenceEvent:
+        raise _RefetchLimitExceeded("invalid public refetch event")
+
+    tags: list[tuple[str, str]] = []
+    for tag in _bounded_refetch_iterable(event.related_tags, budget, maximum=_MAX_REFETCH_ITEMS):
+        pair = _bounded_refetch_iterable(tag, budget, maximum=2)
+        if len(pair) != 2 or any(type(value) is not str for value in pair):
+            raise _RefetchLimitExceeded("invalid public refetch tag")
+        tags.append((pair[0], pair[1]))
+
+    key_fields: list[KeyField] = []
+    for field_value in _bounded_refetch_iterable(
+        event.key_fields,
+        budget,
+        maximum=_MAX_REFETCH_ITEMS,
+    ):
+        if type(field_value) is not KeyField:
+            raise _RefetchLimitExceeded("invalid public refetch key field")
+        evidence_ids = _bounded_refetch_iterable(
+            field_value.evidence_ids,
+            budget,
+            maximum=_MAX_REFETCH_ITEMS,
+        )
+        if any(type(value) is not str for value in evidence_ids):
+            raise _RefetchLimitExceeded("invalid public refetch evidence reference")
+        key_fields.append(replace(field_value, evidence_ids=tuple(evidence_ids)))
+
+    def evidence_group(value: object) -> tuple[EvidenceItem, ...]:
+        result: list[EvidenceItem] = []
+        for item_value in _bounded_refetch_iterable(value, budget, maximum=_MAX_REFETCH_ITEMS):
+            if type(item_value) is not EvidenceItem:
+                raise _RefetchLimitExceeded("invalid public refetch evidence")
+            supports_fields = _bounded_refetch_iterable(
+                item_value.supports_fields,
+                budget,
+                maximum=_MAX_REFETCH_ITEMS,
+            )
+            if any(type(field_name) is not str for field_name in supports_fields):
+                raise _RefetchLimitExceeded("invalid public refetch evidence fields")
+            result.append(replace(item_value, supports_fields=tuple(supports_fields)))
+        return tuple(result)
+
+    transitions = _bounded_refetch_iterable(
+        event.status_history,
+        budget,
+        maximum=_MAX_REFETCH_ITEMS,
+    )
+    if any(type(transition) is not StatusTransition for transition in transitions):
+        raise _RefetchLimitExceeded("invalid public refetch status history")
+    return replace(
+        event,
+        related_tags=tuple(tags),
+        key_fields=tuple(key_fields),
+        primary_evidence=evidence_group(event.primary_evidence),
+        independent_evidence=evidence_group(event.independent_evidence),
+        syndicated_copies=evidence_group(event.syndicated_copies),
+        contradicting_evidence=evidence_group(event.contradicting_evidence),
+        status_history=tuple(transitions),
+    )
+
+
+def _bounded_refetch_snapshot(value: object) -> EvidenceSnapshot | None:
+    budget = {
+        "items": _MAX_REFETCH_ITEMS,
+        "nodes": _MAX_REFETCH_NODES,
+        "text_bytes": _MAX_REFETCH_TEXT_BYTES,
+    }
+    if type(value) is EvidenceSnapshot:
+        event_values = _bounded_refetch_iterable(
+            value.events,
+            budget,
+            maximum=_MAX_REFETCH_EVENTS,
+        )
+        if len(event_values) != 1:
+            return None
+        normalized = EvidenceSnapshot(
+            snapshot_id=value.snapshot_id,
+            raw_snapshot_id=value.raw_snapshot_id,
+            generated_at=value.generated_at,
+            events=(_normalized_refetch_event(event_values[0], budget),),
+        )
+        document: object = snapshot_document(normalized)
+    elif type(value) is dict:
+        if "events" not in value:
+            return None
+        root: dict[str, object] = {}
+        for key, item in value.items():
+            if len(root) >= _MAX_REFETCH_ITEMS or type(key) is not str:
+                raise _RefetchLimitExceeded("invalid public refetch object")
+            if key == "events":
+                event_values = _bounded_refetch_iterable(
+                    item,
+                    budget,
+                    maximum=_MAX_REFETCH_EVENTS,
+                )
+                if len(event_values) != 1:
+                    return None
+                root[key] = event_values
+            else:
+                root[key] = item
+        document = root
+    else:
+        return None
+    materialized = _materialize_refetch_json(document, budget)
+    encoded = json.dumps(
+        materialized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > _MAX_REFETCH_DOCUMENT_BYTES:
+        raise _RefetchLimitExceeded("public refetch byte limit exceeded")
+    return HistoryRecovery._parse_snapshot(materialized)
+
+
 def _event_is_complete(event: EvidenceEvent) -> bool:
-    if not event.event_id or len(event.event_id) > 128 or not event.title.strip():
+    if _canonical_event_id(event.event_id) is None or not event.title.strip():
         return False
     if event.published_at is None or event.verification_status.value not in _KNOWN_STATUSES:
         return False
@@ -277,7 +522,7 @@ class HistoryRecovery:
                 return (), "directory_changed"
             return tuple(sorted(entries, key=lambda path: path.name)), None
         except FileNotFoundError:
-            return (), None
+            return (), "directory_scan_failed"
         except (NotADirectoryError, OSError):
             return (), "directory_scan_failed"
 
@@ -463,15 +708,13 @@ class HistoryRecovery:
                 if type(item) is not dict:
                     self._add_reason(reasons, "missing_required_fields")
                     continue
-                event_id = item.get("event_id")
+                event_id = _canonical_event_id(item.get("event_id"))
                 title = item.get("title")
                 link_value = item.get("original_url") or item.get("canonical_url") or item.get("url")
                 published = _aware_time(item.get("published_at"))
                 status_value = item.get("verification_status")
                 if (
-                    type(event_id) is not str
-                    or not event_id
-                    or len(event_id) > 128
+                    event_id is None
                     or type(title) is not str
                     or not title.strip()
                     or published is None
@@ -530,6 +773,7 @@ class HistoryRecovery:
         total_bytes = 0
         budget = {"rows": _MAX_ROWS, "nodes": _MAX_NODES}
         history = self._evidence_history
+        history_discovered = history is None
         if history is None:
             history, history_error = self._default_named_files(self.root / "history", _HISTORY_NAME)
         else:
@@ -537,6 +781,7 @@ class HistoryRecovery:
         if history_error is not None:
             self._add_reason(reasons, history_error)
         legacy = self._legacy_snapshots
+        legacy_discovered = legacy is None
         if legacy is None:
             legacy, legacy_error = self._default_named_files(self.root / "legacy-snapshots", _LEGACY_NAME)
         else:
@@ -544,16 +789,16 @@ class HistoryRecovery:
         if legacy_error is not None:
             self._add_reason(reasons, legacy_error)
 
-        def requested() -> Iterator[tuple[str, Path]]:
-            yield "radar", self._radar_cache
-            yield "current", self._evidence_current
+        def requested() -> Iterator[tuple[str, Path, bool]]:
+            yield "radar", self._radar_cache, False
+            yield "current", self._evidence_current, False
             for path in history:
-                yield "history", path
+                yield "history", path, history_discovered
             for path in legacy:
-                yield "legacy", path
+                yield "legacy", path, legacy_discovered
 
         seen: set[str] = set()
-        for kind, supplied in requested():
+        for kind, supplied, discovered in requested():
             try:
                 path = Path(os.path.abspath(supplied))
             except Exception:
@@ -572,6 +817,8 @@ class HistoryRecovery:
                 continue
             raw, error = self._safe_read(path, _MAX_TOTAL_BYTES - total_bytes)
             if error == "missing":
+                if discovered:
+                    self._add_reason(reasons, f"{kind}_entry_disappeared")
                 continue
             if raw is None:
                 self._add_reason(reasons, error or "read_failed")
@@ -624,6 +871,101 @@ class HistoryRecovery:
             separators=(",", ":"),
         )
 
+
+    @staticmethod
+    def _lineage_identity(snapshot: EvidenceSnapshot) -> tuple[str, str, datetime]:
+        return (
+            snapshot.snapshot_id,
+            snapshot.raw_snapshot_id,
+            snapshot.generated_at.astimezone(timezone.utc),
+        )
+
+
+    @staticmethod
+    def _transition_identity(transition: StatusTransition) -> tuple[object, ...]:
+        return (
+            transition.from_status.value if transition.from_status is not None else None,
+            transition.to_status.value,
+            transition.changed_at.astimezone(timezone.utc),
+            transition.reason,
+        )
+
+
+    @staticmethod
+    def _cache_source_expression(sources: set[str]) -> str:
+        if not sources or any(source not in _CACHE_SOURCE_ORDER for source in sources):
+            raise ValueError("invalid cache recovery source")
+        return "+".join(sorted(sources, key=lambda source: _CACHE_SOURCE_ORDER[source]))
+
+
+    @classmethod
+    def _cache_record_order(cls, record: _CacheRecord) -> tuple[object, ...]:
+        event = record.snapshot.events[0]
+        return (
+            record.snapshot.generated_at.astimezone(timezone.utc),
+            len(event.status_history),
+            _STATUS_ORDER[event.verification_status.value],
+            record.snapshot.snapshot_id,
+            record.snapshot.raw_snapshot_id,
+            cls._event_fingerprint(event),
+            record.source,
+        )
+
+
+    @classmethod
+    def _resolve_cache_records(
+        cls,
+        records: list[_CacheRecord],
+    ) -> tuple[_CacheRecord, ...] | None:
+        by_lineage: dict[
+            tuple[str, str, datetime],
+            tuple[str, EvidenceSnapshot, set[str]],
+        ] = {}
+        for record in records:
+            event = record.snapshot.events[0]
+            fingerprint = cls._event_fingerprint(event)
+            identity = cls._lineage_identity(record.snapshot)
+            previous = by_lineage.get(identity)
+            if previous is None:
+                by_lineage[identity] = (fingerprint, record.snapshot, {record.source})
+                continue
+            if previous[0] != fingerprint:
+                return None
+            previous[2].add(record.source)
+
+        resolved = [
+            _CacheRecord(
+                snapshot=snapshot,
+                source=cls._cache_source_expression(sources),
+            )
+            for _fingerprint, snapshot, sources in by_lineage.values()
+        ]
+        resolved.sort(key=cls._cache_record_order)
+        for previous, current in zip(resolved, resolved[1:]):
+            previous_event = previous.snapshot.events[0]
+            current_event = current.snapshot.events[0]
+            previous_fingerprint = cls._event_fingerprint(previous_event)
+            current_fingerprint = cls._event_fingerprint(current_event)
+            if previous_fingerprint == current_fingerprint:
+                continue
+            if previous_event.verification_status == current_event.verification_status:
+                return None
+            previous_history = tuple(
+                cls._transition_identity(transition)
+                for transition in previous_event.status_history
+            )
+            current_history = tuple(
+                cls._transition_identity(transition)
+                for transition in current_event.status_history
+            )
+            if (
+                not previous_history
+                or len(current_history) <= len(previous_history)
+                or current_history[:len(previous_history)] != previous_history
+            ):
+                return None
+        return tuple(resolved)
+
     @staticmethod
     def _candidate_identity(candidate: _RefetchCandidate) -> tuple[object, ...]:
         return (
@@ -673,14 +1015,135 @@ class HistoryRecovery:
         })
         return replace(snapshot, recovery_metadata=metadata)
 
-    def _archive_one(self, snapshot: EvidenceSnapshot) -> bool:
-        event = snapshot.events[0]
+    @staticmethod
+    def _source_parts(value: object) -> frozenset[str]:
+        if type(value) is not str:
+            return frozenset()
+        if value == "public_refetch":
+            return frozenset({value})
+        parts = value.split("+")
+        if (
+            not parts
+            or len(parts) != len(set(parts))
+            or any(part not in _CACHE_SOURCE_ORDER for part in parts)
+        ):
+            return frozenset()
+        return frozenset(parts)
+
+
+    def _archive_many(
+        self,
+        snapshots: tuple[EvidenceSnapshot, ...],
+        *,
+        now: datetime,
+    ) -> str | None:
+        if not snapshots:
+            return "archive_rejected"
+        event_id = snapshots[0].events[0].event_id
+        if any(
+            len(snapshot.events) != 1 or snapshot.events[0].event_id != event_id
+            for snapshot in snapshots
+        ):
+            return "archive_rejected"
         try:
-            self.archive.upsert(snapshot)
-            archived = self.archive.get(event.event_id)
+            operation_archive = (
+                EvidenceArchive(self.archive.root, now=lambda: now)
+                if type(self.archive) is EvidenceArchive
+                else self.archive
+            )
+            expected = [
+                _archive_document(snapshot, event_document(snapshot.events[0]), now)[
+                    "snapshot_history"
+                ][0]
+                for snapshot in snapshots
+            ]
+            for snapshot in snapshots:
+                operation_archive.upsert(snapshot)
+            archived = operation_archive.get(event_id)
         except Exception:
-            return False
-        return type(archived) is dict and archived.get("event_id") == event.event_id
+            return "archive_rejected"
+        if type(archived) is not dict or archived.get("event_id") != event_id:
+            return "archive_rejected"
+        history = archived.get("snapshot_history")
+        if type(history) is not list:
+            return "archive_rejected"
+        archived_by_identity = {
+            (
+                lineage.get("evidence_snapshot_id"),
+                lineage.get("raw_snapshot_id"),
+                lineage.get("generated_at"),
+                lineage.get("content_digest"),
+            ): lineage
+            for lineage in history
+            if type(lineage) is dict
+        }
+        missing: list[dict[str, object]] = []
+        for lineage in expected:
+            identity = (
+                lineage["evidence_snapshot_id"],
+                lineage["raw_snapshot_id"],
+                lineage["generated_at"],
+                lineage["content_digest"],
+            )
+            persisted = archived_by_identity.get(identity)
+            if persisted is None:
+                missing.append(lineage)
+                continue
+            expected_recovery = lineage.get("recovery")
+            persisted_recovery = persisted.get("recovery")
+            if type(expected_recovery) is not dict or type(persisted_recovery) is not dict:
+                return "archive_rejected"
+            if (
+                expected_recovery.get("status") != persisted_recovery.get("status")
+                or expected_recovery.get("source_snapshot_id")
+                != persisted_recovery.get("source_snapshot_id")
+                or not self._source_parts(expected_recovery.get("source"))
+                <= self._source_parts(persisted_recovery.get("source"))
+            ):
+                return "archive_rejected"
+            persisted_at = _aware_time(persisted_recovery.get("recovered_at"))
+            generated_at = _aware_time(persisted.get("generated_at"))
+            if (
+                persisted_at is None
+                or generated_at is None
+                or persisted_at < generated_at
+                or persisted_at > now
+            ):
+                return "archive_rejected"
+        if missing:
+            cutoff = now - timedelta(days=90)
+            if any(
+                (generated := _aware_time(lineage.get("generated_at"))) is None
+                or generated < cutoff
+                or generated > now
+                for lineage in missing
+            ):
+                return "recovery_out_of_window"
+            return "archive_rejected"
+        final_event = snapshots[-1].events[0]
+        if archived.get("verification_status") != final_event.verification_status.value:
+            return "archive_rejected"
+        expected_transitions = {
+            self._transition_identity(transition)
+            for snapshot in snapshots
+            for transition in snapshot.events[0].status_history
+        }
+        persisted_transitions = archived.get("status_history")
+        if type(persisted_transitions) is not list:
+            return "archive_rejected"
+        persisted_transition_identities = {
+            (
+                row.get("from_status"),
+                row.get("to_status"),
+                _aware_time(row.get("changed_at")),
+                row.get("reason"),
+            )
+            for row in persisted_transitions
+            if type(row) is dict
+        }
+        if not expected_transitions <= persisted_transition_identities:
+            return "archive_rejected"
+        return None
 
     def import_records(self) -> RecoveryReport:
         scanned = self.scan()
@@ -707,15 +1170,15 @@ class HistoryRecovery:
             refetch_groups.setdefault(candidate.event_id, []).append(candidate)
 
         blocked: set[str] = set()
-        selected_cache: dict[str, _CacheRecord] = {}
+        selected_cache: dict[str, tuple[_CacheRecord, ...]] = {}
         selected_refetch: dict[str, _RefetchCandidate] = {}
         for event_id, records in cache_groups.items():
-            fingerprints = {self._event_fingerprint(record.snapshot.events[0]) for record in records}
-            if len(fingerprints) != 1:
+            resolved = self._resolve_cache_records(records)
+            if resolved is None:
                 blocked.add(event_id)
                 self._add_reason(reasons, "ambiguous_record")
             else:
-                selected_cache[event_id] = records[0]
+                selected_cache[event_id] = resolved
         for event_id, candidates in refetch_groups.items():
             identities = {self._candidate_identity(candidate) for candidate in candidates}
             if len(identities) != 1:
@@ -729,28 +1192,30 @@ class HistoryRecovery:
                 continue
             if not self._candidate_matches_event(
                 selected_refetch[event_id],
-                selected_cache[event_id].snapshot.events[0],
+                selected_cache[event_id][-1].snapshot.events[0],
             ):
                 blocked.add(event_id)
                 self._add_reason(reasons, "ambiguous_record")
 
-        for event_id, record in selected_cache.items():
+        for event_id, records in selected_cache.items():
             if event_id in blocked:
                 continue
             cache_terminal_ids.add(event_id)
-            snapshot = record.snapshot
-            event = snapshot.events[0]
-            if not self._in_window(event, now):
+            if any(not self._in_window(record.snapshot.events[0], now) for record in records):
                 self._add_reason(reasons, "outside_retention_window")
                 continue
-            recovered = self._recovery_snapshot(
-                snapshot,
-                source=record.source,
-                status="cache_recovered",
-                recovered_at=now,
+            recovered = tuple(
+                self._recovery_snapshot(
+                    record.snapshot,
+                    source=record.source,
+                    status="cache_recovered",
+                    recovered_at=now,
+                )
+                for record in records
             )
-            if not self._archive_one(recovered):
-                self._add_reason(reasons, "archive_rejected")
+            archive_error = self._archive_many(recovered, now=now)
+            if archive_error is not None:
+                self._add_reason(reasons, archive_error)
                 continue
             cache_ids.add(event_id)
 
@@ -765,11 +1230,8 @@ class HistoryRecovery:
                 continue
             try:
                 value = self._public_refetcher(candidate.public_link)
-                if type(value) is EvidenceSnapshot:
-                    snapshot = value
-                else:
-                    snapshot = self._parse_snapshot(value)
-                if snapshot is None or len(snapshot.events) != 1:
+                snapshot = _bounded_refetch_snapshot(value)
+                if snapshot is None:
                     raise ValueError("invalid refetch")
                 event = snapshot.events[0]
                 if not self._candidate_matches_event(candidate, event) or not self._in_window(event, now):
@@ -783,8 +1245,9 @@ class HistoryRecovery:
                 status="public_refetched",
                 recovered_at=now,
             )
-            if not self._archive_one(recovered):
-                self._add_reason(reasons, "archive_rejected")
+            archive_error = self._archive_many((recovered,), now=now)
+            if archive_error is not None:
+                self._add_reason(reasons, archive_error)
                 continue
             refetched_ids.add(event_id)
         return RecoveryReport(
