@@ -61,6 +61,8 @@ _MAX_SCAN_ROWS = _MAX_INDEX_EVENTS * 2
 _MAX_ARCHIVE_SCAN_NODES = _MAX_INDEX_EVENTS * 128
 _MAX_SCAN_NODES = _MAX_ARCHIVE_SCAN_NODES + _MAX_SNAPSHOT_NODES * 2
 _MAX_MUTATION_BYTES = 128 * 1_048_576
+_MAX_CAS_BYTES = 1_024 * 1_048_576
+_MAX_CAS_FILES = (_MAX_ARCHIVE_FILES + 4) * 8
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _MAX_DIAGNOSTIC_COUNT = 1_000_000
 _MAX_TOLERATED_CORRUPT_ROWS = 1
@@ -173,6 +175,7 @@ _NESTED_SECRET = re.compile(
     re.IGNORECASE,
 )
 _QUERY_ASSIGNMENT = re.compile(r"(?<![A-Za-z0-9])([A-Za-z0-9_-]{1,128})\s*[:=]")
+_PATH_ASSIGNMENT = re.compile(r"^([A-Za-z0-9_-]{1,128})\s*[:=](.*)$", re.DOTALL)
 _MAX_QUERY_DECODE_ROUNDS = 8
 _MAX_QUERY_JSON_NODES = 512
 _MAX_QUERY_JSON_DEPTH = 8
@@ -210,6 +213,7 @@ _NAT64_NETWORKS = (
 _IPV4_COMPATIBLE_NETWORK = ipaddress.IPv6Network("::/96")
 _UNRESERVED_PATH_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 _JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
+_UNBOUND_READ_RECORD = object()
 
 
 def _new_scan_budget() -> dict[str, int]:
@@ -218,6 +222,13 @@ def _new_scan_budget() -> dict[str, int]:
         "rows": _MAX_SCAN_ROWS,
         "nodes": _MAX_SCAN_NODES,
         "files": _MAX_SCAN_FILES,
+    }
+
+
+def _new_cas_budget() -> dict[str, int]:
+    return {
+        "bytes": _MAX_CAS_BYTES,
+        "files": _MAX_CAS_FILES,
     }
 
 
@@ -543,6 +554,40 @@ def _decoded_query_value_contains_sensitive_name(
     return False
 
 
+def _decoded_path_contains_sensitive_name(value: str) -> bool:
+    if len(value) > 8_192:
+        raise ValueError("invalid archive evidence URL")
+    remaining = [_MAX_QUERY_JSON_NODES]
+    decoded = value
+    stabilized = False
+    for _ in range(_MAX_QUERY_DECODE_ROUNDS):
+        if _NESTED_SECRET.search(decoded) or _text_contains_sensitive_assignment(decoded):
+            return True
+        segments = decoded.split("/")
+        remaining[0] -= len(segments)
+        if remaining[0] < 0:
+            raise ValueError("invalid archive evidence URL")
+        for segment in segments:
+            assignment = _PATH_ASSIGNMENT.fullmatch(segment)
+            if assignment is None:
+                continue
+            name, nested = assignment.groups()
+            if _query_name_is_sensitive(name) or _decoded_query_value_contains_sensitive_name(
+                nested,
+                depth=1,
+                remaining=remaining,
+            ):
+                return True
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            stabilized = True
+            break
+        decoded = next_value
+    if not stabilized:
+        raise ValueError("invalid archive evidence URL")
+    return False
+
+
 def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
     numeric_part = r"(?:0[xX][0-9A-Fa-f]+|[0-9]+)"
     if not re.fullmatch(rf"{numeric_part}(?:\.{numeric_part})*", host):
@@ -657,6 +702,8 @@ def _archive_public_url(value: object) -> str:
     except (TypeError, ValueError):
         raise ValueError("invalid archive evidence URL") from None
     if parsed.fragment:
+        raise ValueError("invalid archive evidence URL")
+    if _decoded_path_contains_sensitive_name(parsed.path):
         raise ValueError("invalid archive evidence URL")
     decoded_query = parsed.query
     stabilized = False
@@ -2155,6 +2202,22 @@ class EvidenceArchive:
                     raise OSError("storage_error") from None
         self._verify_directory_chain(self.archive_root)
 
+    def _lock_path_binds_handle(self, handle: io.FileIO) -> bool:
+        try:
+            opened = os.fstat(handle.fileno())
+            current = self.lock_path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return (
+            (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+            and stat.S_ISREG(opened.st_mode)
+            and stat.S_ISREG(current.st_mode)
+            and opened.st_nlink == 1
+            and current.st_nlink == 1
+            and not getattr(opened, "st_reparse_tag", 0)
+            and not getattr(current, "st_reparse_tag", 0)
+        )
+
     def _open_lock(self) -> io.FileIO:
         self._prepare()
         self._verify_parent(self.lock_path)
@@ -2198,6 +2261,9 @@ class EvidenceArchive:
                 raise OSError("storage_error")
             handle = io.FileIO(descriptor, mode="r+", closefd=True)
             descriptor = None
+            if os.name != "nt" and not self._lock_path_binds_handle(handle):
+                handle.close()
+                raise OSError("storage_error")
             return handle
         except OSError:
             if descriptor is not None:
@@ -2255,6 +2321,8 @@ class EvidenceArchive:
                 if time.monotonic() >= deadline:
                     raise OSError("storage_lock_unavailable")
                 time.sleep(0.01)
+            if os.name != "nt" and not self._lock_path_binds_handle(handle):
+                raise OSError("storage_error")
             yield
         finally:
             if acquired:
@@ -2286,6 +2354,9 @@ class EvidenceArchive:
                 raise OSError("storage_error")
             handle = io.FileIO(descriptor, mode="r+", closefd=True)
             descriptor = None
+            if os.name != "nt" and not self._lock_path_binds_handle(handle):
+                handle.close()
+                raise OSError("storage_error")
             return handle
         except OSError:
             if descriptor is not None:
@@ -2345,6 +2416,8 @@ class EvidenceArchive:
                 if time.monotonic() >= deadline:
                     raise OSError("storage_lock_unavailable")
                 time.sleep(0.01)
+            if os.name != "nt" and not self._lock_path_binds_handle(handle):
+                raise OSError("storage_error")
             yield True
         finally:
             if acquired:
@@ -2534,10 +2607,23 @@ class EvidenceArchive:
         maximum: int,
         *,
         semantic_digest: str,
+        budget: dict[str, int] | None = None,
     ) -> dict[str, object] | None:
         before = self._safe_file(path)
         if before is None:
             return None
+        if budget is not None:
+            size = before.st_size
+            if (
+                budget.get("files", 0) <= 0
+                or type(size) is not int
+                or size < 0
+                or size > maximum
+                or size > budget.get("bytes", 0)
+            ):
+                return None
+            budget["files"] -= 1
+            budget["bytes"] -= size
         before_signature = _file_signature(before)
         self._verify_parent(path)
         descriptor: int | None = None
@@ -2613,6 +2699,8 @@ class EvidenceArchive:
         path: Path,
         record: dict[str, object] | None,
         maximum: int,
+        *,
+        budget: dict[str, int] | None = None,
     ) -> bool:
         if record is None:
             return not self._entry_present(path)
@@ -2627,31 +2715,64 @@ class EvidenceArchive:
                 path,
                 maximum,
                 semantic_digest=expected["semantic_digest"],
+                budget=budget,
             )
             return current == expected
         except (KeyError, OSError, TypeError):
             return False
 
+    def _bind_written_record(
+        self,
+        path: Path,
+        payload: bytes,
+        maximum: int,
+        *,
+        semantic_digest: str | None = None,
+        budget: dict[str, int] | None = None,
+    ) -> dict[str, object]:
+        payload_digest = self._payload_digest(payload)
+        expected_semantic = payload_digest if semantic_digest is None else semantic_digest
+        record = self._capture_current_read_record(
+            path,
+            maximum,
+            semantic_digest=expected_semantic,
+            budget=budget,
+        )
+        if (
+            record is None
+            or record["payload_digest"] != payload_digest
+            or record["semantic_digest"] != expected_semantic
+        ):
+            raise OSError("storage_corrupt")
+        return record
+
     def _bind_written_state_record(
         self,
         state: dict[str, Any],
         payload: bytes,
+        *,
+        budget: dict[str, int] | None = None,
     ) -> None:
-        digest = self._payload_digest(payload)
-        record = self._capture_current_read_record(
+        record = self._bind_written_record(
             self.state_path,
+            payload,
             _MAX_STATE_BYTES,
-            semantic_digest=digest,
+            budget=budget,
         )
-        if record is None or record["payload_digest"] != digest:
-            raise OSError("storage_corrupt")
         state["_read_record"] = record
 
     def _state_read_record_is_current(
         self,
         record: dict[str, object] | None,
+        *,
+        budget: dict[str, int] | None = None,
     ) -> bool:
-        return self._read_record_is_current(self.state_path, record, _MAX_STATE_BYTES)
+        return self._read_record_is_current(
+            self.state_path,
+            record,
+            _MAX_STATE_BYTES,
+            budget=budget,
+        )
 
     def _assert_prewrite_authority_is_current(
         self,
@@ -2659,16 +2780,42 @@ class EvidenceArchive:
         state_record: dict[str, object] | None,
         index_record: dict[str, Any] | None,
         bucket_records: dict[str, dict[str, object] | None],
+        journal_record: dict[str, object] | None | object = _UNBOUND_READ_RECORD,
+        bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] | None = None,
+        cas_budget: dict[str, int] | None = None,
     ) -> None:
-        if not self._state_read_record_is_current(state_record):
+        budget = _new_cas_budget() if cas_budget is None else cas_budget
+        requested_names = None if bucket_names is None else set(bucket_names)
+        selected = dict(bucket_records) if requested_names is None else {
+            name: bucket_records[name]
+            for name in sorted(requested_names)
+            if name in bucket_records
+        }
+        if requested_names is not None and len(selected) != len(requested_names):
             raise OSError("storage_corrupt")
-        if not self._bucket_mutation_records_are_current(bucket_records):
-            raise OSError("storage_corrupt")
-        if not self._index_record_is_current(index_record):
-            raise OSError("storage_corrupt")
-        if not self._state_read_record_is_current(state_record):
-            raise OSError("storage_corrupt")
-        if not self._bucket_mutation_records_are_current(bucket_records):
+        for _round in range(2):
+            if not self._state_read_record_is_current(state_record, budget=budget):
+                raise OSError("storage_corrupt")
+            if journal_record is not _UNBOUND_READ_RECORD and not self._read_record_is_current(
+                self.journal_path,
+                journal_record,
+                _MAX_JOURNAL_BYTES,
+                budget=budget,
+            ):
+                raise OSError("storage_corrupt")
+            if not self._index_record_is_current(index_record, budget=budget):
+                raise OSError("storage_corrupt")
+            if not self._bucket_mutation_records_are_current(selected, budget=budget):
+                raise OSError("storage_corrupt")
+        # Keep legacy takeover bound immediately beside the following write.
+        # A non-cooperating process can still race the eventual replace syscall;
+        # the next guard/final validation detects that bounded filesystem edge.
+        if journal_record is not _UNBOUND_READ_RECORD and not self._read_record_is_current(
+            self.journal_path,
+            journal_record,
+            _MAX_JOURNAL_BYTES,
+            budget=budget,
+        ):
             raise OSError("storage_corrupt")
 
     def _atomic_write(self, path: Path, payload: bytes, maximum: int) -> tuple[int, int]:
@@ -2987,12 +3134,15 @@ class EvidenceArchive:
     def _bucket_mutation_records_are_current(
         self,
         records: dict[str, dict[str, object] | None],
+        *,
+        budget: dict[str, int] | None = None,
     ) -> bool:
         return all(
             self._read_record_is_current(
                 self.archive_root / name,
                 record,
                 _MAX_BUCKET_BYTES,
+                budget=budget,
             )
             for name, record in sorted(records.items())
         )
@@ -3005,65 +3155,51 @@ class EvidenceArchive:
         record = self._read_index_record(budget=_new_scan_budget())
         return _MISSING_DIGEST if record is None else record["digest"]
 
-    def _index_record_is_current(self, record: dict[str, Any] | None) -> bool:
+    def _index_record_is_current(
+        self,
+        record: dict[str, Any] | None,
+        *,
+        budget: dict[str, int] | None = None,
+    ) -> bool:
         if record is None:
             return not self._entry_present(self.index_path)
-        expected = record.get("metadata")
-        expected_descriptor = record.get("descriptor_metadata")
-        if (
-            type(expected) is not tuple
-            or len(expected) != 8
-            or any(type(value) is not int for value in expected)
-            or type(expected_descriptor) is not tuple
-            or len(expected_descriptor) != 8
-            or any(type(value) is not int for value in expected_descriptor)
-            or expected_descriptor[:2] != expected[:2]
-        ):
-            return False
-        before = self._safe_file(self.index_path)
-        if before is None:
-            return False
-        if _file_signature(before) != expected:
-            return False
-        self._verify_parent(self.index_path)
-        descriptor: int | None = None
-        identity: tuple[int, int] | None = None
         try:
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(self.index_path, flags)
-            opened = os.fstat(descriptor)
-            identity = (opened.st_dev, opened.st_ino)
-            opened_signature = _file_signature(opened)
-            final_path = self.index_path.stat(follow_symlinks=False)
-            final_path_signature = _file_signature(final_path)
-            final_descriptor = os.fstat(descriptor)
-            final_descriptor_signature = _file_signature(final_descriptor)
-            return (
-                (opened.st_dev, opened.st_ino) == expected[:2]
-                and opened_signature == expected_descriptor
-                and final_path_signature == expected
-                and final_descriptor_signature == expected_descriptor
-                and stat.S_ISREG(opened.st_mode)
-                and opened.st_nlink == 1
-                and not getattr(opened, "st_reparse_tag", 0)
-                and stat.S_ISREG(final_path.st_mode)
-                and final_path.st_nlink == 1
-                and not getattr(final_path, "st_reparse_tag", 0)
-                and stat.S_ISREG(final_descriptor.st_mode)
-                and final_descriptor.st_nlink == 1
-                and not getattr(final_descriptor, "st_reparse_tag", 0)
+            expected_digest = record["digest"]
+            read_record = record["read_record"]
+            if (
+                type(expected_digest) is not str
+                or _CONTENT_DIGEST.fullmatch(expected_digest) is None
+                or read_record["payload_digest"] != expected_digest
+                or read_record["semantic_digest"] != expected_digest
+            ):
+                return False
+            return self._read_record_is_current(
+                self.index_path,
+                read_record,
+                _MAX_INDEX_BYTES,
+                budget=budget,
             )
-        except OSError:
+        except (KeyError, OSError, TypeError):
             return False
-        finally:
-            if descriptor is not None:
-                if identity is None:
-                    try:
-                        os.close(descriptor)
-                    except OSError:
-                        pass
-                else:
-                    _close_owned_descriptor(descriptor, identity)
+
+    def _bind_written_index_record(
+        self,
+        payload: bytes,
+        *,
+        budget: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        read_record = self._bind_written_record(
+            self.index_path,
+            payload,
+            _MAX_INDEX_BYTES,
+            budget=budget,
+        )
+        return {
+            "digest": read_record["payload_digest"],
+            "metadata": read_record["metadata"],
+            "descriptor_metadata": read_record["descriptor_metadata"],
+            "read_record": read_record,
+        }
 
     def _parse_authority_state(
         self,
@@ -3426,12 +3562,19 @@ class EvidenceArchive:
             if diagnostics is not None:
                 self._increment(diagnostics, "scanned_files")
                 self._increment(diagnostics, "scanned_rows", entry_count)
+            digest = self._payload_digest(raw)
             return {
                 "events": events,
                 "payload": raw,
-                "digest": self._payload_digest(raw),
+                "digest": digest,
                 "metadata": observed_metadata[0],
                 "descriptor_metadata": observed_descriptor_metadata[0],
+                "read_record": self._read_record(
+                    metadata=observed_metadata[0],
+                    descriptor_metadata=observed_descriptor_metadata[0],
+                    payload_digest=digest,
+                    semantic_digest=digest,
+                ),
             }
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
             if diagnostics is not None:
@@ -3813,20 +3956,40 @@ class EvidenceArchive:
         legacy_state: dict[str, Any] | None = None,
         allow_unrecognized: bool = False,
         physical_index_record: dict[str, Any] | None = None,
+        observed_record: list[dict[str, object] | None] | None = None,
     ) -> dict[str, Any] | None:
         observed_metadata: list[tuple[int, int, int, int, int, int, int, int]] = []
+        observed_descriptor_metadata: list[tuple[int, int, int, int, int, int, int, int]] = []
         raw = self._read_budgeted_bytes(
             self.journal_path,
             _MAX_JOURNAL_BYTES,
             budget=budget,
             observed_metadata=observed_metadata,
+            observed_descriptor_metadata=observed_descriptor_metadata,
         )
         if raw is None:
             if self._entry_present(self.journal_path):
                 self._increment(diagnostics, "skipped_files")
                 self._last_diagnostics = diagnostics
                 raise OSError("storage_corrupt")
+            if observed_record is not None:
+                if observed_record:
+                    raise OSError("storage_corrupt")
+                observed_record.append(None)
             return None
+        if len(observed_metadata) != 1 or len(observed_descriptor_metadata) != 1:
+            raise OSError("storage_corrupt")
+        raw_digest = self._payload_digest(raw)
+        journal_read_record = self._read_record(
+            metadata=observed_metadata[0],
+            descriptor_metadata=observed_descriptor_metadata[0],
+            payload_digest=raw_digest,
+            semantic_digest=raw_digest,
+        )
+        if observed_record is not None:
+            if observed_record:
+                raise OSError("storage_corrupt")
+            observed_record.append(journal_read_record)
         owned_shape = False
         try:
             self._increment(diagnostics, "scanned_files")
@@ -3895,8 +4058,6 @@ class EvidenceArchive:
                 raise ValueError("invalid archive journal order")
             for row in rows:
                 _validate_temporal_row(row, now)
-            if len(observed_metadata) != 1:
-                raise ValueError("invalid archive journal identity")
             file_metadata = observed_metadata[0]
             transaction_mtime = _file_mtime_utc(file_metadata)
             if legacy:
@@ -3904,7 +4065,7 @@ class EvidenceArchive:
                     "legacy": True,
                     "rows": rows,
                     "file_identity": file_metadata[:2],
-                    "file_digest": self._payload_digest(raw),
+                    "file_digest": raw_digest,
                     "transaction_mtime": transaction_mtime,
                 }
             transaction_id = document["transaction_id"]
@@ -4008,7 +4169,7 @@ class EvidenceArchive:
                 "target_index": target_index,
                 "physical_index_digest": actual_index_digest,
                 "file_identity": file_metadata[:2],
-                "file_digest": self._payload_digest(raw),
+                "file_digest": raw_digest,
                 "transaction_mtime": transaction_mtime,
             }
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
@@ -4208,6 +4369,8 @@ class EvidenceArchive:
         preloaded_locations: dict[str, set[str]] | None = None,
         preloaded_bucket_records: dict[str, dict[str, object] | None] | None = None,
         physical_index_record: dict[str, Any] | None,
+        journal_record: dict[str, object] | None | object = _UNBOUND_READ_RECORD,
+        cas_budget: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         if state["legacy"] or state["phase"] != "prepared":
             raise OSError("storage_corrupt")
@@ -4372,6 +4535,8 @@ class EvidenceArchive:
                 name: all_bucket_records[name]
                 for name in sorted(mutation_names)
             },
+            "journal_record": journal_record,
+            "cas_budget": _new_cas_budget() if cas_budget is None else cas_budget,
             "mutation_bytes": mutation_bytes,
         }
 
@@ -4406,25 +4571,59 @@ class EvidenceArchive:
         try:
             state_record = state["_read_record"]
             bucket_records = recovery_plan["bucket_records"]
+            journal_record = recovery_plan["journal_record"]
+            cas_budget = recovery_plan["cas_budget"]
         except KeyError:
             raise OSError("storage_corrupt") from None
+        index_record = recovery_plan["physical_index_record"]
         self._assert_prewrite_authority_is_current(
             state_record=state_record,
-            index_record=recovery_plan["physical_index_record"],
+            index_record=index_record,
             bucket_records=bucket_records,
+            journal_record=journal_record,
+            cas_budget=cas_budget,
         )
         for name in sorted(affected):
             if observed[name] != state["target_bucket_digests"][name]:
+                self._assert_prewrite_authority_is_current(
+                    state_record=state_record,
+                    index_record=index_record,
+                    bucket_records=bucket_records,
+                    journal_record=journal_record,
+                    bucket_names=(name,),
+                    cas_budget=cas_budget,
+                )
                 self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
+                bucket_records[name] = self._bind_written_record(
+                    self.archive_root / name,
+                    bucket_payloads[name],
+                    _MAX_BUCKET_BYTES,
+                    semantic_digest=state["target_bucket_digests"][name],
+                    budget=cas_budget,
+                )
         actual_index_digest = recovery_plan["actual_index_digest"]
         if actual_index_digest not in {state["base_index_digest"], state["target_index_digest"]}:
             raise OSError("storage_corrupt")
+        self._assert_prewrite_authority_is_current(
+            state_record=state_record,
+            index_record=index_record,
+            bucket_records=bucket_records,
+            journal_record=journal_record,
+            cas_budget=cas_budget,
+        )
         if actual_index_digest != state["target_index_digest"]:
-            if not self._index_record_is_current(recovery_plan["physical_index_record"]):
-                raise OSError("storage_corrupt")
             self._atomic_write(self.index_path, index_payload, _MAX_INDEX_BYTES)
-        if not self._state_read_record_is_current(state_record):
-            raise OSError("storage_corrupt")
+            index_record = self._bind_written_index_record(
+                index_payload,
+                budget=cas_budget,
+            )
+        self._assert_prewrite_authority_is_current(
+            state_record=state_record,
+            index_record=index_record,
+            bucket_records=bucket_records,
+            journal_record=journal_record,
+            cas_budget=cas_budget,
+        )
         self._atomic_write(self.state_path, finalized_payload, _MAX_STATE_BYTES)
 
     def _migration_prepared_payload(
@@ -4461,6 +4660,7 @@ class EvidenceArchive:
         diagnostics: dict[str, int],
         budget: dict[str, int],
         physical_index_record: dict[str, Any] | None,
+        journal_record: dict[str, object],
     ) -> dict[str, Any]:
         if not journal["legacy"]:
             raise OSError("storage_corrupt")
@@ -4506,6 +4706,7 @@ class EvidenceArchive:
             diagnostics=diagnostics,
             budget=budget,
             physical_index_record=physical_index_record,
+            journal_record=journal_record,
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
@@ -4513,9 +4714,15 @@ class EvidenceArchive:
             state_record=None,
             index_record=recovery_plan["physical_index_record"],
             bucket_records=recovery_plan["bucket_records"],
+            journal_record=journal_record,
+            cas_budget=recovery_plan["cas_budget"],
         )
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
-        self._bind_written_state_record(prepared, prepared_payload)
+        self._bind_written_state_record(
+            prepared,
+            prepared_payload,
+            budget=recovery_plan["cas_budget"],
+        )
         self._recover_prepared_authority(
             prepared,
             now=now,
@@ -4540,6 +4747,7 @@ class EvidenceArchive:
         diagnostics: dict[str, int],
         budget: dict[str, int],
         observed_bucket_records: dict[str, dict[str, object] | None] | None = None,
+        observed_journal_record: list[dict[str, object] | None] | None = None,
         prospective_bucket_names: Iterator[str] | list[str] | set[str] | tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         bucket_read_records = (
@@ -4586,6 +4794,7 @@ class EvidenceArchive:
                 state_document["bucket_digests"] = self._bucket_digest_map(state_document["bucket_digests"])
             except (KeyError, TypeError, ValueError):
                 raise OSError("storage_corrupt") from None
+        journal_records: list[dict[str, object] | None] = []
         journal = self._read_journal(
             now,
             diagnostics,
@@ -4593,7 +4802,15 @@ class EvidenceArchive:
             legacy_state=state_document,
             allow_unrecognized=journal_only,
             physical_index_record=physical_index_record,
+            observed_record=journal_records,
         )
+        if len(journal_records) != 1:
+            raise OSError("storage_corrupt")
+        journal_record = journal_records[0]
+        if observed_journal_record is not None:
+            if observed_journal_record:
+                raise OSError("storage_corrupt")
+            observed_journal_record.append(journal_record)
         if journal is not None and journal.get("foreign") is True:
             journal = None
         if journal_only and journal is None:
@@ -4605,6 +4822,7 @@ class EvidenceArchive:
                 diagnostics=diagnostics,
                 budget=budget,
                 physical_index_record=physical_index_record,
+                journal_record=journal_record,
             )
         if state_document is not None and state_document["phase"] == "prepared" and journal is None:
             raise OSError("storage_corrupt")
@@ -4668,6 +4886,7 @@ class EvidenceArchive:
                 preloaded_locations=journal_locations,
                 preloaded_bucket_records=bucket_read_records,
                 physical_index_record=physical_index_record,
+                journal_record=journal_record,
             )
             if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
                 raise OSError("storage_corrupt")
@@ -4675,9 +4894,15 @@ class EvidenceArchive:
                 state_record=state_record,
                 index_record=recovery_plan["physical_index_record"],
                 bucket_records=recovery_plan["bucket_records"],
+                journal_record=journal_record,
+                cas_budget=recovery_plan["cas_budget"],
             )
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
-            self._bind_written_state_record(prepared, prepared_payload)
+            self._bind_written_state_record(
+                prepared,
+                prepared_payload,
+                budget=recovery_plan["cas_budget"],
+            )
             self._recover_prepared_authority(
                 prepared,
                 now=now,
@@ -4877,6 +5102,7 @@ class EvidenceArchive:
             preloaded_locations=locations,
             preloaded_bucket_records=bucket_read_records,
             physical_index_record=physical_index_record,
+            journal_record=journal_record,
         )
         if len(prepared_payload) + recovery_plan["mutation_bytes"] > _MAX_MUTATION_BYTES:
             raise OSError("storage_corrupt")
@@ -4884,9 +5110,15 @@ class EvidenceArchive:
             state_record=state_record,
             index_record=recovery_plan["physical_index_record"],
             bucket_records=recovery_plan["bucket_records"],
+            journal_record=journal_record,
+            cas_budget=recovery_plan["cas_budget"],
         )
         self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
-        self._bind_written_state_record(prepared, prepared_payload)
+        self._bind_written_state_record(
+            prepared,
+            prepared_payload,
+            budget=recovery_plan["cas_budget"],
+        )
         self._recover_prepared_authority(
             prepared,
             now=now,
@@ -4923,6 +5155,7 @@ class EvidenceArchive:
             diagnostics = self._diagnostics()
             budget = _new_scan_budget()
             bucket_read_records: dict[str, dict[str, object] | None] = {}
+            takeover_journal_record: dict[str, object] | None | object = _UNBOUND_READ_RECORD
             state = self._read_authority_state(
                 archived_at,
                 diagnostics=diagnostics,
@@ -4930,14 +5163,20 @@ class EvidenceArchive:
             )
             if state is None or state["legacy"]:
                 previous_state = state
+                migration_journal_records: list[dict[str, object] | None] = []
                 state = self._migrate_legacy_authority(
                     state,
                     now=archived_at,
                     diagnostics=diagnostics,
                     budget=budget,
                     observed_bucket_records=bucket_read_records,
+                    observed_journal_record=migration_journal_records,
                     prospective_bucket_names=incoming_target_names,
                 )
+                if len(migration_journal_records) != 1:
+                    raise OSError("storage_corrupt")
+                if state is None and previous_state is None:
+                    takeover_journal_record = migration_journal_records[0]
                 if state is not None or previous_state is not None:
                     bucket_read_records = {}
             if state is not None and state["phase"] == "prepared":
@@ -5117,26 +5356,69 @@ class EvidenceArchive:
                 name: bucket_read_records[name]
                 for name in sorted(target_bucket_digests)
             }
+            cas_budget = _new_cas_budget()
+            journal_record = (
+                takeover_journal_record
+                if state is None
+                else _UNBOUND_READ_RECORD
+            )
             self._assert_prewrite_authority_is_current(
                 state_record=expected_state_record,
                 index_record=expected_index_record,
                 bucket_records=bucket_records,
+                journal_record=journal_record,
+                cas_budget=cas_budget,
             )
             self._atomic_write(self.state_path, prepared_payload, _MAX_STATE_BYTES)
-            self._bind_written_state_record(prepared, prepared_payload)
+            self._bind_written_state_record(
+                prepared,
+                prepared_payload,
+                budget=cas_budget,
+            )
             self._assert_prewrite_authority_is_current(
                 state_record=prepared["_read_record"],
                 index_record=expected_index_record,
                 bucket_records=bucket_records,
+                journal_record=journal_record,
+                cas_budget=cas_budget,
             )
             write_order = sorted(target_names) + sorted(affected - target_names)
             for name in write_order:
+                self._assert_prewrite_authority_is_current(
+                    state_record=prepared["_read_record"],
+                    index_record=expected_index_record,
+                    bucket_records=bucket_records,
+                    journal_record=journal_record,
+                    bucket_names=(name,),
+                    cas_budget=cas_budget,
+                )
                 self._atomic_write(self.archive_root / name, bucket_payloads[name], _MAX_BUCKET_BYTES)
-            if not self._index_record_is_current(expected_index_record):
-                raise OSError("storage_corrupt")
+                bucket_records[name] = self._bind_written_record(
+                    self.archive_root / name,
+                    bucket_payloads[name],
+                    _MAX_BUCKET_BYTES,
+                    semantic_digest=target_bucket_digests[name],
+                    budget=cas_budget,
+                )
+            self._assert_prewrite_authority_is_current(
+                state_record=prepared["_read_record"],
+                index_record=expected_index_record,
+                bucket_records=bucket_records,
+                journal_record=journal_record,
+                cas_budget=cas_budget,
+            )
             self._atomic_write(self.index_path, index_payload, _MAX_INDEX_BYTES)
-            if not self._state_read_record_is_current(prepared["_read_record"]):
-                raise OSError("storage_corrupt")
+            expected_index_record = self._bind_written_index_record(
+                index_payload,
+                budget=cas_budget,
+            )
+            self._assert_prewrite_authority_is_current(
+                state_record=prepared["_read_record"],
+                index_record=expected_index_record,
+                bucket_records=bucket_records,
+                journal_record=journal_record,
+                cas_budget=cas_budget,
+            )
             self._atomic_write(self.state_path, finalized_payload, _MAX_STATE_BYTES)
             verification_diagnostics = self._diagnostics()
             verification_budget = _new_scan_budget()

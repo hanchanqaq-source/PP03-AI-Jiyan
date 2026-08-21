@@ -6877,3 +6877,489 @@ def test_archive_legacy_migration_binds_state_read_authority_before_prepared_wri
     assert writes == []
     assert archive.state_path.read_bytes() == state_bytes
     assert archive.index_path.read_bytes() == index_bytes
+
+
+def _mutate_journal_read_authority(path: Path, mutation: str) -> bytes | None:
+    if mutation == "absent_to_present":
+        assert not path.exists()
+        replacement = b'{"schema_version":99,"owner":"foreign-later"}\n'
+        path.write_bytes(replacement)
+        return replacement
+    if mutation == "disappear":
+        path.unlink()
+        return None
+    if mutation == "same_bytes_new_inode":
+        original = path.read_bytes()
+        _replace_path_with_same_bytes(path)
+        return original
+    if mutation == "same_inode_metadata":
+        original = path.read_bytes()
+        metadata = path.stat(follow_symlinks=False)
+        os.utime(
+            path,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+        )
+        return original
+    assert mutation == "same_length_content"
+    changed = bytearray(path.read_bytes())
+    offset = next(
+        index
+        for index, value in enumerate(changed)
+        if value in b"abcdef"
+    )
+    changed[offset] = ord("f") if changed[offset] != ord("f") else ord("e")
+    path.write_bytes(changed)
+    return bytes(changed)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "absent_to_present",
+        "same_bytes_new_inode",
+        "same_inode_metadata",
+        "same_length_content",
+        "disappear",
+    ),
+)
+def test_archive_first_native_takeover_binds_transaction_read_record_before_state_write(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.archive_root.mkdir(parents=True)
+    if mutation != "absent_to_present":
+        archive.journal_path.write_bytes(
+            b'{"schema_version":99,"owner":"foreign-before"}\n'
+        )
+    real_prepared_payload = archive._prepared_authority_payload
+    expected_journal: bytes | None = None
+
+    def mutate_transaction_after_plan(*args, **kwargs):
+        nonlocal expected_journal
+        payload = real_prepared_payload(*args, **kwargs)
+        expected_journal = _mutate_journal_read_authority(
+            archive.journal_path,
+            mutation,
+        )
+        return payload
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_prepared_authority_payload", mutate_transaction_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(event("a" * 20)))
+
+    assert writes == []
+    assert not archive.state_path.exists()
+    assert not archive.index_path.exists()
+    assert not (archive.archive_root / "2026-08-20.jsonl").exists()
+    if expected_journal is None:
+        assert not archive.journal_path.exists()
+    else:
+        assert archive.journal_path.read_bytes() == expected_journal
+
+
+@pytest.mark.parametrize("schema_version", (1, 2, 3))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "same_bytes_new_inode",
+        "same_inode_metadata",
+        "same_length_content",
+        "disappear",
+    ),
+)
+def test_archive_legacy_journal_migration_binds_transaction_read_record_before_first_write(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+    mutation,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    journal = _journal_only_document(
+        archive,
+        snapshot(event("j" * 20)),
+        schema_version,
+    )
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    if schema_version == 2:
+        _set_journal_mtime(archive, NOW)
+    real_plan = archive._plan_prepared_authority
+    expected_journal: bytes | None = None
+
+    def mutate_transaction_after_plan(*args, **kwargs):
+        nonlocal expected_journal
+        plan = real_plan(*args, **kwargs)
+        expected_journal = _mutate_journal_read_authority(
+            archive.journal_path,
+            mutation,
+        )
+        return plan
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", mutate_transaction_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert not archive.state_path.exists()
+    assert not archive.index_path.exists()
+    assert not (archive.archive_root / "2026-08-20.jsonl").exists()
+    if expected_journal is None:
+        assert not archive.journal_path.exists()
+    else:
+        assert archive.journal_path.read_bytes() == expected_journal
+
+
+@pytest.mark.parametrize("schema_version", (1, 2, 3))
+def test_archive_legacy_journal_record_remains_bound_after_prepared_state_write(
+    tmp_path,
+    monkeypatch,
+    schema_version,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    with archive._process_lock():
+        pass
+    journal = _journal_only_document(
+        archive,
+        snapshot(event("j" * 20)),
+        schema_version,
+    )
+    archive.journal_path.write_text(
+        json.dumps(journal, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    if schema_version == 2:
+        _set_journal_mtime(archive, NOW)
+    real_atomic_write = archive._atomic_write
+    changed_journal: bytes | None = None
+
+    def mutate_transaction_after_prepared(path: Path, payload: bytes, maximum: int):
+        nonlocal changed_journal
+        result = real_atomic_write(path, payload, maximum)
+        if (
+            path == archive.state_path
+            and json.loads(payload)["phase"] == "prepared"
+            and changed_journal is None
+        ):
+            changed_journal = _mutate_journal_read_authority(
+                archive.journal_path,
+                "same_length_content",
+            )
+        return result
+
+    monkeypatch.setattr(archive, "_atomic_write", mutate_transaction_after_prepared)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert changed_journal is not None
+    assert archive.journal_path.read_bytes() == changed_journal
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+    assert not archive.index_path.exists()
+    assert not (archive.archive_root / "2026-08-20.jsonl").exists()
+
+
+def test_archive_general_migration_binds_absent_transaction_before_state_write(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    legacy = _write_historical_v1_finalized_archive(
+        archive,
+        (snapshot(event("a" * 20)),),
+    )
+    state_before = archive.state_path.read_bytes()
+    index_before = archive.index_path.read_bytes()
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    bucket_before = bucket.read_bytes()
+    foreign = b'{"schema_version":99,"owner":"foreign-later"}\n'
+    real_plan = archive._plan_prepared_authority
+
+    def install_transaction_after_plan(*args, **kwargs):
+        plan = real_plan(*args, **kwargs)
+        archive.journal_path.write_bytes(foreign)
+        return plan
+
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_plan_prepared_authority", install_transaction_after_plan)
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert writes == []
+    assert archive.state_path.read_bytes() == state_before == legacy["state_bytes"]
+    assert archive.index_path.read_bytes() == index_before
+    assert bucket.read_bytes() == bucket_before
+    assert archive.journal_path.read_bytes() == foreign
+
+
+def test_archive_index_cas_rejects_same_length_content_with_current_metadata(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    record = archive._read_index_record(budget=archive_module._new_scan_budget())
+    assert record is not None
+    original_digest = record["digest"]
+    changed = bytearray(archive.index_path.read_bytes())
+    offset = changed.index(ord("a"))
+    changed[offset] = ord("b")
+    archive.index_path.write_bytes(changed)
+    current = archive._capture_current_read_record(
+        archive.index_path,
+        archive_module._MAX_INDEX_BYTES,
+        semantic_digest=original_digest,
+    )
+    assert current is not None
+    record["metadata"] = current["metadata"]
+    record["descriptor_metadata"] = current["descriptor_metadata"]
+    if "read_record" in record:
+        record["read_record"] = dict(record["read_record"])
+        record["read_record"]["metadata"] = current["metadata"]
+        record["read_record"]["descriptor_metadata"] = current["descriptor_metadata"]
+
+    assert archive._index_record_is_current(record) is False
+
+
+def test_archive_commit_record_hashing_uses_a_shared_byte_budget_before_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    state_before = archive.state_path.read_bytes()
+    index_before = archive.index_path.read_bytes()
+    bucket = archive.archive_root / "2026-08-20.jsonl"
+    bucket_before = bucket.read_bytes()
+    monkeypatch.setattr(archive_module, "_MAX_CAS_BYTES", 0, raising=False)
+    writes: list[Path] = []
+    real_atomic_write = archive._atomic_write
+
+    def record_write(path: Path, payload: bytes, maximum: int):
+        writes.append(path)
+        return real_atomic_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", record_write)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.upsert(snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+
+    assert writes == []
+    assert archive.state_path.read_bytes() == state_before
+    assert archive.index_path.read_bytes() == index_before
+    assert bucket.read_bytes() == bucket_before
+
+
+def _two_bucket_snapshot() -> EvidenceSnapshot:
+    return EvidenceSnapshot(
+        snapshot_id="e" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=NOW,
+        events=(
+            event("a" * 20, published_at=NOW - timedelta(days=1)),
+            event("b" * 20, published_at=NOW),
+        ),
+    )
+
+
+@pytest.mark.parametrize("operation", ("native", "recovery"))
+def test_archive_multi_bucket_commit_rechecks_later_target_before_overwrite(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    selected = _two_bucket_snapshot()
+    if operation == "recovery":
+        _leave_inline_state_before_bucket(archive, monkeypatch, selected)
+    second_bucket = archive.archive_root / "2026-08-20.jsonl"
+    foreign = b'{"foreign":"later-target-must-survive"}\n'
+    real_atomic_write = archive._atomic_write
+    installed = False
+    writes: list[Path] = []
+
+    def install_foreign_after_first_bucket(path: Path, payload: bytes, maximum: int):
+        nonlocal installed
+        result = real_atomic_write(path, payload, maximum)
+        writes.append(path)
+        if path.name == "2026-08-19.jsonl" and not installed:
+            second_bucket.write_bytes(foreign)
+            installed = True
+        return result
+
+    monkeypatch.setattr(archive, "_atomic_write", install_foreign_after_first_bucket)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        if operation == "native":
+            archive.upsert(selected)
+        else:
+            archive.query(days=90)
+
+    assert installed is True
+    assert second_bucket.read_bytes() == foreign
+    assert second_bucket not in writes
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+    assert not archive.index_path.exists()
+
+
+@pytest.mark.parametrize("operation", ("native", "recovery"))
+def test_archive_commit_rechecks_written_buckets_before_final_state(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    selected = _two_bucket_snapshot()
+    if operation == "recovery":
+        _leave_inline_state_before_bucket(archive, monkeypatch, selected)
+    target = archive.archive_root / "2026-08-19.jsonl"
+    foreign = b'{"foreign":"post-index-must-survive"}\n'
+    real_atomic_write = archive._atomic_write
+    injected = False
+
+    def replace_bucket_after_index(path: Path, payload: bytes, maximum: int):
+        nonlocal injected
+        result = real_atomic_write(path, payload, maximum)
+        if path == archive.index_path and not injected:
+            target.write_bytes(foreign)
+            injected = True
+        return result
+
+    monkeypatch.setattr(archive, "_atomic_write", replace_bucket_after_index)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        if operation == "native":
+            archive.upsert(selected)
+        else:
+            archive.query(days=90)
+
+    assert injected is True
+    assert target.read_bytes() == foreign
+    assert json.loads(archive.state_path.read_text(encoding="utf-8"))["phase"] == "prepared"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX lock path binding")
+def test_archive_writer_rechecks_lock_path_binding_after_os_lock(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    checks = 0
+
+    def staged_binding(_handle):
+        nonlocal checks
+        checks += 1
+        return checks == 1
+
+    monkeypatch.setattr(
+        archive,
+        "_lock_path_binds_handle",
+        staged_binding,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="storage_error"):
+        with archive._process_lock():
+            pass
+
+    assert checks == 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dual-inode lock race")
+def test_archive_posix_rejects_lock_path_rebound_after_flock(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    real_try_lock = archive._try_lock
+    replacement = tmp_path / "replacement.lock"
+    replacement.write_bytes(b"replacement")
+    rebound = False
+
+    def rebind_after_flock(handle):
+        nonlocal rebound
+        acquired = real_try_lock(handle)
+        if acquired and not rebound:
+            os.replace(replacement, archive.lock_path)
+            rebound = True
+        return acquired
+
+    monkeypatch.setattr(archive, "_try_lock", rebind_after_flock)
+
+    with pytest.raises(OSError, match="storage_error"):
+        with archive._process_lock():
+            pass
+
+    assert rebound is True
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        "/proof/api_key=placeholder",
+        "/proof/access-token%3Dplaceholder",
+        "/proof/payload%3D%257B%2522client_secret%2522%253A%2522placeholder%2522%257D",
+        "/proof/%252574oken%25253Dplaceholder",
+    ),
+)
+def test_archive_rejects_sensitive_assignments_in_public_url_path_before_storage(
+    tmp_path,
+    unsafe_path,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    public_url = "https://official.example.com" + unsafe_path
+
+    with pytest.raises(ValueError, match="URL"):
+        archive.upsert(snapshot(event(primary_evidence=(evidence_item(
+            "path-sensitive",
+            canonical_url=public_url,
+        ),))))
+
+    assert not archive.archive_root.exists()
+
+
+@pytest.mark.parametrize(
+    "safe_path",
+    (
+        "/research/tokenization/article",
+        "/proof/monkey=capuchin",
+        "/proof/session-notes",
+        "/proof/a%2Fb",
+    ),
+)
+def test_archive_allows_benign_public_url_path_material(tmp_path, safe_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    public_url = "https://official.example.com" + safe_path
+
+    archive.upsert(snapshot(event(primary_evidence=(evidence_item(
+        "path-benign",
+        canonical_url=public_url,
+    ),))))
+
+    assert archive.get("a" * 20)["primary_evidence"][0]["canonical_url"] == public_url
