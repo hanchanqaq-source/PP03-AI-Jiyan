@@ -2137,9 +2137,11 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     )
     if _CONTENT_DIGEST.fullmatch(content_digest) is None or calculated_digest != content_digest:
         raise ValueError("archive content digest mismatch")
-    if legacy or previous:
-        marker = f"legacy-raw-input-v{1 if legacy else 2}:{content_digest}"
-        raw_input_digest = hashlib.sha256(marker.encode("ascii")).hexdigest()
+    if legacy:
+        marker = f"legacy-raw-input-v1:{content_digest}"
+        raw_input_digest: str | None = hashlib.sha256(marker.encode("ascii")).hexdigest()
+    elif previous:
+        raw_input_digest = None
     else:
         raw_input_digest = _bounded_text(
             value["raw_input_digest"],
@@ -2182,8 +2184,11 @@ def _archive_from_document(value: object) -> dict[str, Any]:
     if parsed_history != sorted(parsed_history, key=_lineage_order):
         raise ValueError("archive lineage is not ordered")
     current_identity = (evidence_snapshot_id, raw_snapshot_id, generated_at.isoformat())
+    if previous and current_identity in identities:
+        raw_input_digest = identities[current_identity][1]
     if (
-        current_identity not in identities
+        raw_input_digest is None
+        or current_identity not in identities
         or identities[current_identity][1] != raw_input_digest
         or generated_at != max(_metadata_time(row["generated_at"], "lineage generated_at") for row in parsed_history)
         or last_updated_at != generated_at

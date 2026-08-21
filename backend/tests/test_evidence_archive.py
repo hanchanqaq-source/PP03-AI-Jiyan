@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import errno
+import hashlib
 import json
 import multiprocessing
 import os
@@ -9347,3 +9348,153 @@ def test_archive_previous_schema_without_raw_digest_is_readable_but_cannot_autho
     with pytest.raises(ValueError, match="lineage|raw snapshot"):
         archive.upsert(selected)
     assert archive.state_path.read_bytes() == state_before
+
+
+def _schema_v2_merged_multi_lineage_row(tmp_path):
+    operation_now = NOW + timedelta(hours=2)
+    archive = EvidenceArchive(tmp_path, now=lambda: operation_now)
+    verified, disproved = _causal_recovery_snapshots()
+    replacement_evidence = evidence_item(
+        "replacement-proof",
+        canonical_url="https://official.example.com/replacement-proof",
+        published_at=disproved.generated_at,
+    )
+    disproved = replace(
+        disproved,
+        events=(replace(
+            disproved.events[0],
+            primary_evidence=(replacement_evidence,),
+        ),),
+    )
+    archive.upsert_many((verified, disproved))
+    bucket = next(archive.archive_root.glob("*.jsonl"))
+    current = json.loads(bucket.read_text(encoding="utf-8"))
+    current_identity = (
+        current["evidence_snapshot_id"],
+        current["raw_snapshot_id"],
+        current["snapshot_generated_at"],
+    )
+    current_lineage = next(
+        lineage
+        for lineage in current["snapshot_history"]
+        if (
+            lineage["evidence_snapshot_id"],
+            lineage["raw_snapshot_id"],
+            lineage["generated_at"],
+        ) == current_identity
+    )
+    assert current["content_digest"] != current_lineage["content_digest"]
+    previous = json.loads(json.dumps(current, ensure_ascii=False))
+    previous["schema_version"] = 2
+    previous.pop("raw_input_digest")
+    for lineage in previous["snapshot_history"]:
+        lineage.pop("raw_input_digest")
+    bucket.write_text(
+        json.dumps(previous, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _refresh_finalized_bucket_manifest(archive)
+    return archive, bucket, previous, current_identity
+
+
+def test_archive_schema_v2_merged_multi_lineage_uses_current_lineage_synthetic_raw_digest(
+    tmp_path,
+):
+    archive, _bucket, previous, current_identity = _schema_v2_merged_multi_lineage_row(
+        tmp_path
+    )
+    current_lineage = next(
+        lineage
+        for lineage in previous["snapshot_history"]
+        if (
+            lineage["evidence_snapshot_id"],
+            lineage["raw_snapshot_id"],
+            lineage["generated_at"],
+        ) == current_identity
+    )
+    expected_raw_digest = hashlib.sha256(
+        f"legacy-raw-input-v2:{current_lineage['content_digest']}".encode("ascii")
+    ).hexdigest()
+
+    parsed = archive_module._archive_from_document(previous)
+
+    assert parsed["raw_input_digest"] == expected_raw_digest
+    assert next(
+        lineage["raw_input_digest"]
+        for lineage in parsed["snapshot_history"]
+        if (
+            lineage["evidence_snapshot_id"],
+            lineage["raw_snapshot_id"],
+            lineage["generated_at"],
+        ) == current_identity
+    ) == expected_raw_digest
+    assert {item["evidence_id"] for item in parsed["primary_evidence"]} == {
+        "evidence-" + ("a" * 20),
+        "replacement-proof",
+    }
+    assert [transition["to_status"] for transition in parsed["status_history"]] == [
+        "verified",
+        "disproved",
+    ]
+
+    queried = archive.query(90)
+    assert [row["event_id"] for row in queried] == ["a" * 20]
+    independent = snapshot(
+        event(
+            "c" * 20,
+            published_at=NOW - timedelta(days=1),
+            primary_evidence=(evidence_item(
+                "independent-proof",
+                published_at=NOW - timedelta(days=1),
+            ),),
+        ),
+        snapshot_id="5" * 20,
+        raw_snapshot_id="6" * 20,
+        generated_at=NOW + timedelta(hours=1),
+    )
+    archive.upsert(independent)
+    archive.upsert(independent)
+    migrated = {row["event_id"]: row for row in archive.query(90)}
+    assert set(migrated) == {"a" * 20, "c" * 20}
+    assert len(migrated["a" * 20]["snapshot_history"]) == 2
+    assert {item["evidence_id"] for item in migrated["a" * 20]["primary_evidence"]} == {
+        "evidence-" + ("a" * 20),
+        "replacement-proof",
+    }
+
+
+@pytest.mark.parametrize("corruption", ("missing", "duplicate", "mismatched-current"))
+def test_archive_schema_v2_current_lineage_identity_is_fail_closed(tmp_path, corruption):
+    _archive, _bucket, previous, current_identity = _schema_v2_merged_multi_lineage_row(
+        tmp_path
+    )
+    current_index = next(
+        index
+        for index, lineage in enumerate(previous["snapshot_history"])
+        if (
+            lineage["evidence_snapshot_id"],
+            lineage["raw_snapshot_id"],
+            lineage["generated_at"],
+        ) == current_identity
+    )
+    if corruption == "missing":
+        previous["snapshot_history"].pop(current_index)
+    elif corruption == "duplicate":
+        previous["snapshot_history"].append(
+            json.loads(json.dumps(previous["snapshot_history"][current_index]))
+        )
+    else:
+        previous["raw_snapshot_id"] = "9" * 20
+
+    with pytest.raises(ValueError, match="lineage"):
+        archive_module._archive_from_document(previous)
+
+
+def test_archive_schema_v3_still_requires_exact_current_raw_input_digest(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(hours=1))
+    archive.upsert(snapshot(event()))
+    row = json.loads(next(archive.archive_root.glob("*.jsonl")).read_text(encoding="utf-8"))
+    row["raw_input_digest"] = "0" * 64
+
+    with pytest.raises(ValueError, match="lineage"):
+        archive_module._archive_from_document(row)

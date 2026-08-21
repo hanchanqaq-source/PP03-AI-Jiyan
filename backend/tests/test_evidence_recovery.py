@@ -2608,3 +2608,375 @@ def test_recovery_invalid_cache_keeps_verifiable_raw_marker_with_missing_fields(
         "missing_required_fields": 1,
     }
     assert {row["event_id"] for row in archive.query(90)} == {"c" * 20}
+
+
+@pytest.mark.parametrize("invalid_events", (None, {}, []))
+def test_recovery_invalid_cache_container_closes_same_raw_legacy_component(
+    tmp_path,
+    invalid_events,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    legacy_source = evidence_snapshot(
+        evidence_event("a" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    invalid_document = snapshot_document(legacy_source)
+    invalid_document["events"] = invalid_events
+    current = write_json(root / "current.json", invalid_document)
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(legacy_source),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "missing_required_fields": 1,
+    }
+    assert archive.query(90) == []
+
+
+@pytest.mark.parametrize("invalid_events", (None, []))
+def test_recovery_invalid_public_container_closes_same_raw_cache_component(
+    tmp_path,
+    invalid_events,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    cached = evidence_snapshot(
+        evidence_event("b" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(cached),
+    )
+    candidate = evidence_event(
+        "a" * 20,
+        link="https://publisher.example.com/a",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+    invalid_result = snapshot_document(replace(
+        evidence_snapshot(candidate),
+        snapshot_id=cached.snapshot_id,
+        raw_snapshot_id=cached.raw_snapshot_id,
+        generated_at=cached.generated_at,
+    ))
+    invalid_result["events"] = invalid_events
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        public_refetcher=lambda _url: invalid_result,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 2
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 1,
+    }
+    assert archive.query(90) == []
+
+
+def test_recovery_invalid_container_with_unsafe_raw_id_does_not_create_group_marker(
+    tmp_path,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    invalid_document = snapshot_document(evidence_snapshot(evidence_event("b" * 20)))
+    invalid_document["raw_snapshot_id"] = "../unsafe"
+    invalid_document["events"] = None
+    current = write_json(root / "current.json", invalid_document)
+    valid = evidence_snapshot(
+        evidence_event("a" * 20),
+        snapshot_id="t" * 20,
+        raw_snapshot_id="u" * 20,
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-valid.json",
+        snapshot_document(valid),
+    )
+
+    report = HistoryRecovery(
+        root,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 1
+    assert report.unrecoverable == 1
+    assert report.reasons == {"missing_required_fields": 1}
+    assert {row["event_id"] for row in archive.query(90)} == {"a" * 20}
+
+
+def _combined_cache_and_public_sources(root: Path):
+    cached = evidence_snapshot(
+        evidence_event("a" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    current = write_json(root / "current.json", snapshot_document(cached))
+    candidates = {
+        key: evidence_event(
+            key * 20,
+            link=f"https://publisher.example.com/{key}",
+        )
+        for key in ("b", "c")
+    }
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [
+            {
+                "event_id": selected.event_id,
+                "title": selected.title,
+                "original_url": selected.primary_evidence[0].canonical_url,
+                "published_at": selected.published_at.isoformat(),
+                "verification_status": selected.verification_status.value,
+            }
+            for selected in candidates.values()
+        ]}],
+    })
+    return cached, current, candidates, radar
+
+
+def test_recovery_combined_cache_and_public_count_exceeds_archive_cap_before_callbacks(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.archive as archive_module
+    import evidence_verification.recovery as recovery_module
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    _cached, current, candidates, radar = _combined_cache_and_public_sources(root)
+    monkeypatch.setattr(archive_module, "_MAX_BATCH_SNAPSHOTS", 2)
+    monkeypatch.setattr(recovery_module, "_MAX_BATCH_SNAPSHOTS", 2)
+    calls: list[str] = []
+
+    def refetch(url):
+        key = url.rsplit("/", 1)[-1]
+        calls.append(key)
+        return evidence_snapshot(
+            candidates[key],
+            snapshot_id=key * 20,
+            raw_snapshot_id=key.upper() * 20,
+        )
+
+    report = recovery_module.HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == []
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.unrecoverable == 3
+    assert report.reasons == {
+        "archive_rejected": 1,
+        "public_refetch_failed": 2,
+    }
+    assert archive.query(90) == []
+
+
+def test_recovery_combined_static_budget_is_checked_before_public_callback(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.recovery as recovery_module
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    cached = evidence_snapshot(evidence_event("a" * 20))
+    current = write_json(root / "current.json", snapshot_document(cached))
+    candidate = evidence_event(
+        "b" * 20,
+        link="https://publisher.example.com/b",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+    monkeypatch.setattr(recovery_module, "_MAX_REFETCH_TEXT_BYTES", 180)
+    calls = 0
+
+    def refetch(_url):
+        nonlocal calls
+        calls += 1
+        return evidence_snapshot(candidate, snapshot_id="t" * 20, raw_snapshot_id="u" * 20)
+
+    report = recovery_module.HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == 0
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {
+        "archive_rejected": 1,
+        "public_refetch_failed": 1,
+    }
+    assert archive.query(90) == []
+
+
+def test_recovery_duplicate_cache_lineage_counts_once_at_combined_cap_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.archive as archive_module
+    import evidence_verification.recovery as recovery_module
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    cached = evidence_snapshot(evidence_event("a" * 20))
+    current = write_json(root / "current.json", snapshot_document(cached))
+    duplicate = write_json(
+        root / "legacy-snapshots" / "evidence-duplicate.json",
+        snapshot_document(cached),
+    )
+    candidate = evidence_event(
+        "b" * 20,
+        link="https://publisher.example.com/b",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+    monkeypatch.setattr(archive_module, "_MAX_BATCH_SNAPSHOTS", 2)
+    monkeypatch.setattr(recovery_module, "_MAX_BATCH_SNAPSHOTS", 2)
+    calls = 0
+
+    def refetch(_url):
+        nonlocal calls
+        calls += 1
+        return evidence_snapshot(candidate, snapshot_id="t" * 20, raw_snapshot_id="u" * 20)
+
+    report = recovery_module.HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        legacy_snapshots=(duplicate,),
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == 1
+    assert report.cache_recovered == 1
+    assert report.public_refetched == 1
+    assert report.unrecoverable == 0
+    assert {row["event_id"] for row in archive.query(90)} == {"a" * 20, "b" * 20}
+
+
+def test_recovery_invalid_raw_group_does_not_consume_combined_cap_for_independent_public(
+    tmp_path,
+    monkeypatch,
+):
+    import evidence_verification.archive as archive_module
+    import evidence_verification.recovery as recovery_module
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    invalid_source = evidence_snapshot(
+        evidence_event("a" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    invalid_document = snapshot_document(invalid_source)
+    invalid_document["events"] = None
+    current = write_json(root / "current.json", invalid_document)
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(invalid_source),
+    )
+    candidate = evidence_event(
+        "b" * 20,
+        link="https://publisher.example.com/b",
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": candidate.event_id,
+            "title": candidate.title,
+            "original_url": candidate.primary_evidence[0].canonical_url,
+            "published_at": candidate.published_at.isoformat(),
+            "verification_status": candidate.verification_status.value,
+        }]}],
+    })
+    monkeypatch.setattr(archive_module, "_MAX_BATCH_SNAPSHOTS", 1)
+    monkeypatch.setattr(recovery_module, "_MAX_BATCH_SNAPSHOTS", 1)
+    calls = 0
+
+    def refetch(_url):
+        nonlocal calls
+        calls += 1
+        return evidence_snapshot(candidate, snapshot_id="t" * 20, raw_snapshot_id="u" * 20)
+
+    report = recovery_module.HistoryRecovery(
+        root,
+        radar_cache=radar,
+        evidence_current=current,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        public_refetcher=refetch,
+        now=lambda: NOW,
+    ).import_records()
+
+    assert calls == 1
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 1
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "missing_required_fields": 1,
+    }
+    assert {row["event_id"] for row in archive.query(90)} == {"b" * 20}

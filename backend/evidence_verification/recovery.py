@@ -478,7 +478,22 @@ def _normalized_refetch_event(
 
 
 def _shallow_refetch_marker(value: object) -> _RawGroupMarker | None:
-    if type(value) is EvidenceSnapshot and type(value.events) in {tuple, list}:
+    if type(value) is EvidenceSnapshot:
+        events = value.events
+        shallow_events = (
+            [
+                {
+                    "event_id": (
+                        event.event_id
+                        if type(event) is EvidenceEvent
+                        else None
+                    )
+                }
+                for event in events[:_MAX_REFETCH_EVENTS + 1]
+            ]
+            if type(events) in {tuple, list}
+            else None
+        )
         document = {
             "snapshot_id": value.snapshot_id,
             "raw_snapshot_id": value.raw_snapshot_id,
@@ -487,36 +502,30 @@ def _shallow_refetch_marker(value: object) -> _RawGroupMarker | None:
                 if type(value.generated_at) is datetime
                 else None
             ),
-            "events": [
-                {
-                    "event_id": (
-                        event.event_id
-                        if type(event) is EvidenceEvent
-                        else None
-                    )
-                }
-                for event in value.events[:_MAX_REFETCH_EVENTS + 1]
-            ],
+            "events": shallow_events,
         }
         return _raw_group_marker_from_document(
             document,
-            invalid=False,
+            invalid=shallow_events is None,
             allow_empty=True,
         )
     if type(value) is dict:
         events = value.get("events")
-        if type(events) is list:
-            shallow = {
-                "snapshot_id": value.get("snapshot_id"),
-                "raw_snapshot_id": value.get("raw_snapshot_id"),
-                "generated_at": value.get("generated_at"),
-                "events": events[:_MAX_REFETCH_EVENTS + 1],
-            }
-            return _raw_group_marker_from_document(
-                shallow,
-                invalid=False,
-                allow_empty=True,
-            )
+        shallow = {
+            "snapshot_id": value.get("snapshot_id"),
+            "raw_snapshot_id": value.get("raw_snapshot_id"),
+            "generated_at": value.get("generated_at"),
+            "events": (
+                events[:_MAX_REFETCH_EVENTS + 1]
+                if type(events) is list
+                else None
+            ),
+        }
+        return _raw_group_marker_from_document(
+            shallow,
+            invalid=type(events) is not list,
+            allow_empty=True,
+        )
     return None
 
 
@@ -619,39 +628,81 @@ def _bounded_refetch_snapshot(
 
 def _preflight_refetch_candidates(
     candidates: list[_RefetchCandidate],
+    *,
+    materialized_snapshots: tuple[EvidenceSnapshot, ...] = (),
 ) -> bool:
-    if len(candidates) > _MAX_BATCH_SNAPSHOTS:
+    if len(candidates) + len(materialized_snapshots) > _MAX_BATCH_SNAPSHOTS:
         return False
     budget = _new_refetch_budget()
+
+    def take_identity(document: dict[str, object], values: tuple[str, ...]) -> None:
+        if int(budget["events"]) <= 0:
+            budget["exhausted"] = True
+            raise _RefetchLimitExceeded("public refetch event limit exceeded")
+        budget["events"] = int(budget["events"]) - 1
+        _refetch_item(budget)
+        _refetch_node(budget)
+        for value in values:
+            _validated_refetch_text(value, budget)
+        encoded = json.dumps(
+            document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        _take_refetch_document_bytes(encoded, budget)
+
     try:
-        for candidate in candidates:
-            if int(budget["events"]) <= 0:
-                budget["exhausted"] = True
-                raise _RefetchLimitExceeded("public refetch event limit exceeded")
-            budget["events"] = int(budget["events"]) - 1
-            _refetch_item(budget)
-            _refetch_node(budget)
-            for value in (
-                candidate.event_id,
-                candidate.title,
-                candidate.public_link,
-                candidate.published_at.isoformat(),
-                candidate.verification_status,
+        for snapshot in materialized_snapshots:
+            if type(snapshot) is not EvidenceSnapshot or len(snapshot.events) != 1:
+                raise _RefetchLimitExceeded("invalid materialized recovery snapshot")
+            event = snapshot.events[0]
+            published_at = event.published_at
+            if (
+                type(published_at) is not datetime
+                or published_at.tzinfo is None
+                or published_at.utcoffset() is None
             ):
-                _validated_refetch_text(value, budget)
-            encoded = json.dumps(
+                raise _RefetchLimitExceeded("invalid materialized recovery timestamp")
+            public_links = _event_links(event)
+            if not public_links:
+                raise _RefetchLimitExceeded("invalid materialized recovery evidence")
+            published = published_at.isoformat()
+            status = event.verification_status.value
+            take_identity(
+                {
+                    "event_id": event.event_id,
+                    "title": event.title,
+                    "public_links": list(public_links),
+                    "published_at": published,
+                    "verification_status": status,
+                },
+                (
+                    event.event_id,
+                    event.title,
+                    *public_links,
+                    published,
+                    status,
+                ),
+            )
+        for candidate in candidates:
+            published = candidate.published_at.isoformat()
+            take_identity(
                 {
                     "event_id": candidate.event_id,
                     "title": candidate.title,
                     "public_link": candidate.public_link,
-                    "published_at": candidate.published_at.isoformat(),
+                    "published_at": published,
                     "verification_status": candidate.verification_status,
                 },
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            _take_refetch_document_bytes(encoded, budget)
+                (
+                    candidate.event_id,
+                    candidate.title,
+                    candidate.public_link,
+                    published,
+                    candidate.verification_status,
+                ),
+            )
     except _RefetchLimitExceeded:
         return False
     return True
@@ -707,8 +758,13 @@ def _raw_group_marker_from_document(
     accounted_event_ids: tuple[str, ...] = (),
     allow_empty: bool = False,
 ) -> _RawGroupMarker | None:
-    if type(value) is not dict or type(value.get("events")) is not list:
+    if type(value) is not dict:
         return None
+    events = value.get("events")
+    if type(events) is not list:
+        if not (invalid and allow_empty):
+            return None
+        events = []
     raw_value = value.get("raw_snapshot_id")
     raw_candidate = (
         value.get("snapshot_id")
@@ -729,7 +785,7 @@ def _raw_group_marker_from_document(
     generated_at = _aware_time(value.get("generated_at"))
     event_ids = tuple(
         event_id
-        for row in value["events"]
+        for row in events
         for event_id in (
             _canonical_event_id(row.get("event_id")) if type(row) is dict else None,
         )
@@ -747,7 +803,7 @@ def _raw_group_marker_from_document(
             invalid
             or not event_ids
             or duplicate
-            or len(event_ids) != len(value["events"])
+            or len(event_ids) != len(events)
         ),
         accounted_event_ids=tuple(sorted(set(accounted_event_ids))),
     )
@@ -1036,18 +1092,7 @@ class HistoryRecovery:
     ) -> None:
         if not first_row_precounted and not self._take_row(budget, reasons):
             return
-        if type(value) is not dict or type(value.get("events")) is not list:
-            self._add_reason(reasons, "missing_required_fields")
-            return
-        events = value["events"]
-        if not events:
-            self._add_reason(reasons, "missing_required_fields")
-            return
-        source_event_ids = [
-            _canonical_event_id(row.get("event_id")) if type(row) is dict else None
-            for row in events
-        ]
-        valid_source_ids = [event_id for event_id in source_event_ids if event_id is not None]
+        valid_source_ids: list[str] = []
 
         def record_marker(*, invalid: bool) -> None:
             marker = _raw_group_marker_from_document(
@@ -1060,6 +1105,20 @@ class HistoryRecovery:
             )
             if marker is not None:
                 markers.append(marker)
+
+        if type(value) is not dict:
+            self._add_reason(reasons, "missing_required_fields")
+            return
+        events = value.get("events")
+        if type(events) is not list or not events:
+            self._add_reason(reasons, "missing_required_fields")
+            record_marker(invalid=True)
+            return
+        source_event_ids = [
+            _canonical_event_id(row.get("event_id")) if type(row) is dict else None
+            for row in events
+        ]
+        valid_source_ids = [event_id for event_id in source_event_ids if event_id is not None]
 
         if len(valid_source_ids) != len(set(valid_source_ids)):
             self._add_reason(reasons, "ambiguous_record", len(set(valid_source_ids)) or 1)
@@ -1780,6 +1839,56 @@ class HistoryRecovery:
             )
             units[event_id] = ("cache", recovered, records)
 
+        # Close cache/refetch identities connected to a known-invalid raw group
+        # before they can consume the combined gate or enter a callback. Marker
+        # declarations and selected cache lineages form one bounded bipartite
+        # graph, so a conflict propagates across every linked raw component.
+        raw_to_declared_events: dict[str, set[str]] = {}
+        event_to_raw_ids: dict[str, set[str]] = {}
+        invalid_raw_ids: set[str] = set()
+        invalid_accounted_event_ids: set[str] = set()
+        for marker in raw_markers:
+            raw_to_declared_events.setdefault(marker.raw_snapshot_id, set()).update(
+                marker.declared_event_ids
+            )
+            for declared_event_id in marker.declared_event_ids:
+                event_to_raw_ids.setdefault(declared_event_id, set()).add(
+                    marker.raw_snapshot_id
+                )
+            if marker.invalid:
+                invalid_raw_ids.add(marker.raw_snapshot_id)
+                invalid_accounted_event_ids.update(marker.accounted_event_ids)
+        for event_id, (_kind, snapshots, _records) in units.items():
+            for snapshot in snapshots:
+                raw_to_declared_events.setdefault(snapshot.raw_snapshot_id, set()).add(
+                    event_id
+                )
+                event_to_raw_ids.setdefault(event_id, set()).add(snapshot.raw_snapshot_id)
+
+        closed_raw_ids: set[str] = set()
+        closed_event_ids: set[str] = set()
+        pending_raw_ids = list(sorted(invalid_raw_ids, reverse=True))
+        while pending_raw_ids:
+            raw_snapshot_id = pending_raw_ids.pop()
+            if raw_snapshot_id in closed_raw_ids:
+                continue
+            closed_raw_ids.add(raw_snapshot_id)
+            for event_id in sorted(raw_to_declared_events.get(raw_snapshot_id, ())):
+                if event_id in closed_event_ids:
+                    continue
+                closed_event_ids.add(event_id)
+                pending_raw_ids.extend(
+                    sorted(
+                        event_to_raw_ids.get(event_id, ()) - closed_raw_ids,
+                        reverse=True,
+                    )
+                )
+        for event_id in sorted(closed_event_ids & (set(units) | set(selected_refetch))):
+            if event_id in invalid_accounted_event_ids:
+                blocked.add(event_id)
+            else:
+                block((event_id,), "ambiguous_record")
+
         public_candidates: list[tuple[str, _RefetchCandidate]] = []
         for event_id, candidate in sorted(selected_refetch.items()):
             if event_id in blocked or event_id in cache_terminal_ids:
@@ -1795,9 +1904,21 @@ class HistoryRecovery:
         # Candidate count and static identity costs are checked before the
         # first dependency callback. Returned graphs then consume one shared
         # budget immediately, before any archive mutation.
-        if public_candidates and not _preflight_refetch_candidates([
-            candidate for _event_id, candidate in public_candidates
-        ]):
+        eligible_cache_ids = tuple(
+            event_id
+            for event_id, (kind, _snapshots, _records) in sorted(units.items())
+            if kind == "cache" and event_id not in blocked
+        )
+        materialized_cache_snapshots = tuple(
+            snapshot
+            for event_id in eligible_cache_ids
+            for snapshot in units[event_id][1]
+        )
+        if public_candidates and not _preflight_refetch_candidates(
+            [candidate for _event_id, candidate in public_candidates],
+            materialized_snapshots=materialized_cache_snapshots,
+        ):
+            block(eligible_cache_ids, "archive_rejected")
             block(
                 (event_id for event_id, _candidate in public_candidates),
                 "public_refetch_failed",
