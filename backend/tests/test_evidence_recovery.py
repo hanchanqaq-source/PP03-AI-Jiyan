@@ -2982,10 +2982,17 @@ def test_recovery_invalid_raw_group_does_not_consume_combined_cap_for_independen
     assert {row["event_id"] for row in archive.query(90)} == {"b" * 20}
 
 
-@pytest.mark.parametrize("successful_offsets", (0, 4))
-def test_public_refetch_malformed_timezone_keeps_raw_marker_and_closes_cache_sibling(
+@pytest.mark.parametrize(
+    ("successful_offsets", "expected_reasons"),
+    (
+        (0, {"ambiguous_record": 1, "public_refetch_failed": 1}),
+        (4, {"ambiguous_record": 2}),
+    ),
+)
+def test_public_refetch_timezone_boundary_keeps_raw_marker_or_frozen_value(
     tmp_path,
     successful_offsets,
+    expected_reasons,
 ):
     from evidence_verification.recovery import HistoryRecovery
 
@@ -3048,10 +3055,7 @@ def test_public_refetch_malformed_timezone_keeps_raw_marker_and_closes_cache_sib
 
     assert report.cache_recovered == 0
     assert report.public_refetched == 0
-    assert report.reasons == {
-        "ambiguous_record": 1,
-        "public_refetch_failed": 1,
-    }
+    assert report.reasons == expected_reasons
     assert "private timezone detail" not in repr(report.to_dict())
     assert archive.query(90) == []
 
@@ -3256,3 +3260,200 @@ def test_public_refetch_accepts_valid_unicode_within_utf8_budget(tmp_path):
     assert report.public_refetched == 1
     assert report.unrecoverable == 0
     assert archive.get(selected.event_id)["title"] == selected.title
+
+
+class StatefulOffsetTimezone(tzinfo):
+    def __init__(self, successful_calls: int, offset: timedelta = timedelta(hours=8)):
+        self.successful_calls = successful_calls
+        self.offset = offset
+        self.calls = 0
+
+    def utcoffset(self, _value):
+        self.calls += 1
+        if self.calls > self.successful_calls:
+            raise RuntimeError("private timezone detail")
+        return self.offset
+
+    def dst(self, _value):
+        return timedelta(0)
+
+
+def refetch_snapshot_with_target_timezone(
+    target: str,
+    selected_timezone: tzinfo,
+) -> EvidenceSnapshot:
+    published = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+    verified = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+    generated = datetime(2026, 8, 20, 11, 0, tzinfo=timezone.utc)
+    selected = replace(
+        evidence_event("a" * 20, published_at=published, link="https://publisher.example.com/a"),
+        title="公开事件",
+        verified_at=verified,
+        evidence_as_of=verified,
+        primary_evidence=(replace(
+            evidence_event("a" * 20).primary_evidence[0],
+            canonical_url="https://publisher.example.com/a",
+            published_at=published,
+        ),),
+        status_history=(StatusTransition(
+            None,
+            VerificationStatus.VERIFIED,
+            verified,
+            "reason-verified",
+        ),),
+    )
+    selected_time = {
+        "generated_at": datetime(2026, 8, 20, 19, 0, tzinfo=selected_timezone),
+        "published_at": datetime(2026, 8, 20, 16, 0, tzinfo=selected_timezone),
+        "verified_at": datetime(2026, 8, 20, 18, 0, tzinfo=selected_timezone),
+        "evidence_as_of": datetime(2026, 8, 20, 18, 0, tzinfo=selected_timezone),
+        "evidence_published_at": datetime(2026, 8, 20, 16, 0, tzinfo=selected_timezone),
+        "status_changed_at": datetime(2026, 8, 20, 18, 0, tzinfo=selected_timezone),
+    }[target]
+    if target in {"published_at", "verified_at", "evidence_as_of"}:
+        selected = replace(selected, **{target: selected_time})
+    elif target == "evidence_published_at":
+        selected = replace(
+            selected,
+            primary_evidence=(replace(
+                selected.primary_evidence[0],
+                published_at=selected_time,
+            ),),
+        )
+    elif target == "status_changed_at":
+        selected = replace(
+            selected,
+            status_history=(replace(
+                selected.status_history[0],
+                changed_at=selected_time,
+            ),),
+        )
+    if target == "generated_at":
+        generated = selected_time
+    return EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+        generated_at=generated,
+        events=(selected,),
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "generated_at",
+        "published_at",
+        "verified_at",
+        "evidence_as_of",
+        "evidence_published_at",
+        "status_changed_at",
+    ),
+)
+@pytest.mark.parametrize("successful_calls", (5, 6, 7, 8))
+def test_public_refetch_freezes_every_datetime_before_late_marker_hash_and_bind_use(
+    tmp_path,
+    target,
+    successful_calls,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    link = "https://publisher.example.com/a"
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": "a" * 20,
+            "title": "公开事件",
+            "original_url": link,
+            "published_at": "2026-08-20T08:00:00+00:00",
+            "verification_status": "verified",
+        }]}],
+    })
+    selected_timezone = StatefulOffsetTimezone(successful_calls)
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        archive=archive,
+        public_refetcher=lambda _url: refetch_snapshot_with_target_timezone(
+            target,
+            selected_timezone,
+        ),
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.to_dict() == {
+        "cache_recovered": 0,
+        "public_refetched": 1,
+        "unrecoverable": 0,
+        "reasons": {},
+    }
+    assert selected_timezone.calls == 1
+    row = archive.get("a" * 20)
+    assert row["snapshot_generated_at"] == "2026-08-20T11:00:00+00:00"
+    assert row["published_at"] == "2026-08-20T08:00:00+00:00"
+    assert row["verified_at"] == "2026-08-20T10:00:00+00:00"
+    assert row["evidence_as_of"] == "2026-08-20T10:00:00+00:00"
+    assert row["primary_evidence"][0]["published_at"] == "2026-08-20T08:00:00+00:00"
+    assert row["status_history"][0]["changed_at"] == "2026-08-20T10:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "generated_at",
+        "published_at",
+        "verified_at",
+        "evidence_as_of",
+        "evidence_published_at",
+        "status_changed_at",
+    ),
+)
+def test_public_refetch_timestamp_conversion_failure_keeps_safe_raw_marker(
+    tmp_path,
+    target,
+):
+    from evidence_verification.recovery import HistoryRecovery
+
+    root = tmp_path / "evidence"
+    archive = EvidenceArchive(root, now=lambda: NOW)
+    cached = evidence_snapshot(
+        evidence_event("b" * 20),
+        snapshot_id="s" * 20,
+        raw_snapshot_id="r" * 20,
+    )
+    legacy = write_json(
+        root / "legacy-snapshots" / "evidence-sibling.json",
+        snapshot_document(cached),
+    )
+    radar = write_json(root / "radar.json", {
+        "industries": [{"items": [{
+            "event_id": "a" * 20,
+            "title": "公开事件",
+            "original_url": "https://publisher.example.com/a",
+            "published_at": "2026-08-20T08:00:00+00:00",
+            "verification_status": "verified",
+        }]}],
+    })
+    selected_timezone = StatefulOffsetTimezone(0)
+
+    report = HistoryRecovery(
+        root,
+        radar_cache=radar,
+        legacy_snapshots=(legacy,),
+        archive=archive,
+        public_refetcher=lambda _url: refetch_snapshot_with_target_timezone(
+            target,
+            selected_timezone,
+        ),
+        now=lambda: NOW,
+    ).import_records()
+
+    assert report.cache_recovered == 0
+    assert report.public_refetched == 0
+    assert report.reasons == {
+        "ambiguous_record": 1,
+        "public_refetch_failed": 1,
+    }
+    assert "private timezone detail" not in repr(report.to_dict())
+    assert archive.query(90) == []

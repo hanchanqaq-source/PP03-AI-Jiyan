@@ -235,6 +235,28 @@ def _validated_refetch_text(value: object, budget: dict[str, int | bool]) -> str
     return _refetch_text(value, budget)
 
 
+def _frozen_refetch_time(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None:
+        raise _RefetchLimitExceeded("invalid public refetch timestamp")
+    try:
+        offset = value.utcoffset()
+        if type(offset) is not timedelta:
+            raise _RefetchLimitExceeded("invalid public refetch timestamp")
+        wall_time = datetime(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            tzinfo=timezone.utc,
+        )
+        return wall_time - offset
+    except Exception as error:
+        raise _RefetchLimitExceeded("invalid public refetch timestamp") from error
+
+
 def _validated_refetch_time(
     value: object,
     budget: dict[str, int | bool],
@@ -244,14 +266,7 @@ def _validated_refetch_time(
     _refetch_node(budget)
     if value is None and optional:
         return None
-    if type(value) is not datetime or value.tzinfo is None:
-        raise _RefetchLimitExceeded("invalid public refetch timestamp")
-    try:
-        if value.utcoffset() is None:
-            raise _RefetchLimitExceeded("invalid public refetch timestamp")
-    except Exception as error:
-        raise _RefetchLimitExceeded("invalid public refetch timestamp") from error
-    return value
+    return _frozen_refetch_time(value)
 
 
 def _validated_refetch_enum(
@@ -523,12 +538,12 @@ def _shallow_refetch_marker(value: object) -> _RawGroupMarker | None:
                     declared_event_ids=tuple(sorted(set(event_ids))),
                 )
             try:
-                if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+                if generated_at.tzinfo is None:
                     return replace(
                         marker,
                         declared_event_ids=tuple(sorted(set(event_ids))),
                     )
-                normalized_time = generated_at.astimezone(timezone.utc)
+                normalized_time = _frozen_refetch_time(generated_at)
             except Exception:
                 return replace(
                     marker,
@@ -618,7 +633,10 @@ def _bounded_refetch_snapshot(
                 _validated_refetch_text(value.raw_snapshot_id, budget),
                 "raw_snapshot_id",
             )
-            generated_at = _validated_refetch_time(value.generated_at, budget)
+            _refetch_node(budget)
+            generated_at = marker.generated_at if marker is not None else None
+            if generated_at is None:
+                raise _RefetchLimitExceeded("invalid public refetch timestamp")
             if type(value.recovery_metadata) is not dict:
                 raise _RefetchLimitExceeded("invalid public refetch recovery metadata")
             source_snapshot_id = value.recovery_metadata.get("source_snapshot_id")
