@@ -14,10 +14,12 @@ type Tab = "verification" | "health" | "corrections";
 type Filter = "all" | VerificationStatus;
 type Sort = "latest" | "status" | "holding_relevance";
 type SnapshotLoadResult = { loaded: boolean; snapshotId: string | null };
+type ArchiveIntent = { days: EvidenceHistoryDays; filter: Filter };
 
 const tabs: Array<{ value: Tab; label: string }> = [{ value: "verification", label: "资讯核验" }, { value: "health", label: "数据源健康" }, { value: "corrections", label: "更正记录" }];
 const filters: Array<{ value: Filter; label: string }> = [{ value: "all", label: "全部" }, ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value: value as VerificationStatus, label }))];
 const historyDays: EvidenceHistoryDays[] = [1, 3, 7, 30, 90];
+const archivePageLimit = 100;
 const statusPriority: Record<VerificationStatus, number> = { conflicting: 0, disproved: 1, corrected: 2, unverified: 3, corroborated: 4, verified: 5 };
 const holdingPriority: Record<string, number> = { direct_holding: 0, industry_relation: 1, watch_tag: 2, none: 3 };
 const categoryLabel: Record<string, string> = { policy: "政策", industry: "产业", company: "公司", fund_notice: "基金公告", deep_content: "深度内容" };
@@ -64,6 +66,7 @@ export function EvidenceCenter() {
   const [archiveTotal, setArchiveTotal] = useState(0);
   const [archiveDays, setArchiveDays] = useState<EvidenceHistoryDays>(7);
   const [archiveFilter, setArchiveFilter] = useState<Filter>("all");
+  const [archiveNextCursor, setArchiveNextCursor] = useState<string | null>(null);
   const [archiveLoading, setArchiveLoading] = useState(true);
   const [archiveLoaded, setArchiveLoaded] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
@@ -77,9 +80,14 @@ export function EvidenceCenter() {
   const committedSummaryRef = useRef<EvidenceSummaryData | null>(summary);
   const archiveRequestRef = useRef(0);
   const archiveAbortRef = useRef<AbortController | null>(null);
+  const archiveEventsRef = useRef<EvidenceArchiveEvent[]>([]);
   const archiveDaysRef = useRef<EvidenceHistoryDays>(7);
   const archiveFilterRef = useRef<Filter>("all");
+  const archiveIntentRef = useRef<ArchiveIntent>({ days: 7, filter: "all" });
+  const detailRequestRef = useRef(0);
+  const detailAbortRef = useRef<AbortController | null>(null);
   committedSummaryRef.current = summary;
+  archiveEventsRef.current = archiveEvents;
 
   const queryForFilter = useCallback((nextFilter: Filter): EvidenceEventQuery => ({
     days: 7,
@@ -148,7 +156,9 @@ export function EvidenceCenter() {
   const loadHistory = useCallback(async (
     nextDays: EvidenceHistoryDays,
     nextFilter: Filter,
+    cursor?: string,
   ): Promise<boolean> => {
+    const append = cursor !== undefined;
     const requestId = ++archiveRequestRef.current;
     archiveAbortRef.current?.abort();
     const controller = new AbortController();
@@ -156,6 +166,8 @@ export function EvidenceCenter() {
     const query: EvidenceArchiveQuery = {
       days: nextDays,
       ...(nextFilter === "all" ? {} : { verification_status: nextFilter }),
+      limit: archivePageLimit,
+      ...(cursor === undefined ? {} : { cursor }),
     };
     setArchiveLoading(true);
     setArchiveError(null);
@@ -164,21 +176,43 @@ export function EvidenceCenter() {
       if (requestId !== archiveRequestRef.current || controller.signal.aborted) return false;
       if (result.filters.days !== nextDays
         || result.filters.verification_status !== (query.verification_status ?? null)
-        || result.total !== result.events.length) {
+        || result.page.limit !== archivePageLimit
+        || result.page.returned !== result.events.length
+        || result.total < result.events.length) {
         throw new Error("archive response mismatch");
       }
-      setArchiveEvents(result.events);
+      let nextEvents = result.events;
+      if (append) {
+        if (archiveDaysRef.current !== nextDays || archiveFilterRef.current !== nextFilter) {
+          throw new Error("archive response mismatch");
+        }
+        const knownIds = new Set(archiveEventsRef.current.map((event) => event.event_id));
+        if (result.events.some((event) => knownIds.has(event.event_id))) {
+          throw new Error("archive response mismatch");
+        }
+        nextEvents = [...archiveEventsRef.current, ...result.events];
+        if (result.total < nextEvents.length) throw new Error("archive response mismatch");
+      }
+      archiveEventsRef.current = nextEvents;
+      setArchiveEvents(nextEvents);
       setArchiveTotal(result.total);
+      setArchiveNextCursor(result.page.next_cursor);
       setArchiveLoaded(true);
-      archiveDaysRef.current = nextDays;
-      archiveFilterRef.current = nextFilter;
-      setArchiveDays(nextDays);
-      setArchiveFilter(nextFilter);
+      if (!append) {
+        archiveDaysRef.current = nextDays;
+        archiveFilterRef.current = nextFilter;
+        setArchiveDays(nextDays);
+        setArchiveFilter(nextFilter);
+      }
       return true;
     } catch (error) {
       const alreadyAborted = controller.signal.aborted;
       controller.abort();
       if (requestId !== archiveRequestRef.current || alreadyAborted || isAbortError(error)) return false;
+      if (!append) archiveIntentRef.current = {
+        days: archiveDaysRef.current,
+        filter: archiveFilterRef.current,
+      };
       setArchiveError("证据历史加载失败，请稍后重试。");
       return false;
     } finally {
@@ -187,6 +221,55 @@ export function EvidenceCenter() {
         setArchiveLoading(false);
       }
     }
+  }, []);
+
+  const openEvent = useCallback(async (
+    eventId: string,
+    trigger?: HTMLButtonElement | null,
+    history = false,
+    failureMessage = "证据详情加载失败，请稍后重试。",
+  ) => {
+    const requestId = ++detailRequestRef.current;
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
+    triggerRef.current = trigger || null;
+    setFocusHistory(history);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      const nextDetail = await api.evidenceEvent(eventId, controller.signal);
+      if (requestId !== detailRequestRef.current || controller.signal.aborted) return;
+      setDetail(nextDetail);
+    } catch (error) {
+      if (requestId !== detailRequestRef.current || controller.signal.aborted || isAbortError(error)) return;
+      setNotice(failureMessage);
+    } finally {
+      if (requestId === detailRequestRef.current) {
+        detailAbortRef.current = null;
+        setDetailLoading(false);
+      }
+    }
+  }, []);
+
+  const openArchivedEvent = useCallback((event: EvidenceArchiveEvent, trigger?: HTMLButtonElement | null) => {
+    detailRequestRef.current += 1;
+    detailAbortRef.current?.abort();
+    detailAbortRef.current = null;
+    triggerRef.current = trigger || null;
+    setFocusHistory(false);
+    setDetailLoading(false);
+    setDetail(event);
+  }, []);
+
+  const closeEvent = useCallback(() => {
+    detailRequestRef.current += 1;
+    detailAbortRef.current?.abort();
+    detailAbortRef.current = null;
+    setDetail(null);
+    setDetailLoading(false);
+    setFocusHistory(false);
+    triggerRef.current?.focus();
   }, []);
 
   useEffect(() => { void loadSnapshot(filterRef.current, null, "证据快照加载失败，请确认本地后端可用后重试。", true); }, [loadSnapshot]);
@@ -198,13 +281,14 @@ export function EvidenceCenter() {
     pipelineAbortRef.current?.abort();
     archiveRequestRef.current += 1;
     archiveAbortRef.current?.abort();
+    detailRequestRef.current += 1;
+    detailAbortRef.current?.abort();
   }, []);
   useEffect(() => {
     const eventId = new URLSearchParams(window.location.search).get("event_id");
     if (!eventId) return;
-    setDetailLoading(true);
-    api.evidenceEvent(eventId).then(setDetail).catch(() => setNotice("指定证据事件不存在或尚未完成核验。" )).finally(() => setDetailLoading(false));
-  }, []);
+    void openEvent(eventId, null, false, "指定证据事件不存在或尚未完成核验。");
+  }, [openEvent]);
 
   const visibleEvents = useMemo(() => [...events].sort((left, right) => {
     if (sort === "status") return statusPriority[left.verification_status] - statusPriority[right.verification_status] || right.verified_at.localeCompare(left.verified_at);
@@ -215,25 +299,21 @@ export function EvidenceCenter() {
   const total = summary?.counts ? Object.values(summary.counts).reduce((sum, value) => sum + value, 0) : 0;
   const coverage = summary?.loaded && summary.admitted_count != null && total > 0 ? `${Math.round(summary.admitted_count / total * 100)}%` : "—";
 
-  const openEvent = async (eventId: string, trigger?: HTMLButtonElement | null, history = false) => {
-    triggerRef.current = trigger || null; setFocusHistory(history); setDetail(null); setDetailLoading(true);
-    try { setDetail(await api.evidenceEvent(eventId)); } catch { setNotice("证据详情加载失败，请稍后重试。" ); setDetailLoading(false); return; }
-    setDetailLoading(false);
-  };
-  const openArchivedEvent = (event: EvidenceArchiveEvent, trigger?: HTMLButtonElement | null) => {
-    triggerRef.current = trigger || null;
-    setFocusHistory(false);
-    setDetailLoading(false);
-    setDetail(event);
-  };
-  const closeEvent = () => { setDetail(null); setDetailLoading(false); setFocusHistory(false); triggerRef.current?.focus(); };
   const changeFilter = async (next: Filter) => {
     if (next === filterRef.current && !error) return;
     await loadSnapshot(next, null, "证据列表筛选失败，请稍后重试。", true);
   };
   const changeArchiveQuery = async (nextDays: EvidenceHistoryDays, nextFilter: Filter) => {
-    if (nextDays === archiveDaysRef.current && nextFilter === archiveFilterRef.current && !archiveError) return;
+    const pending = archiveIntentRef.current;
+    if (nextDays === pending.days && nextFilter === pending.filter && !archiveError) return;
+    archiveIntentRef.current = { days: nextDays, filter: nextFilter };
     await loadHistory(nextDays, nextFilter);
+  };
+  const loadMoreHistory = async () => {
+    if (!archiveNextCursor || archiveLoading) return;
+    const committed = { days: archiveDaysRef.current, filter: archiveFilterRef.current };
+    archiveIntentRef.current = committed;
+    await loadHistory(committed.days, committed.filter, archiveNextCursor);
   };
   const refresh = async () => {
     if (refreshInFlightRef.current || refreshing) return;
@@ -243,11 +323,37 @@ export function EvidenceCenter() {
     const controller = new AbortController();
     pipelineAbortRef.current = controller;
     let loadedEvidenceSnapshotId: string | null = null;
+    let durableReloadId: string | null = null;
+    let durableReload: Promise<SnapshotLoadResult> | null = null;
+    const scheduleDurableReload = (snapshotId: string): Promise<SnapshotLoadResult> => {
+      if (loadedEvidenceSnapshotId === snapshotId) {
+        return Promise.resolve({ loaded: true, snapshotId });
+      }
+      if (durableReload && durableReloadId === snapshotId) return durableReload;
+      durableReloadId = snapshotId;
+      const pending = loadSnapshot(filterRef.current, snapshotId).then((result) => {
+        if (pipelineCycle === pipelineCycleRef.current
+          && result.loaded
+          && result.snapshotId === snapshotId) {
+          loadedEvidenceSnapshotId = snapshotId;
+          const intent = archiveIntentRef.current;
+          void loadHistory(intent.days, intent.filter);
+        }
+        return result;
+      }).finally(() => {
+        if (durableReload === pending) {
+          durableReload = null;
+          durableReloadId = null;
+        }
+      });
+      durableReload = pending;
+      return pending;
+    };
     setRefreshing(true); setNotice(null); setPipelineStatus(null);
     try {
       const terminal = await runNewsPipelineRefresh({
         signal: controller.signal,
-        onStatus: async (next) => {
+        onStatus: (next) => {
           if (pipelineCycle !== pipelineCycleRef.current) return;
           setPipelineStatus(next);
           const evidenceDurable = next.phase === "evidence_saved" || next.phase === "trusted_published";
@@ -255,27 +361,16 @@ export function EvidenceCenter() {
           const durableEvidenceId = next.evidence_snapshot_id;
           if ((evidenceDurable || terminalFailure) && durableEvidenceId !== null
             && loadedEvidenceSnapshotId !== durableEvidenceId) {
-            const result = await loadSnapshot(
-              filterRef.current,
-              durableEvidenceId,
-            );
-            if (result.loaded && result.snapshotId === durableEvidenceId) {
-              loadedEvidenceSnapshotId = durableEvidenceId;
-              await loadHistory(archiveDaysRef.current, archiveFilterRef.current);
-            }
+            void scheduleDurableReload(durableEvidenceId);
           }
         },
       });
       if (!terminal || pipelineCycle !== pipelineCycleRef.current) return;
       if (terminal.evidence_snapshot_id !== null
         && loadedEvidenceSnapshotId !== terminal.evidence_snapshot_id) {
-        const result = await loadSnapshot(
-          filterRef.current,
-          terminal.evidence_snapshot_id,
-        );
-        if (result.loaded && result.snapshotId === terminal.evidence_snapshot_id) {
-          loadedEvidenceSnapshotId = terminal.evidence_snapshot_id;
-          await loadHistory(archiveDaysRef.current, archiveFilterRef.current);
+        const result = await scheduleDurableReload(terminal.evidence_snapshot_id);
+        if (!result.loaded || result.snapshotId !== terminal.evidence_snapshot_id) {
+          await scheduleDurableReload(terminal.evidence_snapshot_id);
         }
       }
       if (terminal.phase === "trusted_published") {
@@ -320,11 +415,11 @@ export function EvidenceCenter() {
     {tab === "verification" && <section aria-label="证据历史" aria-busy={archiveLoading} className="mt-5 rounded-2xl border border-border/60 bg-gradient-to-b from-slate-950/35 to-background/45 p-4 sm:p-5">
       <div className="flex flex-col gap-3 border-b border-border/45 pb-4 lg:flex-row lg:items-end lg:justify-between">
         <div><p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-primary">Evidence archive</p><h2 className="mt-1 text-lg font-semibold">证据历史</h2><p className="mt-1 max-w-2xl text-xs text-muted-foreground">当前核验概览与历史记录分别计数；历史状态按归档事实显示，不代表已进入可信资讯流。</p></div>
-        <p className="text-sm font-medium">历史记录：{archiveLoaded ? archiveTotal : "—"}</p>
+        <div className="text-sm font-medium lg:text-right"><p>历史记录：{archiveLoaded ? archiveTotal : "—"}</p><p className="mt-1 text-xs font-normal text-muted-foreground">已加载：{archiveLoaded ? archiveEvents.length : "—"}</p></div>
       </div>
       <div className="mt-4 grid gap-3 lg:grid-cols-[auto_minmax(0,1fr)]">
-        <div role="group" aria-label="历史时间范围" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5">{historyDays.map((days) => <button key={days} type="button" aria-pressed={archiveDays === days} onClick={() => void changeArchiveQuery(days, archiveFilterRef.current)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveDays === days ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{days}天</button>)}</div>
-        <div role="group" aria-label="历史核验状态" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5 lg:justify-end">{filters.map((item) => <button key={item.value} type="button" aria-label={`历史筛选：${item.label}`} aria-pressed={archiveFilter === item.value} onClick={() => void changeArchiveQuery(archiveDaysRef.current, item.value)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveFilter === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}</div>
+        <div role="group" aria-label="历史时间范围" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5">{historyDays.map((days) => <button key={days} type="button" aria-pressed={archiveDays === days} onClick={() => void changeArchiveQuery(days, archiveIntentRef.current.filter)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveDays === days ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{days}天</button>)}</div>
+        <div role="group" aria-label="历史核验状态" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5 lg:justify-end">{filters.map((item) => <button key={item.value} type="button" aria-label={`历史筛选：${item.label}`} aria-pressed={archiveFilter === item.value} onClick={() => void changeArchiveQuery(archiveIntentRef.current.days, item.value)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveFilter === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}</div>
       </div>
       {archiveError && <p role="alert" className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{archiveError} {archiveLoaded && "继续显示上次成功查询。"}</p>}
       {archiveLoading && <p className="mt-3 text-xs text-muted-foreground"><Loader2 aria-hidden="true" className="mr-1.5 inline h-3.5 w-3.5 animate-spin" /><span>正在载入证据历史…</span>{archiveLoaded && <span> 继续显示最近一次成功查询。</span>}</p>}
@@ -334,6 +429,7 @@ export function EvidenceCenter() {
         <div className="mt-3 grid gap-1 rounded-lg bg-muted/15 p-3 text-[11px] text-muted-foreground sm:grid-cols-2"><p>证据快照 {shortArchiveId(event.evidence_snapshot_id)}</p><p>原始快照 {shortArchiveId(event.raw_snapshot_id)}</p><p>快照沿革：{event.snapshot_history.length}</p><p>{recovery ? recoveryStatusLabel(recovery.status) : "原生归档"}</p></div>
         <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border/45 pt-3"><p className="text-xs text-muted-foreground">一手证据：{event.primary_evidence.length} · 独立来源：{event.independent_evidence.length} · 转载来源：{event.syndicated_copies.length} · 冲突来源：{event.contradicting_evidence.length}</p><button type="button" onClick={(buttonEvent) => openArchivedEvent(event, buttonEvent.currentTarget)} aria-label={`查看历史证据 ${event.title}`} className="rounded-lg border border-primary/45 px-3 py-1.5 text-xs font-medium text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">查看历史证据</button></div>
       </article>; })}</div>
+      {archiveNextCursor && <div className="mt-4 flex justify-center"><button type="button" aria-label="加载更多历史证据" onClick={() => void loadMoreHistory()} disabled={archiveLoading} className="rounded-lg border border-primary/45 px-4 py-2 text-xs font-medium text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50">{archiveLoading ? "正在加载…" : "加载更多"}</button></div>}
       {archiveLoaded && !archiveLoading && archiveEvents.length === 0 && <p className="mt-4 rounded-xl border border-border/60 p-6 text-center text-sm text-muted-foreground">所选时间和状态下暂无历史证据。</p>}
     </section>}
 

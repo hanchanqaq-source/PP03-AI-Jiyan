@@ -150,6 +150,15 @@ export interface EvidenceArchiveProvenance {
 export interface EvidenceArchiveQuery {
   days: EvidenceHistoryDays;
   verification_status?: VerificationStatus;
+  limit: number;
+  cursor?: string;
+}
+
+export interface EvidenceArchivePage {
+  limit: number;
+  returned: number;
+  has_more: boolean;
+  next_cursor: string | null;
 }
 
 export interface EvidenceArchiveList {
@@ -161,4 +170,5 @@ export interface EvidenceArchiveList {
   };
   diagnostics: EvidenceArchiveDiagnostics;
   provenance: EvidenceArchiveProvenance[];
+  page: EvidenceArchivePage;
 }

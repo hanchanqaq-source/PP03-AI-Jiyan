@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,63 @@ from evidence_verification.storage import snapshot_document
 
 client = TestClient(app_module.app)
 NOW = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+
+
+def _cursor_document(**overrides) -> str:
+    document = {
+        "v": 1,
+        "days": 90,
+        "verification_status": None,
+        "limit": 2,
+        "event_time": "2026-08-20T09:00:00+00:00",
+        "verified_at": "2026-08-20T09:00:00+00:00",
+        "event_id": "legacy event 2",
+    }
+    document.update(overrides)
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _duplicate_key_cursor() -> str:
+    payload = base64.urlsafe_b64decode(_cursor_document() + "==").decode("utf-8")
+    duplicated = payload.replace('"v":1,', '"v":1,"v":1,', 1).encode("utf-8")
+    return base64.urlsafe_b64encode(duplicated).decode("ascii").rstrip("=")
+
+
+def _api_row(event_id: str, *, minute: int, status: str = "verified", padding_lineages: int = 0):
+    timestamp = (NOW - timedelta(minutes=minute)).isoformat()
+    history = [{
+        "evidence_snapshot_id": f"snapshot {event_id} {index}",
+        "raw_snapshot_id": f"raw {event_id} {index}",
+        "generated_at": timestamp,
+        "content_digest": f"{index % 16:x}" * 64,
+        "raw_input_digest": f"{(index + 1) % 16:x}" * 64,
+    } for index in range(max(1, padding_lineages))]
+    return {
+        "event_id": event_id,
+        "published_at": timestamp,
+        "verified_at": timestamp,
+        "verification_status": status,
+        "evidence_snapshot_id": history[-1]["evidence_snapshot_id"],
+        "raw_snapshot_id": history[-1]["raw_snapshot_id"],
+        "snapshot_history": history,
+    }
+
+
+class _ArchiveRows:
+    def __init__(self, rows):
+        self.rows = rows
+        self.last_diagnostics = {
+            "scanned_files": 1,
+            "skipped_files": 0,
+            "scanned_rows": len(rows),
+            "skipped_corrupt_rows": 0,
+            "duplicate_rows": 0,
+        }
+
+    def query(self, days, status=None):
+        del days, status
+        return list(self.rows)
 
 
 def event(
@@ -302,3 +360,141 @@ def test_archive_api_exposes_every_recovered_lineage_and_merged_cache_source(tmp
         "evidence_current+radar_cache",
         "legacy_snapshot",
     }
+
+
+def test_archive_api_keeps_the_legacy_unpaged_response_shape_exact(monkeypatch):
+    rows = [_api_row("legacy event 1", minute=1)]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+
+    response = client.get("/api/news/archive?days=90")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert set(data) == {"events", "total", "filters", "diagnostics", "provenance"}
+    assert data["events"] == rows
+    assert data["total"] == 1
+
+
+def test_archive_api_paginates_more_than_one_bucket_limit_without_loss_or_duplicates(monkeypatch):
+    rows = [_api_row(f"legacy event {index:05d}", minute=index) for index in range(4_097)]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+
+    cursor = None
+    received = []
+    while True:
+        suffix = "" if cursor is None else f"&cursor={cursor}"
+        response = client.get(f"/api/news/archive?days=90&limit=100{suffix}")
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["total"] == 4_097
+        assert data["filters"] == {"days": 90, "verification_status": None}
+        assert len(data["provenance"]) == len(data["events"])
+        assert data["page"]["returned"] == len(data["events"])
+        received.extend(row["event_id"] for row in data["events"])
+        cursor = data["page"]["next_cursor"]
+        assert data["page"]["has_more"] is (cursor is not None)
+        if cursor is None:
+            break
+
+    assert received == [row["event_id"] for row in rows]
+    assert len(received) == len(set(received)) == 4_097
+
+
+def test_archive_cursor_uses_python_codepoint_keyset_order_for_opaque_ids(monkeypatch):
+    timestamp = NOW.isoformat()
+    rows = [
+        _api_row("Z opaque", minute=0),
+        _api_row("a opaque", minute=0),
+        _api_row("_ opaque", minute=0),
+        _api_row("- opaque", minute=0),
+    ]
+    for row in rows:
+        row["published_at"] = timestamp
+        row["verified_at"] = timestamp
+    rows.sort(key=lambda row: (timestamp, timestamp, row["event_id"]), reverse=True)
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+
+    first = client.get("/api/news/archive?days=90&limit=2")
+    assert first.status_code == 200
+    first_data = first.json()["data"]
+    second = client.get(
+        "/api/news/archive",
+        params={"days": 90, "limit": 2, "cursor": first_data["page"]["next_cursor"]},
+    )
+
+    assert second.status_code == 200
+    combined = first_data["events"] + second.json()["data"]["events"]
+    assert [row["event_id"] for row in combined] == [row["event_id"] for row in rows]
+
+
+def test_archive_cursor_is_bound_to_days_status_and_limit(monkeypatch):
+    rows = [_api_row(f"legacy event {index}", minute=index) for index in range(3)]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+    first = client.get("/api/news/archive?days=90&verification_status=verified&limit=2")
+    assert first.status_code == 200
+    cursor = first.json()["data"]["page"]["next_cursor"]
+
+    assert client.get("/api/news/archive", params={"days": 30, "verification_status": "verified", "limit": 2, "cursor": cursor}).status_code == 422
+    assert client.get("/api/news/archive", params={"days": 90, "verification_status": "disproved", "limit": 2, "cursor": cursor}).status_code == 422
+    assert client.get("/api/news/archive", params={"days": 90, "verification_status": "verified", "limit": 3, "cursor": cursor}).status_code == 422
+
+
+def test_archive_cursor_rejects_missing_limit_unknown_keys_noncanonical_base64_and_non_utc(monkeypatch):
+    # Keep the valid cursor anchor present so a malformed parser cannot pass this
+    # matrix merely because pagination later rejects an unknown keyset anchor.
+    monkeypatch.setattr(
+        "news_pipeline.api.EvidenceArchive",
+        lambda: _ArchiveRows([_api_row("legacy event 2", minute=24 * 60)]),
+    )
+    cases = [
+        ("/api/news/archive", {"days": 90, "cursor": _cursor_document()}),
+        ("/api/news/archive", {"days": 90, "limit": 2, "cursor": _cursor_document(extra="unknown")}),
+        ("/api/news/archive", {"days": 90, "limit": 2, "cursor": _cursor_document() + "="}),
+        ("/api/news/archive", {"days": 90, "limit": 2, "cursor": _cursor_document(event_time="2026-08-20T17:00:00+08:00")}),
+        ("/api/news/archive", {"days": 90, "limit": 2, "cursor": _duplicate_key_cursor()}),
+        ("/api/news/archive", {"days": 90, "limit": 2, "cursor": "not!base64"}),
+    ]
+
+    for path, params in cases:
+        response = client.get(path, params=params)
+        assert response.status_code == 422
+        assert "unknown" not in response.text
+
+
+def test_archive_page_applies_three_mib_budget_before_adding_the_next_row(monkeypatch):
+    # A long but row-bounded lineage makes event + repeated provenance material
+    # large enough that two rows exceed the public page budget while either row fits.
+    rows = [_api_row(f"large event {index}", minute=index, padding_lineages=3_500) for index in range(2)]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+
+    first = client.get("/api/news/archive?days=90&limit=100")
+
+    assert first.status_code == 200
+    data = first.json()["data"]
+    assert len(first.content) <= 3 * 1_048_576
+    assert data["page"]["returned"] == 1
+    assert data["page"]["has_more"] is True
+    assert data["page"]["next_cursor"]
+
+
+def test_archive_page_rejects_a_single_projection_that_exceeds_the_budget_without_details(monkeypatch):
+    row = _api_row("oversized internal row", minute=0)
+    row["snapshot_history"] = [{"private": "x" * (3 * 1_048_576)}]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows([row]))
+
+    response = client.get("/api/news/archive?days=90&limit=1")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "资讯历史暂时不可用"}
+    assert "private" not in response.text
+
+
+def test_archive_api_fails_closed_when_filtered_storage_returns_another_status(monkeypatch):
+    rows = [_api_row("wrong filtered row", minute=1, status="corrected")]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+
+    response = client.get("/api/news/archive?days=90&verification_status=disproved&limit=100")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "资讯历史暂时不可用"}
+    assert "wrong filtered row" not in response.text
