@@ -629,7 +629,8 @@ def test_archive_rejects_naive_times_before_mutation_and_keeps_unknown_temp(tmp_
     with pytest.raises(ValueError, match="timezone"):
         archive.upsert(invalid)
 
-    assert archive.count() == 0
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.count()
     assert unknown_temp.read_text(encoding="utf-8") == "user-owned"
 
 
@@ -8112,7 +8113,7 @@ def test_archive_rebinds_every_canonical_candidate_beside_first_native_mutation(
     assert archive.query(days=90) == before_rows
 
 
-def test_archive_query_cleans_real_crash_owned_temp_before_enforcing_normal_entry_cap(
+def test_archive_query_preserves_real_crash_temp_while_enforcing_normal_entry_cap(
     tmp_path,
 ):
     archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
@@ -8133,10 +8134,233 @@ def test_archive_query_cleans_real_crash_owned_temp_before_enforcing_normal_entr
     assert process.exitcode == 73
     owned_temps = list(archive.archive_root.glob(".state.json.*.tmp"))
     assert len(owned_temps) == 1
+    crash_bytes = owned_temps[0].read_bytes()
     assert len(list(archive.archive_root.iterdir())) == archive_module._MAX_ARCHIVE_DIRECTORY_ENTRIES + 1
     assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
-    assert not owned_temps[0].exists()
+    assert owned_temps[0].read_bytes() == crash_bytes
     assert archive.journal_path.read_bytes() == foreign_journal
+
+
+def test_archive_four_real_crash_temps_remain_usable_and_fifth_fails_closed(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    context = multiprocessing.get_context("spawn")
+    residuals: dict[Path, bytes] = {}
+
+    for crash_number in range(1, archive_module._MAX_TEMP_ARTIFACT_FILES + 1):
+        process = context.Process(
+            target=_crash_after_archive_temp_fsync,
+            args=(str(archive.root),),
+        )
+        process.start()
+        process.join(30)
+        assert process.exitcode == 73
+        current = sorted(archive.archive_root.glob(".state.json.*.tmp"))
+        assert len(current) == crash_number
+        residuals = {path: path.read_bytes() for path in current}
+        assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+        assert {path: path.read_bytes() for path in residuals} == residuals
+
+    fifth = context.Process(
+        target=_crash_after_archive_temp_fsync,
+        args=(str(archive.root),),
+    )
+    fifth.start()
+    fifth.join(30)
+    assert fifth.exitcode == 73
+    all_residuals = {
+        path: path.read_bytes()
+        for path in archive.archive_root.glob(".state.json.*.tmp")
+    }
+    assert len(all_residuals) == archive_module._MAX_TEMP_ARTIFACT_FILES + 1
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert {path: path.read_bytes() for path in all_residuals} == all_residuals
+
+
+@pytest.mark.parametrize("operation", ("query", "get", "count", "upsert"))
+def test_archive_public_operations_preserve_exact_named_single_link_foreign_temp(
+    tmp_path,
+    operation,
+):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    foreign_temp = archive.archive_root / ".state.json.abcdefgh.tmp"
+    foreign_bytes = b"foreign-exact-name-must-survive"
+    foreign_temp.write_bytes(foreign_bytes)
+
+    if operation == "query":
+        assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    elif operation == "get":
+        assert archive.get("a" * 20)["event_id"] == "a" * 20
+    elif operation == "count":
+        assert archive.count() == 1
+    else:
+        archive.upsert(snapshot(
+            event("b" * 20),
+            snapshot_id="1" * 20,
+            raw_snapshot_id="2" * 20,
+        ))
+        assert {row["event_id"] for row in archive.query(days=90)} == {
+            "a" * 20,
+            "b" * 20,
+        }
+
+    assert foreign_temp.read_bytes() == foreign_bytes
+
+
+@pytest.mark.parametrize("temp_count", (1, 2, 3, 4))
+def test_archive_ignores_and_preserves_up_to_four_safe_temp_artifacts(tmp_path, temp_count):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    temp_names = (
+        ".state.json.abcdefgh.tmp",
+        ".index.json.bcdefghi.tmp",
+        ".2026-08-20.jsonl.cdefghij.tmp",
+        ".2026-08-19.jsonl.defghijk.tmp",
+    )
+    artifacts: dict[Path, bytes] = {}
+    for index, name in enumerate(temp_names[:temp_count]):
+        path = archive.archive_root / name
+        payload = f"foreign-{index}".encode("ascii")
+        path.write_bytes(payload)
+        artifacts[path] = payload
+
+    state_before = archive.state_path.read_bytes()
+    index_before = archive.index_path.read_bytes()
+    buckets_before = {
+        path.name: path.read_bytes()
+        for path in archive.archive_root.glob("*.jsonl")
+    }
+
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert archive.state_path.read_bytes() == state_before
+    assert archive.index_path.read_bytes() == index_before
+    assert {
+        path.name: path.read_bytes()
+        for path in archive.archive_root.glob("*.jsonl")
+    } == buckets_before
+    assert {path: path.read_bytes() for path in artifacts} == artifacts
+
+
+def test_archive_four_safe_temp_artifacts_use_only_bounded_directory_headroom(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
+    foreign_journal = b'{"schema_version":4,"owner":"foreign"}\n'
+    archive.journal_path.write_bytes(foreign_journal)
+    temp_names = (
+        ".state.json.abcdefgh.tmp",
+        ".index.json.bcdefghi.tmp",
+        ".2026-08-20.jsonl.cdefghij.tmp",
+        ".2026-08-19.jsonl.defghijk.tmp",
+    )
+    artifacts = {
+        archive.archive_root / name: f"foreign-{index}".encode("ascii")
+        for index, name in enumerate(temp_names)
+    }
+    for path, payload in artifacts.items():
+        path.write_bytes(payload)
+    authority_before = {
+        "state": archive.state_path.read_bytes(),
+        "index": archive.index_path.read_bytes(),
+        "buckets": {
+            path.name: path.read_bytes()
+            for path in archive.archive_root.glob("*.jsonl")
+        },
+    }
+
+    assert len(list(archive.archive_root.iterdir())) == archive_module._MAX_ARCHIVE_DIRECTORY_SCAN_ENTRIES
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert archive.state_path.read_bytes() == authority_before["state"]
+    assert archive.index_path.read_bytes() == authority_before["index"]
+    assert {
+        path.name: path.read_bytes()
+        for path in archive.archive_root.glob("*.jsonl")
+    } == authority_before["buckets"]
+    assert {path: path.read_bytes() for path in artifacts} == artifacts
+
+    archive.upsert(snapshot(
+        event("b" * 20),
+        snapshot_id="1" * 20,
+        raw_snapshot_id="2" * 20,
+    ))
+    assert {row["event_id"] for row in archive.query(days=90)} == {
+        "a" * 20,
+        "b" * 20,
+    }
+    assert {path: path.read_bytes() for path in artifacts} == artifacts
+
+
+@pytest.mark.parametrize("operation", ("query", "upsert"))
+def test_archive_fifth_safe_temp_artifact_fails_closed_without_deletion(tmp_path, operation):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    temp_names = (
+        ".state.json.abcdefgh.tmp",
+        ".index.json.bcdefghi.tmp",
+        ".2026-08-20.jsonl.cdefghij.tmp",
+        ".2026-08-19.jsonl.defghijk.tmp",
+        ".state.json.efghijkl.tmp",
+    )
+    artifacts = {}
+    for index, name in enumerate(temp_names):
+        path = archive.archive_root / name
+        payload = f"foreign-{index}".encode("ascii")
+        path.write_bytes(payload)
+        artifacts[path] = payload
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        if operation == "query":
+            archive.query(days=90)
+        else:
+            archive.upsert(snapshot(
+                event("b" * 20),
+                snapshot_id="1" * 20,
+                raw_snapshot_id="2" * 20,
+            ))
+
+    assert {path: path.read_bytes() for path in artifacts} == artifacts
+
+
+def test_archive_unknown_temp_name_fails_closed_without_deletion_below_capacity(tmp_path):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    archive.upsert(snapshot(event("a" * 20)))
+    unknown_temp = archive.archive_root / ".state.json.foreign.tmp"
+    unknown_bytes = b"foreign-unknown-name-must-survive"
+    unknown_temp.write_bytes(unknown_bytes)
+
+    with pytest.raises(OSError, match="storage_corrupt"):
+        archive.query(days=90)
+
+    assert unknown_temp.read_bytes() == unknown_bytes
+
+
+def test_archive_caught_atomic_failure_preserves_created_temp_artifact(tmp_path, monkeypatch):
+    archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
+    real_replace = archive_module._replace_durable
+
+    def fail_state(_source: Path, destination: Path) -> None:
+        if destination == archive.state_path:
+            raise OSError("simulated state write failure")
+        real_replace(_source, destination)
+
+    monkeypatch.setattr(archive_module, "_replace_durable", fail_state)
+
+    with pytest.raises(OSError, match="storage_error"):
+        archive.upsert(snapshot(event("a" * 20)))
+
+    residuals = list(archive.archive_root.glob(".state.json.*.tmp"))
+    assert len(residuals) == 1
+    residual_bytes = residuals[0].read_bytes()
+    assert residual_bytes
+
+    monkeypatch.setattr(archive_module, "_replace_durable", real_replace)
+    archive.upsert(snapshot(event("a" * 20)))
+    assert [row["event_id"] for row in archive.query(days=90)] == ["a" * 20]
+    assert residuals[0].read_bytes() == residual_bytes
 
 
 def test_archive_unknown_temp_over_normal_entry_cap_fails_closed_without_deletion(tmp_path):
@@ -8154,7 +8378,14 @@ def test_archive_unknown_temp_over_normal_entry_cap_fails_closed_without_deletio
     assert unknown_temp.read_bytes() == unknown_bytes
 
 
-def test_archive_owned_looking_hardlinked_temp_fails_closed_without_deletion(tmp_path):
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "hardlink",
+        pytest.param("symlink", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX symlink case")),
+    ),
+)
+def test_archive_unsafe_owned_looking_temp_fails_closed_without_deletion(tmp_path, kind):
     archive = EvidenceArchive(tmp_path / "store", now=lambda: NOW)
     archive.upsert(snapshot(event("a" * 20)))
     _fill_safe_canonical_bucket_capacity(archive, archive_module._MAX_ARCHIVE_FILES)
@@ -8163,14 +8394,17 @@ def test_archive_owned_looking_hardlinked_temp_fails_closed_without_deletion(tmp
     outside_bytes = b"foreign-hardlink-must-survive"
     outside.write_bytes(outside_bytes)
     owned_looking = archive.archive_root / ".state.json.abcdefgh.tmp"
-    os.link(outside, owned_looking)
+    _install_unsafe_bucket_entry(owned_looking, outside, kind)
 
     with pytest.raises(OSError, match="storage_corrupt"):
         archive.query(days=90)
 
     assert owned_looking.read_bytes() == outside_bytes
     assert outside.read_bytes() == outside_bytes
-    assert owned_looking.stat().st_nlink == 2
+    if kind == "hardlink":
+        assert owned_looking.stat().st_nlink == 2
+    else:
+        assert owned_looking.is_symlink()
 
 
 @pytest.mark.parametrize("schema_version", (2, 3))
