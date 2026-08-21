@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat as stat_module
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +14,7 @@ from cache_io_lock import CACHE_IO_LOCK
 
 DEFAULT_MAX_BYTES = 500 * 1024 * 1024
 DEFAULT_LOG_MAX_BYTES = 50 * 1024 * 1024
+MAX_EVIDENCE_ARCHIVE_ENTRIES = 1_024
 RETENTION_AFTER_EXPIRY = {
     "stock_quotes": timedelta(days=1),
     "fund_30d": timedelta(days=30),
@@ -27,7 +29,16 @@ CAPABILITY_CATEGORY = {
     "industry_allocation": "fund_180d",
     "stock_industry_classification": "fund_180d",
 }
-CATEGORY_ORDER = ("temporary", "translations", "source_health", "stock_quotes", "fund_30d", "fund_180d", "logs")
+CATEGORY_ORDER = (
+    "temporary",
+    "translations",
+    "source_health",
+    "evidence_archive",
+    "stock_quotes",
+    "fund_30d",
+    "fund_180d",
+    "logs",
+)
 
 
 def _aware(value: datetime) -> datetime:
@@ -43,6 +54,37 @@ def _parse_time(value: object) -> datetime | None:
 
 def _empty_category() -> dict[str, int]:
     return {"bytes": 0, "file_count": 0, "expired_count": 0, "reclaimable_bytes": 0, "pinned_count": 0}
+
+
+def _directory_chain_signature(path: Path) -> tuple[tuple[object, ...], ...] | None:
+    parts = Path(os.path.abspath(path)).parts
+    if not parts:
+        return None
+    cursor = Path(parts[0])
+    chain: list[tuple[object, ...]] = []
+    for component in (None, *parts[1:]):
+        if component is not None:
+            cursor /= component
+        try:
+            metadata = cursor.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat_module.S_ISDIR(metadata.st_mode) or getattr(metadata, "st_reparse_tag", 0):
+            return None
+        chain.append((
+            os.path.normcase(str(cursor)),
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            getattr(metadata, "st_reparse_tag", 0),
+        ))
+    return tuple(chain)
+
+
+def _safe_directory_chain(path: Path) -> bool:
+    return _directory_chain_signature(path) is not None
 
 
 class CacheManager:
@@ -63,6 +105,7 @@ class CacheManager:
         self.state_file = self.data_dir / "cache" / "cleanup-state.json"
         self.source_health_root = self.data_dir / "source-health"
         self.source_health_history_root = self.source_health_root / "history"
+        self.evidence_archive_root = self.data_dir / "evidence-verification" / "v1" / "archive"
         self.acceptance_root = Path(
             acceptance_root or os.environ.get("VR_ACCEPTANCE_DIR") or repo_root / ".tmp" / "acceptance"
         )
@@ -274,12 +317,91 @@ class CacheManager:
                 "mtime_ns": stat.st_mtime_ns,
             })
 
+    @staticmethod
+    def _file_signature(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_nlink,
+            metadata.st_mode,
+            getattr(metadata, "st_reparse_tag", 0),
+        )
+
+    def _scan_evidence_archive(self, categories: dict[str, dict[str, int]], candidates: list[dict]) -> None:
+        root = self.evidence_archive_root
+        category = categories["evidence_archive"]
+        cutoff = _aware(self._now()).date() - timedelta(days=90)
+        chain_before = _directory_chain_signature(root)
+        if chain_before is None:
+            return
+        discovered = _empty_category()
+        discovered_candidates: list[dict[str, Any]] = []
+        try:
+            with os.scandir(root) as entries:
+                observed = 0
+                for entry in entries:
+                    observed += 1
+                    if observed > MAX_EVIDENCE_ARCHIVE_ENTRIES:
+                        return
+                    path = root / entry.name
+                    try:
+                        # On Windows, ``DirEntry.stat`` may report ``st_nlink``
+                        # as zero even when a direct path/fd stat reports the
+                        # owned file's real single-link identity.
+                        metadata = path.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if (
+                        not stat_module.S_ISREG(metadata.st_mode)
+                        or getattr(metadata, "st_reparse_tag", 0)
+                        or metadata.st_nlink != 1
+                    ):
+                        continue
+                    discovered["bytes"] += metadata.st_size
+                    discovered["file_count"] += 1
+                    if not entry.name.endswith(".jsonl"):
+                        continue
+                    try:
+                        observed_date = datetime.strptime(entry.name[:-6], "%Y-%m-%d").date()
+                    except ValueError:
+                        continue
+                    if entry.name != f"{observed_date.isoformat()}.jsonl" or observed_date >= cutoff:
+                        continue
+                    discovered["expired_count"] += 1
+                    discovered["reclaimable_bytes"] += metadata.st_size
+                    discovered_candidates.append({
+                        "kind": "file",
+                        "category": "evidence_archive",
+                        "path": path,
+                        "root": root,
+                        "size": metadata.st_size,
+                        "time": datetime.combine(
+                            observed_date,
+                            datetime.min.time(),
+                            tzinfo=timezone.utc,
+                        ).timestamp(),
+                        "mtime_ns": metadata.st_mtime_ns,
+                        "signature": self._file_signature(metadata),
+                    })
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            return
+        chain_after = _directory_chain_signature(root)
+        if chain_after is None or chain_before != chain_after:
+            return
+        for key, value in discovered.items():
+            category[key] += value
+        candidates.extend(discovered_candidates)
+
     def _scan(self) -> tuple[dict[str, Any], list[dict]]:
         categories = {name: _empty_category() for name in (*CATEGORY_ORDER, "unclassified_fund")}
         candidates: list[dict] = []
         self._scan_fund_files(categories, candidates)
         self._scan_translations(categories, candidates)
         self._scan_source_health(categories, candidates)
+        self._scan_evidence_archive(categories, candidates)
         self._scan_owned_files(self.acceptance_root, "temporary", timedelta(days=7), categories, candidates)
         self._scan_owned_files(self.logs_root, "logs", timedelta(days=14), categories, candidates)
         total_bytes = sum(row["bytes"] for row in categories.values())
@@ -323,12 +445,36 @@ class CacheManager:
 
     def _file_candidate_still_expired(self, candidate: dict[str, Any]) -> bool:
         path = candidate["path"]
+        evidence_archive_candidate = candidate.get("category") == "evidence_archive"
+        if evidence_archive_candidate and (
+            candidate.get("root") != self.evidence_archive_root
+            or path.parent != self.evidence_archive_root
+            or not _safe_directory_chain(self.evidence_archive_root)
+        ):
+            return False
         try:
-            stat = path.stat()
+            stat = path.stat(follow_symlinks=False)
         except (FileNotFoundError, OSError):
             return False
         if stat.st_size != candidate.get("size") or stat.st_mtime_ns != candidate.get("mtime_ns"):
             return False
+        if evidence_archive_candidate:
+            if (
+                not stat_module.S_ISREG(stat.st_mode)
+                or getattr(stat, "st_reparse_tag", 0)
+                or stat.st_nlink != 1
+                or self._file_signature(stat) != candidate.get("signature")
+                or not path.name.endswith(".jsonl")
+            ):
+                return False
+            try:
+                observed_date = datetime.strptime(path.name[:-6], "%Y-%m-%d").date()
+            except ValueError:
+                return False
+            return bool(
+                path.name == f"{observed_date.isoformat()}.jsonl"
+                and observed_date < _aware(self._now()).date() - timedelta(days=90)
+            )
         if candidate.get("category") == "source_health":
             if candidate.get("root") != self.source_health_history_root or path.parent != self.source_health_history_root:
                 return False
