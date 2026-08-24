@@ -28,7 +28,10 @@ from evidence_verification.models import (
     StatusTransition,
     VerificationStatus,
 )
+from evidence_verification.service import EvidenceVerificationService
+from evidence_verification.storage import EvidenceStorage
 from evidence_verification.verifier import verify_event
+from news_intelligence.models import NewsSourceItem
 
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
@@ -164,6 +167,86 @@ def _causal_recovery_snapshots(
             generated_at=disproved_at,
         ),
     )
+
+
+def test_service_archives_field_only_evidence_without_upgrading_core_claim(tmp_path):
+    def source(name: str, host: str, title: str, summary: str) -> NewsSourceItem:
+        return NewsSourceItem(
+            source_name=name,
+            source_url=f"https://{host}/feed",
+            original_url=f"https://{host}/article",
+            published_at=NOW,
+            fetched_at=NOW,
+            title=title,
+            summary=summary,
+            language="zh-CN",
+            region="CN",
+            track_key="semi",
+            track_name="半导体",
+            category="company",
+            normalized_title=title,
+            tokens=frozenset(title),
+            anchors=frozenset({"项目"}),
+            related_tags=(("semiconductor", "半导体"),),
+            text_related_tags=(("semiconductor", "半导体"),),
+            source_domain=host,
+            data_status="cache",
+        )
+
+    sources = [
+        source(
+            "Core publisher",
+            "core-news.com",
+            "星河科技建设算力中心进度达50%",
+            "项目进度达50%",
+        ),
+        source(
+            "Field publisher",
+            "field-news.com",
+            "行业统计项目进度达50%",
+            "完成率为50%",
+        ),
+    ]
+    selected = SimpleNamespace(
+        event_id="field-closure-event1",
+        title=sources[0].title,
+        summary=sources[0].summary,
+        category="company",
+        published_at_first=NOW,
+        published_at_latest=NOW,
+        related_tags=[{"id": "semiconductor", "name": "半导体"}],
+        sources=sources,
+    )
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    archive = EvidenceArchive(storage.root, now=lambda: NOW)
+    service = EvidenceVerificationService(
+        storage=storage,
+        archive=archive,
+        event_loader=lambda: [selected],
+        now=lambda: NOW,
+    )
+
+    refreshed = service.refresh()
+    verified = refreshed.events[0]
+    archived = archive.get(selected.event_id)
+    percentage = next(row for row in archived["key_fields"] if row["field_name"] == "percentage")
+    available = {
+        row["evidence_id"]
+        for collection_name in (
+            "primary_evidence",
+            "independent_evidence",
+            "syndicated_copies",
+            "contradicting_evidence",
+        )
+        for row in archived[collection_name]
+    }
+
+    assert verified.verification_status == VerificationStatus.UNVERIFIED
+    assert archived["verification_status"] == "unverified"
+    assert percentage["verification_status"] == "corroborated"
+    assert len(percentage["evidence_ids"]) == 2
+    assert set(percentage["evidence_ids"]) <= available
+    assert storage.load_current() == refreshed
 
 
 @pytest.mark.parametrize("failed_write", (1, 2, 3, 4, 5))

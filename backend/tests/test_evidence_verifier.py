@@ -12,11 +12,16 @@ from evidence_verification.verifier import verify_event
 NOW = datetime(2026, 8, 18, 16, 0, tzinfo=timezone.utc)
 
 
-def event(event_id: str = "a" * 20):
+def event(
+    event_id: str = "a" * 20,
+    *,
+    title: str = "星河科技公告建设算力中心",
+    summary: str = "星河科技将建设算力中心。",
+):
     return SimpleNamespace(
         event_id=event_id,
-        title="星河科技公告建设算力中心",
-        summary="星河科技将建设算力中心。",
+        title=title,
+        summary=summary,
         category="company",
         published_at_first=NOW,
         published_at_latest=NOW,
@@ -118,3 +123,61 @@ def test_same_status_and_reason_is_idempotent():
     )
 
     assert second.status_history == first.status_history
+
+
+@pytest.mark.parametrize(
+    "items",
+    (
+        [
+            evidence(
+                "core-support",
+                host="core.example",
+                title="星河科技建设算力中心进度达50%",
+                excerpt="项目进度达50%",
+            ),
+            evidence(
+                "field-only",
+                host="field.example",
+                title="行业统计项目进度达50%",
+                excerpt="完成率为50%",
+            ),
+        ],
+        [
+            evidence(
+                "field-one",
+                host="field-one.example",
+                title="行业统计项目进度达50%",
+                excerpt="完成率为50%",
+            ),
+            evidence(
+                "field-two",
+                host="field-two.example",
+                title="区域工程完成率50%",
+                excerpt="统计值为50%",
+            ),
+        ],
+    ),
+)
+def test_field_corroboration_does_not_upgrade_the_core_claim(items):
+    candidate = event(
+        title="星河科技建设算力中心进度达50%",
+        summary="项目进度达50%。",
+    )
+
+    result = verify_event(candidate, items, previous=None, now=NOW)
+    percentage = next(row for row in result.key_fields if row.field_name == "percentage")
+    available = {
+        row.evidence_id
+        for collection in (
+            result.primary_evidence,
+            result.independent_evidence,
+            result.syndicated_copies,
+            result.contradicting_evidence,
+        )
+        for row in collection
+    }
+
+    assert result.verification_status == VerificationStatus.UNVERIFIED
+    assert percentage.verification_status.value == "corroborated"
+    assert len(percentage.evidence_ids) == 2
+    assert set(percentage.evidence_ids) <= available

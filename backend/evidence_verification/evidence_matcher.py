@@ -66,7 +66,7 @@ def match_evidence(core_claim: str, fields: tuple[KeyField, ...] | list[KeyField
     official_denial = any(item.is_official and _DENIAL_RE.search(blob_by_item[item.evidence_id]) for item in representatives)
     supporting = [item for item in representatives if item.supports_claim]
     primary = [item for item in representatives if item.is_official]
-    independent = [item for item in supporting if not item.is_official]
+    independent_supporting = [item for item in supporting if not item.is_official]
     field_values = _evidence_field_values(representatives)
     has_conflict = any(len(values) > 1 for values in field_values.values())
     contradicting_ids: set[str] = set()
@@ -106,8 +106,19 @@ def match_evidence(core_claim: str, fields: tuple[KeyField, ...] | list[KeyField
             ))
         else:
             updated_fields.append(field)
+    field_evidence_ids = {
+        evidence_id
+        for field in updated_fields
+        for evidence_id in field.evidence_ids
+    }
+    independent = [
+        item
+        for item in representatives
+        if not item.is_official
+        and (item.supports_claim or item.evidence_id in field_evidence_ids)
+    ]
     official_support = any(item.is_official and item.supports_claim for item in representatives)
-    independent_origins = {item.origin_cluster for item in independent}
+    independent_origins = {item.origin_cluster for item in independent_supporting}
     return MatchResult(
         key_fields=tuple(updated_fields),
         primary_evidence=tuple(primary),
