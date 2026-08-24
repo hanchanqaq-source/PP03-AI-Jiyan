@@ -1,0 +1,606 @@
+{
+  "schema": "pp03-a2-w1-task8-evidence-manifest-v1",
+  "generated_at": "2026-08-25T02:20:27.831+08:00",
+  "verdict": "PASS_DUAL_EVIDENCE",
+  "interpretation": "One historical Live discovery plus fixed-HEAD frozen-raw offline replay and fixed-HEAD no-Live browser regression; this is not a second Live 25/25 run.",
+  "branch": "codex/pp03-a2-multi-source-provider-hub",
+  "heads": {
+    "original_live_observation": "32d618651945ae82108b9701402993e99ba465e4",
+    "matcher_fix": "4a045a191c9c9ff7462a95e6f8844d7645c204b7",
+    "storage_and_fixed_browser": "d70b0b22c81427452c77cd217f7aa6e0af2c924b",
+    "formal_evidence_commit": "SELF",
+    "formal_evidence_commit_status": "Git commits cannot self-reference their own SHA; Task 9 records the actual formal evidence commit SHA."
+  },
+  "tools": {
+    "playwright": "1.62.1",
+    "chromium": "151.0.7922.34",
+    "chromium_revision": "1234",
+    "browser_use_used": false,
+    "computer_use_used": false,
+    "user_browser_profile_used": false,
+    "installed_browser_family": "chromium_only",
+    "installed_runtime_components": [
+      "chromium-1234",
+      "chromium_headless_shell-1234",
+      "ffmpeg-1011",
+      "winldd-1007"
+    ]
+  },
+  "urls": {
+    "frontend": "http://127.0.0.1:5899",
+    "backend_api": "http://127.0.0.1:8900/api",
+    "pages": [
+      "http://127.0.0.1:5899/evidence-center",
+      "http://127.0.0.1:5899/market-news"
+    ]
+  },
+  "original_live_discovery": {
+    "status": "NON_PASS",
+    "head": "32d618651945ae82108b9701402993e99ba465e4",
+    "result_path": ".tmp/acceptance/a2-w1/playwright/results/acceptance-full.json",
+    "result_sha256": "2cca4802549158d983274ee6f89d4f19321e85934be28776b2917eb70e697ed8",
+    "script_scenario_summary": {
+      "pass": 25,
+      "fail": 0,
+      "skip": 0,
+      "encoded": 25,
+      "accepted_as_overall_success": false
+    },
+    "run_id": "23556432f3d54c4399c524b5a6ddc47f",
+    "raw_snapshot_id": "d3a684c0c0354e8b89a7ab6da2de5809",
+    "raw_snapshot_sha256": "a252e5e0e3b740601e355ecac73d4b53b9bf9301eb52dc7e536651782f7abf86",
+    "duration_ms": 9341,
+    "production_market_news_refresh_post_count": 1,
+    "source_status": {
+      "registered": 108,
+      "ok": 103,
+      "failed": 5,
+      "raw_event_count": 499,
+      "failures": [
+        {
+          "source": "arXiv cs.AI",
+          "error_type": "tls",
+          "reason": "来源 TLS 连接失败"
+        },
+        {
+          "source": "国际能源网",
+          "error_type": "connection",
+          "reason": "来源连接失败"
+        },
+        {
+          "source": "36氪",
+          "error_type": "rss_parse",
+          "reason": "来源 RSS / XML 解析失败"
+        },
+        {
+          "source": "虎嗅",
+          "error_type": "tls",
+          "reason": "来源 TLS 连接失败"
+        },
+        {
+          "source": "动点科技",
+          "error_type": "http_status",
+          "reason": "来源返回 HTTP 403"
+        }
+      ]
+    },
+    "terminal": {
+      "phase": "failed",
+      "raw_event_count": 499,
+      "verified_count": 27,
+      "corroborated_count": 1,
+      "pending_count": 457,
+      "conflicting_count": 14,
+      "failed_source_count": 5,
+      "admitted_count": 28,
+      "evidence_snapshot_id": "b949fe3f902d563d30dd",
+      "trusted_snapshot_id": null,
+      "displayed_trusted_snapshot_id": "a2acceptdisplayraw001",
+      "compatibility_error": "evidence_compatibility_failed",
+      "redacted_error": "evidence_compatibility_failed"
+    },
+    "second_live_run_performed": false
+  },
+  "offline_replay_run_05": {
+    "status": "PASS",
+    "head": "d70b0b22c81427452c77cd217f7aa6e0af2c924b",
+    "result_path": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/offline-replay-run-05/result.json",
+    "result_sha256": "1d339d296a3cc3bf13797cf419cfce6f1b20ba2ad85ed15ffee0719a96d4207a",
+    "copied_raw_sha256": "a252e5e0e3b740601e355ecac73d4b53b9bf9301eb52dc7e536651782f7abf86",
+    "raw_shape": {
+      "items": 499,
+      "source_statuses": 108,
+      "failed_source_count": 5
+    },
+    "fresh": {
+      "run_id": "task8fixedfresh0001",
+      "phase": "trusted_published",
+      "archive_before": 0,
+      "archive_after": 499
+    },
+    "seeded": {
+      "run_id": "task8fixedseeded001",
+      "phase": "trusted_published",
+      "archive_before": 4,
+      "archive_after": 503
+    },
+    "identity_and_counts": {
+      "raw_snapshot_id": "d3a684c0c0354e8b89a7ab6da2de5809",
+      "evidence_snapshot_id": "b949fe3f902d563d30dd",
+      "trusted_snapshot_id": "d3a684c0c0354e8b89a7ab6da2de5809",
+      "raw_event_count": 499,
+      "verified_count": 27,
+      "corroborated_count": 1,
+      "pending_count": 457,
+      "conflicting_count": 14,
+      "trusted_event_count": 28,
+      "compatibility_error": null,
+      "redacted_error": null
+    },
+    "semantic_target": {
+      "event_id": "86029352f47b95f93493",
+      "event_status": "unverified",
+      "percentage_status": "corroborated",
+      "cnbc_evidence_id": "50016b0a55efb0206e8556c3",
+      "cnbc_supports_claim": false,
+      "reference_closure_failure_count": 0
+    },
+    "transport": {
+      "frozen_radar_fetch_count_per_replay": 1,
+      "document_fetch_attempt_count": 0,
+      "external_transport_attempt_count": 0
+    },
+    "archive_retry_minor": {
+      "first_to_second_changed_event_ids": [
+        "d2234d0020191a1251ef"
+      ],
+      "changed_top_level_keys": [
+        "content_digest",
+        "independent_evidence"
+      ],
+      "raw_input_digest_changed_event_count": 0,
+      "status_changed_event_count": 0,
+      "history_changed_event_count": 0,
+      "lineage_changed_event_count": 0,
+      "second_to_third_event_documents_stable": true,
+      "second_to_third_event_index_bucket_byte_stable": true,
+      "second_to_third_state_generation_only": true,
+      "full_byte_idempotent": false
+    }
+  },
+  "browser_run_01": {
+    "status": "FAIL",
+    "head": "d70b0b22c81427452c77cd217f7aa6e0af2c924b",
+    "result_path": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/browser-run-01/results/acceptance-fixed-head-offline.json",
+    "result_sha256": "bbdf2c40e366b05ce34a24763712ec32d04a0ef633d641dc462efa85ac84644b",
+    "summary": {
+      "pass": 23,
+      "fail": 2,
+      "skip": 0,
+      "encoded": 25
+    },
+    "failed_scenarios": [
+      18,
+      16
+    ],
+    "terminal_phase": "failed",
+    "terminal_compatibility_error": "evidence_compatibility_failed",
+    "diagnostic_path": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/browser-publisher-diagnostic-02/result.json",
+    "diagnostic_sha256": "04b932eb3dcd1233d0c9c218c30c910d840f053c38c3922d24b2af226cba1676",
+    "diagnostic_exception": "OSError: storage_corrupt",
+    "root_cause": "Acceptance seed archive authority was about 93m25s later than the frozen verifier clock and was correctly rejected by temporal validation; scenario 16 also selected an unscoped native region.",
+    "harness_fix": "Seed at VERIFY_TIME minus 5 minutes and scope injected status/terminal assertions to their explicit roots.",
+    "production_change_for_run_01_root_cause": false,
+    "formal_screenshots_copied": false
+  },
+  "browser_seed_preflight_v2": {
+    "status": "PASS",
+    "path": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/browser-run-02/preflight-result-v2.json",
+    "sha256": "e58ef5dc4ae3bdae5dbbec1457e7e8f6b2465123812afb6553bb540a31e350a1",
+    "bytes": 1569,
+    "archive_before": 4,
+    "archive_after": 503,
+    "current_bytes": 872368,
+    "current_sha256": "7320f562b1d22bebe2d6bfe95f404224018e9a1698bddd7218272b02a10ce09a",
+    "object_equal": false,
+    "canonical_document_equal": true,
+    "canonicalized_event_count": 35,
+    "canonicalized_fields": [
+      "summary",
+      "title"
+    ],
+    "document_fetch_count": 0
+  },
+  "browser_run_02": {
+    "status": "PASS",
+    "head": "d70b0b22c81427452c77cd217f7aa6e0af2c924b",
+    "run_id": "task8fixedbrowser001",
+    "result_path": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/browser-run-02/results/acceptance-fixed-head-offline.json",
+    "result_sha256": "2c78ea3f5880eb1e539e45fa05ea88f22a5c6d9a0e9f77719e6b18b2dcd23585",
+    "result_bytes": 90483,
+    "summary": {
+      "pass": 25,
+      "fail": 0,
+      "skip": 0,
+      "encoded": 25,
+      "exit_code": 0
+    },
+    "pipeline": {
+      "phases": [
+        "fetching",
+        "raw_saved",
+        "verifying",
+        "evidence_saved",
+        "trusted_published"
+      ],
+      "duration_ms": 6402,
+      "raw_snapshot_id": "d3a684c0c0354e8b89a7ab6da2de5809",
+      "evidence_snapshot_id": "b949fe3f902d563d30dd",
+      "trusted_snapshot_id": "d3a684c0c0354e8b89a7ab6da2de5809",
+      "raw_event_count": 499,
+      "verified_count": 27,
+      "corroborated_count": 1,
+      "pending_count": 457,
+      "conflicting_count": 14,
+      "corrected_count": 0,
+      "disproved_count": 0,
+      "failed_source_count": 5,
+      "admitted_count": 28,
+      "compatibility_error": null,
+      "redacted_error": null
+    },
+    "guard": {
+      "path": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/browser-run-02/backend-guard.json",
+      "sha256": "91581c7e0f47f879a1239ea6dca790a5d53ba9ea417bae3050628101640fd7a3",
+      "production_market_news_refresh_post_count": 0,
+      "other_production_refresh_post_count": 0,
+      "provider_collection_attempt_count": 0,
+      "document_fetch_attempt_count": 0,
+      "external_transport_attempt_count": 0,
+      "offline_start_count": 1,
+      "offline_release_count": 1,
+      "verifier_entry_count": 1,
+      "frozen_radar_fetch_count": 1,
+      "evidence_publisher_error": null,
+      "launcher_error": null
+    },
+    "observability": {
+      "request_count": 438,
+      "bad_response_count": 0,
+      "console_error_count": 0,
+      "console_warning_count": 0,
+      "console_other_count": 15,
+      "pageerror_count": 0,
+      "requestfailed_count": 6,
+      "blocking_requestfailed_count": 0,
+      "requestfailed": [
+        {
+          "method": "GET",
+          "url": "http://127.0.0.1:5899/api/evidence/summary",
+          "reason": "net::ERR_ABORTED",
+          "blocking": false
+        },
+        {
+          "method": "GET",
+          "url": "http://127.0.0.1:5899/api/evidence/events?days=7",
+          "reason": "net::ERR_ABORTED",
+          "blocking": false
+        },
+        {
+          "method": "GET",
+          "url": "http://127.0.0.1:5899/api/news/archive?days=7&limit=100",
+          "reason": "net::ERR_ABORTED",
+          "blocking": false
+        },
+        {
+          "method": "GET",
+          "url": "http://127.0.0.1:5899/api/market-news/events?mode=my_focus&category=all&days=7&sort=importance&tag_id=storage",
+          "reason": "net::ERR_ABORTED",
+          "blocking": false
+        },
+        {
+          "method": "GET",
+          "url": "http://127.0.0.1:5899/api/market-news/events?mode=my_focus&category=all&days=7&sort=importance&tag_id=artificial-intelligence",
+          "reason": "net::ERR_ABORTED",
+          "blocking": false
+        },
+        {
+          "method": "GET",
+          "url": "http://127.0.0.1:5899/api/market-news/events?mode=my_focus&category=all&days=7&sort=importance&tag_id=artificial-intelligence",
+          "reason": "net::ERR_ABORTED",
+          "blocking": false
+        }
+      ],
+      "external_ui_assets": [
+        {
+          "method": "GET",
+          "url": "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap",
+          "resource_type": "stylesheet"
+        },
+        {
+          "method": "GET",
+          "url": "https://fonts.gstatic.com/s/inter/v20/UcC73FwrK3iLTeHuS_nVMrMxCp50SjIa1ZL7.woff2",
+          "resource_type": "font"
+        }
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": 1,
+      "name": "Complete Catalog is visible with no funds",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "147 families, 150 adapters, 30 capabilities, 108 news sources, fund_count 0"
+    },
+    {
+      "id": 2,
+      "name": "All 108 registered news sources are visible with no funds",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "108 news sources, 108 news families, 108 feed adapters"
+    },
+    {
+      "id": 3,
+      "name": "Adding an isolated test fund does not change source registration",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Registration counts and fingerprint unchanged"
+    },
+    {
+      "id": 4,
+      "name": "Adding the fund changes only isolated holdings state",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Isolated holding count delta 1; registration unchanged"
+    },
+    {
+      "id": 5,
+      "name": "Eastmoney renders as one source family",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "eastmoney family with three adapters"
+    },
+    {
+      "id": 6,
+      "name": "Eastmoney adapters and capabilities expand",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Three adapters and six direct capabilities"
+    },
+    {
+      "id": 7,
+      "name": "One failed Eastmoney capability yields partial degradation",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "partial_degraded family with successful search and failed stock_snapshot"
+    },
+    {
+      "id": 8,
+      "name": "Configured reference remains visible for a failed capability",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Failed stock_snapshot retains https://fund.eastmoney.com/"
+    },
+    {
+      "id": 9,
+      "name": "BaoStock is an independent family",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "baostock family is independently evidence eligible"
+    },
+    {
+      "id": 10,
+      "name": "SEC, World Bank and OECD show free formal actual states",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "SEC unconfigured_contact, World Bank success, OECD http_client_error"
+    },
+    {
+      "id": 11,
+      "name": "FRED, EIA and Tushare show unconfigured without keys",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "All three credential_configured false and unconfigured"
+    },
+    {
+      "id": 12,
+      "name": "Alpha Vantage, Finnhub and Twelve Data avoid permanent quota claims",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Quota text defers to actual account plan, quota or credits"
+    },
+    {
+      "id": 13,
+      "name": "Nasdaq Data Link distinguishes public and Premium datasets",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Premium requires explicit account entitlement"
+    },
+    {
+      "id": 14,
+      "name": "Enterprise rows display license-required",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Nine license-required families including Bloomberg, LSEG, FactSet and Wind"
+    },
+    {
+      "id": 15,
+      "name": "Free-only mode records zero paid transports",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Fourteen paid or enterprise rows; paid transport count 0"
+    },
+    {
+      "id": 16,
+      "name": "Refresh displays raw, verified and pending counts separately",
+      "status": "PASS",
+      "evidence_layer": "offline_replay_run_05_and_browser_run_02",
+      "historical_live_supplement_only": true,
+      "evidence": "trusted_published; 499 raw, 27 verified, 1 corroborated, 457 pending, 14 conflicting, 28 admitted"
+    },
+    {
+      "id": 17,
+      "name": "Positive raw with zero admission shows explicit pending-evidence copy",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Repository NewsPipelineStatus renders one raw, zero admitted and Evidence Center guidance"
+    },
+    {
+      "id": 18,
+      "name": "Previous trusted content remains visible during verification",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02_pausing_gate",
+      "historical_live_supplement_only": true,
+      "evidence": "a2acceptdisplayraw001 remains visible while verifying, then switches to frozen raw after release"
+    },
+    {
+      "id": 19,
+      "name": "30-day archive returns eligible events",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Three eligible events"
+    },
+    {
+      "id": 20,
+      "name": "90-day archive returns eligible events",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Four eligible events including disproved history"
+    },
+    {
+      "id": 21,
+      "name": "Corrected, conflicting and disproved history remains visible",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02",
+      "evidence": "Each state has snapshot_history 2 and status_history 2"
+    },
+    {
+      "id": 22,
+      "name": "Console error count is zero",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02_whole_run",
+      "evidence": "console error count 0"
+    },
+    {
+      "id": 23,
+      "name": "Console warning count is zero",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02_whole_run",
+      "evidence": "console warning count 0"
+    },
+    {
+      "id": 24,
+      "name": "Pageerror count is zero",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02_whole_run",
+      "evidence": "pageerror count 0"
+    },
+    {
+      "id": 25,
+      "name": "Every failed request has a reason and none is page-blocking",
+      "status": "PASS",
+      "evidence_layer": "browser_run_02_whole_run",
+      "evidence": "Six loopback GET net::ERR_ABORTED rows, all blocking false"
+    }
+  ],
+  "screenshots": [
+    {
+      "path": "docs/screenshots/a2-w1/01-catalog-eastmoney.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 209961,
+      "sha256": "68625522b1c12a00b4dd40fe25013292361b023a6cab076c54c362499eec9f09"
+    },
+    {
+      "path": "docs/screenshots/a2-w1/02-enterprise-license.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 240112,
+      "sha256": "35c7e5106935ce5550b09df31218fb3fa447a7bc1c12079bca199e00396fa6df"
+    },
+    {
+      "path": "docs/screenshots/a2-w1/03-archive-30d.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 256027,
+      "sha256": "c515aac5efe969771a4edc80ac88a1b6b1f3132df406981c1276164fc6606a92"
+    },
+    {
+      "path": "docs/screenshots/a2-w1/04-archive-90d-history.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 262656,
+      "sha256": "8d5178d61be4b6b0cb940740363de3c5c0a6fc25109a598c2d841dbf2e21d044"
+    },
+    {
+      "path": "docs/screenshots/a2-w1/05-news-pending.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 136390,
+      "sha256": "ea11863d14287eecd12403cdf4a9cfe5e9c953e3e44589307c28ee1b9b5e3d5a"
+    },
+    {
+      "path": "docs/screenshots/a2-w1/06-news-verifying-offline.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 371671,
+      "sha256": "fddce192fc56284cec1ef96cb0f0251879c60dccf7bcaf541297029bdf3e969b"
+    },
+    {
+      "path": "docs/screenshots/a2-w1/07-news-terminal-offline.png",
+      "source_run": "browser-run-02",
+      "width": 1440,
+      "height": 1100,
+      "bytes": 511975,
+      "sha256": "9d4a7a9d87d35cb695657a4464e93b651540a27abf72305ce07e2ad4be334c86"
+    }
+  ],
+  "fixture_gate": {
+    "command": "rg -n \"evidenceFixtures|prototype\" frontend/src/features/evidence-center frontend/src/pages/MarketNews.tsx",
+    "rg_exit": 1,
+    "raw_stdout": "",
+    "raw_stderr": "",
+    "match_count": 0,
+    "production_import_present": false,
+    "files_deleted": [],
+    "status": "ALREADY_SATISFIED_NO_CHANGE"
+  },
+  "isolation": {
+    "temporary_root": ".tmp/acceptance/a2-w1/playwright",
+    "browser_run_root": ".tmp/acceptance/a2-w1/playwright/fixed-head-4a045a1/browser-run-02",
+    "vr_data_dir_isolated": true,
+    "vr_news_cache_dir_isolated": true,
+    "vr_acceptance_dir_isolated": true,
+    "npm_cache_isolated": true,
+    "browser_binaries_isolated": true,
+    "profile_isolated": true,
+    "results_logs_raw_screenshots_isolated": true,
+    "credential_like_environment_cleared": true,
+    "paid_test_authorization_set": false,
+    "playwright_route_mock_or_request_interception_used": false,
+    "production_code_modified_by_acceptance_harness": false,
+    "frozen_radar_collection_injected_via_existing_radar_fetcher_di": true,
+    "production_provider_collection_called": false,
+    "user_holding_amount_cost_note_account_or_credential_read": false
+  },
+  "package_integrity": {
+    "frontend_package_json_sha256": "18ccc9e061716c75c5787bf7d2a3307e2d427f81a8074ffc72055e896ad1426f",
+    "frontend_package_lock_json_sha256": "3b5d77fe477432ea6d4ac2d33b098942c64eb5b4b71c373bd71dbe03b5c356ef",
+    "frontend_package_and_lock_diff_count": 0
+  },
+  "service_cleanup_checkpoint": {
+    "owned_processes_remaining": 0,
+    "run_02_chromium_processes_remaining": 0,
+    "port_8900_listeners": 0,
+    "port_5899_listeners": 0,
+    "temporary_evidence_retained_for_independent_review": false,
+    "final_temporary_cleanup_performed": true
+  }
+}
