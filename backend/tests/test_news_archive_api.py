@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -25,10 +26,11 @@ NOW = datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
 
 def _cursor_document(**overrides) -> str:
     document = {
-        "v": 1,
+        "v": 2,
         "days": 90,
         "verification_status": None,
         "limit": 2,
+        "query_version": "0" * 64,
         "event_time": "2026-08-20T09:00:00+00:00",
         "verified_at": "2026-08-20T09:00:00+00:00",
         "event_id": "legacy event 2",
@@ -40,7 +42,7 @@ def _cursor_document(**overrides) -> str:
 
 def _duplicate_key_cursor() -> str:
     payload = base64.urlsafe_b64decode(_cursor_document() + "==").decode("utf-8")
-    duplicated = payload.replace('"v":1,', '"v":1,"v":1,', 1).encode("utf-8")
+    duplicated = payload.replace('"v":2,', '"v":2,"v":2,', 1).encode("utf-8")
     return base64.urlsafe_b64encode(duplicated).decode("ascii").rstrip("=")
 
 
@@ -78,6 +80,21 @@ class _ArchiveRows:
     def query(self, days, status=None):
         del days, status
         return list(self.rows)
+
+
+class _ArchiveSequence:
+    def __init__(self, snapshots, diagnostics=None):
+        self.snapshots = snapshots
+        self.diagnostics = diagnostics
+        self.index = 0
+
+    def __call__(self):
+        selected = min(self.index, len(self.snapshots) - 1)
+        archive = _ArchiveRows(copy.deepcopy(self.snapshots[selected]))
+        if self.diagnostics is not None:
+            archive.last_diagnostics = dict(self.diagnostics[selected])
+        self.index += 1
+        return archive
 
 
 def event(
@@ -381,6 +398,7 @@ def test_archive_api_paginates_more_than_one_bucket_limit_without_loss_or_duplic
 
     cursor = None
     received = []
+    query_version = None
     while True:
         suffix = "" if cursor is None else f"&cursor={cursor}"
         response = client.get(f"/api/news/archive?days=90&limit=100{suffix}")
@@ -390,6 +408,11 @@ def test_archive_api_paginates_more_than_one_bucket_limit_without_loss_or_duplic
         assert data["filters"] == {"days": 90, "verification_status": None}
         assert len(data["provenance"]) == len(data["events"])
         assert data["page"]["returned"] == len(data["events"])
+        assert set(data["page"]) == {"limit", "returned", "has_more", "next_cursor", "query_version"}
+        assert len(data["page"]["query_version"]) == 64
+        assert set(data["page"]["query_version"]) <= set("0123456789abcdef")
+        query_version = query_version or data["page"]["query_version"]
+        assert data["page"]["query_version"] == query_version
         received.extend(row["event_id"] for row in data["events"])
         cursor = data["page"]["next_cursor"]
         assert data["page"]["has_more"] is (cursor is not None)
@@ -437,6 +460,84 @@ def test_archive_cursor_is_bound_to_days_status_and_limit(monkeypatch):
     assert client.get("/api/news/archive", params={"days": 30, "verification_status": "verified", "limit": 2, "cursor": cursor}).status_code == 422
     assert client.get("/api/news/archive", params={"days": 90, "verification_status": "disproved", "limit": 2, "cursor": cursor}).status_code == 422
     assert client.get("/api/news/archive", params={"days": 90, "verification_status": "verified", "limit": 3, "cursor": cursor}).status_code == 422
+
+
+def test_archive_query_version_binds_filters_full_ordered_projection_and_diagnostics(monkeypatch):
+    rows = [_api_row(f"versioned event {index}", minute=index) for index in range(3)]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+
+    day_90 = client.get("/api/news/archive", params={"days": 90, "limit": 2})
+    day_30 = client.get("/api/news/archive", params={"days": 30, "limit": 2})
+
+    assert day_90.status_code == day_30.status_code == 200
+    assert day_90.json()["data"]["page"]["query_version"] != day_30.json()["data"]["page"]["query_version"]
+
+    changed = copy.deepcopy(rows)
+    changed[-1]["title"] = "same sort key, changed displayed fact"
+    factory = _ArchiveSequence([rows, changed])
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", factory)
+    first_page = client.get("/api/news/archive", params={"days": 90, "limit": 2})
+    response = client.get("/api/news/archive", params={
+        "days": 90,
+        "limit": 2,
+        "cursor": first_page.json()["data"]["page"]["next_cursor"],
+    })
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "资讯历史已变化，请重新加载"}
+    assert "changed displayed fact" not in response.text
+
+    baseline_diagnostics = _ArchiveRows(rows).last_diagnostics
+    changed_diagnostics = {**baseline_diagnostics, "skipped_files": 1}
+    factory = _ArchiveSequence([rows, rows], [baseline_diagnostics, changed_diagnostics])
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", factory)
+    first_page = client.get("/api/news/archive", params={"days": 90, "limit": 2})
+    response = client.get("/api/news/archive", params={
+        "days": 90,
+        "limit": 2,
+        "cursor": first_page.json()["data"]["page"]["next_cursor"],
+    })
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "资讯历史已变化，请重新加载"}
+
+
+def test_archive_query_version_rejects_inserted_or_deleted_rows_before_keyset_lookup(monkeypatch):
+    rows = [_api_row(f"mutation event {index}", minute=index) for index in range(3)]
+    mutations = [
+        [_api_row("inserted event", minute=-1), *copy.deepcopy(rows)],
+        [copy.deepcopy(rows[0]), copy.deepcopy(rows[2])],
+    ]
+    for mutated in mutations:
+        factory = _ArchiveSequence([rows, mutated])
+        monkeypatch.setattr("news_pipeline.api.EvidenceArchive", factory)
+        first = client.get("/api/news/archive", params={"days": 90, "limit": 2})
+        response = client.get("/api/news/archive", params={
+            "days": 90,
+            "limit": 2,
+            "cursor": first.json()["data"]["page"]["next_cursor"],
+        })
+
+        assert response.status_code == 409
+        assert response.json() == {"detail": "资讯历史已变化，请重新加载"}
+
+
+def test_archive_cursor_query_version_tampering_is_a_fixed_stale_error(monkeypatch):
+    rows = [_api_row(f"tamper event {index}", minute=index) for index in range(3)]
+    monkeypatch.setattr("news_pipeline.api.EvidenceArchive", lambda: _ArchiveRows(rows))
+    first = client.get("/api/news/archive", params={"days": 90, "limit": 2})
+    cursor = first.json()["data"]["page"]["next_cursor"]
+    payload = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+    document = json.loads(payload.decode("utf-8"))
+    document["v"] = 2
+    document["query_version"] = "0" * 64
+    tampered_payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    tampered = base64.urlsafe_b64encode(tampered_payload).decode("ascii").rstrip("=")
+
+    response = client.get("/api/news/archive", params={"days": 90, "limit": 2, "cursor": tampered})
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "资讯历史已变化，请重新加载"}
 
 
 def test_archive_cursor_rejects_missing_limit_unknown_keys_noncanonical_base64_and_non_utc(monkeypatch):

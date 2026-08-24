@@ -5,9 +5,9 @@ import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh 
 import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { SourceHealthSummary } from "@/features/source-health/SourceHealthSummary";
 import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWorkspace";
-import { api, isAbortError } from "@/lib/api";
+import { ApiError, api, isAbortError } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { EvidenceDrawer, STATUS_LABEL, StatusBadge } from "./EvidenceDrawer";
+import { archiveAuditId, EvidenceDrawer, neutralizeArchiveText, STATUS_LABEL, StatusBadge } from "./EvidenceDrawer";
 import type { EvidenceArchiveEvent, EvidenceArchiveList, EvidenceArchiveQuery, EvidenceEventDetail, EvidenceEventList, EvidenceEventQuery, EvidenceEventSummary, EvidenceHistoryDays, EvidenceSummaryData, VerificationStatus } from "./types";
 
 type Tab = "verification" | "health" | "corrections";
@@ -15,6 +15,8 @@ type Filter = "all" | VerificationStatus;
 type Sort = "latest" | "status" | "holding_relevance";
 type SnapshotLoadResult = { loaded: boolean; snapshotId: string | null };
 type ArchiveIntent = { days: EvidenceHistoryDays; filter: Filter };
+
+class ArchiveSnapshotChangedError extends Error {}
 
 const tabs: Array<{ value: Tab; label: string }> = [{ value: "verification", label: "资讯核验" }, { value: "health", label: "数据源健康" }, { value: "corrections", label: "更正记录" }];
 const filters: Array<{ value: Filter; label: string }> = [{ value: "all", label: "全部" }, ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value: value as VerificationStatus, label }))];
@@ -33,10 +35,6 @@ function snapshotLabel(snapshotId: string | null): string {
   return snapshotId.toLowerCase().startsWith("acceptance")
     ? "隔离验收快照"
     : `核验快照 ${snapshotId.slice(0, 8)}`;
-}
-
-function shortArchiveId(value: string): string {
-  return value.slice(0, 8);
 }
 
 function recoveryStatusLabel(status: "cache_recovered" | "public_refetched"): string {
@@ -70,6 +68,7 @@ export function EvidenceCenter() {
   const [archiveLoading, setArchiveLoading] = useState(true);
   const [archiveLoaded, setArchiveLoaded] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveReloadRequired, setArchiveReloadRequired] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const requestRef = useRef(0);
   const evidenceLoadAbortRef = useRef<AbortController | null>(null);
@@ -81,6 +80,8 @@ export function EvidenceCenter() {
   const archiveRequestRef = useRef(0);
   const archiveAbortRef = useRef<AbortController | null>(null);
   const archiveEventsRef = useRef<EvidenceArchiveEvent[]>([]);
+  const archiveTotalRef = useRef(0);
+  const archiveQueryVersionRef = useRef<string | null>(null);
   const archiveDaysRef = useRef<EvidenceHistoryDays>(7);
   const archiveFilterRef = useRef<Filter>("all");
   const archiveIntentRef = useRef<ArchiveIntent>({ days: 7, filter: "all" });
@@ -171,6 +172,7 @@ export function EvidenceCenter() {
     };
     setArchiveLoading(true);
     setArchiveError(null);
+    setArchiveReloadRequired(false);
     try {
       const result: EvidenceArchiveList = await api.newsArchive(query, controller.signal);
       if (requestId !== archiveRequestRef.current || controller.signal.aborted) return false;
@@ -178,7 +180,9 @@ export function EvidenceCenter() {
         || result.filters.verification_status !== (query.verification_status ?? null)
         || result.page.limit !== archivePageLimit
         || result.page.returned !== result.events.length
-        || result.total < result.events.length) {
+        || result.total < result.events.length
+        || result.page.has_more !== (result.page.next_cursor !== null)
+        || (result.page.has_more && (result.events.length === 0 || result.events.length >= result.total))) {
         throw new Error("archive response mismatch");
       }
       let nextEvents = result.events;
@@ -186,16 +190,30 @@ export function EvidenceCenter() {
         if (archiveDaysRef.current !== nextDays || archiveFilterRef.current !== nextFilter) {
           throw new Error("archive response mismatch");
         }
+        if (result.total !== archiveTotalRef.current
+          || archiveQueryVersionRef.current === null
+          || result.page.query_version !== archiveQueryVersionRef.current) {
+          throw new ArchiveSnapshotChangedError();
+        }
         const knownIds = new Set(archiveEventsRef.current.map((event) => event.event_id));
         if (result.events.some((event) => knownIds.has(event.event_id))) {
-          throw new Error("archive response mismatch");
+          throw new ArchiveSnapshotChangedError();
         }
         nextEvents = [...archiveEventsRef.current, ...result.events];
-        if (result.total < nextEvents.length) throw new Error("archive response mismatch");
+        if ((result.page.has_more && nextEvents.length >= archiveTotalRef.current)
+          || (!result.page.has_more && nextEvents.length !== archiveTotalRef.current)) {
+          throw new ArchiveSnapshotChangedError();
+        }
+      } else {
+        if (!result.page.has_more && result.events.length !== result.total) {
+          throw new Error("archive response mismatch");
+        }
+        archiveTotalRef.current = result.total;
+        archiveQueryVersionRef.current = result.page.query_version;
       }
       archiveEventsRef.current = nextEvents;
       setArchiveEvents(nextEvents);
-      setArchiveTotal(result.total);
+      if (!append) setArchiveTotal(result.total);
       setArchiveNextCursor(result.page.next_cursor);
       setArchiveLoaded(true);
       if (!append) {
@@ -209,6 +227,13 @@ export function EvidenceCenter() {
       const alreadyAborted = controller.signal.aborted;
       controller.abort();
       if (requestId !== archiveRequestRef.current || alreadyAborted || isAbortError(error)) return false;
+      if (error instanceof ArchiveSnapshotChangedError
+        || (error instanceof ApiError && error.status === 409)) {
+        setArchiveNextCursor(null);
+        setArchiveReloadRequired(true);
+        setArchiveError("证据历史已变化，已保留当前已加载记录；请重新加载历史证据。");
+        return false;
+      }
       if (!append) archiveIntentRef.current = {
         days: archiveDaysRef.current,
         filter: archiveFilterRef.current,
@@ -314,6 +339,11 @@ export function EvidenceCenter() {
     const committed = { days: archiveDaysRef.current, filter: archiveFilterRef.current };
     archiveIntentRef.current = committed;
     await loadHistory(committed.days, committed.filter, archiveNextCursor);
+  };
+  const reloadHistory = async () => {
+    const committed = { days: archiveDaysRef.current, filter: archiveFilterRef.current };
+    archiveIntentRef.current = committed;
+    await loadHistory(committed.days, committed.filter);
   };
   const refresh = async () => {
     if (refreshInFlightRef.current || refreshing) return;
@@ -421,13 +451,13 @@ export function EvidenceCenter() {
         <div role="group" aria-label="历史时间范围" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5">{historyDays.map((days) => <button key={days} type="button" aria-pressed={archiveDays === days} onClick={() => void changeArchiveQuery(days, archiveIntentRef.current.filter)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveDays === days ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{days}天</button>)}</div>
         <div role="group" aria-label="历史核验状态" className="flex flex-wrap gap-1 rounded-xl border border-border/55 bg-muted/10 p-1.5 lg:justify-end">{filters.map((item) => <button key={item.value} type="button" aria-label={`历史筛选：${item.label}`} aria-pressed={archiveFilter === item.value} onClick={() => void changeArchiveQuery(archiveIntentRef.current.days, item.value)} className={cn("rounded-lg px-2.5 py-1.5 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", archiveFilter === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}</div>
       </div>
-      {archiveError && <p role="alert" className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{archiveError} {archiveLoaded && "继续显示上次成功查询。"}</p>}
+      {archiveError && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"><span>{archiveError} {archiveLoaded && !archiveReloadRequired && "继续显示上次成功查询。"}</span>{archiveReloadRequired && <button type="button" aria-label="重新加载历史证据" onClick={() => void reloadHistory()} className="rounded-md border border-destructive/40 px-2.5 py-1 font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive">重新加载</button>}</div>}
       {archiveLoading && <p className="mt-3 text-xs text-muted-foreground"><Loader2 aria-hidden="true" className="mr-1.5 inline h-3.5 w-3.5 animate-spin" /><span>正在载入证据历史…</span>{archiveLoaded && <span> 继续显示最近一次成功查询。</span>}</p>}
-      <div className="mt-4 grid gap-3 xl:grid-cols-2">{archiveEvents.map((event) => { const recovery = latestRecovery(event); return <article key={`${event.event_id}-${event.evidence_snapshot_id}`} className="rounded-xl border border-border/60 bg-background/55 p-4">
-        <div className="flex flex-wrap items-start justify-between gap-2"><div><StatusBadge status={event.verification_status} /><h3 className="mt-2 font-semibold">{event.title}</h3></div><p className="text-xs text-muted-foreground">归档：{new Date(event.archived_at).toLocaleString("zh-CN", { hour12: false })}</p></div>
-        <p className="mt-3 text-sm">核心主张：{event.core_claim}</p><p className="mt-2 text-xs text-muted-foreground">{event.verification_reason}</p>
-        <div className="mt-3 grid gap-1 rounded-lg bg-muted/15 p-3 text-[11px] text-muted-foreground sm:grid-cols-2"><p>证据快照 {shortArchiveId(event.evidence_snapshot_id)}</p><p>原始快照 {shortArchiveId(event.raw_snapshot_id)}</p><p>快照沿革：{event.snapshot_history.length}</p><p>{recovery ? recoveryStatusLabel(recovery.status) : "原生归档"}</p></div>
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border/45 pt-3"><p className="text-xs text-muted-foreground">一手证据：{event.primary_evidence.length} · 独立来源：{event.independent_evidence.length} · 转载来源：{event.syndicated_copies.length} · 冲突来源：{event.contradicting_evidence.length}</p><button type="button" onClick={(buttonEvent) => openArchivedEvent(event, buttonEvent.currentTarget)} aria-label={`查看历史证据 ${event.title}`} className="rounded-lg border border-primary/45 px-3 py-1.5 text-xs font-medium text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">查看历史证据</button></div>
+      <div className="mt-4 grid gap-3 xl:grid-cols-2">{archiveEvents.map((event) => { const recovery = latestRecovery(event); const safeTitle = neutralizeArchiveText(event.title); return <article key={`${event.event_id}-${event.evidence_snapshot_id}`} className="rounded-xl border border-border/60 bg-background/55 p-4">
+        <div className="flex flex-wrap items-start justify-between gap-2"><div><StatusBadge status={event.verification_status} /><h3 className="mt-2 whitespace-pre-wrap font-semibold">{safeTitle}</h3></div><p className="text-xs text-muted-foreground">归档：{new Date(event.archived_at).toLocaleString("zh-CN", { hour12: false })}</p></div>
+        <p className="mt-3 whitespace-pre-wrap text-sm">核心主张：{neutralizeArchiveText(event.core_claim)}</p><p className="mt-2 whitespace-pre-wrap text-xs text-muted-foreground">{neutralizeArchiveText(event.verification_reason)}</p>
+        <div className="mt-3 grid gap-1 rounded-lg bg-muted/15 p-3 text-[11px] text-muted-foreground sm:grid-cols-2"><p>证据快照 {archiveAuditId(event.evidence_snapshot_id)}</p><p>原始快照 {archiveAuditId(event.raw_snapshot_id)}</p><p>快照沿革：{event.snapshot_history.length}</p><p>{recovery ? recoveryStatusLabel(recovery.status) : "原生归档"}</p></div>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border/45 pt-3"><p className="text-xs text-muted-foreground">一手证据：{event.primary_evidence.length} · 独立来源：{event.independent_evidence.length} · 转载来源：{event.syndicated_copies.length} · 冲突来源：{event.contradicting_evidence.length}</p><button type="button" onClick={(buttonEvent) => openArchivedEvent(event, buttonEvent.currentTarget)} aria-label={`查看历史证据 ${safeTitle}`} className="rounded-lg border border-primary/45 px-3 py-1.5 text-xs font-medium text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">查看历史证据</button></div>
       </article>; })}</div>
       {archiveNextCursor && <div className="mt-4 flex justify-center"><button type="button" aria-label="加载更多历史证据" onClick={() => void loadMoreHistory()} disabled={archiveLoading} className="rounded-lg border border-primary/45 px-4 py-2 text-xs font-medium text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50">{archiveLoading ? "正在加载…" : "加载更多"}</button></div>}
       {archiveLoaded && !archiveLoading && archiveEvents.length === 0 && <p className="mt-4 rounded-xl border border-border/60 p-6 text-center text-sm text-muted-foreground">所选时间和状态下暂无历史证据。</p>}

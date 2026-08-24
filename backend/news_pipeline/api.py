@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -25,9 +26,10 @@ ArchiveStatus = Literal[
 ]
 
 _ARCHIVE_CURSOR_KEYS = {
-    "v", "days", "verification_status", "limit", "event_time", "verified_at", "event_id",
+    "v", "days", "verification_status", "limit", "query_version", "event_time", "verified_at", "event_id",
 }
 _ARCHIVE_CURSOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_ARCHIVE_QUERY_VERSION_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _ARCHIVE_CURSOR_MAX_LENGTH = 2_048
 _ARCHIVE_PAGE_MAX_BYTES = 3 * 1_048_576
 
@@ -90,12 +92,14 @@ def _archive_cursor(
     days: int,
     verification_status: ArchiveStatus | None,
     limit: int,
+    query_version: str,
 ) -> str:
     document = {
-        "v": 1,
+        "v": 2,
         "days": days,
         "verification_status": verification_status,
         "limit": limit,
+        "query_version": query_version,
         "event_time": key[0].isoformat(),
         "verified_at": key[1].isoformat(),
         "event_id": key[2],
@@ -119,7 +123,7 @@ def _archive_cursor_key(
     days: int,
     verification_status: ArchiveStatus | None,
     limit: int,
-) -> tuple[datetime, datetime, str]:
+) -> tuple[tuple[datetime, datetime, str], str]:
     if (
         type(cursor) is not str
         or not cursor
@@ -145,7 +149,7 @@ def _archive_cursor_key(
         type(document) is not dict
         or set(document) != _ARCHIVE_CURSOR_KEYS
         or type(document["v"]) is not int
-        or document["v"] != 1
+        or document["v"] != 2
         or type(document["days"]) is not int
         or document["days"] != days
         or document["verification_status"] != verification_status
@@ -154,13 +158,54 @@ def _archive_cursor_key(
         or type(document["event_id"]) is not str
         or not document["event_id"]
         or len(document["event_id"]) > 128
+        or type(document["query_version"]) is not str
+        or _ARCHIVE_QUERY_VERSION_PATTERN.fullmatch(document["query_version"]) is None
     ):
         raise ValueError("invalid archive cursor")
     return (
-        _archive_utc(document["event_time"]),
-        _archive_utc(document["verified_at"]),
-        document["event_id"],
+        (
+            _archive_utc(document["event_time"]),
+            _archive_utc(document["verified_at"]),
+            document["event_id"],
+        ),
+        document["query_version"],
     )
+
+
+def _archive_query_version(
+    events: list[dict[str, object]],
+    *,
+    days: int,
+    verification_status: ArchiveStatus | None,
+    diagnostics: dict[str, int],
+) -> str:
+    digest = hashlib.sha256()
+
+    def update(label: bytes, value: object) -> None:
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, UnicodeEncodeError, ValueError) as error:
+            raise RuntimeError("archive contract mismatch") from error
+        digest.update(len(label).to_bytes(2, "big"))
+        digest.update(label)
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    update(b"authority", {
+        "version": 1,
+        "total": len(events),
+        "filters": {"days": days, "verification_status": verification_status},
+        "diagnostics": diagnostics,
+    })
+    for event in events:
+        update(b"event", event)
+        update(b"provenance", _archive_provenance(event))
+    return digest.hexdigest()
 
 
 def _archive_json_size(value: object) -> int:
@@ -178,6 +223,7 @@ def _archive_page_size(
     limit: int,
     has_more: bool,
     next_cursor: str | None,
+    query_version: str,
 ) -> int:
     return _archive_json_size({"data": {
         "events": events,
@@ -190,6 +236,7 @@ def _archive_page_size(
             "returned": len(events),
             "has_more": has_more,
             "next_cursor": next_cursor,
+            "query_version": query_version,
         },
     }})
 
@@ -203,6 +250,7 @@ def _archive_page(
     diagnostics: dict[str, int],
     limit: int,
     cursor_key: tuple[datetime, datetime, str] | None,
+    query_version: str,
 ) -> dict[str, object]:
     keys = [_archive_order_key(event) for event in events]
     if (
@@ -229,6 +277,7 @@ def _archive_page(
             days=days,
             verification_status=verification_status,
             limit=limit,
+            query_version=query_version,
         ) if has_more else None
         size = _archive_page_size(
             events=candidate_events,
@@ -240,6 +289,7 @@ def _archive_page(
             limit=limit,
             has_more=has_more,
             next_cursor=next_cursor,
+            query_version=query_version,
         )
         if size > _ARCHIVE_PAGE_MAX_BYTES:
             if not selected:
@@ -255,6 +305,7 @@ def _archive_page(
         days=days,
         verification_status=verification_status,
         limit=limit,
+        query_version=query_version,
     ) if has_more and selected else None
     result = {
         "events": selected,
@@ -267,6 +318,7 @@ def _archive_page(
             "returned": len(selected),
             "has_more": has_more,
             "next_cursor": next_cursor,
+            "query_version": query_version,
         },
     }
     if _archive_json_size({"data": result}) > _ARCHIVE_PAGE_MAX_BYTES:
@@ -338,7 +390,7 @@ def news_archive(
     if cursor is not None and limit is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "无效的资讯历史游标")
     try:
-        cursor_key = None if cursor is None else _archive_cursor_key(
+        cursor_data = None if cursor is None else _archive_cursor_key(
             cursor,
             days=days,
             verification_status=verification_status,
@@ -359,6 +411,14 @@ def news_archive(
         ):
             raise RuntimeError("archive contract mismatch")
         if limit is not None:
+            query_version = _archive_query_version(
+                events,
+                days=days,
+                verification_status=verification_status,
+                diagnostics=archive.last_diagnostics,
+            )
+            if cursor_data is not None and cursor_data[1] != query_version:
+                raise HTTPException(status.HTTP_409_CONFLICT, "资讯历史已变化，请重新加载")
             return {"data": _archive_page(
                 events,
                 total=len(events),
@@ -366,7 +426,8 @@ def news_archive(
                 verification_status=verification_status,
                 diagnostics=archive.last_diagnostics,
                 limit=limit,
-                cursor_key=cursor_key,
+                cursor_key=None if cursor_data is None else cursor_data[0],
+                query_version=query_version,
             )}
     except ValueError as error:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "无效的资讯历史筛选") from error

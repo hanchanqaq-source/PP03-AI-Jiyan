@@ -793,8 +793,7 @@ function marketNewsSensitiveQueryValue(value: string): boolean {
   ));
 }
 
-function marketNewsPublicUrlBounded(value: unknown, maximum: number): string {
-  const raw = marketNewsString(value, maximum);
+function marketNewsValidatedPublicUrl(raw: string): string {
   let parsed: URL;
   try {
     parsed = new URL(raw);
@@ -808,6 +807,10 @@ function marketNewsPublicUrlBounded(value: unknown, maximum: number): string {
       marketNewsSensitiveQueryKey(key) || marketNewsSensitiveQueryValue(queryValue)
     ))) marketNewsError();
   return raw;
+}
+
+function marketNewsPublicUrlBounded(value: unknown, maximum: number): string {
+  return marketNewsValidatedPublicUrl(marketNewsString(value, maximum));
 }
 
 function marketNewsPublicUrl(value: unknown): string {
@@ -1407,7 +1410,7 @@ function adapterAction(value: unknown): AdapterActionResponse {
 
 const ARCHIVE_RESPONSE_KEYS = new Set(["events", "total", "filters", "diagnostics", "provenance", "page"]);
 const ARCHIVE_FILTER_KEYS = new Set(["days", "verification_status"]);
-const ARCHIVE_PAGE_KEYS = new Set(["limit", "returned", "has_more", "next_cursor"]);
+const ARCHIVE_PAGE_KEYS = new Set(["limit", "returned", "has_more", "next_cursor", "query_version"]);
 const ARCHIVE_DIAGNOSTIC_KEYS = new Set([
   "scanned_files", "skipped_files", "scanned_rows", "skipped_corrupt_rows", "duplicate_rows",
 ]);
@@ -1457,6 +1460,12 @@ const ARCHIVE_MAX_COLLECTION = 5_000;
 const ARCHIVE_MAX_TEXT = 8_192;
 const ARCHIVE_MAX_CURSOR = 2_048;
 const ARCHIVE_MAX_DIAGNOSTIC = 1_000_000;
+const ARCHIVE_CLOCK_SKEW_MICROS = 300_000_000n;
+const ARCHIVE_PYTHON_MAX_MICROS = 3_652_059n * 86_400_000_000n - 1n;
+const ARCHIVE_PYTHON_WHITESPACE = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/u;
+const ARCHIVE_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{6}))?\+00:00$/;
+
+type ArchiveInstant = { value: string; micros: bigint };
 
 function archiveError(): never {
   throw new ApiError("证据历史响应无效", 502);
@@ -1469,12 +1478,27 @@ function archiveExactRecord(value: unknown, keys: Set<string>): Record<string, u
 }
 
 function archiveText(value: unknown, maximum = ARCHIVE_MAX_TEXT): string {
-  return marketNewsBoundedText(value, maximum);
+  if (typeof value !== "string") marketNewsError();
+  let scalars = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) marketNewsError();
+      index += 1;
+    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+      marketNewsError();
+    }
+    scalars += 1;
+    if (scalars > maximum) marketNewsError();
+  }
+  return value;
 }
 
 function archiveOpaqueId(value: unknown, maximum = ARCHIVE_MAX_TEXT, allowEmpty = true): string {
-  if (typeof value !== "string" || value.length > maximum || (!allowEmpty && value.length === 0)) marketNewsError();
-  return value;
+  const identifier = archiveText(value, maximum);
+  if (!allowEmpty && identifier.length === 0) marketNewsError();
+  return identifier;
 }
 
 function archiveAuthorityId(value: unknown): string {
@@ -1516,11 +1540,47 @@ function archiveBoolean(value: unknown): boolean {
 }
 
 function archiveTimestamp(value: unknown): string {
-  return marketNewsTimestamp(value);
+  return archiveInstant(value).value;
 }
 
 function archiveNullableTimestamp(value: unknown): string | null {
   return value === null ? null : archiveTimestamp(value);
+}
+
+function archiveInstant(value: unknown): ArchiveInstant {
+  const timestamp = archiveText(value, 64);
+  const match = ARCHIVE_TIMESTAMP.exec(timestamp);
+  if (!match) marketNewsError();
+  const [, yearRaw, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw, fractionRaw] = match;
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  const hour = Number(hourRaw);
+  const minute = Number(minuteRaw);
+  const second = Number(secondRaw);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthLengths = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (year < 1 || year > 9_999 || month < 1 || month > 12
+    || day < 1 || day > monthLengths[month - 1]
+    || hour > 23 || minute > 59 || second > 59) marketNewsError();
+  const priorYear = year - 1;
+  const daysBeforeYear = priorYear * 365 + Math.floor(priorYear / 4)
+    - Math.floor(priorYear / 100) + Math.floor(priorYear / 400);
+  let daysBeforeMonth = 0;
+  for (let index = 0; index < month - 1; index += 1) daysBeforeMonth += monthLengths[index];
+  const dayOrdinal = BigInt(daysBeforeYear + daysBeforeMonth + day - 1);
+  const micros = (((dayOrdinal * 24n + BigInt(hour)) * 60n + BigInt(minute)) * 60n + BigInt(second))
+    * 1_000_000n + BigInt(fractionRaw ?? "000000");
+  return { value: timestamp, micros };
+}
+
+function compareArchiveTimestamps(left: string, right: string): number {
+  const difference = archiveInstant(left).micros - archiveInstant(right).micros;
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}
+
+function archivePythonBlank(value: string): boolean {
+  return ARCHIVE_PYTHON_WHITESPACE.test(value);
 }
 
 function shapeArchiveTag(value: unknown): { id: string; name: string } {
@@ -1540,6 +1600,13 @@ function shapeArchiveField(value: unknown): EvidenceField {
   };
 }
 
+function archivePublicUrl(value: unknown): string {
+  const raw = archiveText(value, ARCHIVE_MAX_TEXT);
+  if (raw.length === 0) return raw;
+  if (raw !== raw.trim() || /[\u0000-\u0020\u007f-\u009f]/u.test(raw)) marketNewsError();
+  return marketNewsValidatedPublicUrl(raw);
+}
+
 function shapeArchiveEvidence(value: unknown): EvidenceItem {
   const row = archiveExactRecord(value, ARCHIVE_EVIDENCE_KEYS);
   const sourceRole = archiveText(row.source_role, 16) as EvidenceItem["source_role"];
@@ -1548,7 +1615,7 @@ function shapeArchiveEvidence(value: unknown): EvidenceItem {
     evidence_id: archiveOpaqueId(row.evidence_id),
     content_source: archiveText(row.content_source),
     collector_source: archiveText(row.collector_source),
-    canonical_url: row.canonical_url === "" ? "" : marketNewsPublicUrlBounded(row.canonical_url, ARCHIVE_MAX_TEXT),
+    canonical_url: archivePublicUrl(row.canonical_url),
     published_at: archiveNullableTimestamp(row.published_at),
     source_role: sourceRole,
     origin_cluster: archiveText(row.origin_cluster),
@@ -1632,7 +1699,7 @@ function compareArchiveCodePoints(left: string, right: string): number {
 }
 
 function compareArchiveLineage(left: EvidenceArchiveLineage, right: EvidenceArchiveLineage): number {
-  const timeDifference = Date.parse(left.generated_at) - Date.parse(right.generated_at);
+  const timeDifference = compareArchiveTimestamps(left.generated_at, right.generated_at);
   if (timeDifference !== 0) return timeDifference;
   for (const key of ["evidence_snapshot_id", "raw_snapshot_id", "content_digest", "raw_input_digest"] as const) {
     const compared = compareArchiveCodePoints(left[key], right[key]);
@@ -1644,11 +1711,21 @@ function compareArchiveLineage(left: EvidenceArchiveLineage, right: EvidenceArch
 function archiveLineages(value: unknown): EvidenceArchiveLineage[] {
   const history = archiveArray(value, ARCHIVE_MAX_COLLECTION, shapeArchiveLineage);
   if (history.length < 1) marketNewsError();
-  const identities = new Set<string>();
+  const identities = new Map<string, Map<string, Set<string>>>();
   history.forEach((lineage, index) => {
-    const identity = [lineage.evidence_snapshot_id, lineage.raw_snapshot_id, lineage.generated_at].join("\u0000");
-    if (identities.has(identity) || (index > 0 && compareArchiveLineage(history[index - 1], lineage) >= 0)) marketNewsError();
-    identities.add(identity);
+    let rawIdentities = identities.get(lineage.evidence_snapshot_id);
+    if (!rawIdentities) {
+      rawIdentities = new Map<string, Set<string>>();
+      identities.set(lineage.evidence_snapshot_id, rawIdentities);
+    }
+    let timestamps = rawIdentities.get(lineage.raw_snapshot_id);
+    if (!timestamps) {
+      timestamps = new Set<string>();
+      rawIdentities.set(lineage.raw_snapshot_id, timestamps);
+    }
+    if (timestamps.has(lineage.generated_at)
+      || (index > 0 && compareArchiveLineage(history[index - 1], lineage) >= 0)) marketNewsError();
+    timestamps.add(lineage.generated_at);
   });
   return history;
 }
@@ -1657,6 +1734,7 @@ function shapeArchiveEvent(value: unknown): EvidenceArchiveEvent {
   const row = archiveExactRecord(value, ARCHIVE_EVENT_KEYS);
   if (row.schema_version !== 3) marketNewsError();
   const verificationStatus = archiveStatus(row.verification_status);
+  const verificationReason = archiveText(row.verification_reason);
   const tags = archiveArray(row.related_tags, ARCHIVE_MAX_COLLECTION, shapeArchiveTag);
   const keyFields = archiveArray(row.key_fields, ARCHIVE_MAX_COLLECTION, shapeArchiveField);
   const primaryEvidence = archiveArray(row.primary_evidence, ARCHIVE_MAX_COLLECTION, shapeArchiveEvidence);
@@ -1668,34 +1746,84 @@ function shapeArchiveEvent(value: unknown): EvidenceArchiveEvent {
   const evidenceSnapshotId = archiveAuthorityId(row.evidence_snapshot_id);
   const rawSnapshotId = archiveAuthorityId(row.raw_snapshot_id);
   const snapshotGeneratedAt = archiveTimestamp(row.snapshot_generated_at);
+  const archivedAt = archiveTimestamp(row.archived_at);
+  const lastUpdatedAt = archiveTimestamp(row.last_updated_at);
+  const publishedAt = archiveNullableTimestamp(row.published_at);
+  const verifiedAt = archiveTimestamp(row.verified_at);
+  const evidenceAsOf = archiveTimestamp(row.evidence_as_of);
   const contentDigest = archiveDigest(row.content_digest);
   const rawInputDigest = archiveDigest(row.raw_input_digest);
 
   const currentLineage = snapshotHistory.find((lineage) => lineage.evidence_snapshot_id === evidenceSnapshotId
     && lineage.raw_snapshot_id === rawSnapshotId && lineage.generated_at === snapshotGeneratedAt);
-  let maximumGeneratedAt = Number.NEGATIVE_INFINITY;
+  let maximumGeneratedAt = archiveInstant(snapshotHistory[0].generated_at).micros;
   snapshotHistory.forEach((lineage) => {
-    maximumGeneratedAt = Math.max(maximumGeneratedAt, Date.parse(lineage.generated_at));
+    const generated = archiveInstant(lineage.generated_at).micros;
+    if (generated > maximumGeneratedAt) maximumGeneratedAt = generated;
   });
   if (!currentLineage || currentLineage.raw_input_digest !== rawInputDigest
-    || Date.parse(snapshotGeneratedAt) !== maximumGeneratedAt
-    || archiveTimestamp(row.last_updated_at) !== snapshotGeneratedAt) marketNewsError();
+    || archiveInstant(snapshotGeneratedAt).micros !== maximumGeneratedAt
+    || lastUpdatedAt !== snapshotGeneratedAt) marketNewsError();
 
+  if (statusHistory.length < 1) marketNewsError();
+  let previousStatus: VerificationStatus | null = null;
+  let previousStatusTime: bigint | null = null;
   statusHistory.forEach((transition, index) => {
-    if ((index > 0 && (transition.from_status !== statusHistory[index - 1].to_status
-      || Date.parse(transition.changed_at) < Date.parse(statusHistory[index - 1].changed_at)))) marketNewsError();
+    const changed = archiveInstant(transition.changed_at).micros;
+    if (archivePythonBlank(transition.reason)
+      || (previousStatusTime !== null && changed < previousStatusTime)
+      || (index === 0 && transition.from_status !== null)
+      || (index > 0 && transition.from_status !== null
+        && (transition.from_status !== previousStatus || transition.from_status === transition.to_status))) marketNewsError();
+    previousStatus = transition.to_status;
+    previousStatusTime = changed;
   });
-  if (statusHistory.length > 0 && statusHistory[statusHistory.length - 1].to_status !== verificationStatus) marketNewsError();
+  if (previousStatus !== verificationStatus || archivePythonBlank(verificationReason)
+    || statusHistory[statusHistory.length - 1].reason !== verificationReason) marketNewsError();
 
   const allEvidence = [...primaryEvidence, ...independentEvidence, ...syndicatedCopies, ...contradictingEvidence];
-  const evidenceIds = new Set(allEvidence.map((item) => item.evidence_id));
-  if (evidenceIds.size !== allEvidence.length
-    || primaryEvidence.some((item) => item.source_role !== "primary")
-    || independentEvidence.some((item) => item.source_role !== "independent")
-    || syndicatedCopies.some((item) => item.source_role !== "syndicated")) marketNewsError();
-  const fieldNames = new Set(keyFields.map((field) => field.field_name));
-  if (keyFields.some((field) => field.evidence_ids.some((evidenceId) => !evidenceIds.has(evidenceId)))
-    || allEvidence.some((item) => item.supports_fields.some((fieldName) => !fieldNames.has(fieldName)))) marketNewsError();
+  const evidenceIds = new Set<string>();
+  const evidenceUrls = new Set<string>();
+  allEvidence.forEach((item) => {
+    if (evidenceIds.has(item.evidence_id)
+      || (item.canonical_url !== "" && evidenceUrls.has(item.canonical_url))) marketNewsError();
+    evidenceIds.add(item.evidence_id);
+    if (item.canonical_url !== "") evidenceUrls.add(item.canonical_url);
+  });
+  keyFields.forEach((field) => {
+    const references = new Set(field.evidence_ids);
+    if (references.size !== field.evidence_ids.length
+      || field.evidence_ids.some((evidenceId) => !evidenceIds.has(evidenceId))) marketNewsError();
+  });
+
+  const verifiedInstant = archiveInstant(verifiedAt).micros;
+  const evidenceAsOfInstant = archiveInstant(evidenceAsOf).micros;
+  const snapshotInstant = archiveInstant(snapshotGeneratedAt).micros;
+  if (snapshotInstant > ARCHIVE_PYTHON_MAX_MICROS - ARCHIVE_CLOCK_SKEW_MICROS) marketNewsError();
+  const snapshotMaximum = snapshotInstant + ARCHIVE_CLOCK_SKEW_MICROS;
+  if (evidenceAsOfInstant > verifiedInstant
+    || (publishedAt !== null && archiveInstant(publishedAt).micros > verifiedInstant)
+    || statusHistory.some((transition) => archiveInstant(transition.changed_at).micros > verifiedInstant)
+    || allEvidence.some((item) => item.published_at !== null
+      && archiveInstant(item.published_at).micros > evidenceAsOfInstant)) marketNewsError();
+  const rowTimes = [
+    ...(publishedAt === null ? [] : [publishedAt]),
+    verifiedAt,
+    evidenceAsOf,
+    ...statusHistory.map((transition) => transition.changed_at),
+    ...allEvidence.flatMap((item) => item.published_at === null ? [] : [item.published_at]),
+  ];
+  if (rowTimes.some((timestamp) => archiveInstant(timestamp).micros > snapshotMaximum)) marketNewsError();
+  if (snapshotHistory.length === 1) {
+    const archivedInstant = archiveInstant(archivedAt).micros;
+    if (archivedInstant > ARCHIVE_PYTHON_MAX_MICROS - ARCHIVE_CLOCK_SKEW_MICROS
+      || snapshotInstant > archivedInstant + ARCHIVE_CLOCK_SKEW_MICROS) marketNewsError();
+  }
+  snapshotHistory.forEach((lineage) => {
+    const lineageInstant = archiveInstant(lineage.generated_at).micros;
+    if (lineageInstant > snapshotInstant
+      || (lineage.recovery && archiveInstant(lineage.recovery.recovered_at).micros < lineageInstant)) marketNewsError();
+  });
 
   return {
     event_id: archiveEventId(row.event_id),
@@ -1703,12 +1831,12 @@ function shapeArchiveEvent(value: unknown): EvidenceArchiveEvent {
     summary: archiveText(row.summary, 1_200),
     category: archiveText(row.category),
     related_tags: tags,
-    published_at: archiveNullableTimestamp(row.published_at),
+    published_at: publishedAt,
     core_claim: archiveText(row.core_claim, 1_200),
     verification_status: verificationStatus,
-    verification_reason: archiveText(row.verification_reason),
-    verified_at: archiveTimestamp(row.verified_at),
-    evidence_as_of: archiveTimestamp(row.evidence_as_of),
+    verification_reason: verificationReason,
+    verified_at: verifiedAt,
+    evidence_as_of: evidenceAsOf,
     key_fields: keyFields,
     primary_evidence: primaryEvidence,
     independent_evidence: independentEvidence,
@@ -1729,7 +1857,7 @@ function shapeArchiveEvent(value: unknown): EvidenceArchiveEvent {
     evidence_snapshot_id: evidenceSnapshotId,
     raw_snapshot_id: rawSnapshotId,
     snapshot_generated_at: snapshotGeneratedAt,
-    archived_at: archiveTimestamp(row.archived_at),
+    archived_at: archivedAt,
     last_updated_at: snapshotGeneratedAt,
     snapshot_history: snapshotHistory,
     content_digest: contentDigest,
@@ -1785,11 +1913,13 @@ function shapeNewsArchiveInternal(value: unknown, query: EvidenceArchiveQuery): 
   const returned = archiveCount(pageRow.returned, ARCHIVE_MAX_PAGE_EVENTS);
   const hasMore = archiveBoolean(pageRow.has_more);
   const nextCursor = pageRow.next_cursor === null ? null : archiveCursor(pageRow.next_cursor);
+  const queryVersion = archiveDigest(pageRow.query_version);
   if (pageLimit !== queryLimit || returned !== events.length || provenance.length !== events.length
     || total < events.length || hasMore !== (nextCursor !== null)
     || (hasMore && total <= events.length)
     || (query.cursor === undefined && !hasMore && total !== events.length)
-    || (query.cursor === undefined && total > 0 && events.length === 0)) marketNewsError();
+    || (query.cursor === undefined && total > 0 && events.length === 0)
+    || (query.cursor !== undefined && (events.length === 0 || nextCursor === query.cursor))) marketNewsError();
 
   const eventIds = new Set<string>();
   events.forEach((event, index) => {
@@ -1810,7 +1940,7 @@ function shapeNewsArchiveInternal(value: unknown, query: EvidenceArchiveQuery): 
     filters: { days: days as EvidenceArchiveList["filters"]["days"], verification_status: verificationStatus },
     diagnostics,
     provenance,
-    page: { limit: pageLimit, returned, has_more: hasMore, next_cursor: nextCursor },
+    page: { limit: pageLimit, returned, has_more: hasMore, next_cursor: nextCursor, query_version: queryVersion },
   };
 }
 

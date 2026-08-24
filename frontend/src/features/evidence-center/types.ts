@@ -159,6 +159,7 @@ export interface EvidenceArchivePage {
   returned: number;
   has_more: boolean;
   next_cursor: string | null;
+  query_version: string;
 }
 
 export interface EvidenceArchiveList {

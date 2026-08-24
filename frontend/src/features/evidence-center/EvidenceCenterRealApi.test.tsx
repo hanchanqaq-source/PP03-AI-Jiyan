@@ -40,6 +40,7 @@ const archiveLineage = {
   raw_input_digest: "b".repeat(64),
   recovery: archiveRecovery,
 };
+const archiveQueryVersion = "1".repeat(64);
 const archivedRow: EvidenceArchiveEvent = {
   ...detail,
   event_id: "aaaaaaaaaaaaaaaaaaaa",
@@ -50,6 +51,9 @@ const archivedRow: EvidenceArchiveEvent = {
   verification_status: "corrected",
   verification_reason: "官方公告更正项目日期",
   status_history: archivedTransitions,
+  primary_evidence: detail.primary_evidence.map((item) => ({ ...item, published_at: "2026-07-20T07:00:00+00:00" })),
+  independent_evidence: detail.independent_evidence.map((item) => ({ ...item, published_at: "2026-07-20T07:10:00+00:00" })),
+  syndicated_copies: detail.syndicated_copies.map((item) => ({ ...item, published_at: "2026-07-20T07:20:00+00:00" })),
   schema_version: 3,
   evidence_snapshot_id: archiveLineage.evidence_snapshot_id,
   raw_snapshot_id: archiveLineage.raw_snapshot_id,
@@ -72,7 +76,7 @@ const archiveListing: EvidenceArchiveList = {
     snapshot_history: archivedRow.snapshot_history,
     recovery: [archiveRecovery],
   }],
-  page: { limit: 100, returned: 1, has_more: false, next_cursor: null },
+  page: { limit: 100, returned: 1, has_more: false, next_cursor: null, query_version: archiveQueryVersion } as any,
 } as EvidenceArchiveList;
 
 function archiveHttpResponse(value: unknown): Response {
@@ -99,6 +103,36 @@ function archiveWireListing(): any {
     "contradicting_evidence_count", "status_change_count", "latest_transition",
   ]) delete payload.events[0][key];
   return payload;
+}
+
+function syncArchiveProvenance(payload: any): void {
+  const event = payload.events[0];
+  payload.provenance[0] = {
+    event_id: event.event_id,
+    evidence_snapshot_id: event.evidence_snapshot_id,
+    raw_snapshot_id: event.raw_snapshot_id,
+    snapshot_history: structuredClone(event.snapshot_history),
+    recovery: event.snapshot_history.flatMap((lineage: any) => lineage.recovery ? [structuredClone(lineage.recovery)] : []),
+  };
+}
+
+function setArchiveClock(payload: any, timestamp: string): void {
+  payload.events[0].published_at = null;
+  payload.events[0].verified_at = timestamp;
+  payload.events[0].evidence_as_of = timestamp;
+  payload.events[0].status_history = [{ from_status: null, to_status: payload.events[0].verification_status, changed_at: timestamp, reason: payload.events[0].verification_reason }];
+  for (const collection of ["primary_evidence", "independent_evidence", "syndicated_copies", "contradicting_evidence"]) {
+    payload.events[0][collection].forEach((item: any) => { item.published_at = null; });
+  }
+  payload.events[0].snapshot_generated_at = timestamp;
+  payload.events[0].archived_at = timestamp;
+  payload.events[0].last_updated_at = timestamp;
+  payload.events[0].snapshot_history = [{
+    ...payload.events[0].snapshot_history[0],
+    generated_at: timestamp,
+  }];
+  delete payload.events[0].snapshot_history[0].recovery;
+  syncArchiveProvenance(payload);
 }
 const pipelineStarted = { run_id: "run-evidence", raw_snapshot_id: "raw-evidence", phase: "queued" as const };
 const pipelineDone: NewsPipelineStatusData = {
@@ -252,7 +286,7 @@ describe("EvidenceCenter real verification workspace", () => {
     vi.mocked((api as any).newsArchive).mockResolvedValue({
       ...archiveListing,
       events: [], total: 0, provenance: [],
-      page: { limit: 100, returned: 0, has_more: false, next_cursor: null },
+      page: { ...archiveListing.page, returned: 0 },
     });
     render(<EvidenceCenter />);
     const history = await screen.findByRole("region", { name: "证据历史" });
@@ -326,14 +360,14 @@ describe("EvidenceCenter real verification workspace", () => {
       .mockResolvedValueOnce({
         ...archiveListing,
         total: 2,
-        page: { limit: 100, returned: 1, has_more: true, next_cursor: "opaque-page-2" },
+        page: { ...archiveListing.page, has_more: true, next_cursor: "opaque-page-2" },
       })
       .mockResolvedValueOnce({
         ...archiveListing,
         events: [second],
         total: 2,
         provenance: [],
-        page: { limit: 100, returned: 1, has_more: false, next_cursor: null },
+        page: { ...archiveListing.page },
       });
     render(<EvidenceCenter />);
     const history = await screen.findByRole("region", { name: "证据历史" });
@@ -353,6 +387,73 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(within(screen.getByRole("region", { name: "真实核验概览" })).getByText("已核验").nextElementSibling).toHaveTextContent("3");
   });
 
+  it.each([
+    ["total drift", 3, 2, archiveQueryVersion],
+    ["query-version drift", 2, 2, "2".repeat(64)],
+    ["terminal cumulative count mismatch", 3, 3, archiveQueryVersion],
+  ])("preserves the first archive page and requires a reload on %s", async (_name, firstTotal, secondTotal, secondVersion) => {
+    const user = userEvent.setup();
+    const second = { ...archivedRow, event_id: `second-${_name}`, title: `第二页-${_name}` };
+    vi.mocked((api as any).newsArchive)
+      .mockResolvedValueOnce({
+        ...archiveListing,
+        total: firstTotal,
+        page: { ...archiveListing.page, has_more: true, next_cursor: "snapshot-page-2" },
+      })
+      .mockResolvedValueOnce({
+        ...archiveListing,
+        events: [second],
+        total: secondTotal,
+        page: { ...archiveListing.page, query_version: secondVersion },
+      });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    await within(history).findByText(archivedRow.title);
+
+    await user.click(within(history).getByRole("button", { name: "加载更多历史证据" }));
+
+    expect(await within(history).findByRole("alert")).toHaveTextContent("证据历史已变化");
+    expect(within(history).getByText(archivedRow.title)).toBeInTheDocument();
+    expect(within(history).queryByText(second.title)).not.toBeInTheDocument();
+    expect(within(history).getByText("已加载：1")).toBeInTheDocument();
+    expect(within(history).getByRole("button", { name: "重新加载历史证据" })).toBeInTheDocument();
+    expect(within(history).queryByRole("button", { name: "加载更多历史证据" })).not.toBeInTheDocument();
+  });
+
+  it("keeps loaded facts on a stale 409 and can restart from the first page", async () => {
+    const user = userEvent.setup();
+    const refreshed = { ...archivedRow, event_id: "refreshed-event", title: "重新首载后的历史事件" };
+    vi.mocked((api as any).newsArchive)
+      .mockResolvedValueOnce({
+        ...archiveListing,
+        total: 2,
+        page: { ...archiveListing.page, has_more: true, next_cursor: "stale-page-2" },
+      })
+      .mockRejectedValueOnce(new ApiError("证据历史请求失败", 409))
+      .mockResolvedValueOnce({
+        ...archiveListing,
+        events: [refreshed],
+        total: 1,
+        page: { ...archiveListing.page, query_version: "3".repeat(64) },
+      });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    await within(history).findByText(archivedRow.title);
+
+    await user.click(within(history).getByRole("button", { name: "加载更多历史证据" }));
+
+    expect(await within(history).findByRole("alert")).toHaveTextContent("证据历史已变化");
+    expect(within(history).getByText(archivedRow.title)).toBeInTheDocument();
+    expect(within(history).queryByRole("button", { name: "加载更多历史证据" })).not.toBeInTheDocument();
+    await user.click(within(history).getByRole("button", { name: "重新加载历史证据" }));
+    expect(await within(history).findByText(refreshed.title)).toBeInTheDocument();
+    expect(within(history).queryByText(archivedRow.title)).not.toBeInTheDocument();
+    expect((api as any).newsArchive).toHaveBeenLastCalledWith(
+      { days: 7, limit: 100 },
+      expect.any(AbortSignal),
+    );
+  });
+
   it("never appends a stale load-more page after the filters change", async () => {
     const user = userEvent.setup();
     let resolveOldPage!: (value: EvidenceArchiveList) => void;
@@ -363,7 +464,7 @@ describe("EvidenceCenter real verification workspace", () => {
       .mockResolvedValueOnce({
         ...archiveListing,
         total: 2,
-        page: { limit: 100, returned: 1, has_more: true, next_cursor: "old-page" },
+        page: { ...archiveListing.page, has_more: true, next_cursor: "old-page" },
       })
       .mockImplementationOnce((_query: unknown, signal: AbortSignal) => {
         oldPageSignal = signal;
@@ -373,7 +474,7 @@ describe("EvidenceCenter real verification workspace", () => {
         ...archiveListing,
         events: [fresh],
         filters: { days: 30, verification_status: null },
-        page: { limit: 100, returned: 1, has_more: false, next_cursor: null },
+        page: { ...archiveListing.page },
       });
     render(<EvidenceCenter />);
     const history = await screen.findByRole("region", { name: "证据历史" });
@@ -388,7 +489,7 @@ describe("EvidenceCenter real verification workspace", () => {
       ...archiveListing,
       events: [stale],
       total: 2,
-      page: { limit: 100, returned: 1, has_more: false, next_cursor: null },
+      page: { ...archiveListing.page },
     }));
     expect(within(history).queryByText(stale.title)).not.toBeInTheDocument();
     expect(within(history).getByText(fresh.title)).toBeInTheDocument();
@@ -494,6 +595,104 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(card).not.toHaveTextContent(archiveLineage.raw_input_digest);
   });
 
+  it("shortens archive IDs by Unicode scalar and visibly escapes hidden controls", async () => {
+    const selected = {
+      ...archivedRow,
+      evidence_snapshot_id: `${"😀".repeat(9)}\u0000tail`,
+      raw_snapshot_id: `raw\u202E${"界".repeat(9)}`,
+    };
+    vi.mocked((api as any).newsArchive).mockResolvedValueOnce({ ...archiveListing, events: [selected] });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    const card = (await within(history).findByText(selected.title)).closest("article")!;
+
+    expect(card).toHaveTextContent(`证据快照 ${"😀".repeat(8)}…`);
+    expect(card).toHaveTextContent("原始快照 raw\\u{202e}界界界界…");
+    expect(card.textContent).not.toContain("\u202E");
+  });
+
+  it("renders every archive lineage and recovery fact through a bounded accessible disclosure", async () => {
+    const user = userEvent.setup();
+    const lineages = Array.from({ length: 21 }, (_, index) => ({
+      evidence_snapshot_id: index === 0 ? "evidence\u0000root" : `evidence-${String(index).padStart(2, "0")}`,
+      raw_snapshot_id: index === 0 ? "raw\u202Eroot" : `raw-${String(index).padStart(2, "0")}`,
+      generated_at: `2026-08-01T08:00:${String(index).padStart(2, "0")}.00000${index % 10}+00:00`,
+      content_digest: `${(index % 16).toString(16)}`.repeat(64),
+      raw_input_digest: `${((index + 1) % 16).toString(16)}`.repeat(64),
+      ...(index === 0 || index === 20 ? { recovery: {
+        source: index === 0 ? "evidence_history" as const : "legacy_snapshot" as const,
+        status: "cache_recovered" as const,
+        recovered_at: `2026-08-19T08:00:${String(index).padStart(2, "0")}+00:00`,
+        source_snapshot_id: index === 0 ? "source\u0007snapshot" : `source-${index}`,
+      } } : {}),
+    }));
+    const selected = {
+      ...archivedRow,
+      evidence_snapshot_id: lineages[20].evidence_snapshot_id,
+      raw_snapshot_id: lineages[20].raw_snapshot_id,
+      snapshot_generated_at: lineages[20].generated_at,
+      last_updated_at: lineages[20].generated_at,
+      raw_input_digest: lineages[20].raw_input_digest,
+      snapshot_history: lineages,
+    } as EvidenceArchiveEvent;
+    vi.mocked((api as any).newsArchive).mockResolvedValueOnce({ ...archiveListing, events: [selected] });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    await user.click(await within(history).findByRole("button", { name: `查看历史证据 ${selected.title}` }));
+    const drawer = await screen.findByRole("dialog", { name: "证据详情" });
+
+    const auditHeading = within(drawer).getByRole("heading", { name: "快照沿革与恢复来源" });
+    expect(auditHeading).toBeInTheDocument();
+    expect(within(drawer).getByText("已显示 20 / 共 21 条")).toBeInTheDocument();
+    expect(drawer).toHaveTextContent("evidence\\u{0000}root");
+    expect(drawer).toHaveTextContent("raw\\u{202e}root");
+    expect(drawer).toHaveTextContent("source\\u{0007}snapshot");
+    expect(drawer).toHaveTextContent("evidence_history");
+    expect(drawer).toHaveTextContent("cache_recovered");
+    expect(drawer).not.toHaveTextContent(lineages[0].content_digest);
+    expect(drawer).not.toHaveTextContent(lineages[0].raw_input_digest);
+    expect(drawer).not.toHaveTextContent("evidence-20");
+
+    const more = within(drawer).getByRole("button", { name: "显示更多快照沿革" });
+    await user.click(more);
+    expect(within(drawer).getByText("已显示 21 / 共 21 条")).toBeInTheDocument();
+    expect(drawer).toHaveTextContent("evidence-20");
+    expect(within(drawer).queryByRole("button", { name: "显示更多快照沿革" })).not.toBeInTheDocument();
+    expect(auditHeading).toHaveFocus();
+  });
+
+  it("neutralizes hidden archive controls in every visible audit string while preserving real newlines", async () => {
+    const user = userEvent.setup();
+    const selected = {
+      ...archivedRow,
+      title: "归档\u0000标题\u202E\n第二行",
+      core_claim: "主张\u0007内容",
+      verification_reason: "理由\u2066文本",
+      primary_evidence: [{
+        ...archivedRow.primary_evidence[0],
+        title: "证据\u200B标题",
+        content_source: "来源\u0001名称",
+        collector_source: "采集\u0002来源",
+        origin_cluster: "链\u202D路",
+        excerpt: "第一行\n第二行\u0003",
+      }],
+    };
+    vi.mocked((api as any).newsArchive).mockResolvedValueOnce({ ...archiveListing, events: [selected] });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    const trigger = await within(history).findByRole("button", { name: /查看历史证据 归档\\u\{0000\}标题/ });
+    expect(history.textContent).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u200B\u202D\u202E\u2066]/u);
+    await user.click(trigger);
+    const drawer = await screen.findByRole("dialog", { name: "证据详情" });
+
+    expect(drawer.textContent).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u200B\u202D\u202E\u2066]/u);
+    expect(drawer).toHaveTextContent("主张\\u{0007}内容");
+    expect(drawer).toHaveTextContent("理由\\u{2066}文本");
+    expect(drawer).toHaveTextContent("来源\\u{0001}名称");
+    expect(drawer).toHaveTextContent("第一行 第二行\\u{0003}");
+    expect(selected.primary_evidence[0].excerpt).toContain("\n");
+  });
+
   it("uses the exact archive query and forwards its AbortSignal through the real client", async () => {
     const payload: EvidenceArchiveList = {
       ...archiveListing,
@@ -501,7 +700,7 @@ describe("EvidenceCenter real verification workspace", () => {
       total: 0,
       filters: { days: 90, verification_status: "disproved" },
       provenance: [],
-      page: { limit: 100, returned: 0, has_more: false, next_cursor: null },
+      page: { ...archiveListing.page, returned: 0 },
     } as EvidenceArchiveList;
     const fetchMock = restoreArchiveClientWithResponse({ data: payload });
     const signal = new AbortController().signal;
@@ -664,6 +863,251 @@ describe("EvidenceCenter real verification workspace", () => {
     payload.events[0].primary_evidence[0].title = "e".repeat(500);
     payload.events[0].primary_evidence[0].excerpt = "x".repeat(1_200);
     payload.events[0].verification_reason = "r".repeat(8_192);
+    payload.events[0].status_history[payload.events[0].status_history.length - 1].reason = payload.events[0].verification_reason;
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+  });
+
+  it("counts archive text and authority IDs by Unicode scalar instead of UTF-16 code units", async () => {
+    const payload = archiveWireListing();
+    const reason = "🧭".repeat(8_192);
+    payload.events[0].title = "😀".repeat(500);
+    payload.events[0].summary = "📝".repeat(1_200);
+    payload.events[0].core_claim = "🧩".repeat(1_200);
+    payload.events[0].verification_reason = reason;
+    payload.events[0].status_history[payload.events[0].status_history.length - 1].reason = reason;
+    payload.events[0].primary_evidence[0].title = "📄".repeat(500);
+    payload.events[0].primary_evidence[0].excerpt = "🔎".repeat(1_200);
+    payload.events[0].event_id = "🆔".repeat(128);
+    payload.events[0].evidence_snapshot_id = "📸".repeat(128);
+    payload.events[0].raw_snapshot_id = "🧪".repeat(128);
+    payload.events[0].snapshot_history[0].evidence_snapshot_id = payload.events[0].evidence_snapshot_id;
+    payload.events[0].snapshot_history[0].raw_snapshot_id = payload.events[0].raw_snapshot_id;
+    payload.events[0].snapshot_history[0].recovery.source_snapshot_id = "🗄️".repeat(64);
+    syncArchiveProvenance(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    const result = await api.newsArchive({ days: 7, limit: 100 });
+
+    expect(Array.from(result.events[0].title)).toHaveLength(500);
+    expect(Array.from(result.events[0].summary)).toHaveLength(1_200);
+    expect(Array.from(result.events[0].verification_reason)).toHaveLength(8_192);
+    expect(Array.from(result.events[0].event_id)).toHaveLength(128);
+  });
+
+  it("accepts backend-legal newlines and controls without mutating the shaped archive value", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].summary = "首行\n次行\u0000审计";
+    payload.events[0].primary_evidence[0].excerpt = "公开摘录\n第二行\u0007";
+    restoreArchiveClientWithResponse({ data: payload });
+
+    const result = await api.newsArchive({ days: 7, limit: 100 });
+
+    expect(result.events[0].summary).toBe("首行\n次行\u0000审计");
+    expect(result.events[0].primary_evidence[0].excerpt).toBe("公开摘录\n第二行\u0007");
+  });
+
+  it("rejects isolated UTF-16 surrogates even when their code-unit length is in bounds", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].title = "broken-\uD800";
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it("accepts an exact 8192-scalar public URL and rejects the next scalar", async () => {
+    const exact = `https://example.com/${"a".repeat(8_192 - "https://example.com/".length)}`;
+    expect(Array.from(exact)).toHaveLength(8_192);
+    const accepted = archiveWireListing();
+    accepted.events[0].primary_evidence[0].canonical_url = exact;
+    const fetchMock = restoreArchiveClientWithResponse({ data: accepted });
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+
+    const rejected = archiveWireListing();
+    rejected.events[0].primary_evidence[0].canonical_url = `${exact}a`;
+    fetchMock.mockResolvedValueOnce(archiveHttpResponse({ data: rejected }));
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it.each([
+    ["title", (payload: any) => { payload.events[0].title = "😀".repeat(501); }],
+    ["summary", (payload: any) => { payload.events[0].summary = "📝".repeat(1_201); }],
+    ["core claim", (payload: any) => { payload.events[0].core_claim = "🧩".repeat(1_201); }],
+    ["excerpt", (payload: any) => { payload.events[0].primary_evidence[0].excerpt = "🔎".repeat(1_201); }],
+    ["generic text", (payload: any) => { payload.events[0].category = "🗂️".repeat(4_097); }],
+    ["authority id", (payload: any) => { payload.events[0].event_id = "🆔".repeat(129); }],
+  ])("rejects one Unicode scalar beyond the backend field boundary: %s", async (_name, mutate) => {
+    const payload = archiveWireListing();
+    mutate(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it("orders lineage and status timestamps at full Python microsecond precision", async () => {
+    const payload = archiveWireListing();
+    const first = {
+      ...structuredClone(payload.events[0].snapshot_history[0]),
+      evidence_snapshot_id: "z-first",
+      raw_snapshot_id: "z-raw",
+      generated_at: "2026-08-01T08:00:00.000001+00:00",
+      content_digest: "c".repeat(64),
+      raw_input_digest: "d".repeat(64),
+    };
+    delete first.recovery;
+    const current = {
+      ...structuredClone(payload.events[0].snapshot_history[0]),
+      evidence_snapshot_id: "a-current",
+      raw_snapshot_id: "a-raw",
+      generated_at: "2026-08-01T08:00:00.000002+00:00",
+    };
+    payload.events[0].snapshot_history = [first, current];
+    payload.events[0].evidence_snapshot_id = current.evidence_snapshot_id;
+    payload.events[0].raw_snapshot_id = current.raw_snapshot_id;
+    payload.events[0].snapshot_generated_at = current.generated_at;
+    payload.events[0].last_updated_at = current.generated_at;
+    payload.events[0].raw_input_digest = current.raw_input_digest;
+    payload.events[0].verified_at = current.generated_at;
+    payload.events[0].evidence_as_of = current.generated_at;
+    payload.events[0].status_history = [
+      { from_status: null, to_status: "verified", changed_at: first.generated_at, reason: "first" },
+      { from_status: "verified", to_status: "corrected", changed_at: current.generated_at, reason: payload.events[0].verification_reason },
+    ];
+    syncArchiveProvenance(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+  });
+
+  it("rejects reverse microsecond order that Date.parse aliases to one millisecond", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].status_history = [
+      { from_status: null, to_status: "verified", changed_at: "2026-08-01T08:00:00.000002+00:00", reason: "first" },
+      { from_status: "verified", to_status: "corrected", changed_at: "2026-08-01T08:00:00.000001+00:00", reason: payload.events[0].verification_reason },
+    ];
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it.each([
+    "0001-01-01T00:00:00+00:00",
+    "2024-02-29T23:59:59.999999+00:00",
+  ])("accepts a real Gregorian UTC boundary timestamp: %s", async (timestamp) => {
+    const payload = archiveWireListing();
+    setArchiveClock(payload, timestamp);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+  });
+
+  it.each([
+    "2026-02-29T08:00:00+00:00",
+    "2026-08-01T08:00:00Z",
+    "0000-01-01T00:00:00+00:00",
+    "10000-01-01T00:00:00+00:00",
+    "9999-12-31T23:59:59.999999+00:00",
+  ])("rejects a noncanonical or impossible archive UTC timestamp: %s", async (timestamp) => {
+    const payload = archiveWireListing();
+    setArchiveClock(payload, timestamp);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it("rejects an event fact one microsecond beyond the backend snapshot five-minute skew", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].snapshot_generated_at = "2026-08-01T08:00:00+00:00";
+    payload.events[0].last_updated_at = payload.events[0].snapshot_generated_at;
+    payload.events[0].snapshot_history[0].generated_at = payload.events[0].snapshot_generated_at;
+    payload.events[0].verified_at = "2026-08-01T08:05:00.000001+00:00";
+    payload.events[0].evidence_as_of = "2026-08-01T08:00:00+00:00";
+    payload.events[0].status_history = [{
+      from_status: null,
+      to_status: payload.events[0].verification_status,
+      changed_at: payload.events[0].verified_at,
+      reason: payload.events[0].verification_reason,
+    }];
+    syncArchiveProvenance(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it("uses structural lineage identity so backend-legal NUL IDs cannot collide", async () => {
+    const payload = archiveWireListing();
+    const first = {
+      ...structuredClone(payload.events[0].snapshot_history[0]),
+      evidence_snapshot_id: "a",
+      raw_snapshot_id: "b\u0000c",
+      content_digest: "c".repeat(64),
+      raw_input_digest: "d".repeat(64),
+    };
+    delete first.recovery;
+    const current = {
+      ...structuredClone(payload.events[0].snapshot_history[0]),
+      evidence_snapshot_id: "a\u0000b",
+      raw_snapshot_id: "c",
+    };
+    payload.events[0].snapshot_history = [first, current];
+    payload.events[0].evidence_snapshot_id = current.evidence_snapshot_id;
+    payload.events[0].raw_snapshot_id = current.raw_snapshot_id;
+    payload.events[0].raw_input_digest = current.raw_input_digest;
+    syncArchiveProvenance(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+  });
+
+  it("accepts a later null status transition as a backend reappearance root", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].status_history[1].from_status = null;
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+  });
+
+  it("accepts nonblank status reasons with backend-legal surrounding whitespace", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].verification_reason = "  official correction  ";
+    payload.events[0].status_history[1].reason = payload.events[0].verification_reason;
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
+  });
+
+  it.each([
+    ["empty history", (payload: any) => { payload.events[0].status_history = []; }],
+    ["first transition has a previous status", (payload: any) => { payload.events[0].status_history[0].from_status = "unverified"; }],
+    ["non-null discontinuity", (payload: any) => { payload.events[0].status_history[1].from_status = "disproved"; }],
+    ["self transition", (payload: any) => { payload.events[0].status_history[1].to_status = "verified"; payload.events[0].verification_status = "verified"; }],
+    ["final status reason mismatch", (payload: any) => { payload.events[0].verification_reason = "different"; }],
+    ["Python-whitespace-only reason", (payload: any) => { payload.events[0].verification_reason = "\u0085"; payload.events[0].status_history[1].reason = "\u0085"; }],
+  ])("rejects an archive status-history domain violation: %s", async (_name, mutate) => {
+    const payload = archiveWireListing();
+    mutate(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it.each([
+    ["duplicate canonical URL", (payload: any) => { payload.events[0].independent_evidence[0].canonical_url = payload.events[0].primary_evidence[0].canonical_url; }],
+    ["duplicate key-field reference", (payload: any) => { payload.events[0].key_fields[0].evidence_ids = ["official-1", "official-1"]; }],
+    ["missing key-field reference", (payload: any) => { payload.events[0].key_fields[0].evidence_ids = ["missing-proof"]; }],
+  ])("rejects an archive evidence-domain violation: %s", async (_name, mutate) => {
+    const payload = archiveWireListing();
+    mutate(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it("does not invent supports-field or collection-role constraints absent from the backend archive", async () => {
+    const payload = archiveWireListing();
+    payload.events[0].primary_evidence[0].supports_fields = ["historical-field-without-key-row"];
+    payload.events[0].primary_evidence[0].source_role = "independent";
     restoreArchiveClientWithResponse({ data: payload });
 
     await expect(api.newsArchive({ days: 7, limit: 100 })).resolves.toMatchObject({ total: 1 });
@@ -706,6 +1150,48 @@ describe("EvidenceCenter real verification workspace", () => {
     await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
   });
 
+  it("requires the backend archive authority query version on every paged response", async () => {
+    const payload = archiveWireListing();
+    delete payload.page.query_version;
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it.each([
+    ["not a digest", "version-1"],
+    ["uppercase digest", "A".repeat(64)],
+    ["short digest", "a".repeat(63)],
+  ])("rejects an invalid archive query version: %s", async (_name, queryVersion) => {
+    const payload = archiveWireListing();
+    payload.page.query_version = queryVersion;
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100 })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
+  it.each([
+    ["zero progress", (payload: any) => {
+      payload.events = [];
+      payload.provenance = [];
+      payload.total = 2;
+      payload.page.returned = 0;
+      payload.page.has_more = true;
+      payload.page.next_cursor = "next-page";
+    }],
+    ["same next cursor", (payload: any) => {
+      payload.total = 2;
+      payload.page.has_more = true;
+      payload.page.next_cursor = "current-page";
+    }],
+  ])("rejects an archive cursor page with %s", async (_name, mutate) => {
+    const payload = archiveWireListing();
+    mutate(payload);
+    restoreArchiveClientWithResponse({ data: payload });
+
+    await expect(api.newsArchive({ days: 7, limit: 100, cursor: "current-page" })).rejects.toMatchObject(archiveInvalidResponse());
+  });
+
   it("redacts a non-success archive error while preserving its status", async () => {
     vi.mocked(api.newsArchive).mockRestore();
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
@@ -730,7 +1216,6 @@ describe("EvidenceCenter real verification workspace", () => {
     ["unknown event key such as full article body", (payload: any) => { payload.events[0].article_body = "private full text"; }],
     ["unknown verification status", (payload: any) => { payload.events[0].verification_status = "trusted"; }],
     ["overlong text", (payload: any) => { payload.events[0].title = "x".repeat(8_193); }],
-    ["control characters", (payload: any) => { payload.events[0].summary = "unsafe\u0000summary"; }],
     ["excessive nested array", (payload: any) => { payload.events[0].related_tags = Array.from({ length: 5_001 }, (_, index) => ({ id: `tag-${index}`, name: "标签" })); }],
     ["mismatched total", (payload: any) => { payload.total = 2; }],
     ["mismatched echoed filters", (payload: any) => { payload.filters.days = 30; }],
