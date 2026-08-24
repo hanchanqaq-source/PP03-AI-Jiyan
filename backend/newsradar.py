@@ -50,6 +50,11 @@ SOURCE_ERROR_TYPES = {"timeout", "http_status", "tls", "dns", "connection", "rss
 _ORIGINAL_URLOPEN = urllib.request.urlopen
 
 
+def _utc_now() -> datetime:
+    """Return the aware UTC clock used by all news freshness decisions."""
+    return datetime.now(timezone.utc)
+
+
 @dataclass(frozen=True, slots=True)
 class RadarCollection:
     """One non-persisting radar collection prepared for pipeline storage."""
@@ -361,7 +366,7 @@ def probe_source_config(
     timeout: float | None = None,
 ) -> dict:
     """Use the production request/decode/parser path without cache or user-data access."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
+    cutoff = _utc_now() - timedelta(days=recent_days)
     result = _request_decode_parse_source(
         dict(source),
         max(1, int(per_source)),
@@ -558,7 +563,7 @@ def _collect_radar_data() -> dict:
     previous = load_cache()
     days = cfg.get("fetch", {}).get("recent_days", 7)
     per = cfg.get("fetch", {}).get("per_source", 6)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = _utc_now() - timedelta(days=days)
     redline = [k.lower() for k in cfg.get("redline_keywords", [])]
 
     byhint: dict[str, list] = {}
@@ -610,7 +615,7 @@ def _collect_radar_data() -> dict:
         ind["items"].sort(key=lambda x: x.get("ts", 0), reverse=True)
 
     data = {
-        "generated_at": datetime.now(BEIJING).isoformat(timespec="seconds"),
+        "generated_at": _utc_now().astimezone(BEIJING).isoformat(timespec="seconds"),
         "recent_days": days,
         "industries": industries,
         "stats": {"industries": len(cfg["industries"]), "total_sources": len(cfg["sources"]), "failed_sources": failed},
@@ -626,7 +631,7 @@ def collect_radar() -> RadarCollection:
     from news_intelligence.clustering import cluster_items
     from news_intelligence.normalizer import normalize_radar
 
-    collected_at = datetime.now(timezone.utc)
+    collected_at = _utc_now()
     radar = _collect_radar_data()
     events = cluster_items(normalize_radar(radar, now=collected_at))
     source_statuses = tuple(dict(row) for row in radar.get("source_statuses") or [])
@@ -669,7 +674,7 @@ def load_cache():
         _normalize_cached_source_statuses(data, sources)
         generated_at = _parse_dt(str(data.get("generated_at") or ""))
         recent_days = int(data.get("recent_days") or 7)
-        is_stale = bool(generated_at and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
+        is_stale = bool(generated_at and _utc_now() - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
         data["cache_status"] = "stale" if is_stale else "cache"
         failed_sources = int((data.get("stats") or {}).get("failed_sources") or 0)
         data["source_state"] = "stale_cache" if is_stale else ("partial_failure" if failed_sources else "cached")
@@ -706,7 +711,7 @@ def retry_source(requested_source_id: str) -> dict:
     previous = load_cache()
     days = int(cfg.get("fetch", {}).get("recent_days", 7))
     per = int(cfg.get("fetch", {}).get("per_source", 6))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = _utc_now() - timedelta(days=days)
     redline = [str(key).lower() for key in cfg.get("redline_keywords", [])]
     result = _fetch_source(src, per, cutoff, redline)
     cached_items = _cached_items_for_source(previous, str(src.get("hint") or ""), src)
@@ -767,13 +772,13 @@ def retry_source(requested_source_id: str) -> dict:
 
     failed = sum(row.get("status") == "failed" for row in statuses)
     if not data.get("generated_at"):
-        data["generated_at"] = datetime.now(BEIJING).isoformat(timespec="seconds")
+        data["generated_at"] = _utc_now().astimezone(BEIJING).isoformat(timespec="seconds")
     data["recent_days"] = days
     data["source_statuses"] = statuses
     generated_at = _parse_dt(str(data.get("generated_at") or ""))
     is_stale = bool(
         generated_at
-        and datetime.now(timezone.utc) - generated_at.astimezone(timezone.utc) > timedelta(days=days)
+        and _utc_now() - generated_at.astimezone(timezone.utc) > timedelta(days=days)
     )
     data["cache_status"] = "stale" if is_stale else ("partial" if failed else "realtime")
     data["source_state"] = "stale_cache" if is_stale else ("partial_failure" if failed else "all_success")

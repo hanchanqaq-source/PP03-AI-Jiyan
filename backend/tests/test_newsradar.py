@@ -7,10 +7,19 @@ import ssl
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import newsradar
 import pytest
+
+
+FROZEN_NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_newsradar_utc_clock(monkeypatch):
+    monkeypatch.setattr(newsradar, "_utc_now", lambda: FROZEN_NOW, raising=False)
 
 
 class _Response:
@@ -844,6 +853,27 @@ def test_collect_radar_exposes_current_attempt_outcome_without_using_cached_item
     assert result.attempted_source_count == expected_attempted
     assert result.failed_source_count == expected_failed
     assert result.raw_events == ()
+
+
+def test_fetch_radar_keeps_exact_freshness_cutoff_and_excludes_one_second_older(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    _write_sources(sources, ["https://feed.example.test/rss"])
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    payload = b'''<?xml version="1.0"?><rss><channel>
+      <item><title>Keep exact cutoff</title><link>https://news.example.test/keep</link><pubDate>Tue, 11 Aug 2026 12:00:00 GMT</pubDate></item>
+      <item><title>Drop one second older</title><link>https://news.example.test/drop</link><pubDate>Tue, 11 Aug 2026 11:59:59 GMT</pubDate></item>
+    </channel></rss>'''
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(payload),
+    )
+
+    data = newsradar.fetch_radar()
+
+    assert [item["title"] for item in data["industries"][0]["items"]] == ["Keep exact cutoff"]
 
 
 def test_retry_source_rejects_unknown_id_and_failed_retry_preserves_cache_bytes(tmp_path, monkeypatch):
