@@ -658,7 +658,9 @@ class EvidenceStorage:
 
     def _atomic_write(self, path: Path, document: dict[str, Any]) -> None:
         _exact_builtin(document)
-        payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        payload = (
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
         if len(payload) > _MAX_EVIDENCE_DOCUMENT_BYTES:
             raise ValueError("evidence document is too large")
         descriptor: int | None = None

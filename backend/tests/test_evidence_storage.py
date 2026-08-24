@@ -47,6 +47,18 @@ def evidence_event(*, status: VerificationStatus, history_hours: tuple[int, ...]
     )
 
 
+def repeated_evidence_snapshot(*, event_count: int, summary_size: int) -> EvidenceSnapshot:
+    base = evidence_event(status=VerificationStatus.UNVERIFIED, history_hours=(12,))
+    return EvidenceSnapshot(
+        snapshot_id="s" * 20,
+        generated_at=NOW,
+        events=tuple(
+            replace(base, event_id=f"{index:020d}", summary="x" * summary_size)
+            for index in range(event_count)
+        ),
+    )
+
+
 def test_default_root_is_isolated_below_vr_data_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("VR_DATA_DIR", str(tmp_path / "data"))
     assert EvidenceStorage().root == tmp_path / "data" / "evidence-verification" / "v1"
@@ -69,6 +81,41 @@ def test_publish_uses_atomic_replace_and_round_trips_snapshot(monkeypatch, tmp_p
     assert [destination.name for _, destination in replacements] == ["current.json", "last-refresh.json"]
     assert storage.load_current() == snapshot
     assert not list(storage.root.glob("*.tmp"))
+
+
+def test_publish_accepts_canonical_snapshot_when_compact_json_fits_one_mib(tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    snapshot = repeated_evidence_snapshot(event_count=450, summary_size=1_600)
+    document = snapshot_document(snapshot)
+    compact_payload = (
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    pretty_payload = (
+        json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    assert len(compact_payload) <= 1_048_576 < len(pretty_payload)
+
+    storage.publish(snapshot)
+
+    assert storage.current_path.read_bytes() == compact_payload
+    assert storage.load_current() == snapshot
+
+
+def test_publish_rejects_snapshot_when_compact_json_exceeds_one_mib(tmp_path):
+    storage = EvidenceStorage(root=tmp_path / "evidence", now=lambda: NOW)
+    snapshot = repeated_evidence_snapshot(event_count=500, summary_size=1_600)
+    compact_payload = (
+        json.dumps(
+            snapshot_document(snapshot), ensure_ascii=False, separators=(",", ":")
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert len(compact_payload) > 1_048_576
+
+    with pytest.raises(ValueError, match="^evidence document is too large$"):
+        storage.publish(snapshot)
+
+    assert not storage.current_path.exists()
 
 
 def test_evidence_atomic_failure_cleans_only_its_own_temp_identity(monkeypatch, tmp_path):
