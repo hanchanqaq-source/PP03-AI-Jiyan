@@ -85,3 +85,44 @@ news-publisher:f9846f6b444ed0fe -> news-feed:f9846f6b444ed0fe; news-publisher:fb
 ```
 
 The 108 pairs derive from the exact five-field configured identity (`hint`, `name`, `url`, `language`, `region`) and are sorted by stable ID. They preserve the unchanged `backend/news_sources.json` registrations; duplicate display names or URL text never imply duplicate Catalog IDs.
+
+## Phase 4 final qualification overlay
+
+The Phase 1 matrix above remains the historical registration snapshot. Current
+qualification at `09c4145334b4502dde55185b8b72653c1e53d2f9` has 147 families,
+150 Adapters, 30 capabilities and 108 feed Adapters. The deterministic
+registration fingerprint is
+`b51d725f8ea653b54fb6ac39bea47e29fa592549cc5a07805087121726ed6f79`;
+it is identical for `holding_ids=[]` and `holding_ids=["017811"]`. Eastmoney
+still has exactly three Adapter entries and one family, so aggregation and
+holdings independence remain intact.
+
+| Current Catalog classification | Families | Adapters | Current meaning |
+| --- | ---: | ---: | --- |
+| `configured` | 13 | 15 | Registered configuration, not an automatic connection claim |
+| `catalog_only` | 109 | 109 | 108 publisher feeds plus IMF; registration only |
+| `disabled` | 1 | 2 | Default-off routes, not health failures |
+| `unconfigured` | 15 | 15 | 13 credentialed/keyed Adapters plus 2 connector-only official entries |
+| `license_required` | 9 | 9 | Enterprise shells without runtime integration |
+
+The final billing counts are 128 `free_no_key`, 2 `free_key`, 6 `freemium`,
+5 `paid_api` and 9 `enterprise_license`. Exactly 13 unconfigured Adapters name
+an allowlisted credential environment variable; the other two unconfigured
+entries are `fund-company-official-evidence` and
+`index-company-official-evidence`, which require an approved public-host
+configuration rather than a Key.
+
+The preserved free/no-Key Live window observed only World Bank connected.
+BaoStock and Yahoo Finance were optional-dependency unavailable, SEC remained
+`unconfigured_contact`, IMF remained `catalog_only`, OECD returned an HTTP
+client error, and GDELT timed out. The seven official-evidence link entries
+remain connector-only/unexamined or unconfigured; registration never converts
+them to connected. Detailed current evidence is in
+[free-provider-matrix.md](free-provider-matrix.md), and routing/independence is
+defined in [routing-and-fallback-policy.md](routing-and-fallback-policy.md).
+
+This overlay uses Catalog snapshot fingerprint `b51d725f...` and
+`backend/news_sources.json` SHA-256 `2d53b3d7...` captured during
+`2026-08-24T20:45:56.372963+08:00`–`20:46:46.912056+08:00`. It does not
+rewrite the Phase 1/2/3 historical counts above or infer a connection from a
+static row.

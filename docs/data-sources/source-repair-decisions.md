@@ -57,3 +57,35 @@ replacement that has been validated before disabling an existing source. A
 single failure therefore caused neither deletion nor TLS relaxation. Network
 conditions, not code, may explain variation in a later matched After audit and
 will be reported separately.
+
+## Phase 4 observation overlay — no decision rewrite
+
+The 2026-08-19 rows above remain the authoritative repair-decision history.
+They record 23 degraded/failure observations: 21 `观察`, one `需要凭据`, and one
+`需要许可证`. Successfully repaired 0, official entries updated 0,
+alternatives added 0, old sources disabled 0, and unresolved 23 remain the
+qualified decision counts. A later successful response alone is not proof that
+a source was repaired.
+
+Task 7 performed two new bounded observations of the current 108-source
+configuration (SHA-256
+`2d53b3d7064688823a0fdd41c1bbd29c0d67f40c072ea6975ae4226015779f7a`)
+under `.tmp/acceptance/a2-w1/live-data`:
+
+| Observation | Time | Success | Partial | Failure | Connected |
+| --- | --- | ---: | ---: | ---: | ---: |
+| audit 1 | `2026-08-24T20:46:27.375149+08:00` | 85 | 17 | 6 | 99 |
+| audit 2 | `2026-08-24T20:46:36.342191+08:00` | 84 | 17 | 7 | 98 |
+
+The error-class totals were otherwise stable, but current source ID
+`news:44726681bff6e16e` changed from connected `success/none` to disconnected
+`failure/authentication` between the two passes. That is transient network or
+access variance, not a verified parser/config regression, a credential
+authorization, or evidence that the publisher should be disabled. No
+`news_sources.json`, parser, official-entry, alternative or disable change was
+made from this observation.
+
+The original Live pipeline later failed at the archive compatibility boundary;
+that code defect was fixed separately at `09c4145` and qualified using the
+already-saved evidence snapshot offline. It did not alter these source repair
+decisions or claim a second Live source audit.

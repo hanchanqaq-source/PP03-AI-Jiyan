@@ -72,3 +72,33 @@ Provider-level truth is listed in the
 [credentialed/freemium matrix](freemium-provider-matrix.md),
 [paid matrix](paid-provider-matrix.md), and
 [enterprise Catalog](enterprise-provider-catalog.md).
+
+## Phase 4 news, archive and recovery boundaries
+
+- The Task 7 Live run used only existing free/no-Key public adapters and the
+  108 configured news references. Paid authorization was absent. No `.env`,
+  credential value, private account/portfolio field, browser profile, licensed
+  provider or persistent service was used.
+- A publisher feed response grants neither republication rights nor truth.
+  Trusted market news admits only `verified` and `corroborated` events from the
+  exact durable evidence snapshot. `pending`, `conflicting`, `corrected` and
+  `disproved` records remain in Evidence Center/archive.
+- The 90-day archive stores bounded public excerpts and evidence/status
+  metadata, not full copyrighted bodies. URLs are sanitized; credentials,
+  cookies, authorization fields and sensitive query parameters are prohibited.
+- Recovery may open only allowlisted radar/evidence legacy paths and may
+  refetch only an event's existing public link. Cache-recovered,
+  public-refetched and unrecoverable counts remain separate; missing identity
+  fields are never fabricated.
+- The original Live pipeline failed after durable evidence with
+  `evidence_compatibility_failed`, so its archive/recovery counts were explicit
+  zero. The repair at `09c4145` archived the same 507-event saved snapshot in a
+  new offline diagnostic root and exact retry remained 507. This did not make a
+  paid/licensed request, recover history, or rerun the network.
+- Archive retention is exactly 90 days. Cleanup is limited to whole expired
+  date buckets through the existing safe cache-candidate boundary; it cannot
+  broaden into user/default data.
+
+See [news pipeline and history](news-pipeline-and-history.md) and
+[routing and fallback policy](routing-and-fallback-policy.md) for the qualified
+lineage and admission rules.

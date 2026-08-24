@@ -47,3 +47,36 @@ degraded/failure source observations are unresolved by design: 21 `观察`, one
 The three HTTP feeds remain partial `insecure_transport`, not connected. This
 matrix does not claim all sources fixed, any optional package installed, SEC
 configured, IMF connected, or GDELT independent evidence.
+
+## Phase 4 Task 7 Live observation
+
+The Phase 2 matrix above remains historical. The current bounded observation
+used only free/no-Key public paths at starting HEAD `57fd3384` and ran from
+`2026-08-24T20:45:56.372963+08:00` to
+`2026-08-24T20:46:46.912056+08:00`. The archive compatibility repair at
+`09c4145` did not rerun providers or network requests.
+
+| Adapter | Current Catalog boundary | Task 7 status | Connected | Duration / rows | Qualification |
+| --- | --- | --- | --- | --- | --- |
+| `baostock` | configured Provider | `optional_dependency_unavailable` | no | 2 ms / 0 | Optional package was not installed. |
+| `yahoo-finance` | disabled Provider | `optional_dependency_unavailable` | no | 1 ms / 0 | Personal-research-only and still default-off. |
+| `imf` | catalog-only Provider | `catalog_only` | no | 1 ms / 0 | No public request was made. |
+| `sec-edgar` | configured Provider with contact gate | `unconfigured_contact` | no | 371 ms / 0 | A truthful public contact was not fabricated. |
+| `world-bank` | configured Provider | `success` | yes | 1336 ms / 2 | The only connected formal free Provider in this window. |
+| `oecd` | configured Provider | `http_client_error` | no | 1765 ms / 0 | Bounded request failure; no alternate scraping. |
+| `gdelt` | configured candidate collector | `timeout` | no | 8255 ms / 0 | Discovery only; never independent evidence. |
+
+The SSE, SZSE, CNInfo, HKEXnews and CSRC official-link Adapters remain
+registered connector-only entries without a Task 7 connection observation.
+The fund-company and index-company official connectors remain unconfigured.
+They are neither Provider failures nor connected official evidence.
+
+Two configured-news passes over all 108 source IDs used configuration SHA-256
+`2d53b3d7064688823a0fdd41c1bbd29c0d67f40c072ea6975ae4226015779f7a`.
+At `2026-08-24T20:46:27.375149+08:00`, results were 85 success / 17
+partial / 6 failure (99 connected). At
+`2026-08-24T20:46:36.342191+08:00`, results were 84 / 17 / 7 (98 connected).
+`news:44726681bff6e16e` alone changed from `success/none` to
+`failure/authentication`; no repair or disable is inferred from that transient
+variance. Publisher-feed accessibility also does not establish that any
+particular event is verified.

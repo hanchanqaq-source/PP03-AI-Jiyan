@@ -35,3 +35,18 @@ separate evidence and review; this phase does not infer header authentication.
 See [licensing and usage boundaries](licensing-and-usage-boundaries.md) for
 credential, Free-only, budget, and account-plan rules, and the
 [paid Provider matrix](paid-provider-matrix.md) for the separate paid shells.
+
+## Phase 4 final status
+
+At `09c4145334b4502dde55185b8b72653c1e53d2f9`, all eight rows in this
+matrix remain registered, default-disabled, `unconfigured`, and not connected.
+No credential value, `.env`, account plan, paid-test gate or keyed network path
+was read during Task 7. Together with the five paid shells, they form the exact
+13 `unconfigured` Key-bearing Adapters. The Catalog has two additional
+unconfigured connector-only official entries with no credential environment
+name; those are not part of the unconfigured-Key count.
+
+The preserved Task 7 Live artifact covers free/no-Key routes only. Therefore
+the absence of a credentialed request is an explicit not-exercised boundary,
+not a successful connection or a Provider-health failure. Deterministic parser
+fixtures remain parser evidence only.

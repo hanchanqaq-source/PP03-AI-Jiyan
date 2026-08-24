@@ -32,3 +32,12 @@ independent evidence; the Catalog shell itself is not usable evidence.
 
 See [licensing and usage boundaries](licensing-and-usage-boundaries.md) for the
 common license and purchase rules.
+
+## Phase 4 final status
+
+The final Catalog still contains exactly nine `license_required` enterprise
+shells. At `09c4145334b4502dde55185b8b72653c1e53d2f9` they have no
+runtime factory, SDK, credential name, health probe or connection. Task 7 made
+no licensed or enterprise request and read no entitlement. Registration and an
+advertised capability boundary are not license coverage, health, connectivity
+or admissible evidence.

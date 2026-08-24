@@ -121,3 +121,129 @@ not claim a news-source repair, and does not relabel any parser fixture as Live.
 Detailed boundaries: [credentialed/freemium matrix](freemium-provider-matrix.md),
 [paid matrix](paid-provider-matrix.md), and
 [enterprise Catalog](enterprise-provider-catalog.md).
+
+## Phase 4 final 26-measure qualification
+
+This section is the final Task 7 measurement overlay at
+`09c4145334b4502dde55185b8b72653c1e53d2f9`. It keeps every earlier phase
+table above as history. The original Task 7 network run remains a failed Live
+observation; the archive value after the compatibility fix comes from a new
+isolated **offline** archive of that same saved snapshot, not from a Live rerun.
+
+### Reproducible measurement commands
+
+All commands below were run from the repository root. They are read-only except
+for the separately identified offline archive producer `A1`, whose output is
+confined to the preserved Task 7 diagnostic root.
+
+`C1` — current deterministic Catalog and holdings-independence measurement,
+exit 0 at `2026-08-24T15:10:00.635911+00:00`:
+
+```powershell
+$env:PYTHONPATH=(Resolve-Path 'backend').Path
+backend\.venv\Scripts\python.exe -c "from datetime import datetime,timezone; from data_sources.catalog import build_catalog; from source_health.registry import load_news_config; c=build_catalog(news_config=load_news_config()); f0=c.registration_fingerprint(holding_ids=[]); f1=c.registration_fingerprint(holding_ids=['017811']); feed=sum('feed' in x.capability_ids for x in c.adapters); print('measured_at='+datetime.now(timezone.utc).isoformat()); print('families='+str(len(c.families))); print('adapters='+str(len(c.adapters))); print('capabilities='+str(len(c.capabilities))); print('eastmoney_entries_before='+str(len(c.adapters_for_family('eastmoney')))); print('eastmoney_families_after='+str(sum(x.source_family_id=='eastmoney' for x in c.families))); print('visible_news_without_funds='+str(feed)); print('visible_news_with_fund='+str(feed)); print('fingerprint_without='+f0); print('fingerprint_with='+f1); print('registration_equal='+str(f0==f1).lower()); print('unconfigured_key='+str(sum(x.catalog_status.value=='unconfigured' and bool(x.credential_env_names) for x in c.adapters))); print('license_required='+str(sum(x.catalog_status.value=='license_required' for x in c.adapters)))"
+```
+
+`C1` returned fingerprint
+`b51d725f8ea653b54fb6ac39bea47e29fa592549cc5a07805087121726ed6f79`
+for both holding sets. The same Catalog was captured in Live artifact `L1`
+with `backend/news_sources.json` SHA-256
+`2d53b3d7064688823a0fdd41c1bbd29c0d67f40c072ea6975ae4226015779f7a`.
+
+`R1` — matched Phase 2 audit comparison, exit 0 at
+`2026-08-24T15:10:15.3521238Z`:
+
+```powershell
+$b=Get-Content -LiteralPath '.tmp\acceptance\a2-w1-phase2-before\public-audit.json' -Raw|ConvertFrom-Json
+$a=Get-Content -LiteralPath '.tmp\acceptance\a2-w1-phase2-after\public-audit.json' -Raw|ConvertFrom-Json
+$bm=@{}; $b.news|ForEach-Object{$bm[$_.source_id]=$_}
+$am=@{}; $a.news|ForEach-Object{$am[$_.source_id]=$_}
+$degraded=@($b.news|Where-Object{$_.status-ne'success'})
+$repaired=@($degraded|Where-Object{$am[$_.source_id].status-eq'success'})
+$updated=@($b.news|Where-Object{$am.ContainsKey($_.source_id)-and(($am[$_.source_id].configuration_hash-ne$_.configuration_hash)-or($am[$_.source_id].source_reference-ne$_.source_reference))})
+$added=@($a.news|Where-Object{-not $bm.ContainsKey($_.source_id)})
+$removed=@($b.news|Where-Object{-not $am.ContainsKey($_.source_id)})
+"failures_before_repair=$($degraded.Count) successfully_repaired=$($repaired.Count) official_entries_updated=$($updated.Count) alternatives_added=$($added.Count) old_sources_disabled=$($removed.Count) unresolved=$($degraded.Count-$repaired.Count)"
+```
+
+The exact input snapshots are schema
+`pp03-a2-w1-task6-public-audit-v2`, observed at
+`2026-08-19T18:17:13+08:00` and `2026-08-19T18:17:57+08:00`, with identical
+108-source hash
+`fbb2239676aa22d16a755780a80621a433b9ceb60f19499967440eac20c1f33e`.
+`R2` parsed only the 24 decision-table rows in
+`source-repair-decisions.md` at `2026-08-24T15:10:22.4996562Z`, excluded its
+one `success` observation, and grouped the remaining conclusion column:
+
+```powershell
+$rows=Get-Content -LiteralPath 'docs\data-sources\source-repair-decisions.md'|Where-Object{$_ -match '^\| `news:'}|ForEach-Object{$p=$_ -split '\|'; [pscustomobject]@{Result=$p[3].Trim();Conclusion=$p[9].Trim()}}
+$unresolved=@($rows|Where-Object{$_.Result -notmatch '^success'})
+$unresolved|Group-Object Conclusion|Sort-Object Name|ForEach-Object{"reason[$($_.Name)]=$($_.Count)"}
+```
+
+`P1` — preserved Task 7 Live result reader, exit 0 at
+`2026-08-24T15:10:30.2863989Z`:
+
+```powershell
+$d=Get-Content '.tmp\acceptance\a2-w1\live-data\outputs\live-qualification.json' -Raw|ConvertFrom-Json
+$d.pipeline.counts; $d.recovery
+```
+
+`L1` is `pp03-task7-live-qualification-v1`, finished at
+`2026-08-24T20:46:46.912056+08:00`, with run
+`7fe1e552fd254ee98c6a221e66a31fec`, raw snapshot
+`87663551b9404a57bd1b5eb7f6f03dc3`, evidence snapshot
+`9cbcceb192697d2f7ce9`, and output SHA-256
+`B868BB66DF7011A29830687D234D1CB2D1D5AF9A9269D5F3536A080316C6C1B5`.
+
+`A1` — repair-qualified offline archive producer and state measurement:
+
+```powershell
+backend\.venv\Scripts\python.exe .tmp\acceptance\a2-w1\live-data\diagnostics\archive-fix-offline\run.py
+$s=Get-Content '.tmp\acceptance\a2-w1\live-data\diagnostics\archive-fix-offline\actual\archive\state.json' -Raw|ConvertFrom-Json
+@($s.target_index.PSObject.Properties).Count
+```
+
+The isolated schema-v4 state finalized at
+`2026-08-24T14:55:26.4354283Z`, generation 2, phase `finalized`, with 8 date
+buckets and 507 indexed events. First write and exact retry both returned 507;
+all 12 legal overlaps, key-field triples, raw/content digests and history were
+checked, while genuine ambiguity was rejected with zero writes.
+
+### Exact measures
+
+| No. | Required measure | Qualified value | Measurement command / snapshot / time | Meaning |
+| ---: | --- | ---: | --- | --- |
+| 1 | Family count | **147** | `C1`; fingerprint `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Static Catalog families, not connected families. |
+| 2 | Adapter count | **150** | `C1`; fingerprint `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Stable Adapter registrations. |
+| 3 | Capability count | **30** | `C1`; fingerprint `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Stable capability registrations. |
+| 4 | Eastmoney entries before aggregation | **3** | `C1`; fingerprint `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Direct, AKShare and efinance access paths. |
+| 5 | Eastmoney families after aggregation | **1** | `C1`; fingerprint `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Three paths do not add source independence. |
+| 6 | Visible sources without funds | **108** | `C1`; fingerprint `b51d725f...`, `holding_ids=[]`; `2026-08-24T15:10:00.635911+00:00` | All registered feed Adapters remain visible. |
+| 7 | Visible sources with a fund | **108** | `C1`; fingerprint `b51d725f...`, `holding_ids=['017811']`; `2026-08-24T15:10:00.635911+00:00` | Adding a fund changes only relation overlays. |
+| 8 | Registration equality | **true** | `C1`; both fingerprints `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Exact registration equality before/after the sample fund relation. |
+| 9 | Failures before repair | **23** | `R1`; Before snapshot `2026-08-19T18:17:13+08:00`; measured `2026-08-24T15:10:15.3521238Z` | 16 partial + 7 failure observations; “failure” here means the repair workload. |
+| 10 | Successfully repaired | **0** | `R1`; After `2026-08-19T18:17:57+08:00`; measured `2026-08-24T15:10:15.3521238Z` | No degraded row transitioned to success under a qualified config/parser change. |
+| 11 | Official entries updated | **0** | `R1`; matched snapshots `2026-08-19T18:17:13+08:00` / `18:17:57+08:00`; measured `2026-08-24T15:10:15.3521238Z` | No official endpoint migration was proven. |
+| 12 | Alternatives added | **0** | `R1`; matched snapshots `2026-08-19T18:17:13+08:00` / `18:17:57+08:00`; measured `2026-08-24T15:10:15.3521238Z` | No unqualified replacement was inserted. |
+| 13 | Old sources disabled | **0** | `R1`; matched snapshots `2026-08-19T18:17:13+08:00` / `18:17:57+08:00`; measured `2026-08-24T15:10:15.3521238Z` | Single failures did not trigger deletion. |
+| 14 | Unresolved | **23** | `R1`; matched snapshots `2026-08-19T18:17:13+08:00` / `18:17:57+08:00`; measured `2026-08-24T15:10:15.3521238Z` | Every degraded/failure decision remains explicit. |
+| 15 | Unresolved reasons | **21 observation + 1 credential + 1 license = 23** | `R2`; 24-row decision ledger; `2026-08-24T15:10:22.4996562Z` | The one successful ledger row is not unresolved. |
+| 16 | Unconfigured-Key count | **13** | `C1` + `L1` Catalog snapshot; credential-named and `unconfigured`; `2026-08-24T15:10:00.635911+00:00` | 2 free-Key + 6 freemium + 5 paid; excludes 2 no-Key connector-only entries from the Catalog's total 15 unconfigured. |
+| 17 | License-required count | **9** | `C1`; fingerprint `b51d725f...`; `2026-08-24T15:10:00.635911+00:00` | Enterprise static shells; none connected. |
+| 18 | Raw news count | **507** | `P1` / `L1`; raw snapshot `876635...`; finished `2026-08-24T20:46:46.912056+08:00` | Durable raw events from the preserved Live run. |
+| 19 | Verified count | **28** | `P1` / `L1`; evidence snapshot `9cbc...`; `2026-08-24T20:46:46.912056+08:00` | Eligible for trusted projection only after all durability gates. |
+| 20 | Corroborated count | **0** | `P1` / `L1`; evidence snapshot `9cbc...`; `2026-08-24T20:46:46.912056+08:00` | No event met corroborated status. |
+| 21 | Pending count | **467** | `P1` / `L1`; evidence snapshot `9cbc...`; `2026-08-24T20:46:46.912056+08:00` | Remains Evidence Center/archive only. |
+| 22 | Conflicting count | **12** | `P1` / `L1`; evidence snapshot `9cbc...`; `2026-08-24T20:46:46.912056+08:00` | Preserved as conflict, never trusted admission. |
+| 23 | Archived event count | **507** | `A1`; same saved `9cbc...` snapshot; finalized `2026-08-24T14:55:26.4354283Z` | Current post-fix offline qualification: first write 507 and exact retry 507. Historical pre-fix Live value was **0** from `P1` because it terminated `evidence_compatibility_failed`; no network rerun occurred. |
+| 24 | Cache-recovered count | **0** | `P1` / `L1` recovery import; `2026-08-24T20:46:46.912056+08:00` | Explicit Live recovery result, not inferred from the offline archive. |
+| 25 | Public-refetched count | **0** | `P1` / `L1` recovery import; `2026-08-24T20:46:46.912056+08:00` | No public history refetch occurred. |
+| 26 | Unrecoverable-history count | **0** | `P1` / `L1` recovery import; `2026-08-24T20:46:46.912056+08:00` | Explicit zero for that empty scan/import boundary, not proof that arbitrary missing history is recoverable. |
+
+The preserved Live run stopped at durable `evidence_saved` with
+`failed / evidence_compatibility_failed`, trusted snapshot `null`, and trusted
+event count 0. The repaired offline archive result closes the specific archive
+compatibility blocker for the saved evidence but does not relabel the failed
+Live run, provider timeouts, optional dependency states, or empty recovery as a
+successful end-to-end network publication.
