@@ -315,13 +315,26 @@ class _ArchiveFutureSchemaError(ValueError):
 
 
 def _utc(value: datetime, name: str) -> datetime:
-    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+    if type(value) is not datetime or value.tzinfo is None:
         raise ValueError(f"{name} timezone must be aware")
-    return value.astimezone(timezone.utc)
+    try:
+        if value.utcoffset() is None:
+            raise ValueError(f"{name} timezone must be aware")
+        return value.astimezone(timezone.utc)
+    except Exception:
+        raise ValueError(f"{name} timestamp is invalid") from None
 
 
 def _timestamp(value: datetime, name: str) -> str:
     return _utc(value, name).isoformat()
+
+
+def _canonical_archive_timestamp(value: object, name: str) -> str:
+    try:
+        parsed = _parse_datetime(value)
+    except (OverflowError, ValueError):
+        raise ValueError(f"invalid archive {name}") from None
+    return _timestamp(parsed, f"archive {name}")
 
 
 def _bounded_text(value: object, name: str, *, maximum: int = 128) -> str:
@@ -459,7 +472,10 @@ def _recovery_provenance_from_snapshot(snapshot: EvidenceSnapshot) -> dict[str, 
     return _recovery_provenance_from_document({
         "source": metadata["source"],
         "status": metadata["recovery_status"],
-        "recovered_at": metadata["recovered_at"],
+        "recovered_at": _canonical_archive_timestamp(
+            metadata["recovered_at"],
+            "recovered_at",
+        ),
         "source_snapshot_id": metadata["source_snapshot_id"],
     })
 
@@ -983,6 +999,112 @@ def _sanitize_archive_urls(row: dict[str, Any]) -> dict[str, Any]:
             items.append(item)
         sanitized[collection_name] = items
     return sanitized
+
+
+def _normalize_evidence_role_copies(row: dict[str, Any]) -> dict[str, Any]:
+    """Project one evidence authority with a conflict relation into one archive row."""
+    collections = {
+        collection_name: [dict(item) for item in row[collection_name]]
+        for collection_name in _EVIDENCE_COLLECTION_KEYS
+    }
+    occurrences: dict[str, list[tuple[str, int, dict[str, Any]]]] = {}
+    for collection_name, items in collections.items():
+        for index, item in enumerate(items):
+            occurrences.setdefault(item["evidence_id"], []).append(
+                (collection_name, index, item)
+            )
+
+    removable: dict[str, set[int]] = {
+        "primary_evidence": set(),
+        "independent_evidence": set(),
+    }
+    expected_roles = {
+        "primary_evidence": "primary",
+        "independent_evidence": "independent",
+    }
+    for copies in occurrences.values():
+        if len(copies) != 2:
+            continue
+        contradicting = next(
+            (copy for copy in copies if copy[0] == "contradicting_evidence"),
+            None,
+        )
+        base = next((copy for copy in copies if copy[0] in expected_roles), None)
+        if (
+            contradicting is None
+            or base is None
+            or {copy[0] for copy in copies} != {base[0], "contradicting_evidence"}
+            or base[2] != contradicting[2]
+            or base[2]["source_role"] != expected_roles[base[0]]
+        ):
+            continue
+        removable[base[0]].add(base[1])
+
+    normalized = dict(row)
+    for collection_name, items in collections.items():
+        normalized[collection_name] = [
+            item
+            for index, item in enumerate(items)
+            if index not in removable.get(collection_name, set())
+        ]
+    return normalized
+
+
+def _key_field_identity(field: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        field["field_name"],
+        field["raw_value"],
+        field["normalized_value"],
+    )
+
+
+def _validate_key_field_identity_domain(row: dict[str, Any]) -> None:
+    semantics: dict[tuple[str, str, str], tuple[str, str]] = {}
+    for field in row["key_fields"]:
+        references = field["evidence_ids"]
+        if len(references) != len(set(references)):
+            raise ValueError("invalid archive key-field evidence reference")
+        identity = _key_field_identity(field)
+        semantic = (field["verification_status"], field["reason"])
+        previous = semantics.setdefault(identity, semantic)
+        if previous != semantic:
+            raise ValueError("ambiguous archive key-field identity")
+
+
+def _normalize_archive_projection(row: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize the archive projection without changing source authority."""
+    normalized = dict(row)
+    for field_name in ("published_at", "verified_at", "evidence_as_of"):
+        value = normalized[field_name]
+        if value is not None:
+            normalized[field_name] = _canonical_archive_timestamp(value, field_name)
+    for collection_name in _EVIDENCE_COLLECTION_KEYS:
+        normalized_items: list[dict[str, Any]] = []
+        for item in normalized[collection_name]:
+            normalized_item = dict(item)
+            if normalized_item["published_at"] is not None:
+                normalized_item["published_at"] = _canonical_archive_timestamp(
+                    normalized_item["published_at"],
+                    "evidence published_at",
+                )
+            normalized_items.append(normalized_item)
+        normalized[collection_name] = normalized_items
+    normalized["status_history"] = [
+        {
+            **transition,
+            "changed_at": _canonical_archive_timestamp(
+                transition["changed_at"],
+                "status changed_at",
+            ),
+        }
+        for transition in normalized["status_history"]
+    ]
+    _validate_key_field_identity_domain(normalized)
+    normalized["key_fields"] = _merge_key_fields(
+        [],
+        [dict(field) for field in normalized["key_fields"]],
+    )
+    return normalized
 
 
 def _json_string_bytes(value: str, *, maximum_bytes: int, error: str) -> int:
@@ -2076,7 +2198,9 @@ def _archive_document(
         if len(matching) != 1:
             raise ValueError("invalid archive raw input identity")
         raw_input_digest = _raw_input_event_digest(matching[0])
-    archived_event = _sanitize_archive_urls(row)
+    archived_event = _sanitize_archive_urls(_normalize_archive_projection(
+        _normalize_evidence_role_copies(row)
+    ))
     archived_event["title"] = archived_event["title"][:500]
     archived_event["summary"] = archived_event["summary"][:1_200]
     archived_event["core_claim"] = archived_event["core_claim"][:1_200]
@@ -2311,15 +2435,51 @@ def _merge_key_fields(
     loser: list[dict[str, Any]],
     winner: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, str], dict[str, Any]] = {}
-    references: dict[tuple[str, str], set[str]] = {}
-    for item in (*loser, *winner):
-        identity = (item["field_name"], item["verification_status"])
-        merged[identity] = dict(item)
-        references.setdefault(identity, set()).update(item["evidence_ids"])
+    def grouped(
+        rows: list[dict[str, Any]],
+    ) -> tuple[
+        list[tuple[str, str, str]],
+        dict[tuple[str, str, str], dict[str, Any]],
+        dict[tuple[str, str, str], set[str]],
+    ]:
+        order: list[tuple[str, str, str]] = []
+        selected: dict[tuple[str, str, str], dict[str, Any]] = {}
+        references: dict[tuple[str, str, str], set[str]] = {}
+        for item in rows:
+            identity = _key_field_identity(item)
+            previous = selected.get(identity)
+            if previous is None:
+                order.append(identity)
+                selected[identity] = dict(item)
+            elif (
+                previous["verification_status"],
+                previous["reason"],
+            ) != (
+                item["verification_status"],
+                item["reason"],
+            ):
+                raise ValueError("ambiguous archive key-field identity")
+            references.setdefault(identity, set()).update(item["evidence_ids"])
+        return order, selected, references
+
+    loser_order, loser_fields, loser_references = grouped(loser)
+    winner_order, winner_fields, winner_references = grouped(winner)
+    order = winner_order + [
+        identity for identity in loser_order if identity not in winner_fields
+    ]
     result: list[dict[str, Any]] = []
-    for identity, item in merged.items():
-        item["evidence_ids"] = sorted(references[identity])
+    for identity in order:
+        item = dict(
+            winner_fields[identity]
+            if identity in winner_fields
+            else loser_fields[identity]
+        )
+        references = (
+            loser_references.get(identity, set())
+            | winner_references.get(identity, set())
+        )
+        if references != set(item["evidence_ids"]):
+            item["evidence_ids"] = sorted(references)
         result.append(item)
     return result
 
@@ -2492,6 +2652,130 @@ def _merge_status_history(
     raise ValueError("invalid archive status history merge")
 
 
+def _lineage_identity(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        row["evidence_snapshot_id"],
+        row["raw_snapshot_id"],
+        row["generated_at"],
+    )
+
+
+def _merge_lineage_recovery(
+    previous: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if previous is None:
+        return None if incoming is None else dict(incoming)
+    if incoming is None:
+        return dict(previous)
+    stable_keys = {"status", "source_snapshot_id"}
+    if (
+        {key: previous[key] for key in stable_keys}
+        != {key: incoming[key] for key in stable_keys}
+    ):
+        raise ValueError("archive lineage recovery mismatch")
+    previous_time = _metadata_time(previous["recovered_at"], "recovered_at")
+    incoming_time = _metadata_time(incoming["recovered_at"], "recovered_at")
+    merged = dict(incoming if incoming_time < previous_time else previous)
+    merged["source"] = _merged_recovery_source(
+        previous["source"],
+        incoming["source"],
+    )
+    return merged
+
+
+def _is_legacy_duplicate_key_field_retry(
+    previous: dict[str, Any],
+    incoming: dict[str, Any],
+) -> bool:
+    if (
+        previous["schema_version"] != _ARCHIVE_SCHEMA_VERSION
+        or incoming["schema_version"] != _ARCHIVE_SCHEMA_VERSION
+        or len(incoming["snapshot_history"]) != 1
+    ):
+        return False
+    incoming_lineage = incoming["snapshot_history"][0]
+    previous_current_identity = (
+        previous["evidence_snapshot_id"],
+        previous["raw_snapshot_id"],
+        previous["snapshot_generated_at"],
+    )
+    if _lineage_identity(incoming_lineage) != previous_current_identity:
+        return False
+    matching_previous = [
+        lineage
+        for lineage in previous["snapshot_history"]
+        if _lineage_identity(lineage) == previous_current_identity
+    ]
+    if len(matching_previous) != 1:
+        return False
+    previous_lineage = matching_previous[0]
+    raw_digests = {
+        previous["raw_input_digest"],
+        incoming["raw_input_digest"],
+        previous_lineage["raw_input_digest"],
+        incoming_lineage["raw_input_digest"],
+    }
+    if len(raw_digests) != 1:
+        return False
+    if (
+        previous["content_digest"] != previous_lineage["content_digest"]
+        or incoming["content_digest"] != incoming_lineage["content_digest"]
+        or previous["content_digest"] == incoming["content_digest"]
+    ):
+        return False
+    if any(
+        previous[key] != incoming[key]
+        for key in _EVENT_KEYS - {"key_fields"}
+    ):
+        return False
+    if _merge_key_fields([], list(previous["key_fields"])) != incoming["key_fields"]:
+        return False
+    return _merge_key_fields([], list(incoming["key_fields"])) == incoming["key_fields"]
+
+
+def _merge_legacy_duplicate_key_field_retry(
+    previous: dict[str, Any],
+    incoming: dict[str, Any],
+    *,
+    lineage_cutoff: datetime | None,
+) -> dict[str, Any]:
+    incoming_lineage = incoming["snapshot_history"][0]
+    current_identity = (
+        previous["evidence_snapshot_id"],
+        previous["raw_snapshot_id"],
+        previous["snapshot_generated_at"],
+    )
+    histories: list[dict[str, Any]] = []
+    for lineage in previous["snapshot_history"]:
+        if _lineage_identity(lineage) != current_identity:
+            histories.append(lineage)
+            continue
+        updated = dict(lineage)
+        recovery = _merge_lineage_recovery(
+            lineage.get("recovery"),
+            incoming_lineage.get("recovery"),
+        )
+        if recovery is not None:
+            updated["recovery"] = recovery
+        histories.append(updated)
+    histories.sort(key=_lineage_order)
+    if lineage_cutoff is not None:
+        histories = [
+            row for row in histories
+            if _metadata_time(row["generated_at"], "lineage generated_at") >= lineage_cutoff
+        ]
+    if not histories:
+        histories = [max(previous["snapshot_history"], key=_lineage_order)]
+    merged = dict(previous)
+    merged["snapshot_history"] = histories
+    validation_now = max(
+        _metadata_time(previous["archived_at"], "archived_at"),
+        _metadata_time(incoming["archived_at"], "archived_at"),
+    )
+    return _validate_archive_projection(merged, validation_now=validation_now)
+
+
 def _merge_archive_rows(
     previous: dict[str, Any],
     incoming: dict[str, Any],
@@ -2500,6 +2784,12 @@ def _merge_archive_rows(
 ) -> dict[str, Any]:
     if previous["event_id"] != incoming["event_id"]:
         raise ValueError("archive event identity mismatch")
+    if _is_legacy_duplicate_key_field_retry(previous, incoming):
+        return _merge_legacy_duplicate_key_field_retry(
+            previous,
+            incoming,
+            lineage_cutoff=lineage_cutoff,
+        )
     use_incoming = _row_precedence(incoming) > _row_precedence(previous)
     current, other = (incoming, previous) if use_incoming else (previous, incoming)
 
@@ -2508,7 +2798,7 @@ def _merge_archive_rows(
         for row in previous["snapshot_history"]
     }
     for row in incoming["snapshot_history"]:
-        identity = (row["evidence_snapshot_id"], row["raw_snapshot_id"], row["generated_at"])
+        identity = _lineage_identity(row)
         previous_lineage = histories_by_identity.get(identity)
         if previous_lineage is None:
             histories_by_identity[identity] = row
@@ -2520,30 +2810,20 @@ def _merge_archive_rows(
             raise ValueError("archive lineage content mismatch")
         previous_recovery = previous_lineage.get("recovery")
         incoming_recovery = row.get("recovery")
-        if previous_recovery is not None and incoming_recovery is not None:
-            stable_keys = {"status", "source_snapshot_id"}
-            if (
-                {key: previous_recovery[key] for key in stable_keys}
-                != {key: incoming_recovery[key] for key in stable_keys}
-            ):
-                raise ValueError("archive lineage recovery mismatch")
-            previous_time = _metadata_time(previous_recovery["recovered_at"], "recovered_at")
-            incoming_time = _metadata_time(incoming_recovery["recovered_at"], "recovered_at")
-            selected_lineage = row if incoming_time < previous_time else previous_lineage
-            merged_recovery = dict(
-                incoming_recovery if incoming_time < previous_time else previous_recovery
-            )
-            merged_recovery["source"] = _merged_recovery_source(
-                previous_recovery["source"],
-                incoming_recovery["source"],
-            )
+        merged_recovery = _merge_lineage_recovery(previous_recovery, incoming_recovery)
+        if incoming_recovery is not None and (
+            previous_recovery is None
+            or _metadata_time(incoming_recovery["recovered_at"], "recovered_at")
+            < _metadata_time(previous_recovery["recovered_at"], "recovered_at")
+        ):
+            selected_lineage = row
+        else:
+            selected_lineage = previous_lineage
+        if merged_recovery is not None:
             updated_lineage = dict(selected_lineage)
             updated_lineage["recovery"] = merged_recovery
             histories_by_identity[identity] = updated_lineage
             previous_lineage = updated_lineage
-        if previous_recovery is None and incoming_recovery is not None:
-            histories_by_identity[identity] = row
-            previous_lineage = row
         previous_legacy = previous_lineage.get("legacy_v1") is True
         incoming_legacy = row.get("legacy_v1") is True
         if previous_legacy and not incoming_legacy:
@@ -2585,8 +2865,19 @@ def _merge_archive_rows(
     remapped_fields: list[dict[str, Any]] = []
     for field in merged["key_fields"]:
         updated = dict(field)
-        references = [aliases.get(evidence_id, evidence_id) for evidence_id in field["evidence_ids"]]
-        updated["evidence_ids"] = sorted(set(references))
+        references = [
+            aliases.get(evidence_id, evidence_id)
+            for evidence_id in field["evidence_ids"]
+        ]
+        if any(
+            reference != evidence_id
+            for reference, evidence_id in zip(
+                references,
+                field["evidence_ids"],
+                strict=True,
+            )
+        ):
+            updated["evidence_ids"] = sorted(set(references))
         if any(evidence_id not in available_evidence for evidence_id in updated["evidence_ids"]):
             raise ValueError("invalid archive key-field evidence reference")
         remapped_fields.append(updated)

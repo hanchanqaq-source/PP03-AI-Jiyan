@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 import errno
 import hashlib
 import json
@@ -28,9 +28,15 @@ from evidence_verification.models import (
     StatusTransition,
     VerificationStatus,
 )
+from evidence_verification.verifier import verify_event
 
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+
+
+class ExplodingOffset(tzinfo):
+    def utcoffset(self, _value):
+        raise RuntimeError("private timezone failure")
 
 
 def evidence_item(
@@ -850,7 +856,7 @@ def test_archive_does_not_store_full_article_body(tmp_path):
     assert len(archive.get("a" * 20)["primary_evidence"][0]["excerpt"]) == 1_200
 
 
-def test_archive_merges_evidence_by_id_or_url_and_key_fields_by_name_and_status(tmp_path):
+def test_archive_merges_evidence_by_id_or_url_and_key_fields_by_value_identity(tmp_path):
     archive = EvidenceArchive(tmp_path, now=lambda: NOW)
     shared_url = "https://official.example.com/shared"
     archive.upsert(snapshot(event(
@@ -889,9 +895,12 @@ def test_archive_merges_evidence_by_id_or_url_and_key_fields_by_name_and_status(
         shared_url,
         "https://official.example.com/second-proof",
     }
-    assert [(field["field_name"], field["verification_status"]) for field in row["key_fields"]] == [
-        ("money", "verified"),
-        ("money", "conflicting"),
+    assert [
+        (field["field_name"], field["normalized_value"], field["verification_status"])
+        for field in row["key_fields"]
+    ] == [
+        ("money", "CNY:1500000000", "conflicting"),
+        ("money", "CNY:1200000000", "verified"),
     ]
 
 
@@ -2213,6 +2222,1060 @@ def test_archive_rejects_ambiguous_evidence_identity_across_collections_before_s
         archive.upsert(snapshot(event(
             primary_evidence=(primary,),
             contradicting_evidence=(contradicting,),
+        )))
+
+    assert not archive.archive_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("source_role", "is_official", "base_collection"),
+    (
+        (SourceRole.INDEPENDENT, False, "independent_evidence"),
+        (SourceRole.PRIMARY, True, "primary_evidence"),
+    ),
+)
+def test_archive_normalizes_exact_verifier_overlap_without_changing_input_authority(
+    tmp_path,
+    source_role,
+    is_official,
+    base_collection,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    source_now = NOW.astimezone(timezone(timedelta(hours=8)))
+    raw_event = SimpleNamespace(
+        event_id="a" * 20,
+        title="星河科技公告建设算力中心",
+        summary="星河科技将建设算力中心，项目投资12亿元。",
+        category="company",
+        published_at_first=source_now,
+        published_at_latest=source_now,
+        related_tags=[{"id": "semiconductor", "name": "半导体"}],
+    )
+    first = EvidenceItem(
+        evidence_id="source-one",
+        content_source="one.public-example.com",
+        collector_source="one-feed.public-example.com",
+        canonical_url="https://one.public-example.com/report",
+        published_at=source_now,
+        source_role=source_role,
+        origin_cluster="publisher:one.public-example.com",
+        is_official=is_official,
+        title="星河科技公告建设算力中心",
+        excerpt="项目投资12亿元。",
+    )
+    second = replace(
+        first,
+        evidence_id="source-two",
+        content_source="two.public-example.com",
+        collector_source="two-feed.public-example.com",
+        canonical_url="https://two.public-example.com/report",
+        origin_cluster="publisher:two.public-example.com",
+        excerpt="项目投资15亿元。",
+    )
+    verified = verify_event(raw_event, [first, second], previous=None, now=NOW)
+    selected = snapshot(verified)
+    raw_input_digest = archive_module._raw_input_event_digest(verified)
+
+    assert verified.verification_status is VerificationStatus.CONFLICTING
+    base_items = getattr(verified, base_collection)
+    assert {item.evidence_id for item in base_items} == {
+        "source-one",
+        "source-two",
+    }
+    assert verified.contradicting_evidence == base_items
+
+    archive.upsert(selected)
+    first_row = archive.get(verified.event_id)
+    assert first_row is not None
+    first_content_digest = first_row["content_digest"]
+    archive.upsert(selected)
+    retried = archive.get(verified.event_id)
+
+    assert retried is not None
+    assert retried["verification_status"] == "conflicting"
+    expected_counts = {
+        "primary_evidence": 0,
+        "independent_evidence": 0,
+        "syndicated_copies": 0,
+        "contradicting_evidence": 2,
+    }
+    assert {
+        collection_name: len(retried[collection_name])
+        for collection_name in archive_module._EVIDENCE_COLLECTION_KEYS
+    } == expected_counts
+    assert retried["independent_evidence"] == []
+    assert [item["evidence_id"] for item in retried["contradicting_evidence"]] == [
+        "source-one",
+        "source-two",
+    ]
+    assert {
+        (item["source_role"], item["origin_cluster"])
+        for item in retried["contradicting_evidence"]
+    } == {
+        (source_role.value, "publisher:one.public-example.com"),
+        (source_role.value, "publisher:two.public-example.com"),
+    }
+    retained_ids = {
+        item["evidence_id"]
+        for collection_name in archive_module._EVIDENCE_COLLECTION_KEYS
+        for item in retried[collection_name]
+    }
+    referenced_ids = {
+        evidence_id
+        for field in retried["key_fields"]
+        for evidence_id in field["evidence_ids"]
+    }
+    assert retained_ids == {"source-one", "source-two"}
+    assert referenced_ids == retained_ids
+    assert retried["raw_input_digest"] == raw_input_digest
+    assert retried["snapshot_history"][0]["raw_input_digest"] == raw_input_digest
+    assert retried["published_at"] == NOW.isoformat()
+    assert retried["evidence_as_of"] == NOW.isoformat()
+    assert {
+        item["published_at"] for item in retried["contradicting_evidence"]
+    } == {NOW.isoformat()}
+    assert retried["content_digest"] == first_content_digest
+    assert len(retried["snapshot_history"]) == 1
+
+
+def test_archive_canonicalizes_all_projected_aware_times_without_changing_instants(
+    tmp_path,
+):
+    canonical_instant = NOW - timedelta(minutes=1, microseconds=876_544)
+    published = canonical_instant.astimezone(timezone(timedelta(hours=8)))
+    evidence_time = canonical_instant.astimezone(timezone(timedelta(hours=5, minutes=30)))
+    verified = canonical_instant.astimezone(timezone(-timedelta(hours=4)))
+    changed = canonical_instant.astimezone(timezone(timedelta(hours=9)))
+    selected = replace(
+        event(
+            published_at=published,
+            history=(StatusTransition(
+                None,
+                VerificationStatus.VERIFIED,
+                changed,
+                "verified across mixed offsets",
+            ),),
+            primary_evidence=(evidence_item("mixed-offset-proof", published_at=evidence_time),),
+        ),
+        verified_at=verified,
+        evidence_as_of=evidence_time,
+    )
+    selected_snapshot = snapshot(selected)
+    raw_input_digest = archive_module._raw_input_event_digest(selected)
+    archive = EvidenceArchive(tmp_path / "offset", now=lambda: NOW)
+
+    archive.upsert(selected_snapshot)
+    row = archive.get(selected.event_id)
+
+    assert row is not None
+    expected = canonical_instant.isoformat()
+    assert row["published_at"] == expected
+    assert row["verified_at"] == expected
+    assert row["evidence_as_of"] == expected
+    assert row["primary_evidence"][0]["published_at"] == expected
+    assert row["status_history"][0]["changed_at"] == expected
+    assert row["raw_input_digest"] == raw_input_digest
+    assert row["snapshot_history"][0]["raw_input_digest"] == raw_input_digest
+
+    utc_selected = replace(
+        selected,
+        published_at=canonical_instant,
+        verified_at=canonical_instant,
+        evidence_as_of=canonical_instant,
+        primary_evidence=(replace(
+            selected.primary_evidence[0],
+            published_at=canonical_instant,
+        ),),
+        status_history=(replace(
+            selected.status_history[0],
+            changed_at=canonical_instant,
+        ),),
+    )
+    utc_archive = EvidenceArchive(tmp_path / "utc", now=lambda: NOW)
+    utc_archive.upsert(snapshot(utc_selected))
+    utc_row = utc_archive.get(utc_selected.event_id)
+
+    assert utc_row is not None
+    assert utc_row["content_digest"] == row["content_digest"]
+    assert utc_row["raw_input_digest"] != row["raw_input_digest"]
+
+
+def test_archive_preserves_ref_order_until_material_union_then_stays_idempotent(
+    tmp_path,
+):
+    initial_ids = ("zeta-10", "Alpha-2")
+    selected = event(
+        primary_evidence=tuple(evidence_item(evidence_id) for evidence_id in initial_ids),
+        key_fields=(KeyField(
+            "amount",
+            "12",
+            "12",
+            FieldVerificationStatus.VERIFIED,
+            initial_ids,
+            "official",
+        ),),
+    )
+    selected_snapshot = snapshot(selected)
+    raw_input_digest = archive_module._raw_input_event_digest(selected)
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(selected_snapshot)
+    first = archive.get(selected.event_id)
+    assert first is not None
+    assert first["key_fields"][0]["evidence_ids"] == list(initial_ids)
+
+    expanded = replace(
+        selected,
+        primary_evidence=selected.primary_evidence + (evidence_item("10-proof"),),
+        key_fields=(replace(
+            selected.key_fields[0],
+            evidence_ids=("10-proof", "zeta-10"),
+            reason="new official evidence",
+        ),),
+    )
+    expanded_snapshot = snapshot(
+        expanded,
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+        generated_at=NOW + timedelta(minutes=1),
+    )
+    archive.upsert(expanded_snapshot)
+    expanded_row = archive.get(selected.event_id)
+    assert expanded_row is not None
+    expanded_digest = expanded_row["content_digest"]
+
+    archive.upsert(expanded_snapshot)
+    retried = archive.get(selected.event_id)
+
+    assert retried is not None
+    assert retried["key_fields"][0]["evidence_ids"] == [
+        "10-proof",
+        "Alpha-2",
+        "zeta-10",
+    ]
+    assert retried["snapshot_history"][0]["raw_input_digest"] == raw_input_digest
+    assert retried["content_digest"] == expanded_digest
+    assert len(retried["snapshot_history"]) == 2
+
+
+def test_archive_rejects_duplicate_key_field_references_before_storage(tmp_path):
+    selected = event(
+        primary_evidence=(evidence_item("duplicate-reference"),),
+        key_fields=(KeyField(
+            "amount",
+            "12",
+            "12",
+            FieldVerificationStatus.VERIFIED,
+            ("duplicate-reference", "duplicate-reference"),
+            "official",
+        ),),
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="key-field evidence reference"):
+        archive.upsert(snapshot(selected))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_rejects_duplicate_refs_hidden_by_same_identity_union_before_storage(
+    tmp_path,
+):
+    evidence_ids = ("dup-a", "dup-b")
+    base = KeyField(
+        "amount",
+        "12",
+        "12",
+        FieldVerificationStatus.VERIFIED,
+        (evidence_ids[0], evidence_ids[0]),
+        "official",
+    )
+    selected = event(
+        primary_evidence=tuple(
+            evidence_item(evidence_id) for evidence_id in evidence_ids
+        ),
+        key_fields=(
+            base,
+            replace(base, evidence_ids=(evidence_ids[1],)),
+        ),
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="key-field evidence reference"):
+        archive.upsert(snapshot(selected))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_exact_retry_preserves_distinct_values_with_same_field_status(tmp_path):
+    proof = evidence_item("multi-value-proof")
+    fields = tuple(
+        KeyField(
+            "money",
+            raw_value,
+            normalized_value,
+            FieldVerificationStatus.CONFLICTING,
+            (proof.evidence_id,),
+            "conflicting values",
+        )
+        for raw_value, normalized_value in (
+            ("12亿元", "CNY:1200000000"),
+            ("15亿元", "CNY:1500000000"),
+            ("18亿元", "CNY:1800000000"),
+        )
+    )
+    selected = snapshot(event(
+        primary_evidence=(proof,),
+        key_fields=fields,
+    ))
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(selected)
+    first = archive.get("a" * 20)
+    assert first is not None
+    first_digest = first["content_digest"]
+    archive.upsert(selected)
+    retried = archive.get("a" * 20)
+
+    assert retried is not None
+    assert [
+        (field["field_name"], field["raw_value"], field["normalized_value"])
+        for field in retried["key_fields"]
+    ] == [
+        (field.field_name, field.raw_value, field.normalized_value)
+        for field in fields
+    ]
+    assert retried["content_digest"] == first_digest
+    assert retried["snapshot_history"][0]["content_digest"] == first_digest
+    assert len(retried["snapshot_history"]) == 1
+
+
+def test_archive_first_projection_unions_same_value_identity_refs_idempotently(tmp_path):
+    refs = ("zeta-proof", "Alpha-proof")
+    base = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.VERIFIED,
+        (refs[0],),
+        "official",
+    )
+    selected_event = event(
+        primary_evidence=tuple(evidence_item(evidence_id) for evidence_id in sorted(refs)),
+        key_fields=(base, replace(base, evidence_ids=(refs[1],))),
+    )
+    selected = snapshot(selected_event)
+    raw_input_digest = archive_module._raw_input_event_digest(selected_event)
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(selected)
+    first = archive.get("a" * 20)
+
+    assert first is not None
+    assert len(first["key_fields"]) == 1
+    assert first["key_fields"][0]["evidence_ids"] == ["Alpha-proof", "zeta-proof"]
+    assert first["raw_input_digest"] == raw_input_digest
+    assert first["snapshot_history"][0]["raw_input_digest"] == raw_input_digest
+    archive.upsert(selected)
+    retried = archive.get("a" * 20)
+
+    assert retried == first
+    assert retried["snapshot_history"][0]["content_digest"] == first["content_digest"]
+    assert len(retried["snapshot_history"]) == 1
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    (
+        KeyField(
+            "money",
+            "120000万元",
+            "CNY:1200000000",
+            FieldVerificationStatus.VERIFIED,
+            ("identity-proof",),
+            "official",
+        ),
+        KeyField(
+            "money",
+            "12亿元",
+            "CNY:1200000000.01",
+            FieldVerificationStatus.VERIFIED,
+            ("identity-proof",),
+            "official",
+        ),
+    ),
+)
+def test_archive_raw_and_normalized_values_are_independent_identity_dimensions(
+    tmp_path,
+    changed_field,
+):
+    base = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.VERIFIED,
+        ("identity-proof",),
+        "official",
+    )
+    selected = snapshot(event(
+        primary_evidence=(evidence_item("identity-proof"),),
+        key_fields=(base, changed_field),
+    ))
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(selected)
+    archive.upsert(selected)
+    row = archive.get("a" * 20)
+
+    assert row is not None
+    assert len(row["key_fields"]) == 2
+    assert {
+        (field["field_name"], field["raw_value"], field["normalized_value"])
+        for field in row["key_fields"]
+    } == {
+        (base.field_name, base.raw_value, base.normalized_value),
+        (
+            changed_field.field_name,
+            changed_field.raw_value,
+            changed_field.normalized_value,
+        ),
+    }
+
+
+def _legacy_duplicate_key_field_snapshot(
+    *,
+    recovery_metadata=None,
+):
+    refs = ("zeta-legacy-proof", "Alpha-legacy-proof")
+    base = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.VERIFIED,
+        (refs[0],),
+        "official",
+    )
+    selected = snapshot(
+        event(
+            primary_evidence=tuple(
+                evidence_item(evidence_id) for evidence_id in sorted(refs)
+            ),
+            key_fields=(base, replace(base, evidence_ids=(refs[1],))),
+        ),
+        generated_at=NOW - timedelta(minutes=3),
+    )
+    return replace(selected, recovery_metadata=recovery_metadata or {})
+
+
+def _write_legacy_duplicate_key_field_projection(
+    archive,
+    selected,
+    monkeypatch,
+):
+    real_normalize = archive_module._normalize_archive_projection
+
+    def preserve_legacy_duplicate_rows(row):
+        normalized = real_normalize(row)
+        normalized["key_fields"] = [dict(field) for field in row["key_fields"]]
+        return normalized
+
+    monkeypatch.setattr(
+        archive_module,
+        "_normalize_archive_projection",
+        preserve_legacy_duplicate_rows,
+    )
+    archive.upsert(selected)
+    historical = archive.get("a" * 20)
+    monkeypatch.setattr(
+        archive_module,
+        "_normalize_archive_projection",
+        real_normalize,
+    )
+    assert historical is not None
+    assert len(historical["key_fields"]) == 2
+    return historical
+
+
+def test_archive_legacy_duplicate_key_fields_exact_current_retry_is_noop(
+    tmp_path,
+    monkeypatch,
+):
+    selected = _legacy_duplicate_key_field_snapshot()
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    historical = _write_legacy_duplicate_key_field_projection(
+        archive,
+        selected,
+        monkeypatch,
+    )
+    original_raw_digest = archive_module._raw_input_event_digest(selected.events[0])
+
+    archive.upsert(selected)
+    retried = archive.get("a" * 20)
+
+    assert historical["raw_input_digest"] == original_raw_digest
+    assert historical["snapshot_history"][0]["raw_input_digest"] == original_raw_digest
+    assert retried == historical
+
+
+@pytest.mark.parametrize(
+    ("initial_recovery", "retry_recovery", "expected_source", "expected_time"),
+    (
+        (
+            None,
+            {
+                "source": "evidence_current",
+                "recovered_at": (NOW - timedelta(minutes=1)).isoformat(),
+                "recovery_status": "cache_recovered",
+                "source_snapshot_id": "source-snapshot",
+            },
+            "evidence_current",
+            NOW - timedelta(minutes=1),
+        ),
+        (
+            {
+                "source": "evidence_current",
+                "recovered_at": (NOW - timedelta(minutes=1)).isoformat(),
+                "recovery_status": "cache_recovered",
+                "source_snapshot_id": "source-snapshot",
+            },
+            {
+                "source": "evidence_history",
+                "recovered_at": (NOW - timedelta(minutes=2)).isoformat(),
+                "recovery_status": "cache_recovered",
+                "source_snapshot_id": "source-snapshot",
+            },
+            "evidence_current+evidence_history",
+            NOW - timedelta(minutes=2),
+        ),
+    ),
+)
+def test_archive_legacy_duplicate_key_fields_retry_merges_only_recovery(
+    tmp_path,
+    monkeypatch,
+    initial_recovery,
+    retry_recovery,
+    expected_source,
+    expected_time,
+):
+    selected = _legacy_duplicate_key_field_snapshot(
+        recovery_metadata=initial_recovery,
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    historical = _write_legacy_duplicate_key_field_projection(
+        archive,
+        selected,
+        monkeypatch,
+    )
+    incoming = replace(selected, recovery_metadata=retry_recovery)
+
+    archive.upsert(incoming)
+    retried = archive.get("a" * 20)
+
+    assert retried is not None
+    assert retried["key_fields"] == historical["key_fields"]
+    assert retried["content_digest"] == historical["content_digest"]
+    assert retried["raw_input_digest"] == historical["raw_input_digest"]
+    assert retried["snapshot_history"][0]["content_digest"] == (
+        historical["snapshot_history"][0]["content_digest"]
+    )
+    assert retried["snapshot_history"][0]["raw_input_digest"] == (
+        historical["snapshot_history"][0]["raw_input_digest"]
+    )
+    assert retried["snapshot_history"][0]["recovery"] == {
+        "source": expected_source,
+        "status": "cache_recovered",
+        "recovered_at": expected_time.isoformat(),
+        "source_snapshot_id": "source-snapshot",
+    }
+
+
+def test_archive_legacy_duplicate_key_fields_retry_rejects_recovery_conflict_zero_write(
+    tmp_path,
+    monkeypatch,
+):
+    initial_recovery = {
+        "source": "evidence_current",
+        "recovered_at": (NOW - timedelta(minutes=1)).isoformat(),
+        "recovery_status": "cache_recovered",
+        "source_snapshot_id": "source-a",
+    }
+    selected = _legacy_duplicate_key_field_snapshot(
+        recovery_metadata=initial_recovery,
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    historical = _write_legacy_duplicate_key_field_projection(
+        archive,
+        selected,
+        monkeypatch,
+    )
+    writes = []
+    real_write = archive._atomic_write
+
+    def observe_write(path, payload, maximum):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", observe_write)
+    conflicting = replace(
+        selected,
+        recovery_metadata={
+            **initial_recovery,
+            "source_snapshot_id": "source-b",
+        },
+    )
+
+    with pytest.raises(ValueError, match="lineage|recovery"):
+        archive.upsert(conflicting)
+
+    assert writes == []
+    assert archive.get("a" * 20) == historical
+
+
+def test_archive_legacy_duplicate_key_fields_retry_rejects_non_key_change_with_fake_raw(
+    tmp_path,
+    monkeypatch,
+):
+    selected = _legacy_duplicate_key_field_snapshot()
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    historical = _write_legacy_duplicate_key_field_projection(
+        archive,
+        selected,
+        monkeypatch,
+    )
+    writes = []
+    real_write = archive._atomic_write
+
+    def observe_write(path, payload, maximum):
+        writes.append(path)
+        return real_write(path, payload, maximum)
+
+    monkeypatch.setattr(archive, "_atomic_write", observe_write)
+    monkeypatch.setattr(
+        archive_module,
+        "_raw_input_event_digest",
+        lambda _event: historical["raw_input_digest"],
+    )
+    changed = replace(
+        selected,
+        events=(replace(selected.events[0], title="different public title"),),
+    )
+
+    with pytest.raises(ValueError, match="lineage content mismatch"):
+        archive.upsert(changed)
+
+    assert writes == []
+    assert archive.get("a" * 20) == historical
+
+
+def test_archive_key_field_value_identity_takes_winner_status_reason_and_unions_refs(
+    tmp_path,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(minutes=2))
+    old_proof = evidence_item("old-value-proof")
+    new_proof = evidence_item("new-value-proof")
+    old_field = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.VERIFIED,
+        (old_proof.evidence_id,),
+        "old official reason",
+    )
+    new_field = replace(
+        old_field,
+        verification_status=FieldVerificationStatus.CONFLICTING,
+        evidence_ids=(new_proof.evidence_id,),
+        reason="latest conflicting reason",
+    )
+    archive.upsert(snapshot(event(
+        primary_evidence=(old_proof,),
+        key_fields=(old_field,),
+    )))
+    archive.upsert(snapshot(
+        event(
+            primary_evidence=(new_proof,),
+            key_fields=(new_field,),
+        ),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+        generated_at=NOW + timedelta(minutes=1),
+    ))
+
+    row = archive.get("a" * 20)
+
+    assert row is not None
+    assert len(row["key_fields"]) == 1
+    assert row["key_fields"][0] == {
+        "field_name": "money",
+        "raw_value": "12亿元",
+        "normalized_value": "CNY:1200000000",
+        "verification_status": "conflicting",
+        "evidence_ids": ["new-value-proof", "old-value-proof"],
+        "reason": "latest conflicting reason",
+    }
+
+
+def test_archive_different_key_field_values_coexist_across_snapshots(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(minutes=2))
+    proof = evidence_item("coexisting-values-proof")
+    first_field = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.CONFLICTING,
+        (proof.evidence_id,),
+        "conflict",
+    )
+    second_field = replace(
+        first_field,
+        raw_value="15亿元",
+        normalized_value="CNY:1500000000",
+    )
+    archive.upsert(snapshot(event(
+        primary_evidence=(proof,),
+        key_fields=(first_field,),
+    )))
+    archive.upsert(snapshot(
+        event(
+            primary_evidence=(proof,),
+            key_fields=(second_field,),
+        ),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+        generated_at=NOW + timedelta(minutes=1),
+    ))
+
+    row = archive.get("a" * 20)
+
+    assert row is not None
+    assert [field["normalized_value"] for field in row["key_fields"]] == [
+        "CNY:1500000000",
+        "CNY:1200000000",
+    ]
+
+
+def test_archive_rejects_one_snapshot_with_conflicting_rows_for_same_value_identity(
+    tmp_path,
+):
+    proof = evidence_item("ambiguous-field-proof")
+    base = KeyField(
+        "money",
+        "12亿元",
+        "CNY:1200000000",
+        FieldVerificationStatus.VERIFIED,
+        (proof.evidence_id,),
+        "verified",
+    )
+    selected = snapshot(event(
+        primary_evidence=(proof,),
+        key_fields=(
+            base,
+            replace(
+                base,
+                verification_status=FieldVerificationStatus.CONFLICTING,
+                reason="conflicting",
+            ),
+        ),
+    ))
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="key.field"):
+        archive.upsert(selected)
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_schema_v3_unsorted_refs_exact_retry_preserves_lineage(
+    tmp_path,
+    monkeypatch,
+):
+    refs = ("zeta-proof", "alpha-proof")
+    selected = snapshot(event(
+        primary_evidence=tuple(
+            evidence_item(evidence_id) for evidence_id in sorted(refs)
+        ),
+        key_fields=(KeyField(
+            "amount",
+            "12",
+            "12",
+            FieldVerificationStatus.VERIFIED,
+            refs,
+            "official",
+        ),),
+    ))
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    real_normalize = archive_module._normalize_archive_projection
+
+    def preserve_historical_ref_order(row):
+        normalized = real_normalize(row)
+        normalized["key_fields"] = [
+            {
+                **field,
+                "evidence_ids": list(row["key_fields"][index]["evidence_ids"]),
+            }
+            for index, field in enumerate(normalized["key_fields"])
+        ]
+        return normalized
+
+    monkeypatch.setattr(
+        archive_module,
+        "_normalize_archive_projection",
+        preserve_historical_ref_order,
+    )
+    archive.upsert(selected)
+    historical = archive.get("a" * 20)
+    assert historical is not None
+    assert historical["key_fields"][0]["evidence_ids"] == list(refs)
+    historical_digest = historical["content_digest"]
+    monkeypatch.setattr(
+        archive_module,
+        "_normalize_archive_projection",
+        real_normalize,
+    )
+
+    archive.upsert(selected)
+    retried = archive.get("a" * 20)
+
+    assert retried is not None
+    assert retried["key_fields"][0]["evidence_ids"] == list(refs)
+    assert retried["content_digest"] == historical_digest
+    assert retried["snapshot_history"][0]["content_digest"] == historical_digest
+    assert len(retried["snapshot_history"]) == 1
+
+
+def test_archive_material_alias_remap_sorts_refs_without_losing_value_identity(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW + timedelta(minutes=2))
+    urls = (
+        "https://official.example.com/alias-one",
+        "https://official.example.com/alias-two",
+    )
+    old_items = (
+        evidence_item("a-canonical", canonical_url=urls[0]),
+        evidence_item("b-canonical", canonical_url=urls[1]),
+    )
+    new_items = (
+        evidence_item("z-new", canonical_url=urls[0]),
+        evidence_item("y-new", canonical_url=urls[1]),
+    )
+    old_field = KeyField(
+        "amount",
+        "12",
+        "12",
+        FieldVerificationStatus.VERIFIED,
+        (),
+        "official",
+    )
+    archive.upsert(snapshot(event(
+        primary_evidence=old_items,
+        key_fields=(old_field,),
+    )))
+    archive.upsert(snapshot(
+        event(
+            primary_evidence=new_items,
+            key_fields=(replace(
+                old_field,
+                evidence_ids=("z-new", "y-new"),
+            ),),
+        ),
+        snapshot_id="f" * 20,
+        raw_snapshot_id="d" * 20,
+        generated_at=NOW + timedelta(minutes=1),
+    ))
+
+    row = archive.get("a" * 20)
+
+    assert row is not None
+    assert row["key_fields"][0]["evidence_ids"] == ["a-canonical", "b-canonical"]
+
+
+def test_archive_exact_retry_repairs_historical_collapsed_key_field_values(
+    tmp_path,
+    monkeypatch,
+):
+    proof = evidence_item("repair-proof")
+    fields = tuple(
+        KeyField(
+            "money",
+            raw_value,
+            normalized_value,
+            FieldVerificationStatus.CONFLICTING,
+            (proof.evidence_id,),
+            "conflict",
+        )
+        for raw_value, normalized_value in (
+            ("12亿元", "CNY:1200000000"),
+            ("15亿元", "CNY:1500000000"),
+            ("18亿元", "CNY:1800000000"),
+        )
+    )
+    selected = snapshot(event(
+        primary_evidence=(proof,),
+        key_fields=fields,
+    ))
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    archive.upsert(selected)
+    original = archive.get("a" * 20)
+    assert original is not None
+    original_lineage_digest = original["snapshot_history"][0]["content_digest"]
+    original_raw_digest = original["raw_input_digest"]
+    real_key_field_merge = archive_module._merge_key_fields
+    real_archive_merge = archive_module._merge_archive_rows
+
+    def historical_collapse(loser, winner):
+        merged = {}
+        references = {}
+        for field in (*loser, *winner):
+            identity = (field["field_name"], field["verification_status"])
+            merged[identity] = dict(field)
+            references.setdefault(identity, set()).update(field["evidence_ids"])
+        for identity, field in merged.items():
+            field["evidence_ids"] = sorted(references[identity])
+        return list(merged.values())
+
+    def collapse_only_during_historical_archive_merge(previous, incoming, **kwargs):
+        monkeypatch.setattr(archive_module, "_merge_key_fields", historical_collapse)
+        try:
+            return real_archive_merge(previous, incoming, **kwargs)
+        finally:
+            monkeypatch.setattr(
+                archive_module,
+                "_merge_key_fields",
+                real_key_field_merge,
+            )
+
+    monkeypatch.setattr(
+        archive_module,
+        "_merge_archive_rows",
+        collapse_only_during_historical_archive_merge,
+    )
+    archive.upsert(selected)
+    collapsed = archive.get("a" * 20)
+    assert collapsed is not None
+    assert len(collapsed["key_fields"]) == 1
+    monkeypatch.setattr(
+        archive_module,
+        "_merge_archive_rows",
+        real_archive_merge,
+    )
+
+    archive.upsert(selected)
+    repaired = archive.get("a" * 20)
+    assert repaired is not None
+    repaired_digest = repaired["content_digest"]
+    archive.upsert(selected)
+    retried = archive.get("a" * 20)
+
+    assert retried is not None
+    assert {
+        (field["field_name"], field["raw_value"], field["normalized_value"])
+        for field in retried["key_fields"]
+    } == {
+        (field.field_name, field.raw_value, field.normalized_value)
+        for field in fields
+    }
+    assert retried["content_digest"] == repaired_digest
+    assert retried["snapshot_history"][0]["content_digest"] == original_lineage_digest
+    assert retried["raw_input_digest"] == original_raw_digest
+    assert retried["snapshot_history"][0]["raw_input_digest"] == original_raw_digest
+    assert len(retried["snapshot_history"]) == 1
+
+
+def test_archive_canonicalizes_recovery_provenance_time_from_aware_offset(tmp_path):
+    recovered_at = (NOW - timedelta(minutes=2)).astimezone(
+        timezone(timedelta(hours=8))
+    )
+    selected = replace(
+        snapshot(event(), generated_at=NOW - timedelta(minutes=3)),
+        recovery_metadata={
+            "source": "evidence_current",
+            "recovered_at": recovered_at.isoformat(),
+            "recovery_status": "cache_recovered",
+            "source_snapshot_id": "source-snapshot",
+        },
+    )
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    archive.upsert(selected)
+    row = archive.get("a" * 20)
+
+    assert row is not None
+    assert row["snapshot_history"][0]["recovery"]["recovered_at"] == (
+        NOW - timedelta(minutes=2)
+    ).isoformat()
+
+
+@pytest.mark.parametrize(
+    "invalid_time",
+    (
+        NOW.replace(tzinfo=None),
+        datetime.max.replace(tzinfo=timezone(-timedelta(hours=23, minutes=59))),
+        NOW.replace(tzinfo=ExplodingOffset()),
+    ),
+)
+def test_archive_rejects_noncanonicalizable_projected_times_without_storage(
+    tmp_path,
+    invalid_time,
+):
+    selected = replace(event(), published_at=invalid_time)
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="timestamp|timezone"):
+        archive.upsert(snapshot(selected))
+
+    assert not archive.archive_root.exists()
+
+
+def test_archive_rejects_exact_copy_claiming_two_base_roles_without_storage(tmp_path):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+    duplicated = evidence_item("base-role-conflict")
+
+    with pytest.raises(ValueError, match="evidence"):
+        archive.upsert(snapshot(event(
+            primary_evidence=(duplicated,),
+            independent_evidence=(duplicated,),
+        )))
+
+    assert not archive.archive_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("primary", "independent", "contradicting"),
+    (
+        (
+            (evidence_item("third-role-copy"),),
+            (evidence_item("third-role-copy"),),
+            (evidence_item("third-role-copy"),),
+        ),
+        (
+            (evidence_item("repeated-role-copy"), evidence_item("repeated-role-copy")),
+            (),
+            (evidence_item("repeated-role-copy"),),
+        ),
+        (
+            (evidence_item("changed-role-copy"),),
+            (),
+            (replace(evidence_item("changed-role-copy"), title="different authority"),),
+        ),
+        (
+            (),
+            (evidence_item("role-mismatch"),),
+            (evidence_item("role-mismatch"),),
+        ),
+    ),
+)
+def test_archive_rejects_noncanonical_role_copy_shapes_without_storage(
+    tmp_path,
+    primary,
+    independent,
+    contradicting,
+):
+    archive = EvidenceArchive(tmp_path, now=lambda: NOW)
+
+    with pytest.raises(ValueError, match="evidence"):
+        archive.upsert(snapshot(event(
+            primary_evidence=primary,
+            independent_evidence=independent,
+            contradicting_evidence=contradicting,
         )))
 
     assert not archive.archive_root.exists()
