@@ -562,6 +562,23 @@ def test_archive_cursor_rejects_missing_limit_unknown_keys_noncanonical_base64_a
         assert "unknown" not in response.text
 
 
+def test_archive_cursor_rejects_noncanonical_json_order_and_whitespace(monkeypatch):
+    monkeypatch.setattr(
+        "news_pipeline.api.EvidenceArchive",
+        lambda: _ArchiveRows([_api_row("legacy event 2", minute=24 * 60)]),
+    )
+    payload = base64.urlsafe_b64decode(_cursor_document() + "==")
+    document = json.loads(payload.decode("utf-8"))
+    reordered = {key: document[key] for key in reversed(list(document))}
+    for candidate in (
+        json.dumps(reordered, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        json.dumps(document, ensure_ascii=False, indent=1).encode("utf-8"),
+    ):
+        cursor = base64.urlsafe_b64encode(candidate).decode("ascii").rstrip("=")
+        response = client.get("/api/news/archive", params={"days": 90, "limit": 2, "cursor": cursor})
+        assert response.status_code == 422
+
+
 def test_archive_page_applies_three_mib_budget_before_adding_the_next_row(monkeypatch):
     # A long but row-bounded lineage makes event + repeated provenance material
     # large enough that two rows exceed the public page budget while either row fits.

@@ -128,6 +128,10 @@ export function isAbortError(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "name" in error && error.name === "AbortError");
 }
 
+export class ArchiveSnapshotChangedError extends ApiError {
+  constructor() { super("证据历史已变化，请重新加载", 409); }
+}
+
 const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MARKET_NEWS_SOURCE_RETRY_WRITE_PATH = /^\/market-news\/sources\/[a-f0-9]{16}\/retry(?:\?|$)/;
 
@@ -1471,6 +1475,10 @@ function archiveError(): never {
   throw new ApiError("证据历史响应无效", 502);
 }
 
+function archiveSnapshotChanged(): never {
+  throw new ArchiveSnapshotChangedError();
+}
+
 function archiveExactRecord(value: unknown, keys: Set<string>): Record<string, unknown> {
   const row = marketNewsRecord(value, keys);
   if (Object.keys(row).length !== keys.size) marketNewsError();
@@ -1698,6 +1706,14 @@ function compareArchiveCodePoints(left: string, right: string): number {
   return leftPoints.length - rightPoints.length;
 }
 
+export function compareArchiveEventsDescending(left: EvidenceArchiveEvent, right: EvidenceArchiveEvent): number {
+  const primary = compareArchiveTimestamps(left.published_at ?? left.verified_at, right.published_at ?? right.verified_at);
+  if (primary !== 0) return -primary;
+  const verified = compareArchiveTimestamps(left.verified_at, right.verified_at);
+  if (verified !== 0) return -verified;
+  return -compareArchiveCodePoints(left.event_id, right.event_id);
+}
+
 function compareArchiveLineage(left: EvidenceArchiveLineage, right: EvidenceArchiveLineage): number {
   const timeDifference = compareArchiveTimestamps(left.generated_at, right.generated_at);
   if (timeDifference !== 0) return timeDifference;
@@ -1914,12 +1930,12 @@ function shapeNewsArchiveInternal(value: unknown, query: EvidenceArchiveQuery): 
   const hasMore = archiveBoolean(pageRow.has_more);
   const nextCursor = pageRow.next_cursor === null ? null : archiveCursor(pageRow.next_cursor);
   const queryVersion = archiveDigest(pageRow.query_version);
+  if (query.cursor !== undefined && (events.length === 0 || nextCursor === query.cursor)) archiveSnapshotChanged();
   if (pageLimit !== queryLimit || returned !== events.length || provenance.length !== events.length
     || total < events.length || hasMore !== (nextCursor !== null)
     || (hasMore && total <= events.length)
     || (query.cursor === undefined && !hasMore && total !== events.length)
-    || (query.cursor === undefined && total > 0 && events.length === 0)
-    || (query.cursor !== undefined && (events.length === 0 || nextCursor === query.cursor))) marketNewsError();
+    || (query.cursor === undefined && total > 0 && events.length === 0)) marketNewsError();
 
   const eventIds = new Set<string>();
   events.forEach((event, index) => {
@@ -1932,6 +1948,7 @@ function shapeNewsArchiveInternal(value: unknown, query: EvidenceArchiveQuery): 
       || !marketNewsDeepEqual(fact.snapshot_history, event.snapshot_history)
       || !marketNewsDeepEqual(fact.recovery, expectedRecovery)) marketNewsError();
     eventIds.add(event.event_id);
+    if (index > 0 && compareArchiveEventsDescending(events[index - 1], event) > 0) archiveSnapshotChanged();
   });
 
   return {
@@ -1947,7 +1964,8 @@ function shapeNewsArchiveInternal(value: unknown, query: EvidenceArchiveQuery): 
 function shapeNewsArchive(value: unknown, query: EvidenceArchiveQuery): EvidenceArchiveList {
   try {
     return shapeNewsArchiveInternal(value, query);
-  } catch {
+  } catch (error) {
+    if (error instanceof ArchiveSnapshotChangedError) throw error;
     return archiveError();
   }
 }

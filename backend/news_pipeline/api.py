@@ -162,6 +162,18 @@ def _archive_cursor_key(
         or _ARCHIVE_QUERY_VERSION_PATTERN.fullmatch(document["query_version"]) is None
     ):
         raise ValueError("invalid archive cursor")
+    canonical_payload = json.dumps({
+        "v": 2,
+        "days": days,
+        "verification_status": verification_status,
+        "limit": limit,
+        "query_version": document["query_version"],
+        "event_time": document["event_time"],
+        "verified_at": document["verified_at"],
+        "event_id": document["event_id"],
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if payload != canonical_payload:
+        raise ValueError("invalid archive cursor")
     return (
         (
             _archive_utc(document["event_time"]),

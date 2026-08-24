@@ -5,7 +5,7 @@ import { NewsPipelineStatus, newsPipelineFailureMessage, runNewsPipelineRefresh 
 import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { SourceHealthSummary } from "@/features/source-health/SourceHealthSummary";
 import { SourceHealthWorkspace } from "@/features/source-health/SourceHealthWorkspace";
-import { ApiError, api, isAbortError } from "@/lib/api";
+import { ApiError, ArchiveSnapshotChangedError, api, compareArchiveEventsDescending, isAbortError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { archiveAuditId, EvidenceDrawer, neutralizeArchiveText, STATUS_LABEL, StatusBadge } from "./EvidenceDrawer";
 import type { EvidenceArchiveEvent, EvidenceArchiveList, EvidenceArchiveQuery, EvidenceEventDetail, EvidenceEventList, EvidenceEventQuery, EvidenceEventSummary, EvidenceHistoryDays, EvidenceSummaryData, VerificationStatus } from "./types";
@@ -15,8 +15,6 @@ type Filter = "all" | VerificationStatus;
 type Sort = "latest" | "status" | "holding_relevance";
 type SnapshotLoadResult = { loaded: boolean; snapshotId: string | null };
 type ArchiveIntent = { days: EvidenceHistoryDays; filter: Filter };
-
-class ArchiveSnapshotChangedError extends Error {}
 
 const tabs: Array<{ value: Tab; label: string }> = [{ value: "verification", label: "资讯核验" }, { value: "health", label: "数据源健康" }, { value: "corrections", label: "更正记录" }];
 const filters: Array<{ value: Filter; label: string }> = [{ value: "all", label: "全部" }, ...Object.entries(STATUS_LABEL).map(([value, label]) => ({ value: value as VerificationStatus, label }))];
@@ -176,6 +174,9 @@ export function EvidenceCenter() {
     try {
       const result: EvidenceArchiveList = await api.newsArchive(query, controller.signal);
       if (requestId !== archiveRequestRef.current || controller.signal.aborted) return false;
+      if (append && (result.events.length === 0 || result.page.next_cursor === cursor)) {
+        throw new ArchiveSnapshotChangedError();
+      }
       if (result.filters.days !== nextDays
         || result.filters.verification_status !== (query.verification_status ?? null)
         || result.page.limit !== archivePageLimit
@@ -197,6 +198,10 @@ export function EvidenceCenter() {
         }
         const knownIds = new Set(archiveEventsRef.current.map((event) => event.event_id));
         if (result.events.some((event) => knownIds.has(event.event_id))) {
+          throw new ArchiveSnapshotChangedError();
+        }
+        if (archiveEventsRef.current.length > 0 && result.events.length > 0
+          && compareArchiveEventsDescending(archiveEventsRef.current[archiveEventsRef.current.length - 1], result.events[0]) > 0) {
           throw new ArchiveSnapshotChangedError();
         }
         nextEvents = [...archiveEventsRef.current, ...result.events];
@@ -269,6 +274,10 @@ export function EvidenceCenter() {
     } catch (error) {
       if (requestId !== detailRequestRef.current || controller.signal.aborted || isAbortError(error)) return;
       setNotice(failureMessage);
+      const failedTrigger = triggerRef.current;
+      setTimeout(() => {
+        if (requestId === detailRequestRef.current && !controller.signal.aborted) failedTrigger?.focus();
+      }, 0);
     } finally {
       if (requestId === detailRequestRef.current) {
         detailAbortRef.current = null;

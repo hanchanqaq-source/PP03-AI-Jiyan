@@ -351,7 +351,7 @@ describe("EvidenceCenter real verification workspace", () => {
     const user = userEvent.setup();
     const second = {
       ...archivedRow,
-      event_id: "legacy-event-2",
+      event_id: "a-legacy-event-2",
       evidence_snapshot_id: "legacy snapshot 2",
       raw_snapshot_id: "raw snapshot 2",
       title: "第二页历史事件",
@@ -454,6 +454,33 @@ describe("EvidenceCenter real verification workspace", () => {
     );
   });
 
+  it("treats zero-progress and same-cursor append replies as a reload-required snapshot change", async () => {
+    const user = userEvent.setup();
+    vi.mocked((api as any).newsArchive)
+      .mockResolvedValueOnce({ ...archiveListing, total: 2, page: { ...archiveListing.page, has_more: true, next_cursor: "same-cursor" } })
+      .mockResolvedValueOnce({ ...archiveListing, events: [], total: 2, provenance: [], page: { ...archiveListing.page, returned: 0, has_more: true, next_cursor: "same-cursor" } });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    await user.click(within(history).getByRole("button", { name: "加载更多历史证据" }));
+    expect(await within(history).findByRole("alert")).toHaveTextContent("证据历史已变化");
+    expect(within(history).getByText(archivedRow.title)).toBeInTheDocument();
+    expect(within(history).queryByRole("button", { name: "加载更多历史证据" })).not.toBeInTheDocument();
+  });
+
+  it("preserves the first page when an append page violates descending archive order", async () => {
+    const user = userEvent.setup();
+    const later = { ...archivedRow, event_id: "\u{1F600}\u0000", title: "错误排序第二页", published_at: "2026-08-22T08:00:00.000001+00:00", verified_at: "2026-08-22T08:00:00.000001+00:00" };
+    vi.mocked((api as any).newsArchive)
+      .mockResolvedValueOnce({ ...archiveListing, total: 2, page: { ...archiveListing.page, has_more: true, next_cursor: "order-page-2" } })
+      .mockResolvedValueOnce({ ...archiveListing, events: [later], total: 2, page: { ...archiveListing.page } });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    await user.click(within(history).getByRole("button", { name: "加载更多历史证据" }));
+    expect(await within(history).findByRole("alert")).toHaveTextContent("证据历史已变化");
+    expect(within(history).getByText(archivedRow.title)).toBeInTheDocument();
+    expect(within(history).queryByText(later.title)).not.toBeInTheDocument();
+  });
+
   it("never appends a stale load-more page after the filters change", async () => {
     const user = userEvent.setup();
     let resolveOldPage!: (value: EvidenceArchiveList) => void;
@@ -508,6 +535,26 @@ describe("EvidenceCenter real verification workspace", () => {
     expect(api.evidenceEvent).not.toHaveBeenCalledWith(archivedRow.event_id);
     await user.click(within(drawer).getByRole("button", { name: "关闭证据详情" }));
     expect(trigger).toHaveFocus();
+  });
+
+  it("restores the initiating trigger after a current detail failure without letting a stale failure steal focus", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.evidenceEvent).mockRejectedValueOnce(new ApiError("证据详情请求失败", 502));
+    render(<EvidenceCenter />);
+    const trigger = await screen.findByRole("button", { name: "查看证据" });
+    await user.click(trigger);
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(screen.queryByRole("dialog", { name: "证据详情" })).not.toBeInTheDocument();
+  });
+
+  it("labels a later null-root status transition as reappeared", async () => {
+    const user = userEvent.setup();
+    const selected = { ...archivedRow, status_history: [...archivedRow.status_history, { from_status: null, to_status: "corrected" as const, changed_at: "2026-08-21T08:00:00+00:00", reason: "重新归档" }] };
+    vi.mocked((api as any).newsArchive).mockResolvedValueOnce({ ...archiveListing, events: [selected] });
+    render(<EvidenceCenter />);
+    const history = await screen.findByRole("region", { name: "证据历史" });
+    await user.click(await within(history).findByRole("button", { name: `查看历史证据 ${selected.title}` }));
+    expect(await screen.findByRole("dialog", { name: "证据详情" })).toHaveTextContent("重新出现（新根）");
   });
 
   it("shows an explicit no-link state for a backend-legal empty canonical URL", async () => {
@@ -710,6 +757,16 @@ describe("EvidenceCenter real verification workspace", () => {
       "/api/news/archive?days=90&verification_status=disproved&limit=100",
       expect.objectContaining({ method: "GET", signal }),
     );
+  });
+
+  it("classifies a zero-progress real-client cursor page as a safe snapshot change", async () => {
+    const payload = archiveWireListing();
+    payload.events = [];
+    payload.provenance = [];
+    payload.total = 2;
+    payload.page = { ...payload.page, returned: 0, has_more: true, next_cursor: "same-cursor" };
+    restoreArchiveClientWithResponse({ data: payload });
+    await expect(api.newsArchive({ days: 7, limit: 100, cursor: "same-cursor" })).rejects.toMatchObject({ status: 409 });
   });
 
   it("normalizes omitted optional archive recovery provenance to an empty list", async () => {
@@ -1189,7 +1246,7 @@ describe("EvidenceCenter real verification workspace", () => {
     mutate(payload);
     restoreArchiveClientWithResponse({ data: payload });
 
-    await expect(api.newsArchive({ days: 7, limit: 100, cursor: "current-page" })).rejects.toMatchObject(archiveInvalidResponse());
+    await expect(api.newsArchive({ days: 7, limit: 100, cursor: "current-page" })).rejects.toMatchObject({ status: 409 });
   });
 
   it("redacts a non-success archive error while preserving its status", async () => {
