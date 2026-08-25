@@ -38,6 +38,7 @@ class SafeHttpDocument:
     body: bytes
     final_url: str
     headers: Mapping[str, str]
+    status_code: int
 
 
 class SafeHttpClient:
@@ -159,6 +160,7 @@ class SafeHttpClient:
                     body=self._read_bounded(response, current_url),
                     final_url=current_url,
                     headers={str(key): str(value) for key, value in response.headers.items()},
+                    status_code=status,
                 )
             finally:
                 response.close()

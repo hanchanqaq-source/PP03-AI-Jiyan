@@ -39,6 +39,11 @@ _FACTORIES: Mapping[str, _ProviderFactory] = {
     "tiingo": _ProviderFactory("data_sources.providers.tiingo", "TiingoAdapter", True, True),
     "eodhd": _ProviderFactory("data_sources.providers.eodhd", "EodhdAdapter", True, True),
     "databento": _ProviderFactory("data_sources.providers.databento", "DatabentoAdapter", True, True),
+    "trendforce-public-price": _ProviderFactory(
+        "data_sources.providers.industry_price_public",
+        "TrendForcePublicPriceAdapter",
+        True,
+    ),
 }
 
 

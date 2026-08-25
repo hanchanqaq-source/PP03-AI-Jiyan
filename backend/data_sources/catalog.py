@@ -153,6 +153,7 @@ def _capabilities() -> tuple[CapabilityDescriptor, ...]:
         CapabilityDescriptor("macro_series", "宏观时间序列", "macro", 31 * _DAY_SECONDS, True, "provider_native", "provider_native", ("oecd",), ("imf", "fred", "eia", "nasdaq_data_link"), ()),
         CapabilityDescriptor("fund_holdings", "基金持仓明细", "fund", 200 * _DAY_SECONDS, True, "provider_native", "quarterly", (), ("tushare",), ()),
         CapabilityDescriptor("news_discovery", "资讯候选发现", "news", None, False, "candidate", "event_driven", (), ("gdelt", "finnhub", "news_api"), ()),
+        CapabilityDescriptor("industry_price_snapshot", "行业公开价格当前快照候选", "industry", _DAY_SECONDS, False, "USD", "current_snapshot", (), ("trendforce_public_price",), ()),
     )
 
 
@@ -188,6 +189,7 @@ def _families() -> tuple[SourceFamily, ...]:
         SourceFamily("tiingo", "Tiingo", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "tiingo_paid_terms_apply", CatalogStatus.UNCONFIGURED),
         SourceFamily("eodhd", "EODHD", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "eodhd_paid_terms_apply", CatalogStatus.UNCONFIGURED),
         SourceFamily("databento", "Databento", "global", "overseas", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), True, "databento_paid_terms_apply", CatalogStatus.UNCONFIGURED),
+        SourceFamily("trendforce_public_price", "TrendForce public current price snapshot candidate", "global", "semiconductor", (SourceRole.CANDIDATE,), False, "public_page_reuse_license_unverified", CatalogStatus.UNCONFIGURED),
     )
 
 
@@ -255,6 +257,7 @@ def _static_adapters() -> tuple[AdapterDescriptor, ...]:
         _adapter("tiingo", "Tiingo", "tiingo", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://www.tiingo.com/", 75, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Tiingo paid account and data terms apply.", usage_note="默认关闭；只有凭据、套餐、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("TIINGO_API_KEY",), data_delay="以实际付费套餐与上游返回为准", quota_policy="以用户自有付费账户实际套餐为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
         _adapter("eodhd", "EODHD", "eodhd", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://eodhd.com/", 75, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="EODHD paid account and data terms apply.", usage_note="默认关闭；本轮只登记已覆盖 Mock 的历史行情能力；只有凭据、套餐、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("EODHD_API_KEY",), data_delay="以实际付费套餐与上游返回为准", quota_policy="以用户自有付费账户实际套餐为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
         _adapter("databento", "Databento", "databento", "http_client", (SourceRole.MARKET_DATA, SourceRole.FALLBACK_DATA, SourceRole.CROSS_CHECK), ("stock_history",), "https://databento.com/", 65, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Databento paid account, dataset and market-data terms apply.", usage_note="默认关闭；本轮只登记已覆盖 Mock 的历史行情能力；只有凭据、数据集许可、费用和测试授权全部可信时才允许请求。", billing_model=BillingModel.PAID_API, auth_type="api_key", credential_env_names=("DATABENTO_API_KEY",), data_delay="以实际付费套餐、数据集与上游返回为准", quota_policy="以用户自有付费账户和数据集授权为准", cost_policy="付费 API；成本未知时禁止请求且不自动购买"),
+        _adapter("trendforce-public-price", "TrendForce public current price snapshot candidate", "trendforce_public_price", "bounded_public_html", (SourceRole.CANDIDATE,), ("industry_price_snapshot",), "https://www.trendforce.com/price/dram/dram_spot", 200, default_enabled=False, catalog_status=CatalogStatus.UNCONFIGURED, license_note="Public page reuse license is unverified; current snapshot only and never historical/member download.", usage_note="Candidate only; no login, Cookie, key, subscription, history, download, or report-value promotion.", data_delay="Current snapshot only; upstream timestamp required.", quota_policy="One bounded qualification request; no automated production refresh while unconfigured.", cost_policy="Free public no-key candidate; no purchase, fee, or account upgrade."),
     )
 
 
