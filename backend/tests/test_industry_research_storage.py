@@ -236,6 +236,23 @@ def test_v2_schema_version_is_checksum_bound_and_cannot_be_relabelled_as_v1(tmp_
     assert storage.load_current("storage") is None
 
 
+def test_resigned_v2_report_shape_cannot_be_relabelled_as_legacy_v1(tmp_path) -> None:
+    # Break caught: v1 dispatch accepts the v2-only report-key superset after a valid v1 resign.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    publish(storage, report("trusted-storage-resigned-v1"))
+    path = storage.trusted_snapshot_path("storage")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["schema_version"] = 1
+    legacy_signed = {
+        "lineage": document["lineage"],
+        "report": document["report"],
+    }
+    document["checksum"] = hashlib.sha256(_canonical(legacy_signed)).hexdigest()
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert storage.load_current("storage") is None
+
+
 def test_refresh_write_failure_returns_and_preserves_previous_complete_snapshot(tmp_path, monkeypatch) -> None:
     # Break caught: a failed final replace exposes the new partial report or deletes the old one.
     storage = IndustryResearchStorage(root=tmp_path / "industry")

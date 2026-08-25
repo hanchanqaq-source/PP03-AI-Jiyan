@@ -356,13 +356,18 @@ def _event(value: object) -> IndustryEvidenceEvent:
 def _report_from_document(
     value: object,
     *,
+    schema_version: int,
     legacy_lineage: Mapping[str, object] | None = None,
 ) -> DisplayedTrustedReport:
     if type(value) is not dict:
         raise ValueError("invalid trusted report schema")
-    if set(value) == _REPORT_KEYS:
+    if schema_version == 2 and set(value) == _REPORT_KEYS:
         row = value
-    elif legacy_lineage is not None and set(value) == _LEGACY_V1_REPORT_KEYS:
+    elif (
+        schema_version == 1
+        and legacy_lineage is not None
+        and set(value) == _LEGACY_V1_REPORT_KEYS
+    ):
         row = dict(value)
         row["raw_snapshot_id"] = legacy_lineage["raw_snapshot_id"]
         row["evidence_snapshot_id"] = legacy_lineage["evidence_snapshot_id"]
@@ -669,6 +674,7 @@ class IndustryResearchStorage:
             lineage = _mapping(outer["lineage"], keys=_LINEAGE_KEYS, name="snapshot lineage")
             report = _report_from_document(
                 outer["report"],
+                schema_version=outer["schema_version"],
                 legacy_lineage=lineage if outer["schema_version"] == 1 else None,
             )
             _validate_report(report)
@@ -742,7 +748,7 @@ class IndustryResearchStorage:
     ) -> TrustedPublicationResult:
         if type(document) is not dict or not _REQUIRED_SECTION_KEYS.issubset(document):
             raise ValueError("trusted snapshot requires all required report sections")
-        report = _report_from_document(document)
+        report = _report_from_document(document, schema_version=2)
         _validate_report(report)
         report.validate_for_mode(production=self.production)
         lineage = _lineage_document(
