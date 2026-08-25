@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import shutil
 import weakref
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from industry_research.relationships import resolve_fund_relations
 
 class MemoryAdapter:
     storage_mode = "memory"
+    requires_transient_disk = False
 
     def __init__(self, analyses: dict[str, dict[str, Any] | BaseException]):
         self.analyses = analyses
@@ -37,6 +39,7 @@ class MemoryAdapter:
 
 class DiskAdapter(MemoryAdapter):
     storage_mode = "request_temp"
+    requires_transient_disk = True
 
     def __init__(self, analyses: dict[str, dict[str, Any] | BaseException]):
         super().__init__(analyses)
@@ -456,6 +459,7 @@ def test_real_service_mixed_holding_evidence_ignores_unrelated_industries() -> N
     assert len(relation.evidence_ids) == 2
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -714,6 +718,7 @@ def test_lookthrough_rejects_foreign_security_and_fund_evidence() -> None:
     assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 @pytest.mark.parametrize("failure", [RuntimeError("bind failed"), asyncio.CancelledError()],
                          ids=("exception", "cancellation"))
 def test_constructor_bind_failure_closes_adapter_before_removing_temp(
@@ -733,6 +738,79 @@ def test_constructor_bind_failure_closes_adapter_before_removing_temp(
     assert not any(root.iterdir())
 
 
+@pytest.mark.parametrize("capability", [None, "false", 0], ids=("missing", "string", "integer"))
+def test_ambiguous_disk_capability_fails_before_filesystem_mutation(
+    tmp_path: Path,
+    capability: object,
+) -> None:
+    # Break caught: an adapter without an exact disk capability reaches temp-root creation.
+    class AmbiguousAdapter:
+        storage_mode = "request_temp"
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    adapter = AmbiguousAdapter()
+    if capability is not None:
+        adapter.requires_transient_disk = capability  # type: ignore[attr-defined]
+    root = tmp_path / ".tmp" / "acceptance" / "must-not-exist"
+
+    with pytest.raises(ValueError, match="requires_transient_disk"):
+        TransientFundContext(adapter=adapter, acceptance_root=root)  # type: ignore[arg-type]
+
+    assert adapter.closed == 1
+    assert not root.exists()
+
+
+def test_memory_adapter_never_touches_or_binds_transient_path(tmp_path: Path) -> None:
+    # Break caught: a memory-only adapter is forced through disk-root validation.
+    adapter = MemoryAdapter({"900001": _analysis()})
+    root = tmp_path / ".tmp" / "acceptance" / "must-not-exist"
+
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    try:
+        assert context.temp_root is None
+        assert context.analyze("900001")["code"] == "900001"
+        assert not root.exists()
+    finally:
+        context.close()
+
+    assert adapter.closed == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pathless memory contract")
+def test_posix_memory_adapter_works_without_any_transient_disk(tmp_path: Path) -> None:
+    root = tmp_path / ".tmp" / "acceptance" / "must-not-exist"
+    adapter = MemoryAdapter({"900001": _analysis()})
+
+    with TransientFundContext(adapter=adapter, acceptance_root=root) as context:
+        assert context.temp_root is None
+        assert context.analyze("900001")["code"] == "900001"
+
+    assert adapter.closed == 1
+    assert not root.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX disk-backed context is fail-closed")
+def test_posix_disk_adapter_is_rejected_before_temp_creation_or_binding(tmp_path: Path) -> None:
+    # Break caught: POSIX creates a child before discovering safe recursive deletion is unavailable.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    before = tuple(root.iterdir())
+    adapter = DiskAdapter({})
+
+    with pytest.raises(RuntimeError, match="POSIX.*disk"):
+        TransientFundContext(adapter=adapter, acceptance_root=root)
+
+    assert adapter.closed == 1
+    assert adapter.bound_root is None
+    assert tuple(root.iterdir()) == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 def test_nonexistent_acceptance_parent_is_rejected_and_adapter_is_closed(tmp_path: Path) -> None:
     # Break caught: the context creates an unvalidated parent chain before checking its identity.
     root = tmp_path / ".tmp" / "acceptance" / "missing"
@@ -749,6 +827,7 @@ def test_nonexistent_acceptance_parent_is_rejected_and_adapter_is_closed(tmp_pat
     assert not root.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 def test_directory_identity_swap_refuses_delete_then_allows_safe_retry(tmp_path: Path, monkeypatch) -> None:
     # Break caught: a replaced request directory is recursively deleted by pathname alone.
     root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
@@ -777,6 +856,7 @@ def test_directory_identity_swap_refuses_delete_then_allows_safe_retry(tmp_path:
     assert adapter.closed == 1
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 def test_reparse_detection_refuses_delete_then_allows_safe_retry(tmp_path: Path, monkeypatch) -> None:
     # Break caught: a junction/reparse target is followed during recursive cleanup.
     root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
@@ -816,32 +896,27 @@ def test_guarded_cleanup_blocks_parent_or_child_swap_inside_delete(
     context = TransientFundContext(adapter=adapter, acceptance_root=root)
     assert context.temp_root is not None
     transient = context.temp_root
-    payload = transient / "payload"
-    payload.mkdir()
-    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
     target = root if swap_target == "acceptance-parent" else transient
     moved = target.with_name(f"{target.name}-original")
-    original_rmtree = fund_context_module.shutil.rmtree
+    guard_type = fund_context_module._DirectoryGuard
+    original_delete_empty = guard_type.delete_empty
     attempted = False
     swap_blocked = False
 
-    def inject_swap(path):
+    def inject_swap(self):
         nonlocal attempted, swap_blocked
-        path = Path(path)
-        if not attempted:
+        if self.path == transient and not attempted:
             attempted = True
-            relative_delete = path.relative_to(target)
             try:
                 target.rename(moved)
             except OSError:
                 swap_blocked = True
             else:
-                replacement_delete = target / relative_delete
-                replacement_delete.mkdir(parents=True, exist_ok=True)
+                target.mkdir(parents=True, exist_ok=True)
                 (target / "replacement.marker").write_text("must survive", encoding="utf-8")
-        return original_rmtree(path)
+        return original_delete_empty(self)
 
-    monkeypatch.setattr(fund_context_module.shutil, "rmtree", inject_swap)
+    monkeypatch.setattr(guard_type, "delete_empty", inject_swap)
     try:
         context.close()
 
@@ -852,20 +927,114 @@ def test_guarded_cleanup_blocks_parent_or_child_swap_inside_delete(
         assert not transient.exists()
         assert not moved.exists()
     finally:
-        monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
+        monkeypatch.setattr(guard_type, "delete_empty", original_delete_empty)
         if not context.closed:
             if moved.exists():
                 if target.exists():
-                    original_rmtree(target)
+                    shutil.rmtree(target)
                 moved.rename(target)
             context.close()
         if moved.exists():
             if target.exists():
-                original_rmtree(target)
-            original_rmtree(moved)
+                shutil.rmtree(target)
+            shutil.rmtree(moved)
 
 
-def test_rmtree_failure_keeps_context_retryable_without_double_closing_adapter(
+@pytest.mark.skipif(os.name != "nt", reason="Windows nested directory-handle rename guard")
+def test_guarded_cleanup_blocks_nested_directory_swap_before_enumeration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: a nested directory is replaced after lstat and its replacement is traversed.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    payload = context.temp_root / "payload"
+    payload.mkdir()
+    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
+    moved = payload.with_name("payload-original")
+    original_iterdir = Path.iterdir
+    attempted = False
+    swap_blocked = False
+
+    def inject_swap(path: Path):
+        nonlocal attempted, swap_blocked
+        if path == payload and not attempted:
+            attempted = True
+            try:
+                payload.rename(moved)
+            except OSError:
+                swap_blocked = True
+            else:
+                payload.mkdir()
+                (payload / "replacement.marker").write_text("must survive", encoding="utf-8")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", inject_swap)
+    try:
+        context.close()
+        assert attempted is True
+        assert swap_blocked is True
+        assert context.closed is True
+        assert not moved.exists()
+    finally:
+        monkeypatch.setattr(Path, "iterdir", original_iterdir)
+        if not context.closed:
+            if moved.exists():
+                if payload.exists():
+                    shutil.rmtree(payload)
+                moved.rename(payload)
+            context.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded write-share contract")
+def test_guarded_cleanup_denies_writable_handle_before_nested_enumeration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: a concurrent writable handle can mutate a validated directory into a reparse point.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    payload = context.temp_root / "payload"
+    payload.mkdir()
+    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
+    original_iterdir = Path.iterdir
+    attempted = False
+    writable_opened = False
+
+    def probe_write_share(path: Path):
+        nonlocal attempted, writable_opened
+        if path == payload and not attempted:
+            attempted = True
+            handle = fund_context_module._KERNEL32.CreateFileW(
+                str(payload),
+                0x40000000,
+                0x00000001 | 0x00000002 | 0x00000004,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
+            )
+            if handle != fund_context_module.ctypes.c_void_p(-1).value:
+                writable_opened = True
+                assert fund_context_module._KERNEL32.CloseHandle(handle)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", probe_write_share)
+    context.close()
+
+    assert attempted is True
+    assert writable_opened is False
+    assert context.closed is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
+def test_guarded_delete_failure_keeps_context_retryable_without_double_closing_adapter(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -875,21 +1044,21 @@ def test_rmtree_failure_keeps_context_retryable_without_double_closing_adapter(
     adapter = DiskAdapter({})
     context = TransientFundContext(adapter=adapter, acceptance_root=root)
     assert context.temp_root is not None
-    payload = context.temp_root / "payload"
-    payload.mkdir()
-    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
-    original = fund_context_module.shutil.rmtree
+    transient = context.temp_root
+    guard_type = fund_context_module._DirectoryGuard
+    original = guard_type.delete_empty
     calls = 0
 
-    def fail_once(path):
+    def fail_once(self):
         nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise OSError("injected rmtree failure")
-        return original(path)
+        if self.path == transient:
+            calls += 1
+            if calls == 1:
+                raise OSError("injected guarded delete failure")
+        return original(self)
 
-    monkeypatch.setattr(fund_context_module.shutil, "rmtree", fail_once)
-    with pytest.raises(OSError, match="injected rmtree failure"):
+    monkeypatch.setattr(guard_type, "delete_empty", fail_once)
+    with pytest.raises(OSError, match="injected guarded delete failure"):
         context.close()
 
     assert context.closed is False
@@ -903,6 +1072,201 @@ def test_rmtree_failure_keeps_context_retryable_without_double_closing_adapter(
     assert context.temp_root is not None and not context.temp_root.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
+def test_delete_pending_handle_close_failure_retries_handle_before_path_validation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: retry lstat runs before closing a retained delete-pending child handle.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    transient = context.temp_root
+    guard_type = fund_context_module._DirectoryGuard
+    original_close = guard_type.close
+    failed = False
+
+    def fail_once_after_disposition(self) -> None:
+        nonlocal failed
+        if self.path == transient and not failed:
+            failed = True
+            raise OSError("injected post-disposition handle close failure")
+        original_close(self)
+
+    monkeypatch.setattr(guard_type, "close", fail_once_after_disposition)
+    with pytest.raises(OSError, match="post-disposition handle close failure"):
+        context.close()
+
+    assert context.closed is False
+    assert adapter.closed == 1
+    assert context._temp_guard is not None
+
+    context.close()
+    assert context.closed is True
+    assert adapter.closed == 1
+    assert not transient.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
+def test_abort_cancels_delete_pending_disposition_and_preserves_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: abandonment closes a delete-pending handle and deletes the verified path.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    transient = context.temp_root
+    guard_type = fund_context_module._DirectoryGuard
+    original_close = guard_type.close
+    failed = False
+
+    def fail_once_after_disposition(self) -> None:
+        nonlocal failed
+        if self.path == transient and not failed:
+            failed = True
+            raise OSError("injected pending-delete close failure before abort")
+        original_close(self)
+
+    monkeypatch.setattr(guard_type, "close", fail_once_after_disposition)
+    with pytest.raises(OSError, match="pending-delete close failure"):
+        context.close()
+
+    assert context._temp_guard is not None
+    assert context._temp_guard.delete_pending is True
+    context.abort()
+
+    assert context.closed is True
+    assert adapter.closed == 1
+    assert transient.exists()
+    moved = transient.with_name(f"{transient.name}-abort-preserved")
+    transient.rename(moved)
+    moved.rename(transient)
+    shutil.rmtree(transient)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
+def test_cross_device_cleanup_entry_is_refused_without_recursion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: recursive cleanup crosses a mounted/reparse device boundary.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    payload = context.temp_root / "payload"
+    payload.mkdir()
+    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
+    original_lstat = context._cleanup_entry_lstat
+
+    def foreign_device(path: Path):
+        info = original_lstat(path)
+        if path == payload:
+            class ForeignDevice:
+                st_dev = info.st_dev + 1
+                st_ino = info.st_ino
+                st_mode = info.st_mode
+                st_reparse_tag = getattr(info, "st_reparse_tag", 0)
+
+            return ForeignDevice()
+        return info
+
+    monkeypatch.setattr(context, "_cleanup_entry_lstat", foreign_device)
+    with pytest.raises(RuntimeError, match="device boundary"):
+        context.close()
+
+    assert context.closed is False
+    assert adapter.closed == 1
+    assert (payload / "public.tmp").exists()
+
+    monkeypatch.setattr(context, "_cleanup_entry_lstat", original_lstat)
+    context.close()
+    assert context.closed is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
+def test_guard_close_failure_after_temp_removal_remains_retryable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: _temp_removed skips a still-open failed ancestor guard on retry.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    transient = context.temp_root
+    failed_guard = context._ancestor_guards[-1][2]
+    original_close = failed_guard.close
+    calls = 0
+
+    def fail_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected guard close failure")
+        original_close()
+
+    monkeypatch.setattr(failed_guard, "close", fail_once)
+    with pytest.raises(OSError, match="injected guard close failure"):
+        context.close()
+
+    assert context.closed is False
+    assert not transient.exists()
+    assert adapter.closed == 1
+    assert [entry[2] for entry in context._ancestor_guards] == [failed_guard]
+
+    context.close()
+    assert context.closed is True
+    assert context._ancestor_guards == []
+    assert adapter.closed == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
+def test_abort_guard_close_failure_keeps_context_open_for_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: abort marks closed even though a raw guard close failed.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    transient = context.temp_root
+    failed_guard = context._ancestor_guards[-1][2]
+    original_close = failed_guard.close
+    calls = 0
+
+    def fail_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected abort guard close failure")
+        original_close()
+
+    monkeypatch.setattr(failed_guard, "close", fail_once)
+    with pytest.raises(OSError, match="injected abort guard close failure"):
+        context.abort()
+
+    assert context.closed is False
+    assert transient.exists()
+    assert adapter.closed == 1
+    assert [entry[2] for entry in context._ancestor_guards] == [failed_guard]
+
+    context.abort()
+    assert context.closed is True
+    assert transient.exists()
+    shutil.rmtree(transient)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 def test_guard_constructor_closes_raw_resource_when_post_open_identity_fails(
     tmp_path: Path,
     monkeypatch,
@@ -941,6 +1305,7 @@ def test_guard_constructor_closes_raw_resource_when_post_open_identity_fails(
     moved.rename(root)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 def test_abort_releases_resources_without_deleting_unverified_temp(
     tmp_path: Path,
     monkeypatch,
@@ -953,7 +1318,7 @@ def test_abort_releases_resources_without_deleting_unverified_temp(
     assert context.temp_root is not None
     transient = context.temp_root
     original_identity = context._directory_identity
-    original_rmtree = fund_context_module.shutil.rmtree
+    original_rmtree = shutil.rmtree
 
     def changed_identity(path: Path):
         identity = original_identity(path)
@@ -982,6 +1347,7 @@ def test_abort_releases_resources_without_deleting_unverified_temp(
             original_rmtree(transient)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 def test_failed_context_manager_cleanup_dropped_reference_releases_guards_without_delete(
     tmp_path: Path,
     monkeypatch,
@@ -990,12 +1356,16 @@ def test_failed_context_manager_cleanup_dropped_reference_releases_guards_withou
     root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
     root.mkdir(parents=True)
     adapter = DiskAdapter({})
-    original_rmtree = fund_context_module.shutil.rmtree
+    original_rmtree = shutil.rmtree
+    guard_type = fund_context_module._DirectoryGuard
+    original_delete_empty = guard_type.delete_empty
 
-    def fail_delete(_path):
-        raise OSError("injected context-manager cleanup failure")
+    def fail_delete(self):
+        if self.path.name.startswith("fund-context-"):
+            raise OSError("injected context-manager cleanup failure")
+        return original_delete_empty(self)
 
-    monkeypatch.setattr(fund_context_module.shutil, "rmtree", fail_delete)
+    monkeypatch.setattr(guard_type, "delete_empty", fail_delete)
 
     def leave_failed_context() -> tuple[weakref.ReferenceType[TransientFundContext], Path]:
         context = TransientFundContext(adapter=adapter, acceptance_root=root)
@@ -1013,7 +1383,7 @@ def test_failed_context_manager_cleanup_dropped_reference_releases_guards_withou
         return reference, transient
 
     reference, transient = leave_failed_context()
-    monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
+    monkeypatch.setattr(guard_type, "delete_empty", original_delete_empty)
     gc.collect()
 
     assert reference() is None
@@ -1023,74 +1393,3 @@ def test_failed_context_manager_cleanup_dropped_reference_releases_guards_withou
     transient.rename(moved)
     moved.rename(transient)
     original_rmtree(transient)
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd cleanup contract")
-@pytest.mark.parametrize("swap_target", ["acceptance-parent", "transient-child"])
-def test_posix_fd_relative_cleanup_preserves_injected_parent_or_child_replacement(
-    tmp_path: Path,
-    monkeypatch,
-    swap_target: str,
-) -> None:
-    # Break caught: pathname recursion follows a parent/child replacement during POSIX cleanup.
-    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
-    root.mkdir(parents=True)
-    adapter = DiskAdapter({})
-    context = TransientFundContext(adapter=adapter, acceptance_root=root)
-    assert context.temp_root is not None
-    transient = context.temp_root
-    payload = transient / "payload"
-    payload.mkdir()
-    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
-    target = root if swap_target == "acceptance-parent" else transient
-    moved = target.with_name(f"{target.name}-original")
-    original_unlink = fund_context_module.os.unlink
-    original_rmtree = fund_context_module.shutil.rmtree
-    attempted = False
-
-    def reject_path_rmtree(*_args, **_kwargs):
-        raise AssertionError("POSIX cleanup must not use path rmtree")
-
-    def inject_swap_then_unlink(path, *args, **kwargs):
-        nonlocal attempted
-        if not attempted:
-            attempted = True
-            target.rename(moved)
-            replacement_child = root / transient.name if swap_target == "acceptance-parent" else transient
-            replacement_child.mkdir(parents=True)
-            (replacement_child / "replacement.marker").write_text("must survive", encoding="utf-8")
-        return original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(fund_context_module.shutil, "rmtree", reject_path_rmtree)
-    monkeypatch.setattr(fund_context_module.os, "unlink", inject_swap_then_unlink)
-    try:
-        with pytest.raises(RuntimeError, match="identity"):
-            context.close()
-
-        replacement_child = root / transient.name if swap_target == "acceptance-parent" else transient
-        assert attempted is True
-        assert context.closed is False
-        assert (replacement_child / "replacement.marker").read_text(encoding="utf-8") == "must survive"
-        assert moved.exists()
-
-        monkeypatch.setattr(fund_context_module.os, "unlink", original_unlink)
-        monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
-        if swap_target == "acceptance-parent":
-            original_rmtree(root)
-            moved.rename(root)
-        else:
-            original_rmtree(transient)
-            moved.rename(transient)
-        context.close()
-
-        assert context.closed is True
-        assert adapter.closed == 1
-        assert not transient.exists()
-    finally:
-        monkeypatch.setattr(fund_context_module.os, "unlink", original_unlink)
-        monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
-        if not context.closed:
-            context.abort()
-        for candidate in (root, moved):
-            if candidate.exists():
-                original_rmtree(candidate)

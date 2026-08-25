@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -66,16 +65,24 @@ if os.name == "nt":
 
 
 class _DirectoryGuard:
-    """Retain an OS directory identity and deny rename/delete while it is guarded."""
+    """Retain a path identity and deny rename/delete while it is guarded."""
 
-    def __init__(self, path: Path, *, deletable: bool = False):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        deletable: bool = False,
+        expected_directory: bool = True,
+    ):
         self.path = path
+        self._expected_directory = expected_directory
+        self._delete_pending = False
         self._handle: int | None = None
         self._fd: int | None = None
         if os.name == "nt":
             desired_access = 0x0080 | (0x00010000 if deletable else 0)
             handle = _KERNEL32.CreateFileW(
-                str(path), desired_access, 0x00000001 | 0x00000002, None, 3,
+                str(path), desired_access, 0x00000001, None, 3,
                 0x02000000 | 0x00200000, None,
             )
             if handle == ctypes.c_void_p(-1).value:
@@ -99,9 +106,18 @@ class _DirectoryGuard:
 
     def __del__(self) -> None:
         try:
+            self.cancel_delete()
             self.close()
         except BaseException:
             pass
+
+    @property
+    def closed(self) -> bool:
+        return self._handle is None if os.name == "nt" else self._fd is None
+
+    @property
+    def delete_pending(self) -> bool:
+        return self._delete_pending
 
     def identity(self) -> tuple[int, int, int, int]:
         if os.name == "nt":
@@ -112,6 +128,8 @@ class _DirectoryGuard:
                 raise ctypes.WinError(ctypes.get_last_error())
             if info.attributes & 0x00000400:
                 raise RuntimeError("reparse directory rejected")
+            if bool(info.attributes & 0x00000010) != self._expected_directory:
+                raise RuntimeError("guarded path type changed")
             return (
                 int(info.volume_serial_number),
                 int(info.file_index_high),
@@ -129,19 +147,26 @@ class _DirectoryGuard:
         if os.name == "nt":
             if self._handle is None:
                 raise RuntimeError("directory guard is closed")
-            disposition = _FileDispositionInformation(True)
-            if not _KERNEL32.SetFileInformationByHandle(
-                self._handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
-            ):
-                raise ctypes.WinError(ctypes.get_last_error())
+            if not self._delete_pending:
+                disposition = _FileDispositionInformation(True)
+                if not _KERNEL32.SetFileInformationByHandle(
+                    self._handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                self._delete_pending = True
             self.close()
             return
         raise RuntimeError("POSIX guarded deletion requires a held parent dirfd")
 
-    def fileno(self) -> int:
-        if self._fd is None:
-            raise RuntimeError("POSIX directory guard is closed")
-        return self._fd
+    def cancel_delete(self) -> None:
+        if os.name != "nt" or self._handle is None or not self._delete_pending:
+            return
+        disposition = _FileDispositionInformation(False)
+        if not _KERNEL32.SetFileInformationByHandle(
+            self._handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._delete_pending = False
 
     def close(self) -> None:
         if os.name == "nt":
@@ -162,6 +187,7 @@ class FundAnalysisAdapter(Protocol):
     """Request-scoped adapter for the existing public fund analysis method."""
 
     storage_mode: str
+    requires_transient_disk: bool
 
     def get_fund_analysis(self, code: str, force_refresh: bool = False) -> Mapping[str, Any]: ...
 
@@ -260,6 +286,7 @@ class TransientFundContext:
             tuple[Path, tuple[int, int, int, int], _DirectoryGuard, tuple[int, int, int, int]]
         ] = []
         self._temp_guard: _DirectoryGuard | None = None
+        self._cleanup_guards: list[_DirectoryGuard] = []
         self._temp_guard_identity: tuple[int, int, int, int] | None = None
         self._temp_removed = False
         self._allocation_industry_ids: Mapping[str, frozenset[str]] = MappingProxyType({})
@@ -268,11 +295,19 @@ class TransientFundContext:
             self._allocation_industry_ids, self._security_industry_ids = _normalized_industry_config(
                 official_industry_config
             )
+            requires_disk = getattr(adapter, "requires_transient_disk", None)
+            if type(requires_disk) is not bool:
+                raise ValueError("adapter requires_transient_disk must be an explicit boolean")
             mode = getattr(adapter, "storage_mode", None)
             if mode not in {"memory", "request_temp"}:
                 raise ValueError("adapter storage_mode must be memory or request_temp")
-            if mode == "memory":
+            expected_mode = "request_temp" if requires_disk else "memory"
+            if mode != expected_mode:
+                raise ValueError("adapter storage_mode conflicts with requires_transient_disk")
+            if not requires_disk:
                 return
+            if os.name != "nt":
+                raise RuntimeError("POSIX disk-backed transient fund context is unsupported")
             if acceptance_root is None:
                 raise ValueError("request_temp adapter requires an acceptance_root")
             root = Path(acceptance_root).absolute()
@@ -399,8 +434,9 @@ class TransientFundContext:
         if close_error is not None:
             errors.append(close_error)
         errors.extend(self._release_all_guards())
-        self._aborted = True
-        self._closed = True
+        if self._temp_guard is None and not self._cleanup_guards and not self._ancestor_guards:
+            self._aborted = True
+            self._closed = True
         _raise_errors("transient fund context abort failed", errors)
 
     def _close_adapter_once(self) -> BaseException | None:
@@ -478,8 +514,18 @@ class TransientFundContext:
 
     def _release_all_guards(self) -> list[BaseException]:
         errors: list[BaseException] = []
+        retained_cleanup_guards: list[_DirectoryGuard] = []
+        for guard in reversed(self._cleanup_guards):
+            try:
+                guard.cancel_delete()
+                guard.close()
+            except BaseException as error:
+                errors.append(error)
+                retained_cleanup_guards.append(guard)
+        self._cleanup_guards = list(reversed(retained_cleanup_guards))
         if self._temp_guard is not None:
             try:
+                self._temp_guard.cancel_delete()
                 self._temp_guard.close()
             except BaseException as error:
                 errors.append(error)
@@ -521,87 +567,87 @@ class TransientFundContext:
         if self._temp_guard.identity() != self._temp_guard_identity:
             raise RuntimeError("transient directory handle identity changed")
 
-    @staticmethod
-    def _posix_identity(info: os.stat_result) -> tuple[int, int, int]:
-        return (info.st_dev, info.st_ino, info.st_mode)
-
-    def _clear_posix_directory(self, directory_fd: int) -> None:
-        nofollow = getattr(os, "O_NOFOLLOW", None)
-        directory_flag = getattr(os, "O_DIRECTORY", None)
-        if nofollow is None or directory_flag is None:
-            raise RuntimeError("POSIX no-follow directory cleanup is unavailable")
-        for name in tuple(os.listdir(directory_fd)):
-            try:
-                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except (FileNotFoundError, OSError) as error:
-                raise RuntimeError("POSIX cleanup entry identity unavailable") from error
-            if stat.S_ISLNK(before.st_mode):
-                raise RuntimeError("POSIX cleanup symlink rejected")
-            if stat.S_ISDIR(before.st_mode):
-                subdirectory_fd = os.open(
-                    name,
-                    os.O_RDONLY | directory_flag | nofollow,
-                    dir_fd=directory_fd,
-                )
-                try:
-                    held = os.fstat(subdirectory_fd)
-                    if self._posix_identity(before) != self._posix_identity(held):
-                        raise RuntimeError("POSIX cleanup directory identity changed")
-                    self._clear_posix_directory(subdirectory_fd)
-                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                    if self._posix_identity(current) != self._posix_identity(held):
-                        raise RuntimeError("POSIX cleanup directory identity changed")
-                    os.rmdir(name, dir_fd=directory_fd)
-                finally:
-                    os.close(subdirectory_fd)
-                continue
-            if not stat.S_ISREG(before.st_mode):
-                raise RuntimeError("unsupported transient cleanup entry")
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if self._posix_identity(current) != self._posix_identity(before):
-                raise RuntimeError("POSIX cleanup file identity changed")
-            os.unlink(name, dir_fd=directory_fd)
-
-    def _cleanup_posix_temp_root(self) -> None:
-        if (
-            self._acceptance_root is None
-            or self._temp_root is None
-            or self._temp_guard is None
-            or not self._ancestor_guards
-        ):
-            raise RuntimeError("POSIX transient directory guards missing")
-        parent_path, _path_identity, parent_guard, _guard_identity = self._ancestor_guards[-1]
-        if parent_path != self._acceptance_root:
-            raise RuntimeError("POSIX acceptance parent guard mismatch")
-        parent_fd = parent_guard.fileno()
-        child_fd = self._temp_guard.fileno()
-        held_child = os.fstat(child_fd)
-        held_guard_identity = (*self._posix_identity(held_child), 0)
-        if self._temp_guard_identity is None or held_guard_identity != self._temp_guard_identity:
-            raise RuntimeError("POSIX transient handle identity changed")
-        self._clear_posix_directory(child_fd)
+    def _cleanup_entry_lstat(self, path: Path) -> os.stat_result:
         try:
-            current_child = os.stat(
-                self._temp_root.name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
+            return path.stat(follow_symlinks=False)
         except (FileNotFoundError, OSError) as error:
-            raise RuntimeError("POSIX transient directory entry identity unavailable") from error
-        if (
-            stat.S_ISLNK(current_child.st_mode)
-            or not stat.S_ISDIR(current_child.st_mode)
-            or self._posix_identity(current_child) != self._posix_identity(held_child)
-        ):
-            raise RuntimeError("POSIX transient directory entry identity changed")
-        os.rmdir(self._temp_root.name, dir_fd=parent_fd)
-        self._temp_removed = True
+            raise RuntimeError("transient cleanup entry identity unavailable") from error
+
+    @staticmethod
+    def _cleanup_entry_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+        return (info.st_dev, info.st_ino, info.st_mode, getattr(info, "st_reparse_tag", 0))
+
+    def _remove_windows_entry(self, path: Path, *, expected_device: int) -> None:
+        self._assert_storage_identity(require_temp=True)
+        before = self._cleanup_entry_lstat(path)
+        before_identity = self._cleanup_entry_identity(before)
+        if before_identity[-1] or stat.S_ISLNK(before.st_mode):
+            raise RuntimeError("reparse cleanup entry rejected")
+        if before.st_dev != expected_device:
+            raise RuntimeError("transient cleanup device boundary rejected")
+        is_directory = stat.S_ISDIR(before.st_mode)
+        if not is_directory and not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("unsupported transient cleanup entry")
+        guard = _DirectoryGuard(
+            path,
+            deletable=True,
+            expected_directory=is_directory,
+        )
+        self._cleanup_guards.append(guard)
+        try:
+            current = self._cleanup_entry_lstat(path)
+            if (
+                self._cleanup_entry_identity(current) != before_identity
+                or guard.identity() != guard.saved_identity
+            ):
+                raise RuntimeError("transient cleanup entry identity changed")
+            if is_directory:
+                for child in tuple(path.iterdir()):
+                    self._remove_windows_entry(child, expected_device=expected_device)
+                self._assert_storage_identity(require_temp=True)
+                current = self._cleanup_entry_lstat(path)
+                if self._cleanup_entry_identity(current) != before_identity:
+                    raise RuntimeError("transient cleanup entry identity changed")
+            guard.delete_empty()
+        except BaseException as original:
+            errors: list[BaseException] = [original]
+            if not guard.delete_pending:
+                try:
+                    guard.close()
+                except BaseException as close_error:
+                    errors.append(close_error)
+            if guard.closed:
+                self._cleanup_guards.remove(guard)
+            _raise_errors("transient cleanup entry and guard release failed", errors)
+        else:
+            self._cleanup_guards.remove(guard)
+
+    def _retry_cleanup_guard_closures(self) -> None:
+        errors: list[BaseException] = []
+        retained: list[_DirectoryGuard] = []
+        for guard in reversed(self._cleanup_guards):
+            try:
+                guard.close()
+            except BaseException as error:
+                errors.append(error)
+                retained.append(guard)
+        self._cleanup_guards = list(reversed(retained))
+        _raise_errors("transient cleanup guard retry failed", errors)
+
+    def _finish_pending_temp_delete(self) -> None:
+        if self._temp_guard is None or not self._temp_guard.delete_pending:
+            return
         self._temp_guard.close()
         self._temp_guard = None
+        if self._temp_root is None or self._temp_root.exists():
+            raise RuntimeError("transient directory cleanup incomplete")
+        self._temp_removed = True
         self._assert_ancestor_guards()
         self._release_ancestor_guards()
 
     def _cleanup_temp_root(self) -> None:
+        self._retry_cleanup_guard_closures()
+        self._finish_pending_temp_delete()
         if self._temp_root is None:
             self._release_ancestor_guards()
             return
@@ -609,20 +655,13 @@ class TransientFundContext:
             self._release_ancestor_guards()
             return
         self._assert_storage_identity(require_temp=True)
-        if os.name == "posix":
-            self._cleanup_posix_temp_root()
-            return
+        if os.name != "nt":
+            raise RuntimeError("POSIX disk-backed transient cleanup is unsupported")
+        if self._temp_identity is None:
+            raise RuntimeError("transient directory identity missing")
+        expected_device = self._temp_identity[0]
         for child in tuple(self._temp_root.iterdir()):
-            self._assert_storage_identity(require_temp=True)
-            info = child.stat(follow_symlinks=False)
-            if getattr(info, "st_reparse_tag", 0) or stat.S_ISLNK(info.st_mode):
-                raise RuntimeError("reparse cleanup entry rejected")
-            if stat.S_ISDIR(info.st_mode):
-                shutil.rmtree(child)
-            elif stat.S_ISREG(info.st_mode):
-                child.unlink()
-            else:
-                raise RuntimeError("unsupported transient cleanup entry")
+            self._remove_windows_entry(child, expected_device=expected_device)
             self._assert_storage_identity(require_temp=True)
         self._assert_storage_identity(require_temp=True)
         if self._temp_guard is None:
