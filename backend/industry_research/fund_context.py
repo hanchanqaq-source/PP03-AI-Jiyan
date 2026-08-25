@@ -82,16 +82,26 @@ class _DirectoryGuard:
                 raise ctypes.WinError(ctypes.get_last_error())
             self._handle = int(handle)
         else:
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_flag = getattr(os, "O_DIRECTORY", None)
+            nofollow = getattr(os, "O_NOFOLLOW", None)
+            if directory_flag is None or nofollow is None:
+                raise RuntimeError("POSIX no-follow directory guards are unavailable")
+            flags = os.O_RDONLY | directory_flag | nofollow
             self._fd = os.open(path, flags)
+        try:
+            self.saved_identity = self.identity()
+        except BaseException:
             try:
-                import fcntl
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.close()
             except BaseException:
-                os.close(self._fd)
-                self._fd = None
-                raise
-        self.saved_identity = self.identity()
+                pass
+            raise
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
 
     def identity(self) -> tuple[int, int, int, int]:
         if os.name == "nt":
@@ -126,8 +136,12 @@ class _DirectoryGuard:
                 raise ctypes.WinError(ctypes.get_last_error())
             self.close()
             return
-        os.rmdir(self.path)
-        self.close()
+        raise RuntimeError("POSIX guarded deletion requires a held parent dirfd")
+
+    def fileno(self) -> int:
+        if self._fd is None:
+            raise RuntimeError("POSIX directory guard is closed")
+        return self._fd
 
     def close(self) -> None:
         if os.name == "nt":
@@ -237,6 +251,7 @@ class TransientFundContext:
         self._adapter = adapter
         self._adapter_closed = False
         self._closed = False
+        self._aborted = False
         self._temp_root: Path | None = None
         self._acceptance_root: Path | None = None
         self._acceptance_identity: tuple[int, int, int, int] | None = None
@@ -296,6 +311,12 @@ class TransientFundContext:
             if len(errors) == 1:
                 raise
             _raise_errors("transient fund context initialization and cleanup failed", errors)
+
+    def __del__(self) -> None:
+        try:
+            self.abort()
+        except BaseException:
+            pass
 
     @property
     def closed(self) -> bool:
@@ -368,6 +389,19 @@ class TransientFundContext:
         if not cleanup_failed:
             self._closed = True
         _raise_errors("transient fund context close failed", errors)
+
+    def abort(self) -> None:
+        """Abandon retryable cleanup without deleting any path and release owned resources."""
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        close_error = self._close_adapter_once()
+        if close_error is not None:
+            errors.append(close_error)
+        errors.extend(self._release_all_guards())
+        self._aborted = True
+        self._closed = True
+        _raise_errors("transient fund context abort failed", errors)
 
     def _close_adapter_once(self) -> BaseException | None:
         if self._adapter_closed:
@@ -487,6 +521,86 @@ class TransientFundContext:
         if self._temp_guard.identity() != self._temp_guard_identity:
             raise RuntimeError("transient directory handle identity changed")
 
+    @staticmethod
+    def _posix_identity(info: os.stat_result) -> tuple[int, int, int]:
+        return (info.st_dev, info.st_ino, info.st_mode)
+
+    def _clear_posix_directory(self, directory_fd: int) -> None:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if nofollow is None or directory_flag is None:
+            raise RuntimeError("POSIX no-follow directory cleanup is unavailable")
+        for name in tuple(os.listdir(directory_fd)):
+            try:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except (FileNotFoundError, OSError) as error:
+                raise RuntimeError("POSIX cleanup entry identity unavailable") from error
+            if stat.S_ISLNK(before.st_mode):
+                raise RuntimeError("POSIX cleanup symlink rejected")
+            if stat.S_ISDIR(before.st_mode):
+                subdirectory_fd = os.open(
+                    name,
+                    os.O_RDONLY | directory_flag | nofollow,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    held = os.fstat(subdirectory_fd)
+                    if self._posix_identity(before) != self._posix_identity(held):
+                        raise RuntimeError("POSIX cleanup directory identity changed")
+                    self._clear_posix_directory(subdirectory_fd)
+                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if self._posix_identity(current) != self._posix_identity(held):
+                        raise RuntimeError("POSIX cleanup directory identity changed")
+                    os.rmdir(name, dir_fd=directory_fd)
+                finally:
+                    os.close(subdirectory_fd)
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                raise RuntimeError("unsupported transient cleanup entry")
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if self._posix_identity(current) != self._posix_identity(before):
+                raise RuntimeError("POSIX cleanup file identity changed")
+            os.unlink(name, dir_fd=directory_fd)
+
+    def _cleanup_posix_temp_root(self) -> None:
+        if (
+            self._acceptance_root is None
+            or self._temp_root is None
+            or self._temp_guard is None
+            or not self._ancestor_guards
+        ):
+            raise RuntimeError("POSIX transient directory guards missing")
+        parent_path, _path_identity, parent_guard, _guard_identity = self._ancestor_guards[-1]
+        if parent_path != self._acceptance_root:
+            raise RuntimeError("POSIX acceptance parent guard mismatch")
+        parent_fd = parent_guard.fileno()
+        child_fd = self._temp_guard.fileno()
+        held_child = os.fstat(child_fd)
+        held_guard_identity = (*self._posix_identity(held_child), 0)
+        if self._temp_guard_identity is None or held_guard_identity != self._temp_guard_identity:
+            raise RuntimeError("POSIX transient handle identity changed")
+        self._clear_posix_directory(child_fd)
+        try:
+            current_child = os.stat(
+                self._temp_root.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except (FileNotFoundError, OSError) as error:
+            raise RuntimeError("POSIX transient directory entry identity unavailable") from error
+        if (
+            stat.S_ISLNK(current_child.st_mode)
+            or not stat.S_ISDIR(current_child.st_mode)
+            or self._posix_identity(current_child) != self._posix_identity(held_child)
+        ):
+            raise RuntimeError("POSIX transient directory entry identity changed")
+        os.rmdir(self._temp_root.name, dir_fd=parent_fd)
+        self._temp_removed = True
+        self._temp_guard.close()
+        self._temp_guard = None
+        self._assert_ancestor_guards()
+        self._release_ancestor_guards()
+
     def _cleanup_temp_root(self) -> None:
         if self._temp_root is None:
             self._release_ancestor_guards()
@@ -495,6 +609,9 @@ class TransientFundContext:
             self._release_ancestor_guards()
             return
         self._assert_storage_identity(require_temp=True)
+        if os.name == "posix":
+            self._cleanup_posix_temp_root()
+            return
         for child in tuple(self._temp_root.iterdir()):
             self._assert_storage_identity(require_temp=True)
             info = child.stat(follow_symlinks=False)

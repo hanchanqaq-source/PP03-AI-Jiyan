@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -899,3 +901,196 @@ def test_rmtree_failure_keeps_context_retryable_without_double_closing_adapter(
     assert context.closed is True
     assert adapter.closed == 1
     assert context.temp_root is not None and not context.temp_root.exists()
+
+
+def test_guard_constructor_closes_raw_resource_when_post_open_identity_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: a handle/fd opened before identity validation leaks when validation raises.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    guard_type = fund_context_module._DirectoryGuard
+    original_identity = guard_type.identity
+    original_close = guard_type.close
+    closed_paths: list[Path] = []
+    failed = False
+
+    def fail_root_identity(self):
+        nonlocal failed
+        if self.path == root and not failed:
+            failed = True
+            raise RuntimeError("injected post-open identity failure")
+        return original_identity(self)
+
+    def record_close(self):
+        closed_paths.append(self.path)
+        return original_close(self)
+
+    monkeypatch.setattr(guard_type, "identity", fail_root_identity)
+    monkeypatch.setattr(guard_type, "close", record_close)
+
+    with pytest.raises(RuntimeError, match="post-open identity failure"):
+        TransientFundContext(adapter=adapter, acceptance_root=root)
+
+    assert root in closed_paths
+    assert adapter.closed == 1
+    moved = root.with_name("v0.2-w3-resource-released")
+    root.rename(moved)
+    moved.rename(root)
+
+
+def test_abort_releases_resources_without_deleting_unverified_temp(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: abandoning a retryable cleanup either leaks guards or deletes an unverified path.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    transient = context.temp_root
+    original_identity = context._directory_identity
+    original_rmtree = fund_context_module.shutil.rmtree
+
+    def changed_identity(path: Path):
+        identity = original_identity(path)
+        return (identity[0], identity[1] + 1, *identity[2:]) if path == transient else identity
+
+    monkeypatch.setattr(context, "_directory_identity", changed_identity)
+    try:
+        with pytest.raises(RuntimeError, match="identity"):
+            context.close()
+
+        context.abort()
+
+        assert context.closed is True
+        assert adapter.closed == 1
+        assert transient.exists()
+        with pytest.raises(RuntimeError, match="closed"):
+            context.analyze("900001")
+        moved = transient.with_name(f"{transient.name}-aborted")
+        transient.rename(moved)
+        moved.rename(transient)
+    finally:
+        monkeypatch.setattr(context, "_directory_identity", original_identity)
+        if not context.closed:
+            context.close()
+        elif transient.exists():
+            original_rmtree(transient)
+
+
+def test_failed_context_manager_cleanup_dropped_reference_releases_guards_without_delete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: a failed __exit__ followed by GC leaves raw handles open indefinitely.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    original_rmtree = fund_context_module.shutil.rmtree
+
+    def fail_delete(_path):
+        raise OSError("injected context-manager cleanup failure")
+
+    monkeypatch.setattr(fund_context_module.shutil, "rmtree", fail_delete)
+
+    def leave_failed_context() -> tuple[weakref.ReferenceType[TransientFundContext], Path]:
+        context = TransientFundContext(adapter=adapter, acceptance_root=root)
+        assert context.temp_root is not None
+        payload = context.temp_root / "payload"
+        payload.mkdir()
+        (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
+        reference = weakref.ref(context)
+        transient = context.temp_root
+        try:
+            with context:
+                pass
+        except OSError as error:
+            assert "context-manager cleanup failure" in str(error)
+        return reference, transient
+
+    reference, transient = leave_failed_context()
+    monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
+    gc.collect()
+
+    assert reference() is None
+    assert adapter.closed == 1
+    assert transient.exists()
+    moved = transient.with_name(f"{transient.name}-gc-released")
+    transient.rename(moved)
+    moved.rename(transient)
+    original_rmtree(transient)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd cleanup contract")
+@pytest.mark.parametrize("swap_target", ["acceptance-parent", "transient-child"])
+def test_posix_fd_relative_cleanup_preserves_injected_parent_or_child_replacement(
+    tmp_path: Path,
+    monkeypatch,
+    swap_target: str,
+) -> None:
+    # Break caught: pathname recursion follows a parent/child replacement during POSIX cleanup.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    assert context.temp_root is not None
+    transient = context.temp_root
+    payload = transient / "payload"
+    payload.mkdir()
+    (payload / "public.tmp").write_text("public fixture", encoding="utf-8")
+    target = root if swap_target == "acceptance-parent" else transient
+    moved = target.with_name(f"{target.name}-original")
+    original_unlink = fund_context_module.os.unlink
+    original_rmtree = fund_context_module.shutil.rmtree
+    attempted = False
+
+    def reject_path_rmtree(*_args, **_kwargs):
+        raise AssertionError("POSIX cleanup must not use path rmtree")
+
+    def inject_swap_then_unlink(path, *args, **kwargs):
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            target.rename(moved)
+            replacement_child = root / transient.name if swap_target == "acceptance-parent" else transient
+            replacement_child.mkdir(parents=True)
+            (replacement_child / "replacement.marker").write_text("must survive", encoding="utf-8")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(fund_context_module.shutil, "rmtree", reject_path_rmtree)
+    monkeypatch.setattr(fund_context_module.os, "unlink", inject_swap_then_unlink)
+    try:
+        with pytest.raises(RuntimeError, match="identity"):
+            context.close()
+
+        replacement_child = root / transient.name if swap_target == "acceptance-parent" else transient
+        assert attempted is True
+        assert context.closed is False
+        assert (replacement_child / "replacement.marker").read_text(encoding="utf-8") == "must survive"
+        assert moved.exists()
+
+        monkeypatch.setattr(fund_context_module.os, "unlink", original_unlink)
+        monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
+        if swap_target == "acceptance-parent":
+            original_rmtree(root)
+            moved.rename(root)
+        else:
+            original_rmtree(transient)
+            moved.rename(transient)
+        context.close()
+
+        assert context.closed is True
+        assert adapter.closed == 1
+        assert not transient.exists()
+    finally:
+        monkeypatch.setattr(fund_context_module.os, "unlink", original_unlink)
+        monkeypatch.setattr(fund_context_module.shutil, "rmtree", original_rmtree)
+        if not context.closed:
+            context.abort()
+        for candidate in (root, moved):
+            if candidate.exists():
+                original_rmtree(candidate)
