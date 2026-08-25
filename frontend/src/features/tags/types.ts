@@ -15,9 +15,34 @@ export interface TagDefinition {
   enabled: boolean;
   news_track?: string;
   report_template?: "semiconductor" | "storage" | "robotics";
+  kind?: "built_in" | "custom";
 }
 
 export interface PageTagState {
+  version: 2;
   ids: string[];
   activeId: string;
+  order: string[];
+}
+
+export interface PageTagStateInput {
+  ids: string[];
+  activeId: string;
+  order?: string[];
+}
+
+export interface CustomTagCatalogItem {
+  id: string;
+  name: string;
+  kind: "custom";
+}
+
+export interface CustomTagCatalogState {
+  version: 1;
+  items: CustomTagCatalogItem[];
+}
+
+export interface CustomTagCreateResult {
+  tag: TagDefinition;
+  created: boolean;
 }

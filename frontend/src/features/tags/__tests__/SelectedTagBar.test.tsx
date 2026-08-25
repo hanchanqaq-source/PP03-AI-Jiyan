@@ -39,4 +39,19 @@ describe("SelectedTagBar", () => {
 
     expect(onReorder).toHaveBeenCalledWith("robotics", "semiconductor");
   });
+
+  it("exposes keyboard controls to move the selected tag left and right", async () => {
+    const user = userEvent.setup();
+    const onReorder = vi.fn();
+    render(
+      <SelectedTagBar tags={tags} activeId="storage" onActivate={vi.fn()}
+        onRemove={vi.fn()} onReorder={onReorder} onAdd={vi.fn()} />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "将存储左移" }));
+    await user.click(screen.getByRole("button", { name: "将存储右移" }));
+
+    expect(onReorder).toHaveBeenNthCalledWith(1, "storage", "semiconductor");
+    expect(onReorder).toHaveBeenNthCalledWith(2, "storage", "robotics");
+  });
 });

@@ -539,7 +539,7 @@ export function MarketNews() {
         <MarketNewsSidebar focus={displayedFocusEvents} impact={data.impact_summary} days={data.filters.days} />
       </div>}
 
-      <TagSelector open={selectorOpen} selectedIds={tags.state.ids} onCancel={() => setSelectorOpen(false)} onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
+      <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags} onCreate={tags.create} onCancel={() => setSelectorOpen(false)} onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
       <DataInfoDialog
         open={infoOpen}
         onClose={() => setInfoOpen(false)}

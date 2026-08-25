@@ -42,7 +42,7 @@ export function IndustryResearch() {
           <p className="mt-2 text-sm text-muted-foreground">{tags.activeTag?.name || "当前标签"}已进入共享标签库，但不会由 AI 自动补造行业数据。</p>
         </div>
       )}
-      <TagSelector open={selectorOpen} selectedIds={tags.state.ids} onCancel={() => setSelectorOpen(false)}
+      <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags} onCreate={tags.create} onCancel={() => setSelectorOpen(false)}
         onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
     </div>
   );
