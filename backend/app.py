@@ -135,10 +135,8 @@ _INDUSTRY_RESEARCH_WRITE_PATH = re.compile(
     r"^/api/industry-research/[a-z0-9][a-z0-9_-]{0,63}/(?:refresh|fund-relations/resolve)$",
     re.ASCII,
 )
-_INDUSTRY_RESEARCH_FUND_PATH = re.compile(
-    r"^/api/industry-research/.*/fund-relations/resolve/?$",
-    re.ASCII,
-)
+_INDUSTRY_RESEARCH_PATH_PREFIX = "/api/industry-research/"
+_INDUSTRY_RESEARCH_FUND_COMPONENT = "fund-relations"
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -220,6 +218,35 @@ def _protected_local_write_request(request: Request) -> bool:
     return len(requested_methods) == 1 and requested_methods[0].upper() in _DATA_SOURCE_WRITE_METHODS
 
 
+def _is_industry_fund_path(request: Request) -> bool:
+    candidates = [request.url.path]
+    raw_path = request.scope.get("raw_path")
+    if isinstance(raw_path, bytes):
+        candidates.append(raw_path.decode("latin-1"))
+    for candidate in candidates:
+        folded = candidate.casefold()
+        if (
+            folded.startswith(_INDUSTRY_RESEARCH_PATH_PREFIX)
+            and _INDUSTRY_RESEARCH_FUND_COMPONENT in folded
+        ):
+            return True
+    return False
+
+
+_FUND_REQUEST_TRANSPORT_ERRORS = (OSError, EOFError, ValueError, RuntimeError)
+
+
+def _is_grouped_fund_request_transport_error(error: Exception) -> bool:
+    if isinstance(error, _FUND_REQUEST_TRANSPORT_ERRORS):
+        return True
+    if isinstance(error, ExceptionGroup):
+        return bool(error.exceptions) and all(
+            _is_grouped_fund_request_transport_error(nested)
+            for nested in error.exceptions
+        )
+    return False
+
+
 @app.middleware("http")
 async def _require_api_key(request: Request, call_next):
     if (
@@ -284,18 +311,29 @@ async def _protect_data_source_writes(request: Request, call_next):
 
 @app.middleware("http")
 async def _prevent_industry_fund_response_storage(request: Request, call_next):
-    is_fund_resolution = (
-        _INDUSTRY_RESEARCH_FUND_PATH.fullmatch(request.url.path) is not None
-    )
+    is_fund_resolution = _is_industry_fund_path(request)
     try:
         response = await call_next(request)
-    except Exception:
+    except _FUND_REQUEST_TRANSPORT_ERRORS:
         if not is_fund_resolution:
             raise
         response = JSONResponse(
-            {"detail": "fund_relation_resolution_failed"},
-            status_code=502,
+            {"detail": "invalid_fund_relation_request"},
+            status_code=400,
         )
+    except Exception as error:
+        if not is_fund_resolution:
+            raise
+        if _is_grouped_fund_request_transport_error(error):
+            response = JSONResponse(
+                {"detail": "invalid_fund_relation_request"},
+                status_code=400,
+            )
+        else:
+            response = JSONResponse(
+                {"detail": "fund_relation_resolution_failed"},
+                status_code=502,
+            )
     if is_fund_resolution:
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"

@@ -307,6 +307,8 @@ def _declared_fund_body_length(request: Request) -> int | None:
         raise HTTPException(400, "invalid_fund_relation_request") from None
     if re.fullmatch(r"[0-9]+", value, re.ASCII) is None:
         raise HTTPException(400, "invalid_fund_relation_request")
+    if len(value) > 64:
+        raise HTTPException(413, "fund_relation_request_too_large")
     declared = int(value)
     if declared > _FUND_RELATION_BODY_MAX_BYTES:
         raise HTTPException(413, "fund_relation_request_too_large")
@@ -329,7 +331,7 @@ async def _read_fund_relation_request(request: Request) -> FundRelationRequest:
             body.extend(chunk)
     except HTTPException:
         raise
-    except (ClientDisconnect, OSError, RuntimeError):
+    except (ClientDisconnect, OSError, EOFError, ValueError, RuntimeError):
         raise HTTPException(400, "invalid_fund_relation_request") from None
     if declared is not None and len(body) != declared:
         raise HTTPException(400, "invalid_fund_relation_request")
@@ -360,7 +362,7 @@ async def resolve_fund_relations(
     service = _service(request)
     try:
         projection = service.resolve_fund_relations(industry_id, payload.fund_codes)
-    except (TypeError, ValueError, RuntimeError):
+    except Exception:
         raise HTTPException(502, "fund_relation_resolution_failed") from None
     if type(projection) is not FundRelationProjection:
         raise HTTPException(502, "fund_relation_response_invalid")

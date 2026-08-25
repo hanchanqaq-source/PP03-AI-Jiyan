@@ -24,6 +24,7 @@ import type {
   NewsPipelinePhase,
 } from "@/features/market-news/types";
 import type { LlmConfig } from "@/lib/llm";
+import { pythonCasefold } from "@/lib/pythonCasefold.generated";
 import type {
   SourceHealthRun,
   SourceHealthRunStarted,
@@ -433,6 +434,7 @@ const INDUSTRY_RESPONSE_KEYS = [
   "requested_industry_id", "displayed_industry_id", "displayed_trusted_report",
   "candidate_evidence", "refresh_run", "template_status",
 ] as const;
+const INDUSTRY_DATE_PARSE = Date.parse.bind(Date);
 const INDUSTRY_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const INDUSTRY_EMPTY_REASONS = new Set([
   "source_unconfigured", "source_unavailable", "source_failed", "verifying",
@@ -505,7 +507,7 @@ function industryEnum<T extends string>(value: unknown, allowed: readonly T[]): 
 
 function industryTimestamp(value: unknown): string {
   const result = industryString(value, 64);
-  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(result) || Number.isNaN(Date.parse(result))) industryError();
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(result) || Number.isNaN(INDUSTRY_DATE_PARSE(result))) industryError();
   return result;
 }
 
@@ -614,13 +616,10 @@ function industrySameStringSet(left: string[], right: string[]): boolean {
 }
 
 function industryPythonCasefold(value: string): string {
-  // NFKC handles compatibility forms (for example ligatures); the explicit
-  // expansions cover common Python casefold differences from JS lowercasing.
-  const normalized = value.normalize("NFKC").toLowerCase();
-  if (/[\uD800-\uDFFF]|[\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF]/u.test(normalized)) {
+  if (/[\uD800-\uDFFF]|[\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF]/u.test(value)) {
     industryError();
   }
-  return normalized.replace(/ß/g, "ss").replace(/ς/g, "σ");
+  return pythonCasefold(value);
 }
 
 function validateTrustedMetric(
@@ -638,7 +637,7 @@ function validateTrustedMetric(
   if (!(["verified", "corroborated"] as const).includes(
     metric.verificationStatus as "verified" | "corroborated",
   ) || metric.freshnessStatus === "expired" || metric.evidence.length === 0
-    || (metric.expiresAt !== null && Date.parse(metric.expiresAt) <= decodedAt)
+    || (metric.expiresAt !== null && INDUSTRY_DATE_PARSE(metric.expiresAt) <= decodedAt)
     || metric.rawSnapshotId !== rawSnapshotId || metric.evidenceSnapshotId !== evidenceSnapshotId
     || metric.asOfDate === null || metric.fetchedAt === null || metric.methodology.length === 0
     || metric.judgmentBasis.length === 0 || metric.invalidatingConditions.length === 0
@@ -1132,6 +1131,8 @@ function decodeFundProjection(
     resolutions,
     pendingLookthroughSelectionIds: pending,
   };
+  const expectedState = expectedFundCodes.length === 0 ? "no_holdings" : "resolved";
+  if (result.state !== expectedState) industryError();
   if (result.state === "no_holdings" && (fundSelection.length || resolutions.length || pending.length)) industryError();
   validateFundRows(fundSelection, resolutions, expectedIndustryId, pending);
   if (!industrySameStringSet(

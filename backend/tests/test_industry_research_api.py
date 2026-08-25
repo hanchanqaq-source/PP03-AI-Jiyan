@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 import json
 import logging
 import threading
+from types import SimpleNamespace
 
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 import pytest
 
@@ -552,15 +554,51 @@ def test_every_fund_resolution_path_shape_is_no_store(
     assert response.headers["pragma"] == "no-cache"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/industry-research/storage/fund-relations/resolve//",
+        "/api/industry-research/storage/fund-relations/resolve/%2F",
+        "/api/industry-research/storage/fund-relations//resolve",
+        "/api/industry-research/storage%0A/fund-relations/resolve",
+        "/api/industry-research/storage/fund-relations%0A/resolve",
+    ],
+)
+def test_malformed_fund_resolution_shapes_are_always_no_store(path: str) -> None:
+    # Break caught: separator/newline variants fall outside a brittle exact path regex.
+    service = RecordingService()
+    response = _client(service).post(
+        path,
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code >= 400
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert service.resolutions == []
+
+
+@pytest.mark.parametrize(
+    "resolver_error",
+    [
+        HTTPException(418, "private-marker"),
+        OSError("private-marker"),
+        KeyError("private-marker"),
+    ],
+    ids=["http-exception", "os-error", "key-error"],
+)
 def test_unexpected_fund_resolver_exception_is_redacted_no_store(
     monkeypatch,
     caplog: pytest.LogCaptureFixture,
+    resolver_error: Exception,
 ) -> None:
     # Break caught: an unexpected resolver exception escapes the endpoint privacy middleware.
     service = RecordingService()
 
     def explode(*_args, **_kwargs):
-        raise KeyError("private-marker")
+        raise resolver_error
 
     monkeypatch.setattr(service, "resolve_fund_relations", explode)
     caplog.set_level(logging.DEBUG)
@@ -586,22 +624,28 @@ def test_unexpected_fund_resolver_exception_is_redacted_no_store(
     assert "private-marker" not in caplog.text
 
 
-def test_raw_asgi_disconnect_is_redacted_400_no_store() -> None:
-    # Break caught: ClientDisconnect escapes instead of becoming a bounded public request error.
+def _raw_asgi_fund_response(
+    second_receive: dict[str, object] | BaseException,
+) -> tuple[dict[str, object], dict[bytes, bytes], bytes, RecordingService]:
     service = RecordingService()
     application = app_module.create_app(industry_research_service=service)
     sent: list[dict[str, object]] = []
-    incoming = iter([
-        {
-            "type": "http.request",
-            "body": b'{"fund_codes":["900001"',
-            "more_body": True,
-        },
-        {"type": "http.disconnect"},
-    ])
+    receive_count = 0
 
     async def receive() -> dict[str, object]:
-        return next(incoming, {"type": "http.disconnect"})
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return {
+                "type": "http.request",
+                "body": b'{"fund_codes":["900001"',
+                "more_body": True,
+            }
+        if receive_count == 2:
+            if isinstance(second_receive, BaseException):
+                raise second_receive
+            return second_receive
+        return {"type": "http.disconnect"}
 
     async def send(message: dict[str, object]) -> None:
         sent.append(message)
@@ -634,11 +678,91 @@ def test_raw_asgi_disconnect_is_redacted_400_no_store() -> None:
         for message in sent
         if message["type"] == "http.response.body"
     )
+    return start, headers, body, service
+
+
+def test_raw_asgi_disconnect_is_redacted_400_no_store() -> None:
+    # Break caught: ClientDisconnect escapes instead of becoming a bounded public request error.
+    start, headers, body, service = _raw_asgi_fund_response({"type": "http.disconnect"})
+
     assert start["status"] == 400
     assert json.loads(body) == {"detail": "invalid_fund_relation_request"}
     assert headers[b"cache-control"] == b"no-store"
     assert headers[b"pragma"] == b"no-cache"
     assert service.resolutions == []
+
+
+@pytest.mark.parametrize(
+    "receive_error",
+    [OSError("private-marker"), EOFError("private-marker"), ValueError("private-marker")],
+    ids=["os-error", "eof-error", "value-error"],
+)
+def test_raw_asgi_receive_errors_are_redacted_400_no_store(
+    receive_error: Exception,
+) -> None:
+    # Break caught: raw receive failures are mistaken for resolver/server failures.
+    start, headers, body, service = _raw_asgi_fund_response(receive_error)
+
+    assert start["status"] == 400
+    assert json.loads(body) == {"detail": "invalid_fund_relation_request"}
+    assert headers[b"cache-control"] == b"no-store"
+    assert headers[b"pragma"] == b"no-cache"
+    assert b"private-marker" not in body
+    assert service.resolutions == []
+
+
+@pytest.mark.parametrize(
+    "resolver_error",
+    [
+        HTTPException(418, "private-marker"),
+        OSError("private-marker"),
+        KeyError("private-marker"),
+    ],
+    ids=["http-exception", "os-error", "key-error"],
+)
+def test_resolver_exceptions_are_consumed_inside_the_endpoint(
+    monkeypatch,
+    resolver_error: Exception,
+) -> None:
+    # Break caught: resolver errors rely on outer middleware instead of the endpoint boundary.
+    service = RecordingService()
+
+    def explode(*_args, **_kwargs):
+        raise resolver_error
+
+    monkeypatch.setattr(service, "resolve_fund_relations", explode)
+    body = b'{"fund_codes":["900001"]}'
+    delivered = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/industry-research/storage/fund-relations/resolve",
+            "headers": [(b"content-length", str(len(body)).encode("ascii"))],
+            "app": SimpleNamespace(
+                state=SimpleNamespace(industry_research_service=service),
+            ),
+        },
+        receive=receive,
+    )
+    caught: Exception | None = None
+    try:
+        asyncio.run(industry_api.resolve_fund_relations(request, "storage"))
+    except Exception as error:
+        caught = error
+
+    assert isinstance(caught, HTTPException)
+    assert caught.status_code == 502
+    assert caught.detail == "fund_relation_resolution_failed"
+    assert "private-marker" not in str(caught.detail)
 
 
 def test_fund_request_rejects_declared_oversize_before_model_validation(monkeypatch) -> None:
@@ -673,6 +797,29 @@ def test_fund_request_rejects_declared_oversize_before_model_validation(monkeypa
     assert marker not in response.text
     assert validation_calls == 0
     assert service.resolutions == []
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    ["9" * 5000, ("0" * 5000) + "4097"],
+    ids=["five-thousand-digits", "leading-zeros"],
+)
+def test_huge_digit_content_length_is_stable_413(content_length: str) -> None:
+    # Break caught: Python's integer digit limit turns a huge numeric header into HTTP 500/502.
+    response = _client(RecordingService()).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=[
+            ("X-PP03-Write-Intent", "1"),
+            ("Content-Type", "application/json"),
+            ("Content-Length", content_length),
+        ],
+        content=b'{"fund_codes":[]}',
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "fund_relation_request_too_large"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
 
 
 def test_fund_request_stream_is_bounded_without_content_length() -> None:

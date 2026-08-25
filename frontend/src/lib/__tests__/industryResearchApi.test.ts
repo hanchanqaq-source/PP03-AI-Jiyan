@@ -310,9 +310,19 @@ describe("industry research API decoder", () => {
     ["German sharp s", "STRASSE", "STRAßE"],
     ["Greek final sigma", "ΟΣ", "οσ"],
     ["compatibility ligature", "office", "oﬃce"],
+    ["Cyrillic historic form", "ᲀ", "в"],
+    ["Greek combining ypogegrammeni", "ͅ", "ι"],
   ])("rejects a false conflict under Python casefold: %s", (_label, left, right) => {
     expect(() => decodeIndustryResearchResponse(responseWithConflictValues(left, right)))
       .toThrow(ApiError);
+  });
+
+  it.each([
+    ["fullwidth Latin letter", "Ａ", "A"],
+    ["superscript digit", "¹", "1"],
+  ])("does not apply compatibility normalization to a real conflict: %s", (_label, left, right) => {
+    expect(() => decodeIndustryResearchResponse(responseWithConflictValues(left, right)))
+      .not.toThrow();
   });
 
   it.each([
@@ -481,6 +491,27 @@ describe("industry research API decoder", () => {
       value,
       new Date("2026-08-25T08:00:00+00:00"),
     )).toMatchObject({ displayedTrustedReport: { counts: { verified: 1 } } });
+  });
+
+  it("does not let a post-import Date.parse patch admit a malformed timestamp", () => {
+    vi.spyOn(Date, "parse").mockReturnValue(0);
+    const value = structuredClone(responseWire) as any;
+    value.displayed_trusted_report.generated_at = "not-a-date+00:00";
+
+    expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
+  });
+
+  it("does not let a post-import Date.parse patch bypass structured expiry", () => {
+    vi.spyOn(Date, "parse").mockReturnValue(new Date("2099-01-01T00:00:00+00:00").getTime());
+    const value = responseWithTrustedMetric(trustedMetricWire({
+      freshness_status: "fresh",
+      expires_at: "2026-08-25T07:59:59+00:00",
+    }));
+
+    expect(() => decodeIndustryResearchResponse(
+      value,
+      new Date("2026-08-25T08:00:00+00:00"),
+    )).toThrow(ApiError);
   });
 
   it("rejects completeness ratios that do not match their exact counts", () => {
@@ -672,6 +703,18 @@ describe("industry research API client", () => {
       body: JSON.stringify({ fund_codes: ["900001"] }),
       headers: expect.objectContaining({ "X-PP03-Write-Intent": "1" }),
     }));
+  });
+
+  it("requires the no_holdings state for an empty requested fund set", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({
+      state: "resolved",
+      fund_selection: [],
+      resolutions: [],
+      pending_lookthrough_selection_ids: [],
+    }));
+
+    await expect(api.resolveIndustryFundRelations("storage", []))
+      .rejects.toBeInstanceOf(ApiError);
   });
 
   it("rejects invalid industry ids and windows before transport", async () => {
