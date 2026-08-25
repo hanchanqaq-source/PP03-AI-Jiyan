@@ -13,6 +13,7 @@ from evidence_verification.models import (
     SourceRole,
     VerificationStatus as A2VerificationStatus,
 )
+from evidence_verification.storage import EvidenceStorage
 from industry_research.models import (
     AvailabilityStatus,
     CandidateEvidenceCounts,
@@ -23,7 +24,10 @@ from industry_research.models import (
     EvidenceReference,
     FreshnessStatus,
     IndustryMetricObservation,
+    IndustryReportResponse,
     MetricChange,
+    RefreshPhase,
+    RefreshRun,
     SourceRunStatus,
     VerificationStatus,
 )
@@ -170,6 +174,18 @@ def test_news_projection_is_read_only_stable_and_uses_real_7_30_90_day_cutoffs()
     assert all("outside-100d" not in repr(window) for window in first)
 
 
+def test_news_candidate_events_carry_the_canonical_a2_snapshot_lineage() -> None:
+    # Break caught: projected news candidates lose raw/evidence lineage and cannot be joined safely.
+    window = project_news_windows(industry_id="storage", snapshot=news_snapshot(), now=NOW)[-1]
+    candidates = window.unverified + window.conflicting
+
+    assert candidates
+    assert {
+        (item.candidate_snapshot_id, item.raw_snapshot_id, item.evidence_snapshot_id)
+        for item in candidates
+    } == {("news-evidence-1", "news-raw-1", "news-evidence-1")}
+
+
 def test_pending_and_conflicting_news_are_candidate_only_and_cannot_change_conclusion() -> None:
     rows = (trusted_observation("dram_price"), trusted_observation("nand_price"))
     with_candidates = assemble_storage_report(
@@ -210,6 +226,110 @@ def test_pending_and_conflicting_news_are_candidate_only_and_cannot_change_concl
         item.event_id not in {"pending-2d", "conflict-40d"}
         for item in with_candidates.report.news_risk
     )
+
+
+def test_news_only_candidate_panel_and_response_use_actual_news_lineage() -> None:
+    # Break caught: news candidate ID is paired with null or report-metric raw/evidence IDs.
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        metric_candidates=None,
+        news_snapshot=news_snapshot(),
+        now=NOW,
+    )
+    panel = assembly.candidate_evidence
+    assert (
+        panel.candidate_snapshot_id,
+        panel.raw_snapshot_id,
+        panel.evidence_snapshot_id,
+    ) == ("news-evidence-1", "news-raw-1", "news-evidence-1")
+    refresh = RefreshRun(
+        industry_id="storage",
+        run_id="run-news-1",
+        raw_snapshot_id="news-raw-1",
+        evidence_snapshot_id="news-evidence-1",
+        candidate_snapshot_id="news-evidence-1",
+        phase=RefreshPhase.VERIFYING,
+        error_code=None,
+        displayed_trusted_snapshot_id=None,
+        published_trusted_snapshot_id=None,
+    )
+    response = IndustryReportResponse("storage", None, None, panel, refresh)
+    assert response.candidate_evidence == panel
+
+
+def test_metric_and_news_candidates_from_different_lineages_fail_closed() -> None:
+    # Break caught: independently signed metric and news candidates are fabricated into one panel.
+    pending_metric = replace(
+        trusted_observation("capacity_utilization"),
+        verification_status=VerificationStatus.UNVERIFIED,
+    )
+    metric_panel = CandidateEvidencePanel(
+        industry_id="storage",
+        candidate_snapshot_id="candidate-storage-1",
+        counts=CandidateEvidenceCounts(1, 0, 0, 0),
+        unverified=(pending_metric,),
+        conflicting=(),
+        unverified_events=(),
+        conflicting_events=(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+    )
+
+    with pytest.raises(ValueError, match="cannot merge candidate lineages"):
+        assemble_storage_report(
+            trusted_snapshot_id="trusted-storage-1",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            generated_at=NOW,
+            trusted_observations=(trusted_observation("dram_price"),),
+            metric_candidates=metric_panel,
+            news_snapshot=news_snapshot(),
+            now=NOW,
+        )
+
+
+def test_forged_equal_value_conflict_cannot_set_placeholder_without_canonical_a2_proof(
+    tmp_path,
+) -> None:
+    # Break caught: constructor bypass plus caller IDs sets `conflicting` without canonical A2 proof.
+    forged = object.__new__(ConflictingObservation)
+    object.__setattr__(forged, "industry_id", "storage")
+    object.__setattr__(forged, "metric_id", "manufacturer_capex")
+    object.__setattr__(forged, "aggregate_value", None)
+    object.__setattr__(forged, "source_values", (
+        ConflictingSourceValue("forged-support", "family-a", 1, "index", "2026-08-24"),
+        ConflictingSourceValue("forged-counter", "family-b", 1.0, "INDEX", "2026-08-24"),
+    ))
+    object.__setattr__(forged, "raw_snapshot_id", "raw-storage-1")
+    object.__setattr__(forged, "evidence_snapshot_id", "evidence-storage-1")
+    panel = CandidateEvidencePanel(
+        industry_id="storage",
+        candidate_snapshot_id="candidate-storage-1",
+        counts=CandidateEvidenceCounts(0, 1, 0, 0),
+        unverified=(),
+        conflicting=(forged,),
+        unverified_events=(),
+        conflicting_events=(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+    )
+
+    with pytest.raises(ValueError, match="canonical A2 contradiction proof"):
+        assemble_storage_report(
+            trusted_snapshot_id="trusted-storage-1",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            generated_at=NOW,
+            trusted_observations=(trusted_observation("dram_price"),),
+            metric_candidates=panel,
+            candidate_evidence_storage=EvidenceStorage(tmp_path / "canonical-a2"),
+            news_snapshot=None,
+            now=NOW,
+        )
 
 
 def test_report_assembly_keeps_all_eight_sections_and_explicit_empty_reasons() -> None:

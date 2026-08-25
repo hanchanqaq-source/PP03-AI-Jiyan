@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import InitVar, dataclass, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
 import math
@@ -520,6 +520,9 @@ class CandidateIndustryEvidenceEvent(WireModel):
     supporting_evidence_ids: tuple[str, ...]
     contradicting_evidence_ids: tuple[str, ...]
     roles: tuple[str, ...]
+    candidate_snapshot_id: str
+    raw_snapshot_id: str
+    evidence_snapshot_id: str
 
     def __post_init__(self) -> None:
         _require_enum(self.status, VerificationStatus, "status")
@@ -528,6 +531,13 @@ class CandidateIndustryEvidenceEvent(WireModel):
         if self.status is VerificationStatus.CONFLICTING:
             if not self.supporting_evidence_ids or not self.contradicting_evidence_ids:
                 raise ValueError("conflicting event requires supporting and contradicting evidence_ids")
+        for name, value in (
+            ("candidate_snapshot_id", self.candidate_snapshot_id),
+            ("raw_snapshot_id", self.raw_snapshot_id),
+            ("evidence_snapshot_id", self.evidence_snapshot_id),
+        ):
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise ValueError(f"candidate event {name} must not be blank")
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,6 +574,9 @@ def _conflicting_truth_key(item: ConflictingSourceValue) -> tuple[object, ...]:
     )
 
 
+_CANONICAL_CONTRADICTION_PROOF = object()
+
+
 @dataclass(frozen=True, slots=True)
 class ConflictingObservation(WireModel):
     industry_id: str
@@ -572,9 +585,9 @@ class ConflictingObservation(WireModel):
     source_values: tuple[ConflictingSourceValue, ...]
     raw_snapshot_id: str | None = None
     evidence_snapshot_id: str | None = None
-    has_valid_contradiction: bool = False
+    _canonical_contradiction_proof: InitVar[object] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _canonical_contradiction_proof: object) -> None:
         if self.aggregate_value is not None:
             raise ValueError("conflicting observation aggregate_value must be null")
         if len(self.source_values) < 2:
@@ -590,13 +603,31 @@ class ConflictingObservation(WireModel):
         ):
             if type(value) is not str or not value.strip() or value != value.strip():
                 raise ValueError(f"conflicting observation {name} must not be blank")
-        if type(self.has_valid_contradiction) is not bool:
-            raise TypeError("has_valid_contradiction must be boolean")
         if (
             len({_conflicting_truth_key(item) for item in self.source_values}) < 2
-            and not self.has_valid_contradiction
+            and _canonical_contradiction_proof is not _CANONICAL_CONTRADICTION_PROOF
         ):
             raise ValueError("conflicting observation requires meaningfully distinct truth values")
+
+
+def _verified_conflicting_observation(
+    *,
+    industry_id: str,
+    metric_id: str,
+    source_values: tuple[ConflictingSourceValue, ...],
+    raw_snapshot_id: str,
+    evidence_snapshot_id: str,
+) -> ConflictingObservation:
+    """Construct only after canonical A2 storage proves support and contradiction."""
+    return ConflictingObservation(
+        industry_id=industry_id,
+        metric_id=metric_id,
+        aggregate_value=None,
+        source_values=source_values,
+        raw_snapshot_id=raw_snapshot_id,
+        evidence_snapshot_id=evidence_snapshot_id,
+        _canonical_contradiction_proof=_CANONICAL_CONTRADICTION_PROOF,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -789,6 +820,11 @@ class CandidateEvidencePanel(WireModel):
         if self.unverified or self.conflicting:
             if not self.raw_snapshot_id or not self.evidence_snapshot_id:
                 raise ValueError("metric candidates require raw/evidence lineage")
+        if self.candidate_snapshot_id is None:
+            if self.raw_snapshot_id is not None:
+                raise ValueError("candidate lineage must be absent without candidate_snapshot_id")
+        elif not self.raw_snapshot_id or not self.evidence_snapshot_id:
+            raise ValueError("candidate snapshot requires raw/evidence lineage")
         if self.raw_snapshot_id is not None and (
             not self.raw_snapshot_id.strip()
             or self.raw_snapshot_id != self.raw_snapshot_id.strip()
@@ -805,6 +841,13 @@ class CandidateEvidencePanel(WireModel):
             raise ValueError("candidate conflicting raw lineage mismatch")
         if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in self.conflicting):
             raise ValueError("candidate conflicting evidence lineage mismatch")
+        events = self.unverified_events + self.conflicting_events
+        if any(item.candidate_snapshot_id != self.candidate_snapshot_id for item in events):
+            raise ValueError("candidate event snapshot lineage mismatch")
+        if any(item.raw_snapshot_id != self.raw_snapshot_id for item in events):
+            raise ValueError("candidate event raw lineage mismatch")
+        if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in events):
+            raise ValueError("candidate event evidence lineage mismatch")
         actual = (len(self.unverified), len(self.conflicting), len(self.unverified_events), len(self.conflicting_events))
         expected = (self.counts.unverified, self.counts.conflicting, self.counts.unverified_events, self.counts.conflicting_events)
         if actual != expected:
@@ -842,6 +885,10 @@ class RefreshRun(WireModel):
                 raise ValueError(f"refresh {name} must not be blank")
         if (self.displayed_raw_snapshot_id is None) != (self.displayed_evidence_snapshot_id is None):
             raise ValueError("displayed raw/evidence lineage must be provided together")
+        if self.candidate_snapshot_id is not None and (
+            not self.raw_snapshot_id or not self.evidence_snapshot_id
+        ):
+            raise ValueError("refresh candidate snapshot requires raw/evidence lineage")
         if self.displayed_trusted_snapshot_id is None:
             if self.displayed_raw_snapshot_id is not None:
                 raise ValueError("displayed lineage requires displayed_trusted_snapshot_id")

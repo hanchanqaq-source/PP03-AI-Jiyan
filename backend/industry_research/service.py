@@ -9,11 +9,13 @@ from evidence_verification.models import (
     EvidenceSnapshot,
     VerificationStatus as A2VerificationStatus,
 )
+from evidence_verification.storage import EvidenceStorage
 
 from .models import (
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
     CandidateIndustryEvidenceEvent,
+    ConflictingObservation,
     ConclusionStatus,
     DisplayedTrustedReport,
     EmptyReason,
@@ -27,6 +29,7 @@ from .models import (
     SourceRunStatus,
     VerificationStatus,
     WireModel,
+    _conflicting_truth_key,
 )
 from .rules import (
     evaluate_storage_conclusion,
@@ -120,7 +123,14 @@ def _trusted_event(industry_id: str, event: A2EvidenceEvent) -> IndustryEvidence
     )
 
 
-def _candidate_event(industry_id: str, event: A2EvidenceEvent) -> CandidateIndustryEvidenceEvent:
+def _candidate_event(
+    industry_id: str,
+    event: A2EvidenceEvent,
+    *,
+    candidate_snapshot_id: str,
+    raw_snapshot_id: str,
+    evidence_snapshot_id: str,
+) -> CandidateIndustryEvidenceEvent:
     status = {
         A2VerificationStatus.UNVERIFIED: VerificationStatus.UNVERIFIED,
         A2VerificationStatus.CONFLICTING: VerificationStatus.CONFLICTING,
@@ -146,6 +156,9 @@ def _candidate_event(industry_id: str, event: A2EvidenceEvent) -> CandidateIndus
         supporting_evidence_ids=supporting,
         contradicting_evidence_ids=contradicting,
         roles=_event_roles(event),
+        candidate_snapshot_id=candidate_snapshot_id,
+        raw_snapshot_id=raw_snapshot_id,
+        evidence_snapshot_id=evidence_snapshot_id,
     )
 
 
@@ -180,13 +193,25 @@ def project_news_windows(
             reverse=True,
         ))
         unverified = tuple(sorted(
-            (_candidate_event(industry_id, event) for event in selected
+            (_candidate_event(
+                industry_id,
+                event,
+                candidate_snapshot_id=snapshot.snapshot_id,
+                raw_snapshot_id=snapshot.raw_snapshot_id,
+                evidence_snapshot_id=snapshot.snapshot_id,
+            ) for event in selected
              if event.verification_status is A2VerificationStatus.UNVERIFIED),
             key=lambda item: (item.occurred_at, item.event_id),
             reverse=True,
         ))
         conflicting = tuple(sorted(
-            (_candidate_event(industry_id, event) for event in selected
+            (_candidate_event(
+                industry_id,
+                event,
+                candidate_snapshot_id=snapshot.snapshot_id,
+                raw_snapshot_id=snapshot.raw_snapshot_id,
+                evidence_snapshot_id=snapshot.snapshot_id,
+            ) for event in selected
              if event.verification_status is A2VerificationStatus.CONFLICTING),
             key=lambda item: (item.occurred_at, item.event_id),
             reverse=True,
@@ -212,27 +237,49 @@ def _empty_candidate(industry_id: str) -> CandidateEvidencePanel:
 def _merge_candidates(
     metric_candidates: CandidateEvidencePanel,
     *,
-    news_snapshot_id: str | None,
+    news_snapshot: EvidenceSnapshot | None,
     window: NewsWindowProjection,
 ) -> CandidateEvidencePanel:
+    metric_items_present = bool(
+        metric_candidates.unverified
+        or metric_candidates.conflicting
+        or metric_candidates.unverified_events
+        or metric_candidates.conflicting_events
+    )
+    news_items_present = bool(window.unverified or window.conflicting)
     candidate_snapshot_id = metric_candidates.candidate_snapshot_id
-    if candidate_snapshot_id is None and (window.unverified or window.conflicting):
-        candidate_snapshot_id = news_snapshot_id
+    raw_snapshot_id = metric_candidates.raw_snapshot_id
+    evidence_snapshot_id = metric_candidates.evidence_snapshot_id
+    if news_items_present:
+        if news_snapshot is None:
+            raise ValueError("news candidates require canonical news snapshot lineage")
+        news_lineage = (
+            news_snapshot.snapshot_id,
+            news_snapshot.raw_snapshot_id,
+            news_snapshot.snapshot_id,
+        )
+        metric_lineage = (candidate_snapshot_id, raw_snapshot_id, evidence_snapshot_id)
+        if metric_items_present and metric_lineage != news_lineage:
+            raise ValueError("cannot merge candidate lineages")
+        if not metric_items_present:
+            candidate_snapshot_id, raw_snapshot_id, evidence_snapshot_id = news_lineage
+    unverified_events = metric_candidates.unverified_events + window.unverified
+    conflicting_events = metric_candidates.conflicting_events + window.conflicting
     return CandidateEvidencePanel(
         industry_id=metric_candidates.industry_id,
         candidate_snapshot_id=candidate_snapshot_id,
         counts=CandidateEvidenceCounts(
             unverified=len(metric_candidates.unverified),
             conflicting=len(metric_candidates.conflicting),
-            unverified_events=len(window.unverified),
-            conflicting_events=len(window.conflicting),
+            unverified_events=len(unverified_events),
+            conflicting_events=len(conflicting_events),
         ),
         unverified=metric_candidates.unverified,
         conflicting=metric_candidates.conflicting,
-        unverified_events=window.unverified,
-        conflicting_events=window.conflicting,
-        raw_snapshot_id=metric_candidates.raw_snapshot_id,
-        evidence_snapshot_id=metric_candidates.evidence_snapshot_id,
+        unverified_events=unverified_events,
+        conflicting_events=conflicting_events,
+        raw_snapshot_id=raw_snapshot_id,
+        evidence_snapshot_id=evidence_snapshot_id,
     )
 
 
@@ -411,6 +458,54 @@ def _has_structured_expiry_at_or_before(
     return expiry <= now
 
 
+def _validate_canonical_contradictions(
+    candidates: CandidateEvidencePanel,
+    evidence_storage: EvidenceStorage | None,
+) -> None:
+    equal_truth = tuple(
+        conflict
+        for conflict in candidates.conflicting
+        if len({_conflicting_truth_key(item) for item in conflict.source_values}) < 2
+    )
+    if not equal_truth:
+        return
+    if type(evidence_storage) is not EvidenceStorage:
+        raise ValueError("equal-value conflict requires canonical A2 contradiction proof")
+    snapshot = evidence_storage.load_current()
+    if (
+        snapshot is None
+        or snapshot.snapshot_id != candidates.evidence_snapshot_id
+        or snapshot.raw_snapshot_id != candidates.raw_snapshot_id
+    ):
+        raise ValueError("equal-value conflict requires canonical A2 contradiction proof")
+    for conflict in equal_truth:
+        source_ids = {item.evidence_id for item in conflict.source_values}
+        proven = False
+        for event in snapshot.events:
+            if event.verification_status is not A2VerificationStatus.CONFLICTING:
+                continue
+            evidence = {item.evidence_id: item for item in _event_evidence(event)}
+            if not source_ids.issubset(evidence):
+                continue
+            supporting = {
+                evidence_id
+                for evidence_id in source_ids
+                if evidence[evidence_id].supports_claim
+                and conflict.metric_id in evidence[evidence_id].supports_fields
+                and not evidence[evidence_id].contradicts_claim
+            }
+            contradictory_ids = {
+                item.evidence_id for item in event.contradicting_evidence
+                if item.contradicts_claim
+            }
+            contradictory = source_ids & contradictory_ids
+            if supporting and contradictory and supporting.isdisjoint(contradictory):
+                proven = True
+                break
+        if not proven:
+            raise ValueError("equal-value conflict requires canonical A2 contradiction proof")
+
+
 def assemble_storage_report(
     *,
     trusted_snapshot_id: str,
@@ -420,12 +515,13 @@ def assemble_storage_report(
     trusted_observations: Iterable[IndustryMetricObservation],
     expired_observations: Iterable[IndustryMetricObservation] = (),
     metric_candidates: CandidateEvidencePanel | None,
+    candidate_evidence_storage: EvidenceStorage | None = None,
     news_snapshot: EvidenceSnapshot | None,
     now: datetime,
     source_coverage: SourceCoverage | None = None,
     demo: bool = False,
 ) -> IndustryReportAssembly:
-    """Assemble all fixed sections from one trusted storage snapshot, without I/O."""
+    """Assemble fixed sections without refreshing, mutating, or writing evidence."""
     industry_id = "storage"
     _aware(generated_at, "generated_at")
     _aware(now, "now")
@@ -459,6 +555,7 @@ def assemble_storage_report(
             raise ValueError("candidate raw lineage mismatch")
         if candidates.evidence_snapshot_id != evidence_snapshot_id:
             raise ValueError("candidate evidence lineage mismatch")
+        _validate_canonical_contradictions(candidates, candidate_evidence_storage)
     expired_rows = tuple(expired_observations)
     if any(type(row) is not IndustryMetricObservation or row.industry_id != industry_id for row in expired_rows):
         raise ValueError("expired observations must match the requested industry")
@@ -492,7 +589,7 @@ def assemble_storage_report(
     news_window = windows[-1]
     candidate_evidence = _merge_candidates(
         candidates,
-        news_snapshot_id=news_snapshot.snapshot_id if news_snapshot is not None else None,
+        news_snapshot=news_snapshot,
         window=news_window,
     )
     chain = tuple(
@@ -621,6 +718,7 @@ class IndustryResearchService:
         trusted_observations: Iterable[IndustryMetricObservation],
         expired_observations: Iterable[IndustryMetricObservation] = (),
         metric_candidates: CandidateEvidencePanel | None,
+        candidate_evidence_storage: EvidenceStorage | None = None,
         news_snapshot: EvidenceSnapshot | None,
         source_coverage: SourceCoverage | None = None,
         demo: bool = False,
@@ -633,6 +731,7 @@ class IndustryResearchService:
             trusted_observations=trusted_observations,
             expired_observations=expired_observations,
             metric_candidates=metric_candidates,
+            candidate_evidence_storage=candidate_evidence_storage,
             news_snapshot=news_snapshot,
             now=self._clock(),
             source_coverage=source_coverage,

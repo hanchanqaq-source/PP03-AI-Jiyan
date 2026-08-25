@@ -52,6 +52,7 @@ _REPORT_KEYS = {
     "source_coverage", "counts", "overview", "cycle", "chain", "metrics",
     "capital", "companies", "fund_selection", "funds", "news_risk",
 }
+_LEGACY_V1_REPORT_KEYS = _REPORT_KEYS - {"raw_snapshot_id", "evidence_snapshot_id"}
 _LINEAGE_KEYS = {
     "industry_id", "raw_snapshot_id", "evidence_snapshot_id", "trusted_snapshot_id",
 }
@@ -219,6 +220,17 @@ def _canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _signed_snapshot_payload(
+    schema_version: int,
+    lineage: object,
+    report: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"lineage": lineage, "report": report}
+    if schema_version >= 2:
+        payload = {"schema_version": schema_version, **payload}
+    return payload
+
+
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -341,8 +353,21 @@ def _event(value: object) -> IndustryEvidenceEvent:
     )
 
 
-def _report_from_document(value: object) -> DisplayedTrustedReport:
-    row = _mapping(value, keys=_REPORT_KEYS, name="trusted report")
+def _report_from_document(
+    value: object,
+    *,
+    legacy_lineage: Mapping[str, object] | None = None,
+) -> DisplayedTrustedReport:
+    if type(value) is not dict:
+        raise ValueError("invalid trusted report schema")
+    if set(value) == _REPORT_KEYS:
+        row = value
+    elif legacy_lineage is not None and set(value) == _LEGACY_V1_REPORT_KEYS:
+        row = dict(value)
+        row["raw_snapshot_id"] = legacy_lineage["raw_snapshot_id"]
+        row["evidence_snapshot_id"] = legacy_lineage["evidence_snapshot_id"]
+    else:
+        raise ValueError("invalid trusted report schema")
     if not _REQUIRED_SECTION_KEYS.issubset(row):
         raise ValueError("trusted snapshot requires all required report sections")
     coverage = _mapping(row["source_coverage"], keys={
@@ -632,13 +657,20 @@ class IndustryResearchStorage:
                 keys={"schema_version", "checksum", "lineage", "report"},
                 name="snapshot",
             )
-            if outer["schema_version"] != 1 or type(outer["checksum"]) is not str:
+            if type(outer["schema_version"]) is not int or outer["schema_version"] not in {1, 2}:
                 return None
-            signed_payload = {"lineage": outer["lineage"], "report": outer["report"]}
+            if type(outer["checksum"]) is not str:
+                return None
+            signed_payload = _signed_snapshot_payload(
+                outer["schema_version"], outer["lineage"], outer["report"]
+            )
             if hashlib.sha256(_canonical(signed_payload)).hexdigest() != outer["checksum"]:
                 return None
             lineage = _mapping(outer["lineage"], keys=_LINEAGE_KEYS, name="snapshot lineage")
-            report = _report_from_document(outer["report"])
+            report = _report_from_document(
+                outer["report"],
+                legacy_lineage=lineage if outer["schema_version"] == 1 else None,
+            )
             _validate_report(report)
             report.validate_for_mode(production=self.production)
             expected_lineage = _lineage_document(
@@ -738,9 +770,9 @@ class IndustryResearchStorage:
             previous = recoverable.report if recoverable is not None else None
             previous_id = previous.trusted_snapshot_id if previous is not None else None
             report_document = report.to_dict()
-            signed_payload = {"lineage": lineage, "report": report_document}
+            signed_payload = _signed_snapshot_payload(2, lineage, report_document)
             document = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "checksum": hashlib.sha256(_canonical(signed_payload)).hexdigest(),
                 "lineage": lineage,
                 "report": report_document,

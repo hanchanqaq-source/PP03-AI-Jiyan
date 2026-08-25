@@ -427,16 +427,16 @@ def test_conflict_requires_distinct_normalized_truth_or_valid_contradiction() ->
             evidence_snapshot_id="evidence-1",
         )
 
-    contradiction = ConflictingObservation(
-        "storage",
-        "dram_price",
-        None,
-        equal_truth,
-        raw_snapshot_id="raw-1",
-        evidence_snapshot_id="evidence-1",
-        has_valid_contradiction=True,
-    )
-    assert contradiction.has_valid_contradiction is True
+    with pytest.raises(TypeError, match="has_valid_contradiction"):
+        ConflictingObservation(
+            "storage",
+            "dram_price",
+            None,
+            equal_truth,
+            raw_snapshot_id="raw-1",
+            evidence_snapshot_id="evidence-1",
+            has_valid_contradiction=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -542,6 +542,9 @@ def test_candidate_events_are_type_isolated_from_trusted_news() -> None:
         supporting_evidence_ids=("ev-pending",),
         contradicting_evidence_ids=(),
         roles=("news",),
+        candidate_snapshot_id="candidate-1",
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
     )
     conflict = CandidateIndustryEvidenceEvent(
         industry_id="storage",
@@ -552,6 +555,9 @@ def test_candidate_events_are_type_isolated_from_trusted_news() -> None:
         supporting_evidence_ids=("ev-support",),
         contradicting_evidence_ids=("ev-contradict",),
         roles=("risk",),
+        candidate_snapshot_id="candidate-1",
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
     )
     panel = CandidateEvidencePanel(
         industry_id="storage",
@@ -566,6 +572,8 @@ def test_candidate_events_are_type_isolated_from_trusted_news() -> None:
         conflicting=(),
         unverified_events=(pending,),
         conflicting_events=(conflict,),
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
     )
 
     assert panel.unverified_events == (pending,)
@@ -628,6 +636,9 @@ def test_candidate_panel_rejects_wrong_concrete_element_types(
                 ("ev-r1",),
                 (),
                 ("news",),
+                "candidate-r1",
+                "raw-r1",
+                "evidence-r1",
             ),
             CandidateEvidenceCounts(0, 0, 1, 0),
         ),
@@ -642,6 +653,9 @@ def test_candidate_panel_rejects_wrong_concrete_element_types(
                 ("ev-r1",),
                 ("ev-r2",),
                 ("risk",),
+                "candidate-r1",
+                "raw-r1",
+                "evidence-r1",
             ),
             CandidateEvidenceCounts(0, 0, 0, 1),
         ),
@@ -680,6 +694,48 @@ def test_candidate_panel_rejects_foreign_nested_conflict_lineage() -> None:
             raw_snapshot_id="raw-1",
             evidence_snapshot_id="evidence-1",
         )
+
+
+def test_candidate_panel_and_refresh_require_complete_candidate_lineage_and_bound_events() -> None:
+    # Break caught: a candidate pointer or nested event exists without one exact raw/evidence lineage.
+    event = CandidateIndustryEvidenceEvent(
+        "storage",
+        "event-1",
+        VerificationStatus.UNVERIFIED,
+        "2026-08-25T00:00:00+08:00",
+        ("ev-1",),
+        ("ev-1",),
+        (),
+        ("news",),
+        "candidate-1",
+        "raw-1",
+        "evidence-1",
+    )
+    panel = CandidateEvidencePanel(
+        industry_id="storage",
+        candidate_snapshot_id="candidate-1",
+        counts=CandidateEvidenceCounts(0, 0, 1, 0),
+        unverified=(),
+        conflicting=(),
+        unverified_events=(event,),
+        conflicting_events=(),
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
+    )
+    with pytest.raises(ValueError, match="event raw lineage mismatch"):
+        replace(panel, unverified_events=(replace(event, raw_snapshot_id="raw-foreign"),))
+
+    with pytest.raises(ValueError, match="candidate.*raw/evidence"):
+        replace(_candidate_panel(), candidate_snapshot_id="candidate-1")
+    with pytest.raises(ValueError, match="candidate.*absent"):
+        replace(
+            _candidate_panel(),
+            candidate_snapshot_id=None,
+            raw_snapshot_id="raw-1",
+            evidence_snapshot_id="evidence-1",
+        )
+    with pytest.raises(ValueError, match="candidate.*raw/evidence"):
+        replace(_idle_refresh(), candidate_snapshot_id="candidate-1")
 
 
 def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:

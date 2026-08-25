@@ -23,6 +23,7 @@ from industry_research.admission import (
     admit_metric_observations,
 )
 from industry_research.models import FreshnessStatus, MetricChange, VerificationStatus
+from industry_research.service import assemble_storage_report
 from news_intelligence.models import NewsSourceItem
 
 
@@ -134,7 +135,7 @@ def raw(
     return RawFixture(observation, evidence, supports, contradicts)
 
 
-def admit(*rows: RawFixture):
+def _admit_with_storage(root, *rows: RawFixture):
     supporting = [row for row in rows if row.supports]
     contradictory = [row for row in rows if row.contradicts]
     if contradictory:
@@ -167,18 +168,24 @@ def admit(*rows: RawFixture):
         events=(event,),
         raw_snapshot_id="raw-storage-1",
     )
+    evidence_storage = EvidenceStorage(root)
+    evidence_storage.publish(snapshot)
+    projection = admit_metric_observations(
+        industry_id="storage",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        evidence_storage=evidence_storage,
+        candidate_snapshot_id="candidate-storage-1",
+        observations=tuple(row.observation for row in rows),
+        now=NOW,
+    )
+    return projection, evidence_storage
+
+
+def admit(*rows: RawFixture):
     with TemporaryDirectory() as root:
-        evidence_storage = EvidenceStorage(root)
-        evidence_storage.publish(snapshot)
-        return admit_metric_observations(
-            industry_id="storage",
-            raw_snapshot_id="raw-storage-1",
-            evidence_snapshot_id="evidence-storage-1",
-            evidence_storage=evidence_storage,
-            candidate_snapshot_id="candidate-storage-1",
-            observations=tuple(row.observation for row in rows),
-            now=NOW,
-        )
+        projection, _storage = _admit_with_storage(root, *rows)
+        return projection
 
 
 def test_plain_caller_constructed_a2_snapshot_cannot_authorize_admission() -> None:
@@ -277,6 +284,41 @@ def test_valid_support_and_contradiction_take_conflict_priority() -> None:
     conflict = projection.candidate.conflicting[0]
     assert conflict.aggregate_value is None
     assert {item.value for item in conflict.source_values} == {12.5, 15.0}
+
+
+def test_equal_values_require_canonical_support_and_contradiction_proof(tmp_path) -> None:
+    # Break caught: removing caller authorization also removes a real checksum-bound contradiction.
+    rows = (
+        raw("support", value=12.5),
+        raw(
+            "counter",
+            value=12.5,
+            family="family-b",
+            publisher="publisher-b.example",
+            supports=False,
+            contradicts=True,
+        ),
+    )
+    projection, evidence_storage = _admit_with_storage(tmp_path / "canonical-a2", *rows)
+
+    assert projection.trusted == ()
+    assert projection.candidate.counts.conflicting == 1
+    assert {
+        item.evidence_id for item in projection.candidate.conflicting[0].source_values
+    } == {"support", "counter"}
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(),
+        metric_candidates=projection.candidate,
+        candidate_evidence_storage=evidence_storage,
+        news_snapshot=None,
+        now=NOW,
+    )
+    dram = next(row for row in assembly.report.cycle if row.metric_id == "dram_price")
+    assert dram.empty_reason.value == "conflicting"
 
 
 def test_three_independent_identity_axes_are_required_for_corroboration() -> None:

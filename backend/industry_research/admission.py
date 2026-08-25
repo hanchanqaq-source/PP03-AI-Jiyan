@@ -32,6 +32,7 @@ from .models import (
     MetricChange,
     SourceRunStatus,
     VerificationStatus,
+    _verified_conflicting_observation,
     _validated_change_value,
 )
 from .templates import get_industry_template
@@ -382,28 +383,38 @@ def admit_metric_observations(
         if len(metric_rows) < 2 and (contradicting or event_conflict):
             raise ValueError("conflicting metric requires two per-source values")
         if len(metric_rows) >= 2 and ((supporting and contradicting) or len(support_claims) > 1 or event_conflict):
-            conflicting.append(ConflictingObservation(
-                industry_id=industry_id,
-                metric_id=metric_id,
-                aggregate_value=None,
-                source_values=tuple(
-                    ConflictingSourceValue(
-                        evidence_id=row.decision.evidence_id,
-                        source_family_id=row.identity.source_family_id,
-                        value=_scalar_value(row.provider_value.value),
-                        unit=row.provider_value.unit or None,
-                        as_of_date=(
-                            row.provider_value.as_of_date.isoformat()
-                            if row.provider_value.as_of_date else None
-                        ),
-                        change=row.change,
-                    )
-                    for row in metric_rows
-                ),
-                raw_snapshot_id=raw_snapshot_id,
-                evidence_snapshot_id=evidence_snapshot_id,
-                has_valid_contradiction=bool(supporting and contradicting) or event_conflict,
-            ))
+            source_values = tuple(
+                ConflictingSourceValue(
+                    evidence_id=row.decision.evidence_id,
+                    source_family_id=row.identity.source_family_id,
+                    value=_scalar_value(row.provider_value.value),
+                    unit=row.provider_value.unit or None,
+                    as_of_date=(
+                        row.provider_value.as_of_date.isoformat()
+                        if row.provider_value.as_of_date else None
+                    ),
+                    change=row.change,
+                )
+                for row in metric_rows
+            )
+            if supporting and contradicting:
+                conflict = _verified_conflicting_observation(
+                    industry_id=industry_id,
+                    metric_id=metric_id,
+                    source_values=source_values,
+                    raw_snapshot_id=raw_snapshot_id,
+                    evidence_snapshot_id=evidence_snapshot_id,
+                )
+            else:
+                conflict = ConflictingObservation(
+                    industry_id=industry_id,
+                    metric_id=metric_id,
+                    aggregate_value=None,
+                    source_values=source_values,
+                    raw_snapshot_id=raw_snapshot_id,
+                    evidence_snapshot_id=evidence_snapshot_id,
+                )
+            conflicting.append(conflict)
             continue
 
         official = next((

@@ -159,6 +159,26 @@ def publish(storage: IndustryResearchStorage, value: DisplayedTrustedReport):
     )
 
 
+def legacy_v1_payload(value: DisplayedTrustedReport) -> bytes:
+    # Hand-build the exact signed v1 shape written before report-level lineage fields existed.
+    report_document = value.to_dict()
+    del report_document["raw_snapshot_id"]
+    del report_document["evidence_snapshot_id"]
+    lineage = {
+        "industry_id": value.industry_id,
+        "raw_snapshot_id": value.raw_snapshot_id,
+        "evidence_snapshot_id": value.evidence_snapshot_id,
+        "trusted_snapshot_id": value.trusted_snapshot_id,
+    }
+    signed = {"lineage": lineage, "report": report_document}
+    document = {
+        "schema_version": 1,
+        "checksum": hashlib.sha256(_canonical(signed)).hexdigest(),
+        **signed,
+    }
+    return _canonical(document) + b"\n"
+
+
 def test_trusted_snapshot_round_trips_as_one_checksummed_report(tmp_path) -> None:
     # Break caught: sections are stored independently or load without checksum verification.
     storage = IndustryResearchStorage(root=tmp_path / "industry")
@@ -170,9 +190,50 @@ def test_trusted_snapshot_round_trips_as_one_checksummed_report(tmp_path) -> Non
 
     assert result.displayed_report == expected
     assert result.published_trusted_snapshot_id == "trusted-storage-1"
+    assert document["schema_version"] == 2
     assert document["report"]["trusted_snapshot_id"] == "trusted-storage-1"
     assert len(document["checksum"]) == 64
     assert storage.load_current("storage") == expected
+
+
+def test_checksum_valid_legacy_v1_report_reconstructs_lineage_from_signed_envelope(tmp_path) -> None:
+    # Break caught: adding report lineage makes a previously valid current snapshot unreadable.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    expected = report("trusted-storage-legacy")
+    path = storage.trusted_snapshot_path("storage")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(legacy_v1_payload(expected))
+
+    loaded = storage.load_current("storage")
+
+    assert loaded == expected
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def test_corrupt_current_falls_back_to_checksum_valid_legacy_v1_previous(tmp_path) -> None:
+    # Break caught: fallback rejects a valid pre-v2 previous snapshot after current corruption.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    expected = report("trusted-storage-legacy-previous")
+    current = storage.trusted_snapshot_path("storage")
+    previous = storage.previous_snapshot_path("storage")
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b'{"schema_version":2,"checksum":"corrupt"}\n')
+    previous.write_bytes(legacy_v1_payload(expected))
+
+    assert storage.load_current("storage") == expected
+    assert json.loads(previous.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def test_v2_schema_version_is_checksum_bound_and_cannot_be_relabelled_as_v1(tmp_path) -> None:
+    # Break caught: changing only schema_version reinterprets unchanged signed bytes.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    publish(storage, report("trusted-storage-v2"))
+    path = storage.trusted_snapshot_path("storage")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["schema_version"] = 1
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert storage.load_current("storage") is None
 
 
 def test_refresh_write_failure_returns_and_preserves_previous_complete_snapshot(tmp_path, monkeypatch) -> None:
@@ -256,7 +317,11 @@ def test_checksum_valid_load_still_rejects_noncanonical_metric_shape(tmp_path) -
     path = storage.trusted_snapshot_path("storage")
     document = json.loads(path.read_text(encoding="utf-8"))
     document["report"]["cycle"] = list(reversed(document["report"]["cycle"]))
-    signed = {"lineage": document["lineage"], "report": document["report"]}
+    signed = {
+        "schema_version": document["schema_version"],
+        "lineage": document["lineage"],
+        "report": document["report"],
+    }
     document["checksum"] = hashlib.sha256(_canonical(signed)).hexdigest()
     path.write_text(json.dumps(document), encoding="utf-8")
 
