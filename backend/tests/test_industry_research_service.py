@@ -403,6 +403,8 @@ def test_placeholder_reasons_derive_only_from_bound_structured_inputs() -> None:
             ConflictingSourceValue("capex-a", "family-a", 1.0, "index", "2026-08-24"),
             ConflictingSourceValue("capex-b", "family-b", -1.0, "index", "2026-08-24"),
         ),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
     )
     candidates = CandidateEvidencePanel(
         industry_id="storage",

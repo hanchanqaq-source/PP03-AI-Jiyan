@@ -47,7 +47,8 @@ _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _INDUSTRY_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _REPORT_KEYS = {
     "industry_id", "template_status", "trusted_snapshot_id",
-    "displayed_trusted_snapshot_id", "generated_at", "demo",
+    "displayed_trusted_snapshot_id", "raw_snapshot_id", "evidence_snapshot_id",
+    "generated_at", "demo",
     "source_coverage", "counts", "overview", "cycle", "chain", "metrics",
     "capital", "companies", "fund_selection", "funds", "news_risk",
 }
@@ -353,6 +354,8 @@ def _report_from_document(value: object) -> DisplayedTrustedReport:
         template_status=TemplateStatus(row["template_status"]),
         trusted_snapshot_id=row["trusted_snapshot_id"],
         displayed_trusted_snapshot_id=row["displayed_trusted_snapshot_id"],
+        raw_snapshot_id=row["raw_snapshot_id"],
+        evidence_snapshot_id=row["evidence_snapshot_id"],
         generated_at=row["generated_at"],
         demo=row["demo"],
         source_coverage=SourceCoverage(**coverage),
@@ -435,6 +438,10 @@ def _lineage_document(
         raise ValueError("trusted publication lineage must not be blank")
     if report.industry_id != expected_industry_id:
         raise ValueError("trusted publication industry_id mismatch")
+    if report.raw_snapshot_id != expected_raw_snapshot_id:
+        raise ValueError("trusted report raw lineage mismatch")
+    if report.evidence_snapshot_id != expected_evidence_snapshot_id:
+        raise ValueError("trusted report evidence lineage mismatch")
     observations = tuple(
         row for row in report.cycle + report.metrics + report.capital
         if row.current_value is not None

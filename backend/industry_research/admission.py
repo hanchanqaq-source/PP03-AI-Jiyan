@@ -32,6 +32,7 @@ from .models import (
     MetricChange,
     SourceRunStatus,
     VerificationStatus,
+    _validated_change_value,
 )
 from .templates import get_industry_template
 
@@ -202,12 +203,20 @@ def _change_claim(change: MetricChange | None) -> tuple[str, Decimal, str] | Non
     return ("change", Decimal(str(change.value)).normalize(), change.basis)
 
 
-def _raw_order_key(row: RawMetricObservation) -> tuple[str, str, str, str]:
+def _raw_order_key(row: RawMetricObservation) -> tuple[str, ...]:
     return (
         row.metric_id,
         row.decision.evidence_id,
         row.identity.source_family_id,
         row.identity.final_url,
+        repr(_normalized_claim_value(row.provider_value.value)),
+        row.provider_value.unit.strip().casefold(),
+        row.provider_value.as_of_date.isoformat() if row.provider_value.as_of_date else "",
+        row.provider_value.frequency.strip().casefold(),
+        row.methodology.strip(),
+        repr(_change_claim(row.change)),
+        row.expires_at.isoformat(),
+        row.provider_value.fetched_at.isoformat(),
     )
 
 
@@ -290,6 +299,14 @@ def admit_metric_observations(
     template = get_industry_template(industry_id)
     allowed_metrics = set(template.cycle_metric_ids)
     rows = tuple(observations)
+    seen_evidence_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, RawMetricObservation):
+            raise TypeError("observations must contain RawMetricObservation")
+        evidence_id = row.decision.evidence_id
+        if evidence_id in seen_evidence_ids:
+            raise ValueError("evidence_id must be unique within one projection")
+        seen_evidence_ids.add(evidence_id)
     groups: dict[str, list[RawMetricObservation]] = {}
     expired: list[IndustryMetricObservation] = []
     for row in rows:
@@ -301,6 +318,8 @@ def admit_metric_observations(
             raise ValueError("raw observation metric_id is not in the industry template")
         if row.provider_value.fetched_at.tzinfo is None or row.provider_value.fetched_at.utcoffset() is None:
             raise ValueError("provider fetched_at must be timezone-aware")
+        if row.change is not None:
+            _validated_change_value(row.change)
         resolved = evidence_index.get((row.decision.event_id, row.decision.evidence_id))
         if resolved is None:
             raise ValueError("evidence decision is absent from the bound A2 evidence snapshot")
@@ -338,8 +357,6 @@ def admit_metric_observations(
             _evidence_reference(row, resolved)
             for row, resolved in zip(metric_rows, resolved_rows, strict=True)
         )
-        if len({item.evidence_id for item in evidence}) != len(evidence):
-            raise ValueError("evidence_id must be unique within one metric")
         supporting = [
             row for row, resolved in zip(metric_rows, resolved_rows, strict=True)
             if resolved.item.supports_claim and metric_id in resolved.item.supports_fields
@@ -383,6 +400,9 @@ def admit_metric_observations(
                     )
                     for row in metric_rows
                 ),
+                raw_snapshot_id=raw_snapshot_id,
+                evidence_snapshot_id=evidence_snapshot_id,
+                has_valid_contradiction=bool(supporting and contradicting) or event_conflict,
             ))
             continue
 

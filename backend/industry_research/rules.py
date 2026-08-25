@@ -12,6 +12,7 @@ from .models import (
     IndustryConclusion,
     IndustryMetricObservation,
     VerificationStatus,
+    _validated_change_value,
     render_conclusion_text,
 )
 from .templates import get_industry_template
@@ -73,6 +74,8 @@ def select_current_trusted_observations(
             VerificationStatus.CORROBORATED,
         }:
             raise ValueError("rules accept only verified/corroborated observations")
+        if row.change is not None:
+            _validated_change_value(row.change)
         lineages.add((row.raw_snapshot_id, row.evidence_snapshot_id))
     if len(lineages) > 1:
         raise ValueError("rules consume observations from one trusted snapshot")

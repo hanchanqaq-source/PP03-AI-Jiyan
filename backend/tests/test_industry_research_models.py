@@ -28,6 +28,7 @@ from industry_research.models import (
     IndustryFundRelationResolution,
     IndustryMetricObservation,
     IndustryReportResponse,
+    MetricChange,
     RefreshPhase,
     RefreshRun,
     ReportCounts,
@@ -59,6 +60,19 @@ def _official_evidence(**changes: object) -> EvidenceReference:
     }
     values.update(changes)
     return EvidenceReference(**values)
+
+
+@pytest.mark.parametrize("value", (True, False, float("nan"), float("inf"), float("-inf"), "2"))
+def test_metric_change_rejects_non_real_or_non_finite_values(value: object) -> None:
+    # Break caught: non-finite or boolean change values survive model/wire validation.
+    with pytest.raises((TypeError, ValueError), match="finite real number"):
+        MetricChange(value=value, basis="wow")  # type: ignore[arg-type]
+
+
+def test_metric_change_normalizes_equivalent_safe_numeric_values() -> None:
+    # Break caught: semantically equal 2 and 2.0 serialize or compare differently.
+    assert MetricChange(2, "wow") == MetricChange(2.0, "wow")
+    assert MetricChange(-0.0, "wow").to_dict()["value"] == 0.0
 
 
 def _verified_observation(**changes: object) -> IndustryMetricObservation:
@@ -187,6 +201,8 @@ def _report(
         template_status=TemplateStatus.COMPLETE_LAYOUT,
         trusted_snapshot_id="trusted-storage-1",
         displayed_trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at="2026-08-25T09:05:00+08:00",
         demo=False,
         source_coverage=SourceCoverage(
@@ -383,12 +399,44 @@ def test_conflict_preserves_each_source_value_and_rejects_aggregate() -> None:
         ConflictingSourceValue("ev-1", "family-1", 100, "index", "2026-08-20"),
         ConflictingSourceValue("ev-2", "family-2", 112, "index", "2026-08-20"),
     )
-    conflict = ConflictingObservation("storage", "dram_price", None, source_values)
+    conflict = ConflictingObservation(
+        "storage", "dram_price", None, source_values, "raw-1", "evidence-1"
+    )
 
     assert [item.value for item in conflict.source_values] == [100, 112]
     assert conflict.aggregate_value is None
     with pytest.raises(ValueError, match="aggregate_value"):
-        ConflictingObservation("storage", "dram_price", 106, source_values)  # type: ignore[arg-type]
+        ConflictingObservation(  # type: ignore[arg-type]
+            "storage", "dram_price", 106, source_values, "raw-1", "evidence-1"
+        )
+
+
+def test_conflict_requires_distinct_normalized_truth_or_valid_contradiction() -> None:
+    # Break caught: two source identities asserting the same truth are labelled conflicting.
+    equal_truth = (
+        ConflictingSourceValue("ev-1", "family-1", 2, " INDEX ", "2026-08-20", MetricChange(2, "wow")),
+        ConflictingSourceValue("ev-2", "family-2", 2.0, "index", "2026-08-20", MetricChange(2.0, "wow")),
+    )
+    with pytest.raises(ValueError, match="meaningfully distinct"):
+        ConflictingObservation(
+            "storage",
+            "dram_price",
+            None,
+            equal_truth,
+            raw_snapshot_id="raw-1",
+            evidence_snapshot_id="evidence-1",
+        )
+
+    contradiction = ConflictingObservation(
+        "storage",
+        "dram_price",
+        None,
+        equal_truth,
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
+        has_valid_contradiction=True,
+    )
+    assert contradiction.has_valid_contradiction is True
 
 
 @pytest.mark.parametrize(
@@ -420,6 +468,37 @@ def test_explicit_empty_placeholder_can_enter_report_without_becoming_a_trusted_
     assert report.counts == ReportCounts(verified=0, corroborated=0)
     assert placeholder.current_value is None
     assert placeholder.empty_reason is EmptyReason.SOURCE_UNCONFIGURED
+
+
+@pytest.mark.parametrize(
+    ("verified", "corroborated"),
+    (
+        (-1, 0),
+        (0, -1),
+        (True, 0),
+        (0, 1.5),
+    ),
+)
+def test_report_counts_reject_invalid_types_or_ranges(verified, corroborated) -> None:
+    # Break caught: negative, boolean or fractional counts enter the report contract.
+    with pytest.raises((TypeError, ValueError), match="report counts"):
+        ReportCounts(verified, corroborated)
+
+
+def test_displayed_report_reconciles_counts_against_unique_non_placeholder_truth() -> None:
+    # Break caught: verified=99 or wrong status counts survive model/API construction.
+    empty = _report()
+    trusted = _verified_observation()
+    valid = _report(
+        cycle=(trusted, *empty.cycle[1:]),
+        metrics=(trusted, *empty.metrics[1:]),
+    )
+
+    assert valid.counts == ReportCounts(verified=1, corroborated=0)
+    with pytest.raises(ValueError, match="report counts"):
+        replace(empty, counts=ReportCounts(99, 0))
+    with pytest.raises(ValueError, match="report counts"):
+        replace(valid, counts=ReportCounts(0, 1))
 
 
 @pytest.mark.parametrize(
@@ -533,6 +612,8 @@ def test_candidate_panel_rejects_wrong_concrete_element_types(
                     ConflictingSourceValue("ev-r1", "family-r1", 1, None, None),
                     ConflictingSourceValue("ev-r2", "family-r2", 2, None, None),
                 ),
+                "raw-r1",
+                "evidence-r1",
             ),
             CandidateEvidenceCounts(0, 1, 0, 0),
         ),
@@ -574,6 +655,33 @@ def test_candidate_panel_rejects_cross_industry_elements(
         replace(_candidate_panel(), counts=counts, **{field_name: (entry,)})
 
 
+def test_candidate_panel_rejects_foreign_nested_conflict_lineage() -> None:
+    # Break caught: foreign raw/evidence conflict truth mutates a current candidate panel.
+    conflict = ConflictingObservation(
+        "storage",
+        "dram_price",
+        None,
+        (
+            ConflictingSourceValue("ev-1", "family-1", 100, "index", "2026-08-20"),
+            ConflictingSourceValue("ev-2", "family-2", 112, "index", "2026-08-20"),
+        ),
+        raw_snapshot_id="raw-foreign",
+        evidence_snapshot_id="evidence-1",
+    )
+    with pytest.raises(ValueError, match="conflicting raw lineage mismatch"):
+        CandidateEvidencePanel(
+            industry_id="storage",
+            candidate_snapshot_id="candidate-1",
+            counts=CandidateEvidenceCounts(0, 1, 0, 0),
+            unverified=(),
+            conflicting=(conflict,),
+            unverified_events=(),
+            conflicting_events=(),
+            raw_snapshot_id="raw-1",
+            evidence_snapshot_id="evidence-1",
+        )
+
+
 def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:
     # Break caught: a failed refresh masquerades as a new trusted publication.
     success = RefreshRun(
@@ -586,6 +694,8 @@ def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:
         error_code=None,
         displayed_trusted_snapshot_id="trusted-2",
         published_trusted_snapshot_id="trusted-2",
+        displayed_raw_snapshot_id="raw-2",
+        displayed_evidence_snapshot_id="evidence-2",
     )
     failure = RefreshRun(
         industry_id="storage",
@@ -597,6 +707,8 @@ def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:
         error_code="source_failed",
         displayed_trusted_snapshot_id="trusted-2",
         published_trusted_snapshot_id=None,
+        displayed_raw_snapshot_id="raw-2",
+        displayed_evidence_snapshot_id="evidence-2",
     )
 
     assert success.published_trusted_snapshot_id == "trusted-2"
@@ -608,21 +720,33 @@ def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:
 
 def test_industry_report_response_enforces_composite_industry_and_null_display_contract() -> None:
     # Break caught: a response can mix requested/displayed/report/candidate/refresh industries.
-    candidate = _candidate_panel()
-    refresh = _idle_refresh()
+    candidate = None
+    refresh = RefreshRun(
+        industry_id="storage",
+        run_id="run-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        candidate_snapshot_id=None,
+        phase=RefreshPhase.TRUSTED_PUBLISHED,
+        error_code=None,
+        displayed_trusted_snapshot_id="trusted-storage-1",
+        published_trusted_snapshot_id="trusted-storage-1",
+        displayed_raw_snapshot_id="raw-storage-1",
+        displayed_evidence_snapshot_id="evidence-storage-1",
+    )
     ready = IndustryReportResponse(
         requested_industry_id="storage",
         displayed_industry_id="storage",
         displayed_trusted_report=_report(),
-        candidate_evidence=candidate,
+        candidate_evidence=None,
         refresh_run=refresh,
     )
     empty = IndustryReportResponse(
         requested_industry_id="storage",
         displayed_industry_id=None,
         displayed_trusted_report=None,
-        candidate_evidence=candidate,
-        refresh_run=refresh,
+        candidate_evidence=None,
+        refresh_run=_idle_refresh(),
     )
 
     assert ready.to_dict()["displayed_industry_id"] == "storage"
@@ -635,8 +759,100 @@ def test_industry_report_response_enforces_composite_industry_and_null_display_c
         {"refresh_run": _idle_refresh("robotics")},
     )
     for changes in invalid_values:
-        with pytest.raises(ValueError, match="industry|displayed"):
+        with pytest.raises(ValueError, match="industry|displayed|candidate"):
             replace(ready, **changes)
+
+
+def test_response_joins_candidate_panel_to_refresh_run_or_requires_both_absent() -> None:
+    # Break caught: a panel from another candidate/raw/evidence run is paired with this response.
+    refresh = RefreshRun(
+        industry_id="storage",
+        run_id="run-1",
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
+        candidate_snapshot_id="candidate-1",
+        phase=RefreshPhase.VERIFYING,
+        error_code=None,
+        displayed_trusted_snapshot_id=None,
+        published_trusted_snapshot_id=None,
+    )
+    panel = replace(
+        _candidate_panel(),
+        candidate_snapshot_id="candidate-1",
+        raw_snapshot_id="raw-1",
+        evidence_snapshot_id="evidence-1",
+    )
+    response = IndustryReportResponse("storage", None, None, panel, refresh)
+
+    for field_name, foreign in (
+        ("candidate_snapshot_id", "candidate-foreign"),
+        ("raw_snapshot_id", "raw-foreign"),
+        ("evidence_snapshot_id", "evidence-foreign"),
+    ):
+        with pytest.raises(ValueError, match="candidate.*refresh lineage"):
+            replace(response, candidate_evidence=replace(panel, **{field_name: foreign}))
+    with pytest.raises(ValueError, match="candidate.*required"):
+        replace(response, candidate_evidence=None)
+
+    absent = IndustryReportResponse("storage", None, None, None, _idle_refresh())
+    assert absent.candidate_evidence is None
+    with pytest.raises(ValueError, match="candidate.*absent"):
+        replace(absent, candidate_evidence=_candidate_panel())
+
+
+def test_response_joins_displayed_report_to_refresh_displayed_lineage() -> None:
+    # Break caught: a stale or foreign trusted report is paired with a run's displayed pointer.
+    report = replace(
+        _report(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+    )
+    refresh = RefreshRun(
+        industry_id="storage",
+        run_id="run-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        candidate_snapshot_id=None,
+        phase=RefreshPhase.TRUSTED_PUBLISHED,
+        error_code=None,
+        displayed_trusted_snapshot_id="trusted-storage-1",
+        published_trusted_snapshot_id="trusted-storage-1",
+        displayed_raw_snapshot_id="raw-storage-1",
+        displayed_evidence_snapshot_id="evidence-storage-1",
+    )
+    response = IndustryReportResponse("storage", "storage", report, None, refresh)
+
+    with pytest.raises(ValueError, match="displayed report.*refresh lineage"):
+        replace(response, displayed_trusted_report=replace(report, raw_snapshot_id="raw-foreign"))
+    with pytest.raises(ValueError, match="displayed report.*refresh lineage"):
+        replace(response, displayed_trusted_report=replace(report, trusted_snapshot_id="trusted-foreign"))
+    with pytest.raises(ValueError, match="displayed report.*required"):
+        replace(response, displayed_industry_id=None, displayed_trusted_report=None)
+
+    without_display = IndustryReportResponse("storage", None, None, None, _idle_refresh())
+    with pytest.raises(ValueError, match="displayed report.*absent"):
+        replace(
+            without_display,
+            displayed_industry_id="storage",
+            displayed_trusted_report=report,
+        )
+
+
+def test_displayed_report_binds_each_trusted_row_to_top_level_lineage() -> None:
+    # Break caught: report header lineage and the displayed trusted observation diverge.
+    empty = _report()
+    trusted = _verified_observation()
+    report = replace(
+        _report(
+            cycle=(trusted, *empty.cycle[1:]),
+            metrics=(trusted, *empty.metrics[1:]),
+        ),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+    )
+    assert report.to_dict()["raw_snapshot_id"] == "raw-storage-1"
+    with pytest.raises(ValueError, match="trusted observation raw lineage mismatch"):
+        replace(report, raw_snapshot_id="raw-foreign")
 
 
 def test_structured_conclusion_is_authoritative_and_text_cannot_add_cycle_judgment() -> None:

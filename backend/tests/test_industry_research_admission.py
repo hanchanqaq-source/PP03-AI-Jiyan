@@ -474,3 +474,49 @@ def test_single_row_a2_contradiction_is_rejected_until_per_source_values_exist()
     # Break caught: a bound A2 conflict silently degrades to an ordinary unverified candidate.
     with pytest.raises(ValueError, match="two per-source values"):
         admit(raw("counter", supports=False, contradicts=True))
+
+
+def test_admission_defensively_rejects_forged_infinite_change() -> None:
+    # Break caught: a constructor-bypassed infinite change enters trusted admission.
+    forged = object.__new__(MetricChange)
+    object.__setattr__(forged, "value", float("inf"))
+    object.__setattr__(forged, "basis", "wow")
+    fixture = raw("official", publisher="sec.gov", attested=True)
+    poisoned = replace(fixture.observation, change=forged)
+
+    with pytest.raises(ValueError, match="finite real number"):
+        admit(replace(fixture, observation=poisoned))
+
+
+@pytest.mark.parametrize(
+    "expiries",
+    (
+        (NOW + timedelta(days=1), NOW + timedelta(days=1)),
+        (NOW - timedelta(seconds=1), NOW - timedelta(seconds=1)),
+        (NOW - timedelta(seconds=1), NOW + timedelta(days=1)),
+    ),
+)
+def test_duplicate_evidence_identity_is_rejected_before_expiry_partition(expiries) -> None:
+    # Break caught: duplicated evidence is hidden by expired/current partitioning.
+    fixture = raw("duplicate-evidence")
+    left = replace(fixture.observation, expires_at=expiries[0])
+    right = replace(fixture.observation, expires_at=expiries[1])
+
+    with pytest.raises(ValueError, match="unique within one projection"):
+        admit(
+            replace(fixture, observation=left),
+            replace(fixture, observation=right),
+        )
+
+
+def test_reversed_expired_inputs_produce_equal_full_projection() -> None:
+    # Break caught: expired rows retain caller order despite canonical projection ordering.
+    left = raw("expired-b", expires_at=NOW - timedelta(seconds=1))
+    right = raw(
+        "expired-a",
+        family="family-b",
+        publisher="publisher-b.example",
+        expires_at=NOW - timedelta(seconds=1),
+    )
+
+    assert admit(left, right) == admit(right, left)

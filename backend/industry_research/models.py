@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
+import math
 from typing import Any, Mapping
 
 
@@ -153,8 +154,29 @@ class MetricChange(WireModel):
     basis: str
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "value", _finite_real(self.value, "change.value"))
         if self.basis not in {"mom", "yoy", "wow"}:
             raise ValueError("change.basis must be mom, yoy, or wow")
+
+
+def _finite_real(value: object, field_name: str) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError(f"{field_name} must be a finite real number")
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a finite real number") from error
+    if not math.isfinite(normalized):
+        raise ValueError(f"{field_name} must be a finite real number")
+    return 0.0 if normalized == 0.0 else normalized
+
+
+def _validated_change_value(change: MetricChange) -> float:
+    if type(change) is not MetricChange:
+        raise TypeError("change must be MetricChange")
+    if change.basis not in {"mom", "yoy", "wow"}:
+        raise ValueError("change.basis must be mom, yoy, or wow")
+    return _finite_real(change.value, "change.value")
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +539,30 @@ class ConflictingSourceValue(WireModel):
     as_of_date: str | None
     change: MetricChange | None = None
 
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("evidence_id", self.evidence_id),
+            ("source_family_id", self.source_family_id),
+        ):
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise ValueError(f"conflicting source {name} must not be blank")
+        if type(self.value) in {int, float}:
+            object.__setattr__(self, "value", _finite_real(self.value, "conflicting source value"))
+        elif type(self.value) is not str:
+            raise TypeError("conflicting source value must be a string or finite real number")
+        if self.change is not None:
+            _validated_change_value(self.change)
+
+
+def _conflicting_truth_key(item: ConflictingSourceValue) -> tuple[object, ...]:
+    value = item.value.strip().casefold() if type(item.value) is str else item.value
+    return (
+        value,
+        item.unit.strip().casefold() if item.unit is not None else None,
+        item.as_of_date,
+        None if item.change is None else (_validated_change_value(item.change), item.change.basis),
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class ConflictingObservation(WireModel):
@@ -524,15 +570,33 @@ class ConflictingObservation(WireModel):
     metric_id: str
     aggregate_value: None
     source_values: tuple[ConflictingSourceValue, ...]
+    raw_snapshot_id: str | None = None
+    evidence_snapshot_id: str | None = None
+    has_valid_contradiction: bool = False
 
     def __post_init__(self) -> None:
         if self.aggregate_value is not None:
             raise ValueError("conflicting observation aggregate_value must be null")
         if len(self.source_values) < 2:
             raise ValueError("conflicting observation requires per-source values")
+        if any(type(item) is not ConflictingSourceValue for item in self.source_values):
+            raise TypeError("conflicting observation requires ConflictingSourceValue rows")
         evidence_ids = [item.evidence_id for item in self.source_values]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("conflicting observation source evidence must be unique")
+        for name, value in (
+            ("raw_snapshot_id", self.raw_snapshot_id),
+            ("evidence_snapshot_id", self.evidence_snapshot_id),
+        ):
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise ValueError(f"conflicting observation {name} must not be blank")
+        if type(self.has_valid_contradiction) is not bool:
+            raise TypeError("has_valid_contradiction must be boolean")
+        if (
+            len({_conflicting_truth_key(item) for item in self.source_values}) < 2
+            and not self.has_valid_contradiction
+        ):
+            raise ValueError("conflicting observation requires meaningfully distinct truth values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +623,13 @@ class ReportCounts(WireModel):
     verified: int
     corroborated: int
 
+    def __post_init__(self) -> None:
+        values = (self.verified, self.corroborated)
+        if any(type(value) is not int for value in values):
+            raise TypeError("report counts must be non-negative integers")
+        if any(value < 0 for value in values):
+            raise ValueError("report counts must be non-negative integers")
+
 
 @dataclass(frozen=True, slots=True)
 class DisplayedTrustedReport(WireModel):
@@ -566,6 +637,8 @@ class DisplayedTrustedReport(WireModel):
     template_status: TemplateStatus
     trusted_snapshot_id: str | None
     displayed_trusted_snapshot_id: str | None
+    raw_snapshot_id: str
+    evidence_snapshot_id: str
     generated_at: str | None
     demo: bool
     source_coverage: SourceCoverage
@@ -582,7 +655,16 @@ class DisplayedTrustedReport(WireModel):
 
     def __post_init__(self) -> None:
         _require_enum(self.template_status, TemplateStatus, "template_status")
+        for name, value in (
+            ("raw_snapshot_id", self.raw_snapshot_id),
+            ("evidence_snapshot_id", self.evidence_snapshot_id),
+        ):
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise ValueError(f"displayed report {name} must not be blank")
+        if type(self.counts) is not ReportCounts:
+            raise TypeError("report counts must be ReportCounts")
         observations = self.cycle + self.metrics + self.capital
+        trusted_by_metric: dict[str, IndustryMetricObservation] = {}
         for observation in observations:
             if not isinstance(observation, IndustryMetricObservation):
                 raise TypeError("trusted_observations must contain IndustryMetricObservation")
@@ -604,6 +686,27 @@ class DisplayedTrustedReport(WireModel):
                 VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED,
             } or observation.freshness_status is FreshnessStatus.EXPIRED:
                 raise ValueError("trusted_observations values require current verified/corroborated observations")
+            previous = trusted_by_metric.get(observation.metric_id)
+            if previous is not None and previous != observation:
+                raise ValueError("duplicate report metric rows must be identical")
+            trusted_by_metric[observation.metric_id] = observation
+            if observation.raw_snapshot_id != self.raw_snapshot_id:
+                raise ValueError("trusted observation raw lineage mismatch")
+            if observation.evidence_snapshot_id != self.evidence_snapshot_id:
+                raise ValueError("trusted observation evidence lineage mismatch")
+        trusted = tuple(trusted_by_metric.values())
+        expected_counts = ReportCounts(
+            verified=sum(
+                observation.verification_status is VerificationStatus.VERIFIED
+                for observation in trusted
+            ),
+            corroborated=sum(
+                observation.verification_status is VerificationStatus.CORROBORATED
+                for observation in trusted
+            ),
+        )
+        if self.counts != expected_counts:
+            raise ValueError("trusted report counts do not match observations")
         if any(node.industry_id != self.industry_id for node in self.chain):
             raise ValueError("chain node industry_id mismatch")
         if any(company.industry_id != self.industry_id for company in self.companies):
@@ -677,6 +780,12 @@ class CandidateEvidencePanel(WireModel):
             raise ValueError("conflicting_events accepts only conflicting events")
         if (self.raw_snapshot_id is None) != (self.evidence_snapshot_id is None):
             raise ValueError("candidate raw/evidence lineage must be provided together")
+        if self.candidate_snapshot_id is not None and (
+            type(self.candidate_snapshot_id) is not str
+            or not self.candidate_snapshot_id.strip()
+            or self.candidate_snapshot_id != self.candidate_snapshot_id.strip()
+        ):
+            raise ValueError("candidate_snapshot_id must not be blank")
         if self.unverified or self.conflicting:
             if not self.raw_snapshot_id or not self.evidence_snapshot_id:
                 raise ValueError("metric candidates require raw/evidence lineage")
@@ -692,6 +801,10 @@ class CandidateEvidencePanel(WireModel):
             raise ValueError("candidate unverified raw lineage mismatch")
         if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in self.unverified):
             raise ValueError("candidate unverified evidence lineage mismatch")
+        if any(item.raw_snapshot_id != self.raw_snapshot_id for item in self.conflicting):
+            raise ValueError("candidate conflicting raw lineage mismatch")
+        if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in self.conflicting):
+            raise ValueError("candidate conflicting evidence lineage mismatch")
         actual = (len(self.unverified), len(self.conflicting), len(self.unverified_events), len(self.conflicting_events))
         expected = (self.counts.unverified, self.counts.conflicting, self.counts.unverified_events, self.counts.conflicting_events)
         if actual != expected:
@@ -709,9 +822,31 @@ class RefreshRun(WireModel):
     error_code: str | None
     displayed_trusted_snapshot_id: str | None
     published_trusted_snapshot_id: str | None
+    displayed_raw_snapshot_id: str | None = None
+    displayed_evidence_snapshot_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_enum(self.phase, RefreshPhase, "phase")
+        for name, value in (
+            ("raw_snapshot_id", self.raw_snapshot_id),
+            ("evidence_snapshot_id", self.evidence_snapshot_id),
+            ("candidate_snapshot_id", self.candidate_snapshot_id),
+            ("displayed_trusted_snapshot_id", self.displayed_trusted_snapshot_id),
+            ("published_trusted_snapshot_id", self.published_trusted_snapshot_id),
+            ("displayed_raw_snapshot_id", self.displayed_raw_snapshot_id),
+            ("displayed_evidence_snapshot_id", self.displayed_evidence_snapshot_id),
+        ):
+            if value is not None and (
+                type(value) is not str or not value.strip() or value != value.strip()
+            ):
+                raise ValueError(f"refresh {name} must not be blank")
+        if (self.displayed_raw_snapshot_id is None) != (self.displayed_evidence_snapshot_id is None):
+            raise ValueError("displayed raw/evidence lineage must be provided together")
+        if self.displayed_trusted_snapshot_id is None:
+            if self.displayed_raw_snapshot_id is not None:
+                raise ValueError("displayed lineage requires displayed_trusted_snapshot_id")
+        elif not self.displayed_raw_snapshot_id or not self.displayed_evidence_snapshot_id:
+            raise ValueError("displayed trusted snapshot requires displayed raw/evidence lineage")
         if self.phase is RefreshPhase.TRUSTED_PUBLISHED:
             if not self.published_trusted_snapshot_id:
                 raise ValueError("trusted_published requires published_trusted_snapshot_id")
@@ -719,6 +854,11 @@ class RefreshRun(WireModel):
                 raise ValueError("published snapshot must be the displayed trusted snapshot")
             if not self.raw_snapshot_id or not self.evidence_snapshot_id:
                 raise ValueError("trusted_published requires raw/evidence lineage")
+            if (
+                self.displayed_raw_snapshot_id != self.raw_snapshot_id
+                or self.displayed_evidence_snapshot_id != self.evidence_snapshot_id
+            ):
+                raise ValueError("published displayed lineage must match current raw/evidence lineage")
         elif self.published_trusted_snapshot_id is not None:
             raise ValueError("published_trusted_snapshot_id must be null until trusted_published")
         if self.phase is RefreshPhase.FAILED and not self.error_code:
@@ -730,29 +870,57 @@ class IndustryReportResponse(WireModel):
     requested_industry_id: str
     displayed_industry_id: str | None
     displayed_trusted_report: DisplayedTrustedReport | None
-    candidate_evidence: CandidateEvidencePanel
+    candidate_evidence: CandidateEvidencePanel | None
     refresh_run: RefreshRun
 
     def __post_init__(self) -> None:
         if not self.requested_industry_id.strip():
             raise ValueError("requested_industry_id must not be blank")
-        if not isinstance(self.candidate_evidence, CandidateEvidencePanel):
-            raise TypeError("candidate_evidence must be CandidateEvidencePanel")
         if not isinstance(self.refresh_run, RefreshRun):
             raise TypeError("refresh_run must be RefreshRun")
-        if self.candidate_evidence.industry_id != self.requested_industry_id:
-            raise ValueError("candidate industry_id must match requested_industry_id")
         if self.refresh_run.industry_id != self.requested_industry_id:
             raise ValueError("refresh industry_id must match requested_industry_id")
-        if self.displayed_industry_id is None:
-            if self.displayed_trusted_report is not None:
-                raise ValueError("null displayed_industry_id requires null displayed_trusted_report")
+        if self.refresh_run.candidate_snapshot_id is None:
+            if self.candidate_evidence is not None:
+                raise ValueError("candidate panel must be absent without a refresh candidate snapshot")
+        else:
+            if self.candidate_evidence is None:
+                raise ValueError("candidate panel is required for the refresh candidate snapshot")
+            if not isinstance(self.candidate_evidence, CandidateEvidencePanel):
+                raise TypeError("candidate_evidence must be CandidateEvidencePanel")
+            if self.candidate_evidence.industry_id != self.requested_industry_id:
+                raise ValueError("candidate industry_id must match requested_industry_id")
+            if (
+                self.candidate_evidence.candidate_snapshot_id,
+                self.candidate_evidence.raw_snapshot_id,
+                self.candidate_evidence.evidence_snapshot_id,
+            ) != (
+                self.refresh_run.candidate_snapshot_id,
+                self.refresh_run.raw_snapshot_id,
+                self.refresh_run.evidence_snapshot_id,
+            ):
+                raise ValueError("candidate panel does not match refresh lineage")
+        if self.refresh_run.displayed_trusted_snapshot_id is None:
+            if self.displayed_industry_id is not None or self.displayed_trusted_report is not None:
+                raise ValueError("displayed report must be absent without refresh displayed lineage")
             return
+        if self.displayed_industry_id is None or self.displayed_trusted_report is None:
+            raise ValueError("displayed report is required for refresh displayed lineage")
         if self.displayed_industry_id != self.requested_industry_id:
             raise ValueError("displayed_industry_id must match requested_industry_id")
-        if self.displayed_trusted_report is None:
-            raise ValueError("displayed_industry_id requires displayed_trusted_report")
         if not isinstance(self.displayed_trusted_report, DisplayedTrustedReport):
             raise TypeError("displayed_trusted_report must be DisplayedTrustedReport")
         if self.displayed_trusted_report.industry_id != self.displayed_industry_id:
             raise ValueError("displayed report industry_id mismatch")
+        if (
+            self.displayed_trusted_report.trusted_snapshot_id,
+            self.displayed_trusted_report.displayed_trusted_snapshot_id,
+            self.displayed_trusted_report.raw_snapshot_id,
+            self.displayed_trusted_report.evidence_snapshot_id,
+        ) != (
+            self.refresh_run.displayed_trusted_snapshot_id,
+            self.refresh_run.displayed_trusted_snapshot_id,
+            self.refresh_run.displayed_raw_snapshot_id,
+            self.refresh_run.displayed_evidence_snapshot_id,
+        ):
+            raise ValueError("displayed report does not match refresh lineage")

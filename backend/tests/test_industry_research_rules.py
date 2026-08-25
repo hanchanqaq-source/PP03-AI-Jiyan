@@ -182,3 +182,15 @@ def test_rules_are_pure_stable_and_do_not_accept_candidate_panels() -> None:
     assert evaluate(*rows) == evaluate(*rows)
     signature = inspect.signature(evaluate_storage_conclusion)
     assert "candidate" not in signature.parameters
+
+
+def test_rules_defensively_reject_forged_infinite_change_without_conclusion() -> None:
+    # Break caught: infinite DRAM/NAND changes classify a trusted cycle.
+    poisoned = observation("dram_price")
+    forged = object.__new__(MetricChange)
+    object.__setattr__(forged, "value", float("inf"))
+    object.__setattr__(forged, "basis", "wow")
+    object.__setattr__(poisoned, "change", forged)
+
+    with pytest.raises(ValueError, match="finite real number"):
+        evaluate(poisoned, observation("nand_price"))

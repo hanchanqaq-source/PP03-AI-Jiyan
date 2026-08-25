@@ -555,6 +555,8 @@ def assemble_storage_report(
         template_status=template.status,
         trusted_snapshot_id=trusted_snapshot_id,
         displayed_trusted_snapshot_id=trusted_snapshot_id,
+        raw_snapshot_id=raw_snapshot_id,
+        evidence_snapshot_id=evidence_snapshot_id,
         generated_at=generated_at.isoformat(),
         demo=demo,
         source_coverage=coverage,
