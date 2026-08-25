@@ -2,11 +2,10 @@ import { useCallback, useMemo, useState } from "react";
 import {
   createAndSelectTag,
   deleteCustomTag,
-  loadCustomTagCatalog,
   loadPageTagState,
+  loadTagCatalogView,
   moveTag,
   moveTagByOffset,
-  resolveTag,
   savePageTagState,
 } from "./preferences";
 import type { PageKey, PageTagState, PageTagStateInput } from "./types";
@@ -14,6 +13,7 @@ import type { PageKey, PageTagState, PageTagStateInput } from "./types";
 export function usePageTags(pageKey: PageKey) {
   const [state, setState] = useState<PageTagState>(() => loadPageTagState(pageKey));
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const catalog = useMemo(() => loadTagCatalogView(), [state]);
 
   const update = useCallback((next: PageTagStateInput) => {
     const saved = savePageTagState(pageKey, next);
@@ -23,29 +23,34 @@ export function usePageTags(pageKey: PageKey) {
   }, [pageKey]);
 
   const replace = useCallback((ids: string[]) => {
-    const unique = Array.from(new Set(ids.filter((id) => !!resolveTag(id))));
-    update({
-      ids: unique,
-      order: unique,
-      activeId: unique.includes(state.activeId) ? state.activeId : unique[0] || "",
-    });
-  }, [state.activeId, update]);
+    try {
+      const unique = Array.from(new Set(ids.filter((id) => catalog.byId.has(id))));
+      update({
+        ids: unique,
+        order: unique,
+        activeId: unique.includes(state.activeId) ? state.activeId : unique[0] || "",
+      });
+      return true;
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "标签选择保存失败，请稍后重试");
+      return false;
+    }
+  }, [catalog.byId, state.activeId, update]);
 
   const remove = useCallback((id: string) => {
     try {
-      if (resolveTag(id)?.kind === "custom") {
+      if (catalog.byId.get(id)?.kind === "custom") {
         deleteCustomTag(id);
         setState(loadPageTagState(pageKey));
         setErrorMessage(null);
         return true;
       }
-      replace(state.order.filter((tagId) => tagId !== id));
-      return true;
+      return replace(state.order.filter((tagId) => tagId !== id));
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "标签删除失败，请稍后重试");
       return false;
     }
-  }, [pageKey, replace, state.order]);
+  }, [catalog.byId, pageKey, replace, state.order]);
   const activate = useCallback((id: string) => {
     if (!state.ids.includes(id)) return;
     try {
@@ -84,17 +89,16 @@ export function usePageTags(pageKey: PageKey) {
     }
   }, [pageKey, state.order]);
 
-  const tags = useMemo(() => state.order.map(resolveTag).filter((tag) => tag !== undefined), [state]);
-  const customTags = useMemo(() => loadCustomTagCatalog().items
-    .map((tag) => resolveTag(tag.id))
-    .filter((tag) => tag !== undefined), [state]);
+  const tags = useMemo(() => state.order
+    .map((id) => catalog.byId.get(id))
+    .filter((tag): tag is NonNullable<typeof tag> => tag !== undefined), [catalog.byId, state.order]);
 
   return {
     state,
     errorMessage,
     tags,
-    customTags,
-    activeTag: resolveTag(state.activeId),
+    customTags: catalog.customTags,
+    activeTag: catalog.byId.get(state.activeId),
     replace,
     remove,
     activate,

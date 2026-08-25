@@ -10,6 +10,7 @@ interface TagSelectorProps {
   onConfirm: (ids: string[]) => void;
   onCreate?: (name: string) => unknown;
   customTags?: TagDefinition[];
+  externalError?: string | null;
 }
 
 function TagCheck({ tag, checked, onToggle, depth = 0 }: {
@@ -46,6 +47,7 @@ export function TagSelector({
   onConfirm,
   onCreate,
   customTags = [],
+  externalError = null,
 }: TagSelectorProps) {
   const [query, setQuery] = useState("");
   const [customName, setCustomName] = useState("");
@@ -153,9 +155,12 @@ export function TagSelector({
               <Plus className="h-4 w-4" />创建并激活
             </button>
           </div>
-          {createError && <p role="alert" className="mt-2 text-sm text-destructive">{createError}</p>}
           <p className="mt-1.5 text-xs text-muted-foreground">重名会复用已有标签；没有模板时只显示建设状态，不会自动补造数据。</p>
         </form>}
+
+        {(createError || externalError) && <p role="alert" className="mx-5 mt-3 text-sm text-destructive">
+          {createError || externalError}
+        </p>}
 
         <div className="border-b border-border/50 px-5 py-3">
           <label className="flex items-center gap-2 rounded-xl border border-border bg-black/15 px-3 py-2 focus-within:border-primary/60">

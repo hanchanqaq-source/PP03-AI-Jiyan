@@ -82,6 +82,61 @@ describe("industry tag state and request isolation", () => {
     write.mockRestore();
   });
 
+  it("returns false and exposes a Chinese error when replace refuses corrupt storage", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const tags = usePageTags("industry_research");
+      const [result, setResult] = useState("not-run");
+      return <div>
+        <button onClick={() => setResult(String(tags.replace(["storage"])))}>替换标签</button>
+        <output aria-label="替换结果">{result}</output>
+        {tags.errorMessage && <p role="alert">{tags.errorMessage}</p>}
+      </div>;
+    }
+    render(<Harness />);
+    localStorage.setItem("vr-page-tags:industry_research", "{broken");
+
+    await user.click(screen.getByRole("button", { name: "替换标签" }));
+
+    expect(screen.getByLabelText("替换结果")).toHaveTextContent("false");
+    expect(screen.getByRole("alert")).toHaveTextContent("页面标签存储已损坏，无法安全修改");
+    expect(localStorage.getItem("vr-page-tags:industry_research")).toBe("{broken");
+  });
+
+  it("resolves 120 custom tags with a constant number of catalog reads", () => {
+    const items = Array.from({ length: 120 }, (_, index) => ({
+      id: `custom-${index}`, name: `标签${index}`, kind: "custom" as const,
+    }));
+    const ids = items.map((item) => item.id);
+    localStorage.setItem("vr-custom-tags", JSON.stringify({ version: 1, items }));
+    localStorage.setItem("vr-page-tags:industry_research", JSON.stringify({
+      version: 2, ids, activeId: ids[37], order: [...ids].reverse(),
+    }));
+    const reads = vi.spyOn(Storage.prototype, "getItem");
+    function Harness() {
+      const tags = usePageTags("industry_research");
+      const replaceResult = tags.replace;
+      return <output aria-label="批量目录结果">{JSON.stringify({
+        tagCount: tags.tags.length,
+        customCount: tags.customTags.length,
+        firstId: tags.tags[0]?.id,
+        activeId: tags.activeTag?.id,
+        hasReplace: typeof replaceResult === "function",
+      })}</output>;
+    }
+
+    render(<Harness />);
+
+    expect(screen.getByLabelText("批量目录结果")).toHaveTextContent(JSON.stringify({
+      tagCount: 120,
+      customCount: 120,
+      firstId: "custom-119",
+      activeId: "custom-37",
+      hasReplace: true,
+    }));
+    expect(reads.mock.calls.filter(([key]) => key === "vr-custom-tags")).toHaveLength(2);
+  });
+
   it("binds semiconductor, storage, robotics and custom reports to independent page+industry keys", async () => {
     const coordinator = createTagRequestCoordinator<ReportObject>();
     const committed = new Map<string, ReportObject>();

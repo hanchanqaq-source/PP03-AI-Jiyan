@@ -35,7 +35,7 @@ export function IndustryResearch() {
         <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={tags.activate}
           onRemove={tags.remove} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
       </div>
-      {tags.errorMessage && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{tags.errorMessage}</div>}
+      {tags.errorMessage && !selectorOpen && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{tags.errorMessage}</div>}
       {error && <div className="mb-4 flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/5 p-3 text-sm text-warning"><AlertCircle className="h-4 w-4" />{error}</div>}
       {template ? <IndustryReport template={template} liveNews={liveNews} /> : (
         <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center">
@@ -43,8 +43,9 @@ export function IndustryResearch() {
           <p className="mt-2 text-sm text-muted-foreground">{tags.activeTag?.name || "当前标签"}已进入共享标签库，但不会由 AI 自动补造行业数据。</p>
         </div>
       )}
-      <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags} onCreate={tags.create} onCancel={() => setSelectorOpen(false)}
-        onConfirm={(ids) => { tags.replace(ids); setSelectorOpen(false); }} />
+      <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags}
+        externalError={tags.errorMessage} onCreate={tags.create} onCancel={() => setSelectorOpen(false)}
+        onConfirm={(ids) => { if (tags.replace(ids)) setSelectorOpen(false); }} />
     </div>
   );
 }

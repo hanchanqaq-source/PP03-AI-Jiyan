@@ -36,6 +36,11 @@ interface CatalogIndex {
   byName: Map<string, TagDefinition>;
 }
 
+export interface TagCatalogView {
+  byId: ReadonlyMap<string, TagDefinition>;
+  customTags: TagDefinition[];
+}
+
 const fallback = (): PageTagState => ({
   version: PAGE_TAG_STATE_VERSION,
   ids: [...DEFAULT_TAG_IDS],
@@ -384,6 +389,17 @@ export function inspectCustomTagCatalog(): TagStorageInspection<CustomTagCatalog
 
 export function loadCustomTagCatalog(): CustomTagCatalogState {
   return inspectCustomTagCatalog().value;
+}
+
+export function loadTagCatalogView(): TagCatalogView {
+  const catalog = inspectCustomTagCatalog().value;
+  const index = catalogIndex(catalog);
+  return {
+    byId: index.byId,
+    customTags: catalog.items
+      .map((item) => index.byId.get(item.id))
+      .filter((tag): tag is TagDefinition => tag !== undefined),
+  };
 }
 
 export function inspectPageTagState(pageKey: PageKey): TagStorageInspection<PageTagState> {

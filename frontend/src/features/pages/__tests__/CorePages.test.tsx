@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, vi } from "vitest";
 import { api, type RadarData } from "@/lib/api";
@@ -673,5 +673,37 @@ describe("PP03 core pages", () => {
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
     expect(screen.getByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
     expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the IndustryResearch selector open and shows its storage error when confirm is refused", async () => {
+    const user = userEvent.setup();
+    render(<IndustryResearch />);
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
+    localStorage.setItem("vr-page-tags:industry_research", "{broken");
+
+    await user.click(within(dialog).getByRole("button", { name: "确认添加" }));
+
+    expect(screen.getByRole("dialog", { name: "添加投研标签" })).toBeInTheDocument();
+    expect(within(screen.getByRole("dialog", { name: "添加投研标签" })).getByRole("alert"))
+      .toHaveTextContent("页面标签存储已损坏，无法安全修改");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
+  it("keeps the MarketNews selector open and shows its storage error when confirm is refused", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "marketNewsEvents").mockResolvedValue({ ...marketNewsResponse, events: [directEvent] });
+    render(<MarketNews />);
+    await screen.findByRole("heading", { name: directEvent.title });
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
+    localStorage.setItem("vr-page-tags:market_news", "{broken");
+
+    await user.click(within(dialog).getByRole("button", { name: "确认添加" }));
+
+    expect(screen.getByRole("dialog", { name: "添加投研标签" })).toBeInTheDocument();
+    expect(within(screen.getByRole("dialog", { name: "添加投研标签" })).getByRole("alert"))
+      .toHaveTextContent("页面标签存储已损坏，无法安全修改");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
   });
 });
