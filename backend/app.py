@@ -16,7 +16,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -223,17 +223,25 @@ def _is_industry_fund_path(request: Request) -> bool:
     raw_path = request.scope.get("raw_path")
     if isinstance(raw_path, bytes):
         candidates.append(raw_path.decode("latin-1"))
+        decoded_raw_path = unquote_to_bytes(raw_path)
+        try:
+            candidates.append(decoded_raw_path.decode("utf-8"))
+        except UnicodeDecodeError:
+            candidates.append(decoded_raw_path.decode("latin-1"))
     for candidate in candidates:
-        folded = candidate.casefold()
-        if (
-            folded.startswith(_INDUSTRY_RESEARCH_PATH_PREFIX)
-            and _INDUSTRY_RESEARCH_FUND_COMPONENT in folded
-        ):
+        if not candidate.startswith(_INDUSTRY_RESEARCH_PATH_PREFIX):
+            continue
+        normalized = "".join(
+            "/" if ord(character) < 32 or ord(character) == 127 else character
+            for character in candidate[len(_INDUSTRY_RESEARCH_PATH_PREFIX):]
+        )
+        segments = normalized.split("/")
+        if _INDUSTRY_RESEARCH_FUND_COMPONENT in segments[1:]:
             return True
     return False
 
 
-_FUND_REQUEST_TRANSPORT_ERRORS = (OSError, EOFError, ValueError, RuntimeError)
+_FUND_REQUEST_TRANSPORT_ERRORS = (OSError, EOFError, ValueError)
 
 
 def _is_grouped_fund_request_transport_error(error: Exception) -> bool:
@@ -321,19 +329,25 @@ async def _prevent_industry_fund_response_storage(request: Request, call_next):
             {"detail": "invalid_fund_relation_request"},
             status_code=400,
         )
-    except Exception as error:
+    except ExceptionGroup as error:
+        if (
+            not is_fund_resolution
+            or not _is_grouped_fund_request_transport_error(error)
+        ):
+            raise
+        response = JSONResponse(
+            {"detail": "invalid_fund_relation_request"},
+            status_code=400,
+        )
+    except RuntimeError:
+        raise
+    except Exception:
         if not is_fund_resolution:
             raise
-        if _is_grouped_fund_request_transport_error(error):
-            response = JSONResponse(
-                {"detail": "invalid_fund_relation_request"},
-                status_code=400,
-            )
-        else:
-            response = JSONResponse(
-                {"detail": "fund_relation_resolution_failed"},
-                status_code=502,
-            )
+        response = JSONResponse(
+            {"detail": "fund_relation_resolution_failed"},
+            status_code=502,
+        )
     if is_fund_resolution:
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"

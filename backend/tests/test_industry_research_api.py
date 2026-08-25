@@ -581,6 +581,52 @@ def test_malformed_fund_resolution_shapes_are_always_no_store(path: str) -> None
 
 
 @pytest.mark.parametrize(
+    "path, expected_status",
+    [
+        ("/api/industry-research/refund-relations-market", 200),
+        ("/api/industry-research/fund-relations-market", 200),
+        ("/api/industry-research/fund-relations", 200),
+        ("/api/industry-research/storage/refund-relations-preview", 400),
+        ("/api/industry-research/storage/fund-relations-preview/resolve", 400),
+        ("/api/industry-research/storage/not-fund-relations/resolve", 400),
+    ],
+)
+def test_non_fund_paths_containing_the_substring_are_not_marked_private(
+    path: str,
+    expected_status: int,
+) -> None:
+    # Break caught: substring matching marks ordinary industry IDs/subroutes no-store.
+    response = _client(RecordingService()).get(path)
+
+    assert response.status_code == expected_status
+    assert "cache-control" not in response.headers
+    assert "pragma" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        b"/api/industry-research/storage%2Ffund-relations%2Fresolve",
+        b"/api/industry-research/storage/%66und-relations/resolve",
+    ],
+)
+def test_raw_percent_encoded_exact_fund_segment_is_classified(raw_path: bytes) -> None:
+    # Break caught: an inconsistent decoded path hides a private raw percent path.
+    invoke, sent, _ = _raw_asgi_fund_call(
+        [{"type": "http.request", "body": b"", "more_body": False}],
+        path="/api/industry-research/storage/ordinary",
+        raw_path=raw_path,
+    )
+
+    invoke()
+
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert headers[b"cache-control"] == b"no-store"
+    assert headers[b"pragma"] == b"no-cache"
+
+
+@pytest.mark.parametrize(
     "resolver_error",
     [
         HTTPException(418, "private-marker"),
@@ -624,28 +670,24 @@ def test_unexpected_fund_resolver_exception_is_redacted_no_store(
     assert "private-marker" not in caplog.text
 
 
-def _raw_asgi_fund_response(
-    second_receive: dict[str, object] | BaseException,
-) -> tuple[dict[str, object], dict[bytes, bytes], bytes, RecordingService]:
-    service = RecordingService()
+def _raw_asgi_fund_call(
+    incoming: list[dict[str, object] | BaseException],
+    service: RecordingService | None = None,
+    *,
+    bypass_server_error_middleware: bool = False,
+    path: str = "/api/industry-research/storage/fund-relations/resolve",
+    raw_path: bytes | None = None,
+):
+    service = service or RecordingService()
     application = app_module.create_app(industry_research_service=service)
     sent: list[dict[str, object]] = []
-    receive_count = 0
+    messages = iter(incoming)
 
     async def receive() -> dict[str, object]:
-        nonlocal receive_count
-        receive_count += 1
-        if receive_count == 1:
-            return {
-                "type": "http.request",
-                "body": b'{"fund_codes":["900001"',
-                "more_body": True,
-            }
-        if receive_count == 2:
-            if isinstance(second_receive, BaseException):
-                raise second_receive
-            return second_receive
-        return {"type": "http.disconnect"}
+        message = next(messages, {"type": "http.disconnect"})
+        if isinstance(message, BaseException):
+            raise message
+        return message
 
     async def send(message: dict[str, object]) -> None:
         sent.append(message)
@@ -656,8 +698,8 @@ def _raw_asgi_fund_response(
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/api/industry-research/storage/fund-relations/resolve",
-        "raw_path": b"/api/industry-research/storage/fund-relations/resolve",
+        "path": path,
+        "raw_path": raw_path if raw_path is not None else path.encode("ascii"),
         "query_string": b"",
         "root_path": "",
         "headers": [
@@ -669,7 +711,28 @@ def _raw_asgi_fund_response(
         "server": ("127.0.0.1", 8900),
     }
 
-    asyncio.run(application(scope, receive, send))
+    def invoke() -> None:
+        target = application
+        if bypass_server_error_middleware:
+            scope["app"] = application
+            target = application.build_middleware_stack().app
+        asyncio.run(target(scope, receive, send))
+
+    return invoke, sent, service
+
+
+def _raw_asgi_fund_response(
+    second_receive: dict[str, object] | BaseException,
+) -> tuple[dict[str, object], dict[bytes, bytes], bytes, RecordingService]:
+    invoke, sent, service = _raw_asgi_fund_call([
+        {
+            "type": "http.request",
+            "body": b'{"fund_codes":["900001"',
+            "more_body": True,
+        },
+        second_receive,
+    ])
+    invoke()
 
     start = next(message for message in sent if message["type"] == "http.response.start")
     headers = dict(start["headers"])
@@ -708,6 +771,94 @@ def test_raw_asgi_receive_errors_are_redacted_400_no_store(
     assert headers[b"cache-control"] == b"no-store"
     assert headers[b"pragma"] == b"no-cache"
     assert b"private-marker" not in body
+    assert service.resolutions == []
+
+
+def _exception_leaf_types(error: BaseException) -> set[type[BaseException]]:
+    nested = getattr(error, "exceptions", ())
+    if nested:
+        return set().union(*(_exception_leaf_types(item) for item in nested))
+    return {type(error)}
+
+
+def test_nested_all_transport_exception_group_is_redacted_400_no_store() -> None:
+    pure_transport_group = ExceptionGroup(
+        "transport",
+        [
+            ExceptionGroup("nested", [OSError("private-marker"), EOFError("private-marker")]),
+            ValueError("private-marker"),
+        ],
+    )
+
+    start, headers, body, service = _raw_asgi_fund_response(pure_transport_group)
+
+    assert start["status"] == 400
+    assert json.loads(body) == {"detail": "invalid_fund_relation_request"}
+    assert headers[b"cache-control"] == b"no-store"
+    assert headers[b"pragma"] == b"no-cache"
+    assert b"private-marker" not in body
+    assert service.resolutions == []
+
+
+def test_mixed_exception_group_propagates_without_a_synthetic_response() -> None:
+    mixed_group = ExceptionGroup(
+        "mixed",
+        [OSError("private-marker"), KeyError("private-marker")],
+    )
+    invoke, sent, service = _raw_asgi_fund_call([
+        {
+            "type": "http.request",
+            "body": b'{"fund_codes":["900001"',
+            "more_body": True,
+        },
+        mixed_group,
+    ], bypass_server_error_middleware=True)
+
+    with pytest.raises(ExceptionGroup) as caught:
+        invoke()
+
+    leaf_types = _exception_leaf_types(caught.value)
+    assert OSError in leaf_types
+    assert KeyError in leaf_types
+    assert sent == []
+    assert service.resolutions == []
+
+
+def test_receive_cancellation_propagates_without_a_synthetic_response() -> None:
+    invoke, sent, service = _raw_asgi_fund_call([
+        {
+            "type": "http.request",
+            "body": b'{"fund_codes":["900001"',
+            "more_body": True,
+        },
+        asyncio.CancelledError(),
+    ], bypass_server_error_middleware=True)
+
+    with pytest.raises(RuntimeError):
+        invoke()
+
+    assert sent == []
+    assert service.resolutions == []
+
+
+def test_resolver_cancellation_propagates_without_a_synthetic_response(monkeypatch) -> None:
+    service = RecordingService()
+
+    def cancel(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(service, "resolve_fund_relations", cancel)
+    body = b'{"fund_codes":["900001"]}'
+    invoke, sent, _ = _raw_asgi_fund_call(
+        [{"type": "http.request", "body": body, "more_body": False}],
+        service,
+        bypass_server_error_middleware=True,
+    )
+
+    with pytest.raises(RuntimeError):
+        invoke()
+
+    assert sent == []
     assert service.resolutions == []
 
 

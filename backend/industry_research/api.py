@@ -331,7 +331,7 @@ async def _read_fund_relation_request(request: Request) -> FundRelationRequest:
             body.extend(chunk)
     except HTTPException:
         raise
-    except (ClientDisconnect, OSError, EOFError, ValueError, RuntimeError):
+    except (ClientDisconnect, OSError, EOFError, ValueError):
         raise HTTPException(400, "invalid_fund_relation_request") from None
     if declared is not None and len(body) != declared:
         raise HTTPException(400, "invalid_fund_relation_request")
