@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+from industry_research.relationships import project_company_relations
+
+
+def _candidate(**overrides):
+    value = {
+        "industry_id": "storage",
+        "security_code": "688001",
+        "company_name": "示例存储公司",
+        "chain_node_id": "memory_design_manufacturing",
+        "relation_type": "official_disclosure",
+        "key_metric_ids": ("dram_price",),
+        "evidence_ids": ("evidence-company-1",),
+        "as_of_date": "2026-06-30",
+        "official_evidence": True,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_company_relation_requires_exact_security_code_and_official_evidence() -> None:
+    # Break caught: a company name or an unverified classification becomes a trusted relation.
+    result = project_company_relations(
+        industry_id="storage",
+        candidates=(
+            _candidate(),
+            _candidate(security_code=""),
+            _candidate(security_code="not-a-code"),
+            _candidate(security_code="688002", official_evidence=False),
+            _candidate(security_code="688003", evidence_ids=()),
+            _candidate(security_code="688004", industry_id="semiconductor"),
+        ),
+    )
+
+    assert len(result) == 1
+    assert result[0].security_code == "688001"
+    assert result[0].observation_only is True
+    assert result[0].evidence_ids == ("evidence-company-1",)
+
+
+def test_public_classification_is_admitted_only_when_officially_evidenced() -> None:
+    # Break caught: public-classification is inferred from a name without source attestation.
+    result = project_company_relations(
+        industry_id="storage",
+        candidates=(
+            _candidate(
+                relation_type="public_classification",
+                evidence_ids=("evidence-classification-1",),
+                official_evidence=True,
+            ),
+            _candidate(
+                security_code="688002",
+                relation_type="public_classification",
+                evidence_ids=("evidence-classification-2",),
+                official_evidence=False,
+            ),
+        ),
+    )
+
+    assert [item.security_code for item in result] == ["688001"]
+    assert result[0].relation_type == "public_classification"
