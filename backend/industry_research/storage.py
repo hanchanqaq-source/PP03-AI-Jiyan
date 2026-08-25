@@ -45,6 +45,7 @@ from .templates import get_industry_template, validate_metric_section_shape
 
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _INDUSTRY_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_PUBLICATION_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _REPORT_KEYS = {
     "industry_id", "template_status", "trusted_snapshot_id",
     "displayed_trusted_snapshot_id", "raw_snapshot_id", "evidence_snapshot_id",
@@ -70,9 +71,33 @@ class TrustedPublicationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TrustedPublicationMetadata:
+    publication_token: str
+    report_checksum: str
+    snapshot_checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTrustedPublication:
+    report: DisplayedTrustedReport
+    metadata: TrustedPublicationMetadata
+    expected_industry_id: str
+    expected_raw_snapshot_id: str
+    expected_evidence_snapshot_id: str
+    payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedTrustedPublication:
+    report: DisplayedTrustedReport
+    metadata: TrustedPublicationMetadata | None
+
+
+@dataclass(frozen=True, slots=True)
 class _LoadedSnapshot:
     report: DisplayedTrustedReport
     payload: bytes
+    metadata: TrustedPublicationMetadata | None
 
 
 def _windows_extended_path(path: Path) -> str:
@@ -224,8 +249,11 @@ def _signed_snapshot_payload(
     schema_version: int,
     lineage: object,
     report: object,
+    publication: object | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {"lineage": lineage, "report": report}
+    if schema_version >= 3:
+        payload = {"lineage": lineage, "publication": publication, "report": report}
     if schema_version >= 2:
         payload = {"schema_version": schema_version, **payload}
     return payload
@@ -361,7 +389,7 @@ def _report_from_document(
 ) -> DisplayedTrustedReport:
     if type(value) is not dict:
         raise ValueError("invalid trusted report schema")
-    if schema_version == 2 and set(value) == _REPORT_KEYS:
+    if schema_version in {2, 3} and set(value) == _REPORT_KEYS:
         row = value
     elif (
         schema_version == 1
@@ -657,25 +685,62 @@ class IndustryResearchStorage:
                 object_pairs_hook=_strict_object,
                 parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid JSON number")),
             )
+            if type(document) is not dict or type(document.get("schema_version")) is not int:
+                return None
+            schema_version = document["schema_version"]
             outer = _mapping(
                 document,
-                keys={"schema_version", "checksum", "lineage", "report"},
+                keys=(
+                    {"schema_version", "checksum", "lineage", "publication", "report"}
+                    if schema_version == 3
+                    else {"schema_version", "checksum", "lineage", "report"}
+                ),
                 name="snapshot",
             )
-            if type(outer["schema_version"]) is not int or outer["schema_version"] not in {1, 2}:
+            if schema_version not in {1, 2, 3}:
                 return None
             if type(outer["checksum"]) is not str:
                 return None
+            publication_document = None
+            metadata = None
+            if schema_version == 3:
+                publication_document = _mapping(
+                    outer["publication"],
+                    keys={"publication_token", "report_checksum"},
+                    name="snapshot publication",
+                )
+                if (
+                    type(publication_document["publication_token"]) is not str
+                    or _PUBLICATION_TOKEN.fullmatch(
+                        publication_document["publication_token"]
+                    ) is None
+                    or type(publication_document["report_checksum"]) is not str
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", publication_document["report_checksum"]
+                    ) is None
+                    or hashlib.sha256(_canonical(outer["report"])).hexdigest()
+                    != publication_document["report_checksum"]
+                ):
+                    return None
             signed_payload = _signed_snapshot_payload(
-                outer["schema_version"], outer["lineage"], outer["report"]
+                schema_version,
+                outer["lineage"],
+                outer["report"],
+                publication_document,
             )
             if hashlib.sha256(_canonical(signed_payload)).hexdigest() != outer["checksum"]:
                 return None
+            if publication_document is not None:
+                metadata = TrustedPublicationMetadata(
+                    publication_token=publication_document["publication_token"],
+                    report_checksum=publication_document["report_checksum"],
+                    snapshot_checksum=outer["checksum"],
+                )
             lineage = _mapping(outer["lineage"], keys=_LINEAGE_KEYS, name="snapshot lineage")
             report = _report_from_document(
                 outer["report"],
-                schema_version=outer["schema_version"],
-                legacy_lineage=lineage if outer["schema_version"] == 1 else None,
+                schema_version=schema_version,
+                legacy_lineage=lineage if schema_version == 1 else None,
             )
             _validate_report(report)
             report.validate_for_mode(production=self.production)
@@ -687,7 +752,7 @@ class IndustryResearchStorage:
             )
             if expected_lineage != lineage or report.industry_id != industry_id:
                 return None
-            return _LoadedSnapshot(report, raw)
+            return _LoadedSnapshot(report, raw, metadata)
         except (
             AttributeError,
             FileNotFoundError,
@@ -712,13 +777,21 @@ class IndustryResearchStorage:
                     _close_owned_descriptor(descriptor, identity)
 
     def load_current(self, industry_id: str) -> DisplayedTrustedReport | None:
+        publication = self.load_current_publication(industry_id)
+        return publication.report if publication is not None else None
+
+    def load_current_publication(self, industry_id: str) -> LoadedTrustedPublication | None:
         self._component(industry_id)
         with CACHE_IO_LOCK:
             current = self._load_snapshot_file(self.trusted_snapshot_path(industry_id), industry_id)
             if current is not None:
-                return current.report
+                return LoadedTrustedPublication(current.report, current.metadata)
             previous = self._load_snapshot_file(self.previous_snapshot_path(industry_id), industry_id)
-            return previous.report if previous is not None else None
+            return (
+                LoadedTrustedPublication(previous.report, previous.metadata)
+                if previous is not None
+                else None
+            )
 
     def publish(
         self,
@@ -728,15 +801,84 @@ class IndustryResearchStorage:
         expected_raw_snapshot_id: str,
         expected_evidence_snapshot_id: str,
     ) -> TrustedPublicationResult:
+        prepared = self.prepare_publication(
+            report,
+            expected_industry_id=expected_industry_id,
+            expected_raw_snapshot_id=expected_raw_snapshot_id,
+            expected_evidence_snapshot_id=expected_evidence_snapshot_id,
+            publication_token=secrets.token_hex(16),
+        )
+        return self.publish_prepared(prepared)
+
+    def prepare_publication(
+        self,
+        report: DisplayedTrustedReport,
+        *,
+        expected_industry_id: str,
+        expected_raw_snapshot_id: str,
+        expected_evidence_snapshot_id: str,
+        publication_token: str,
+    ) -> PreparedTrustedPublication:
         _validate_report(report)
         report.validate_for_mode(production=self.production)
+        if (
+            type(publication_token) is not str
+            or _PUBLICATION_TOKEN.fullmatch(publication_token) is None
+        ):
+            raise ValueError("invalid publication token")
         lineage = _lineage_document(
             report,
             expected_industry_id=expected_industry_id,
             expected_raw_snapshot_id=expected_raw_snapshot_id,
             expected_evidence_snapshot_id=expected_evidence_snapshot_id,
         )
-        return self._publish_validated(report, lineage)
+        report_document = report.to_dict()
+        report_checksum = hashlib.sha256(_canonical(report_document)).hexdigest()
+        publication = {
+            "publication_token": publication_token,
+            "report_checksum": report_checksum,
+        }
+        signed_payload = _signed_snapshot_payload(3, lineage, report_document, publication)
+        snapshot_checksum = hashlib.sha256(_canonical(signed_payload)).hexdigest()
+        document = {
+            "schema_version": 3,
+            "checksum": snapshot_checksum,
+            "lineage": lineage,
+            "publication": publication,
+            "report": report_document,
+        }
+        payload = _canonical(document) + b"\n"
+        if len(payload) > _MAX_SNAPSHOT_BYTES:
+            raise ValueError("trusted snapshot is too large")
+        return PreparedTrustedPublication(
+            report=report,
+            metadata=TrustedPublicationMetadata(
+                publication_token=publication_token,
+                report_checksum=report_checksum,
+                snapshot_checksum=snapshot_checksum,
+            ),
+            expected_industry_id=expected_industry_id,
+            expected_raw_snapshot_id=expected_raw_snapshot_id,
+            expected_evidence_snapshot_id=expected_evidence_snapshot_id,
+            payload=payload,
+        )
+
+    def publish_prepared(
+        self,
+        prepared: PreparedTrustedPublication,
+    ) -> TrustedPublicationResult:
+        if type(prepared) is not PreparedTrustedPublication:
+            raise TypeError("trusted publication must be prepared by storage")
+        expected = self.prepare_publication(
+            prepared.report,
+            expected_industry_id=prepared.expected_industry_id,
+            expected_raw_snapshot_id=prepared.expected_raw_snapshot_id,
+            expected_evidence_snapshot_id=prepared.expected_evidence_snapshot_id,
+            publication_token=prepared.metadata.publication_token,
+        )
+        if expected != prepared:
+            raise ValueError("prepared trusted publication does not match canonical payload")
+        return self._publish_validated(prepared)
 
     def publish_document(
         self,
@@ -748,22 +890,23 @@ class IndustryResearchStorage:
     ) -> TrustedPublicationResult:
         if type(document) is not dict or not _REQUIRED_SECTION_KEYS.issubset(document):
             raise ValueError("trusted snapshot requires all required report sections")
-        report = _report_from_document(document, schema_version=2)
+        report = _report_from_document(document, schema_version=3)
         _validate_report(report)
         report.validate_for_mode(production=self.production)
-        lineage = _lineage_document(
+        prepared = self.prepare_publication(
             report,
             expected_industry_id=expected_industry_id,
             expected_raw_snapshot_id=expected_raw_snapshot_id,
             expected_evidence_snapshot_id=expected_evidence_snapshot_id,
+            publication_token=secrets.token_hex(16),
         )
-        return self._publish_validated(report, lineage)
+        return self.publish_prepared(prepared)
 
     def _publish_validated(
         self,
-        report: DisplayedTrustedReport,
-        lineage: dict[str, str],
+        prepared: PreparedTrustedPublication,
     ) -> TrustedPublicationResult:
+        report = prepared.report
         with CACHE_IO_LOCK:
             current_path = self.trusted_snapshot_path(report.industry_id)
             previous_path = self.previous_snapshot_path(report.industry_id)
@@ -775,21 +918,10 @@ class IndustryResearchStorage:
             )
             previous = recoverable.report if recoverable is not None else None
             previous_id = previous.trusted_snapshot_id if previous is not None else None
-            report_document = report.to_dict()
-            signed_payload = _signed_snapshot_payload(2, lineage, report_document)
-            document = {
-                "schema_version": 2,
-                "checksum": hashlib.sha256(_canonical(signed_payload)).hexdigest(),
-                "lineage": lineage,
-                "report": report_document,
-            }
-            payload = _canonical(document) + b"\n"
-            if len(payload) > _MAX_SNAPSHOT_BYTES:
-                raise ValueError("trusted snapshot is too large")
             try:
                 if current is not None:
                     self._atomic_write(previous_path, current.payload)
-                self._atomic_write(current_path, payload)
+                self._atomic_write(current_path, prepared.payload)
             except OSError:
                 return TrustedPublicationResult(previous, None, previous_id, "storage_error")
             return TrustedPublicationResult(report, report.trusted_snapshot_id, previous_id, None)

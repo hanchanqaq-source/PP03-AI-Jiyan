@@ -321,10 +321,15 @@ class RecordingStorage(IndustryResearchStorage):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.publish_calls = 0
+        self.publish_prepared_calls = 0
 
     def publish(self, *args, **kwargs):
         self.publish_calls += 1
         return super().publish(*args, **kwargs)
+
+    def publish_prepared(self, *args, **kwargs):
+        self.publish_prepared_calls += 1
+        return super().publish_prepared(*args, **kwargs)
 
 
 def _seed_old_report(storage: IndustryResearchStorage) -> None:
@@ -359,6 +364,7 @@ def _orchestrator(
     report_storage=None,
     max_workers: int = 2,
     run_ids=None,
+    attempt_tokens=None,
 ):
     descriptor = _descriptor()
     descriptors = tuple(descriptors or (descriptor,))
@@ -367,7 +373,13 @@ def _orchestrator(
     }
     qualifications = qualifications or {row.adapter_id: _qualification() for row in descriptors}
     ids = iter(run_ids or (f"run-{index}" for index in range(100)))
+    tokens = iter(attempt_tokens) if attempt_tokens is not None else None
     evidence_root = tmp_path / "canonical-evidence"
+    kwargs = (
+        {"attempt_token_factory": lambda: next(tokens)}
+        if tokens is not None
+        else {}
+    )
     return IndustryResearchRefreshOrchestrator(
         catalog=FakeCatalog(*descriptors),
         provider_registry=FakeRegistry(providers),
@@ -383,6 +395,7 @@ def _orchestrator(
         max_workers=max_workers,
         now=lambda: NOW,
         run_id_factory=lambda: next(ids),
+        **kwargs,
     )
 
 
@@ -511,6 +524,26 @@ def test_same_industry_requests_return_the_same_future_and_call_provider_once(tm
     provider.release.set()
     assert first.result(5).phase is RefreshPhase.TRUSTED_PUBLISHED
     assert provider.calls == 1
+    orchestrator.shutdown()
+
+
+def test_completed_run_id_cannot_be_reused_for_a_new_refresh_attempt(tmp_path) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("reused-run", "reused-run"),
+        attempt_tokens=("1" * 32, "2" * 32),
+    )
+
+    first = orchestrator.request_refresh("storage").result(5)
+
+    assert first.phase is RefreshPhase.TRUSTED_PUBLISHED
+    with pytest.raises(ValueError, match="reused run_id"):
+        orchestrator.request_refresh("storage")
+    assert provider.calls == 1
+    assert orchestrator.current_run("storage") == first
     orchestrator.shutdown()
 
 
@@ -1074,7 +1107,7 @@ def test_crash_after_prepared_proof_before_publish_keeps_unproved_report_invisib
     def crash_before_publish(*_args, **_kwargs):
         raise SimulatedProcessCrash()
 
-    monkeypatch.setattr(storage, "publish", crash_before_publish)
+    monkeypatch.setattr(storage, "publish_prepared", crash_before_publish)
 
     with pytest.raises(SimulatedProcessCrash):
         orchestrator.request_refresh("storage").result(5)
@@ -1136,7 +1169,14 @@ def test_final_state_failure_recovers_success_from_exact_prepared_visible_report
     assert prepared is not None and prepared.run.phase is RefreshPhase.VERIFYING
     assert prepared.publication is not None and prepared.publication.phase == "prepared"
     assert prepared.publication.prepared_generation == prepared.generation
+    visible_publication = storage.load_current_publication("storage")
     assert visible is not None and visible.trusted_snapshot_id == "trusted-postpublish-recovery"
+    assert visible_publication is not None and visible_publication.metadata is not None
+    assert (
+        visible_publication.metadata.publication_token
+        == prepared.publication.publication_token
+    )
+    assert visible_publication.metadata.snapshot_checksum == prepared.publication.snapshot_checksum
 
     recovered = orchestrator.current_run("storage")
     committed = orchestrator._state.load_record("storage")
@@ -1144,6 +1184,185 @@ def test_final_state_failure_recovers_success_from_exact_prepared_visible_report
     assert committed is not None and committed.run == result
     assert committed.publication is not None and committed.publication.phase == "committed"
     assert committed.publication.prepared_generation == committed.generation - 1
+    orchestrator.shutdown()
+
+
+def test_request_reconciles_exact_prepared_visible_report_before_interrupt_or_provider(
+    tmp_path, monkeypatch
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    storage = RecordingStorage(root=tmp_path / "reports")
+    owner = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_storage=storage,
+        run_ids=("request-recovery",),
+        attempt_tokens=("1" * 32,),
+    )
+    original_write = owner._state.write
+    failed_once = False
+
+    def fail_first_committed_state(run, candidate, **kwargs) -> int:
+        nonlocal failed_once
+        publication = kwargs.get("publication")
+        if publication is not None and publication.phase == "committed" and not failed_once:
+            failed_once = True
+            raise OSError("storage_error")
+        return original_write(run, candidate, **kwargs)
+
+    monkeypatch.setattr(owner._state, "write", fail_first_committed_state)
+    expected = owner.request_refresh("storage").result(5)
+    prepared = owner._state.load_record("storage")
+    assert prepared is not None and prepared.publication is not None
+    assert prepared.publication.phase == "prepared"
+    owner.shutdown()
+
+    reloaded = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_storage=storage,
+        run_ids=("must-not-run",),
+        attempt_tokens=("2" * 32,),
+    )
+    recovered_future = reloaded.request_refresh("storage")
+
+    assert recovered_future.done()
+    assert recovered_future.result(0) == expected
+    assert provider.calls == 1
+    committed = reloaded._state.load_record("storage")
+    assert committed is not None and committed.run == expected
+    assert committed.publication is not None and committed.publication.phase == "committed"
+    reloaded.shutdown()
+
+
+def test_aba_old_identical_report_token_cannot_recover_reused_run_attempt(
+    tmp_path, monkeypatch
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    storage = RecordingStorage(root=tmp_path / "reports")
+    first = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_storage=storage,
+        run_ids=("aba-run",),
+        attempt_tokens=("1" * 32,),
+    )
+    first_result = first.request_refresh("storage").result(5)
+    first_visible = storage.load_current_publication("storage")
+    assert first_visible is not None and first_visible.metadata is not None
+    assert first_visible.metadata.publication_token == "1" * 32
+    first_state_path = first._state._path("storage")
+    first.shutdown()
+    first_state_path.unlink()
+
+    second = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_storage=storage,
+        run_ids=("aba-run",),
+        attempt_tokens=("2" * 32,),
+    )
+    original_write = second._state.write
+
+    def crash_after_prepared_state(run, candidate, **kwargs) -> int:
+        generation = original_write(run, candidate, **kwargs)
+        publication = kwargs.get("publication")
+        if publication is not None and publication.phase == "prepared":
+            raise SimulatedProcessCrash()
+        return generation
+
+    monkeypatch.setattr(second._state, "write", crash_after_prepared_state)
+    publish_calls_before_second = storage.publish_prepared_calls
+    with pytest.raises(SimulatedProcessCrash):
+        second.request_refresh("storage").result(5)
+    second_prepared = second._state.load_record("storage")
+    assert second_prepared is not None and second_prepared.publication is not None
+    assert second_prepared.publication.publication_token == "2" * 32
+    assert storage.publish_prepared_calls == publish_calls_before_second
+    second.shutdown()
+
+    recovery = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_storage=storage,
+        run_ids=("must-not-run",),
+        attempt_tokens=("3" * 32,),
+    )
+    interrupted = recovery.request_refresh("storage").result(5)
+    still_visible = storage.load_current_publication("storage")
+
+    assert interrupted.phase is RefreshPhase.FAILED
+    assert interrupted.error_code == "refresh_interrupted"
+    assert interrupted.published_trusted_snapshot_id is None
+    assert provider.calls == 2
+    assert still_visible is not None and still_visible.report == first_visible.report
+    assert still_visible.metadata == first_visible.metadata
+    assert first_result.published_trusted_snapshot_id == "trusted-aba-run"
+    recovery.shutdown()
+
+
+def test_checksum_valid_replayed_publication_token_cannot_authorize_visible_report(
+    tmp_path,
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("token-replay",),
+        attempt_tokens=("1" * 32,),
+    )
+    orchestrator.request_refresh("storage").result(5)
+    path = orchestrator._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    document["state"]["publication"]["publication_token"] = "2" * 32
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    orchestrator._state._writer._atomic_write(
+        path,
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    current = orchestrator.current_run("storage")
+
+    assert current is not None and current.phase is RefreshPhase.FAILED
+    assert current.error_code == "publication_proof_invalid"
+    assert current.published_trusted_snapshot_id is None
+    assert provider.calls == 1
+    orchestrator.shutdown()
+
+
+def test_checksum_valid_prepared_generation_tamper_fails_state_reload_closed(
+    tmp_path,
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("generation-tamper",),
+    )
+    orchestrator.request_refresh("storage").result(5)
+    path = orchestrator._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    document["state"]["publication"]["prepared_generation"] += 1
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    orchestrator._state._writer._atomic_write(
+        path,
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert orchestrator.current_run("storage") is None
+    assert orchestrator.current_candidate("storage") is None
+    assert provider.calls == 1
     orchestrator.shutdown()
 
 

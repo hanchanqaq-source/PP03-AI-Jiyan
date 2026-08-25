@@ -44,6 +44,7 @@ from .storage import IndustryResearchStorage, _ensure_directory
 _CAPABILITY_ID = "industry_price_snapshot"
 _INDUSTRY_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_ATTEMPT_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _MAX_STATE_BYTES = 4 * 1024 * 1024
 _ERROR_CODES = frozenset({
     "admission_failed",
@@ -253,6 +254,8 @@ class _PublicationProof:
     candidate_snapshot_id: str
     trusted_snapshot_id: str
     report_checksum: str
+    publication_token: str
+    snapshot_checksum: str
     prepared_generation: int
 
     def to_dict(self) -> dict[str, object]:
@@ -265,6 +268,8 @@ class _PublicationProof:
             "candidate_snapshot_id": self.candidate_snapshot_id,
             "trusted_snapshot_id": self.trusted_snapshot_id,
             "report_checksum": self.report_checksum,
+            "publication_token": self.publication_token,
+            "snapshot_checksum": self.snapshot_checksum,
             "prepared_generation": self.prepared_generation,
         }
 
@@ -286,7 +291,7 @@ def _publication_from_dict(value: object) -> _PublicationProof:
         "phase",
         "run_id", "industry_id", "raw_snapshot_id", "evidence_snapshot_id",
         "candidate_snapshot_id", "trusted_snapshot_id", "report_checksum",
-        "prepared_generation",
+        "publication_token", "snapshot_checksum", "prepared_generation",
     }
     if type(value) is not dict or set(value) != keys:
         raise ValueError("invalid publication proof schema")
@@ -304,6 +309,15 @@ def _publication_from_dict(value: object) -> _PublicationProof:
         or re.fullmatch(r"[0-9a-f]{64}", proof.report_checksum) is None
     ):
         raise ValueError("invalid publication report checksum")
+    if type(proof.publication_token) is not str or not _ATTEMPT_TOKEN.fullmatch(
+        proof.publication_token
+    ):
+        raise ValueError("invalid publication token")
+    if (
+        type(proof.snapshot_checksum) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", proof.snapshot_checksum) is None
+    ):
+        raise ValueError("invalid publication snapshot checksum")
     if type(proof.prepared_generation) is not int or proof.prepared_generation <= 0:
         raise ValueError("invalid publication prepared generation")
     return proof
@@ -323,6 +337,26 @@ def _legacy_publication_is_valid(value: object) -> bool:
     )
 
 
+def _legacy_v3_publication_is_valid(value: object) -> bool:
+    keys = {
+        "phase", "run_id", "industry_id", "raw_snapshot_id", "evidence_snapshot_id",
+        "candidate_snapshot_id", "trusted_snapshot_id", "report_checksum",
+        "prepared_generation",
+    }
+    if type(value) is not dict or set(value) != keys:
+        return False
+    return (
+        _valid_run_id(value["run_id"])
+        and value["candidate_snapshot_id"] == f"candidate-{value['run_id']}"
+        and value["trusted_snapshot_id"] == f"trusted-{value['run_id']}"
+        and value["phase"] in {"prepared", "committed"}
+        and type(value["report_checksum"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", value["report_checksum"]) is not None
+        and type(value["prepared_generation"]) is int
+        and value["prepared_generation"] > 0
+    )
+
+
 def _report_checksum(report: object) -> str:
     if not hasattr(report, "to_dict"):
         raise TypeError("trusted report must provide canonical serialization")
@@ -338,6 +372,8 @@ def _proof_identity(proof: _PublicationProof) -> tuple[object, ...]:
         proof.candidate_snapshot_id,
         proof.trusted_snapshot_id,
         proof.report_checksum,
+        proof.publication_token,
+        proof.snapshot_checksum,
         proof.prepared_generation,
     )
 
@@ -431,7 +467,7 @@ class _RefreshStateStore:
                 "publication": publication.to_dict() if publication is not None else None,
             }
             document = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "checksum": hashlib.sha256(_canonical(state)).hexdigest(),
                 "state": state,
             }
@@ -482,7 +518,7 @@ class _RefreshStateStore:
             document = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
             if type(document) is not dict or set(document) != {"schema_version", "checksum", "state"}:
                 return None
-            if document["schema_version"] not in {1, 2, 3} or type(document["checksum"]) is not str:
+            if document["schema_version"] not in {1, 2, 3, 4} or type(document["checksum"]) is not str:
                 return None
             state = document["state"]
             expected_keys = (
@@ -520,6 +556,9 @@ class _RefreshStateStore:
                 if not _legacy_publication_is_valid(state["publication"]):
                     return None
             elif document["schema_version"] == 3 and state["publication"] is not None:
+                if not _legacy_v3_publication_is_valid(state["publication"]):
+                    return None
+            elif document["schema_version"] == 4 and state["publication"] is not None:
                 publication = _publication_from_dict(state["publication"])
             if publication is not None:
                 if not _proof_matches_run(publication, run):
@@ -538,7 +577,7 @@ class _RefreshStateStore:
                     or publication.prepared_generation != generation - 1
                 ):
                     return None
-            if document["schema_version"] == 3 and (
+            if document["schema_version"] == 4 and (
                 run.phase is RefreshPhase.TRUSTED_PUBLISHED
             ) != (publication is not None and publication.phase == "committed"):
                 return None
@@ -678,6 +717,7 @@ class IndustryResearchRefreshOrchestrator:
         max_workers: int = 2,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         run_id_factory: Callable[[], str] = lambda: uuid4().hex,
+        attempt_token_factory: Callable[[], str] = lambda: uuid4().hex,
     ) -> None:
         if type(max_workers) is not int or max_workers <= 0:
             raise ValueError("max_workers must be a positive integer")
@@ -692,6 +732,7 @@ class IndustryResearchRefreshOrchestrator:
         self._state = _RefreshStateStore(state_root)
         self._now = now
         self._run_id_factory = run_id_factory
+        self._attempt_token_factory = attempt_token_factory
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="industry-refresh",
@@ -720,55 +761,23 @@ class IndustryResearchRefreshOrchestrator:
         record = self._state.load_record(industry_id)
         if record is None:
             return None
-        run = record.run
-        proof = record.publication
-        if proof is not None and proof.phase == "prepared":
-            displayed = self._report_storage.load_current(industry_id)
-            if self._display_matches_proof(displayed, proof):
-                completed = self._completed_run(run, proof)
-                lease = _IndustryLease.try_acquire(self._state, industry_id)
-                if lease is None:
-                    return completed
-                try:
-                    committed = _PublicationProof(
-                        phase="committed",
-                        run_id=proof.run_id,
-                        industry_id=proof.industry_id,
-                        raw_snapshot_id=proof.raw_snapshot_id,
-                        evidence_snapshot_id=proof.evidence_snapshot_id,
-                        candidate_snapshot_id=proof.candidate_snapshot_id,
-                        trusted_snapshot_id=proof.trusted_snapshot_id,
-                        report_checksum=proof.report_checksum,
-                        prepared_generation=proof.prepared_generation,
-                    )
-                    with self._lock:
-                        self._generations[industry_id] = record.generation
-                    try:
-                        return self._write_state(
-                            completed,
-                            record.candidate,
-                            publication=committed,
-                            expected_generation=record.generation,
-                        )
-                    except (OSError, ValueError):
-                        return completed
-                finally:
-                    lease.release()
+        if record.publication is not None and record.publication.phase == "prepared":
             lease = _IndustryLease.try_acquire(self._state, industry_id)
             if lease is None:
-                return run
+                return self._reconcile_prepared(record, owns_lease=False)
             try:
-                with self._lock:
-                    self._generations[industry_id] = record.generation
-                return self._failed(run, "refresh_interrupted", record.candidate)
+                return self._reconcile_prepared(record, owns_lease=True)
             finally:
                 lease.release()
+        run = record.run
+        proof = record.publication
         if run.phase is not RefreshPhase.TRUSTED_PUBLISHED:
             return run
-        displayed = self._report_storage.load_current(industry_id)
+        visible = self._report_storage.load_current_publication(industry_id)
         if proof is None or proof.phase != "committed" or not self._display_matches_proof(
-            displayed, proof
+            visible, proof
         ):
+            displayed = visible.report if visible is not None else None
             return RefreshRun(
                 industry_id=run.industry_id,
                 run_id=run.run_id,
@@ -791,18 +800,72 @@ class IndustryResearchRefreshOrchestrator:
         return run
 
     @staticmethod
-    def _display_matches_proof(displayed: object, proof: _PublicationProof) -> bool:
+    def _display_matches_proof(visible: object, proof: _PublicationProof) -> bool:
         try:
+            displayed = visible.report
+            metadata = visible.metadata
             return (
-                displayed is not None
+                visible is not None
+                and displayed is not None
+                and metadata is not None
                 and displayed.industry_id == proof.industry_id
                 and displayed.raw_snapshot_id == proof.raw_snapshot_id
                 and displayed.evidence_snapshot_id == proof.evidence_snapshot_id
                 and displayed.trusted_snapshot_id == proof.trusted_snapshot_id
                 and _report_checksum(displayed) == proof.report_checksum
+                and metadata.publication_token == proof.publication_token
+                and metadata.report_checksum == proof.report_checksum
+                and metadata.snapshot_checksum == proof.snapshot_checksum
             )
         except (AttributeError, TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _committed_proof(proof: _PublicationProof) -> _PublicationProof:
+        return _PublicationProof(
+            phase="committed",
+            run_id=proof.run_id,
+            industry_id=proof.industry_id,
+            raw_snapshot_id=proof.raw_snapshot_id,
+            evidence_snapshot_id=proof.evidence_snapshot_id,
+            candidate_snapshot_id=proof.candidate_snapshot_id,
+            trusted_snapshot_id=proof.trusted_snapshot_id,
+            report_checksum=proof.report_checksum,
+            publication_token=proof.publication_token,
+            snapshot_checksum=proof.snapshot_checksum,
+            prepared_generation=proof.prepared_generation,
+        )
+
+    def _reconcile_prepared(
+        self,
+        record: _PersistedState,
+        *,
+        owns_lease: bool,
+    ) -> RefreshRun:
+        proof = record.publication
+        if proof is None or proof.phase != "prepared":
+            return record.run
+        visible = self._report_storage.load_current_publication(record.run.industry_id)
+        if self._display_matches_proof(visible, proof):
+            completed = self._completed_run(record.run, proof)
+            if not owns_lease:
+                return completed
+            with self._lock:
+                self._generations[record.run.industry_id] = record.generation
+            try:
+                return self._write_state(
+                    completed,
+                    record.candidate,
+                    publication=self._committed_proof(proof),
+                    expected_generation=record.generation,
+                )
+            except (OSError, ValueError):
+                return completed
+        if not owns_lease:
+            return record.run
+        with self._lock:
+            self._generations[record.run.industry_id] = record.generation
+        return self._failed(record.run, "refresh_interrupted", record.candidate)
 
     @staticmethod
     def _completed_run(run: RefreshRun, proof: _PublicationProof) -> RefreshRun:
@@ -916,6 +979,16 @@ class IndustryResearchRefreshOrchestrator:
                 return future
             record = self._state.load_record(industry_id)
             self._generations[industry_id] = record.generation if record is not None else 0
+            if (
+                record is not None
+                and record.publication is not None
+                and record.publication.phase == "prepared"
+            ):
+                recovered = self._reconcile_prepared(record, owns_lease=True)
+                lease.release()
+                completed: Future[RefreshRun] = Future()
+                completed.set_result(recovered)
+                return completed
             if record is not None and record.run.phase in {
                 RefreshPhase.COLLECTING,
                 RefreshPhase.VERIFYING,
@@ -933,6 +1006,13 @@ class IndustryResearchRefreshOrchestrator:
             if not _valid_run_id(run_id):
                 lease.release()
                 raise ValueError("run_id_factory returned an invalid run_id")
+            if record is not None and record.run.run_id == run_id:
+                lease.release()
+                raise ValueError("run_id_factory returned a reused run_id")
+            attempt_token = self._attempt_token_factory()
+            if type(attempt_token) is not str or not _ATTEMPT_TOKEN.fullmatch(attempt_token):
+                lease.release()
+                raise ValueError("attempt_token_factory returned an invalid token")
             try:
                 displayed_id, displayed_raw, displayed_evidence = self._display_lineage(
                     industry_id
@@ -951,7 +1031,7 @@ class IndustryResearchRefreshOrchestrator:
                     displayed_evidence_snapshot_id=displayed_evidence,
                 )
                 self._write_state(initial)
-                future = self._executor.submit(self._execute, initial)
+                future = self._executor.submit(self._execute, initial, attempt_token)
             except BaseException:
                 lease.release()
                 raise
@@ -996,37 +1076,11 @@ class IndustryResearchRefreshOrchestrator:
                 if record is None:
                     raise RuntimeError("refresh owner disappeared before state commit")
                 if record.run.phase in {RefreshPhase.COLLECTING, RefreshPhase.VERIFYING}:
+                    proof = record.publication
+                    if proof is not None and proof.phase == "prepared":
+                        return self._reconcile_prepared(record, owns_lease=True)
                     with self._lock:
                         self._generations[industry_id] = record.generation
-                    proof = record.publication
-                    if (
-                        proof is not None
-                        and proof.phase == "prepared"
-                        and self._display_matches_proof(
-                            self._report_storage.load_current(industry_id), proof
-                        )
-                    ):
-                        completed = self._completed_run(record.run, proof)
-                        committed = _PublicationProof(
-                            phase="committed",
-                            run_id=proof.run_id,
-                            industry_id=proof.industry_id,
-                            raw_snapshot_id=proof.raw_snapshot_id,
-                            evidence_snapshot_id=proof.evidence_snapshot_id,
-                            candidate_snapshot_id=proof.candidate_snapshot_id,
-                            trusted_snapshot_id=proof.trusted_snapshot_id,
-                            report_checksum=proof.report_checksum,
-                            prepared_generation=proof.prepared_generation,
-                        )
-                        try:
-                            return self._write_state(
-                                completed,
-                                record.candidate,
-                                publication=committed,
-                                expected_generation=record.generation,
-                            )
-                        except (OSError, ValueError):
-                            return completed
                     return self._failed(record.run, "refresh_interrupted", record.candidate)
                 return self.current_run(industry_id) or record.run
             finally:
@@ -1087,7 +1141,7 @@ class IndustryResearchRefreshOrchestrator:
                 failures += 1
         return tuple(values), failures, len(descriptors), industry_mismatches
 
-    def _execute(self, initial: RefreshRun) -> RefreshRun:
+    def _execute(self, initial: RefreshRun, attempt_token: str) -> RefreshRun:
         run = initial
         candidate: CandidateEvidencePanel | None = None
         try:
@@ -1220,7 +1274,14 @@ class IndustryResearchRefreshOrchestrator:
                     or assembly.report.evidence_snapshot_id != evidence_snapshot.snapshot_id
                 ):
                     raise ValueError("assembled report publication lineage mismatch")
-                report_checksum = _report_checksum(assembly.report)
+                storage_prepared = self._report_storage.prepare_publication(
+                    assembly.report,
+                    expected_industry_id=initial.industry_id,
+                    expected_raw_snapshot_id=raw.raw_snapshot_id,
+                    expected_evidence_snapshot_id=evidence_snapshot.snapshot_id,
+                    publication_token=attempt_token,
+                )
+                report_checksum = storage_prepared.metadata.report_checksum
                 candidate = assembly.candidate_evidence
                 self._write_state(run, candidate)
             except Exception:
@@ -1239,6 +1300,8 @@ class IndustryResearchRefreshOrchestrator:
                 candidate_snapshot_id=candidate_id,
                 trusted_snapshot_id=trusted_id,
                 report_checksum=report_checksum,
+                publication_token=storage_prepared.metadata.publication_token,
+                snapshot_checksum=storage_prepared.metadata.snapshot_checksum,
                 prepared_generation=current_generation + 1,
             )
             try:
@@ -1254,32 +1317,17 @@ class IndustryResearchRefreshOrchestrator:
             with self._publish_gate:
                 if self._stop.is_set():
                     return self._failed(run, "refresh_shutdown", candidate)
-                publication = self._report_storage.publish(
-                    assembly.report,
-                    expected_industry_id=initial.industry_id,
-                    expected_raw_snapshot_id=raw.raw_snapshot_id,
-                    expected_evidence_snapshot_id=evidence_snapshot.snapshot_id,
-                )
+                publication = self._report_storage.publish_prepared(storage_prepared)
             if publication.error_code is not None:
                 return self._failed(run, publication.error_code, candidate)
-            displayed = publication.displayed_report
+            visible = self._report_storage.load_current_publication(initial.industry_id)
             if (
                 publication.published_trusted_snapshot_id != trusted_id
-                or not self._display_matches_proof(displayed, prepared)
+                or not self._display_matches_proof(visible, prepared)
             ):
                 return self._failed(run, "publication_failed", candidate)
             completed = self._completed_run(run, prepared)
-            committed = _PublicationProof(
-                phase="committed",
-                run_id=prepared.run_id,
-                industry_id=prepared.industry_id,
-                raw_snapshot_id=prepared.raw_snapshot_id,
-                evidence_snapshot_id=prepared.evidence_snapshot_id,
-                candidate_snapshot_id=prepared.candidate_snapshot_id,
-                trusted_snapshot_id=prepared.trusted_snapshot_id,
-                report_checksum=prepared.report_checksum,
-                prepared_generation=prepared.prepared_generation,
-            )
+            committed = self._committed_proof(prepared)
             try:
                 return self._write_state(completed, candidate, publication=committed)
             except (OSError, ValueError):

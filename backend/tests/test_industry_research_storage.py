@@ -179,6 +179,24 @@ def legacy_v1_payload(value: DisplayedTrustedReport) -> bytes:
     return _canonical(document) + b"\n"
 
 
+def legacy_v2_payload(value: DisplayedTrustedReport) -> bytes:
+    report_document = value.to_dict()
+    lineage = {
+        "industry_id": value.industry_id,
+        "raw_snapshot_id": value.raw_snapshot_id,
+        "evidence_snapshot_id": value.evidence_snapshot_id,
+        "trusted_snapshot_id": value.trusted_snapshot_id,
+    }
+    signed = {"schema_version": 2, "lineage": lineage, "report": report_document}
+    document = {
+        "schema_version": 2,
+        "checksum": hashlib.sha256(_canonical(signed)).hexdigest(),
+        "lineage": lineage,
+        "report": report_document,
+    }
+    return _canonical(document) + b"\n"
+
+
 def test_trusted_snapshot_round_trips_as_one_checksummed_report(tmp_path) -> None:
     # Break caught: sections are stored independently or load without checksum verification.
     storage = IndustryResearchStorage(root=tmp_path / "industry")
@@ -190,10 +208,84 @@ def test_trusted_snapshot_round_trips_as_one_checksummed_report(tmp_path) -> Non
 
     assert result.displayed_report == expected
     assert result.published_trusted_snapshot_id == "trusted-storage-1"
-    assert document["schema_version"] == 2
+    assert document["schema_version"] == 3
+    assert set(document) == {"schema_version", "checksum", "lineage", "publication", "report"}
+    assert set(document["publication"]) == {"publication_token", "report_checksum"}
     assert document["report"]["trusted_snapshot_id"] == "trusted-storage-1"
     assert len(document["checksum"]) == 64
     assert storage.load_current("storage") == expected
+
+
+def test_prepare_publication_is_nonvisible_deterministic_and_publishes_exact_token(
+    tmp_path,
+) -> None:
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    expected = report("trusted-storage-prepared")
+    kwargs = {
+        "expected_industry_id": "storage",
+        "expected_raw_snapshot_id": "raw-storage-1",
+        "expected_evidence_snapshot_id": "evidence-storage-1",
+        "publication_token": "a" * 32,
+    }
+
+    first = storage.prepare_publication(expected, **kwargs)
+    second = storage.prepare_publication(expected, **kwargs)
+
+    assert first == second
+    assert first.metadata.publication_token == "a" * 32
+    assert len(first.metadata.report_checksum) == 64
+    assert len(first.metadata.snapshot_checksum) == 64
+    assert storage.load_current("storage") is None
+
+    result = storage.publish_prepared(first)
+    loaded = storage.load_current_publication("storage")
+
+    assert result.error_code is None
+    assert loaded is not None and loaded.report == expected
+    assert loaded.metadata == first.metadata
+
+
+def test_checksum_valid_legacy_v2_report_remains_readable_without_attempt_metadata(
+    tmp_path,
+) -> None:
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    expected = report("trusted-storage-legacy-v2")
+    path = storage.trusted_snapshot_path("storage")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(legacy_v2_payload(expected))
+
+    loaded = storage.load_current_publication("storage")
+
+    assert loaded is not None and loaded.report == expected
+    assert loaded.metadata is None
+
+
+def test_corrupt_v3_current_falls_back_with_exact_previous_publication_metadata(tmp_path) -> None:
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    old = report("trusted-storage-token-old")
+    current = report("trusted-storage-token-current")
+    old_prepared = storage.prepare_publication(
+        old,
+        expected_industry_id="storage",
+        expected_raw_snapshot_id="raw-storage-1",
+        expected_evidence_snapshot_id="evidence-storage-1",
+        publication_token="1" * 32,
+    )
+    current_prepared = storage.prepare_publication(
+        current,
+        expected_industry_id="storage",
+        expected_raw_snapshot_id="raw-storage-1",
+        expected_evidence_snapshot_id="evidence-storage-1",
+        publication_token="2" * 32,
+    )
+    storage.publish_prepared(old_prepared)
+    storage.publish_prepared(current_prepared)
+    storage.trusted_snapshot_path("storage").write_bytes(b"{}\n")
+
+    loaded = storage.load_current_publication("storage")
+
+    assert loaded is not None and loaded.report == old
+    assert loaded.metadata == old_prepared.metadata
 
 
 def test_checksum_valid_legacy_v1_report_reconstructs_lineage_from_signed_envelope(tmp_path) -> None:
@@ -337,6 +429,7 @@ def test_checksum_valid_load_still_rejects_noncanonical_metric_shape(tmp_path) -
     signed = {
         "schema_version": document["schema_version"],
         "lineage": document["lineage"],
+        "publication": document["publication"],
         "report": document["report"],
     }
     document["checksum"] = hashlib.sha256(_canonical(signed)).hexdigest()
