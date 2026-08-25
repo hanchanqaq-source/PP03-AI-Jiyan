@@ -22,7 +22,11 @@ from industry_research.models import (
     render_conclusion_text,
     VerificationStatus,
 )
-from industry_research.storage import IndustryResearchStorage
+from industry_research.storage import (
+    IndustryResearchStorage,
+    _create_owned_temp,
+    _replace_owned_temp,
+)
 
 
 NOW = datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)
@@ -258,6 +262,93 @@ def test_directory_identity_change_during_write_fails_closed_without_replacing_c
     assert result.displayed_report == old
     assert storage.trusted_snapshot_path("storage").read_bytes() == old_bytes
     assert not list(storage.trusted_snapshot_path("storage").parent.glob("*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 competing-handle regression")
+def test_windows_owned_temp_rejects_competing_writer_delete_and_rename_handle(tmp_path) -> None:
+    # Break caught: FILE_SHARE_WRITE/DELETE lets a rival alter the open temp after publish rename.
+    import ctypes
+    from ctypes import wintypes
+
+    directory = tmp_path / "industry" / "storage"
+    directory.mkdir(parents=True)
+    destination = directory / "trusted_snapshot.json"
+    descriptor, temp_path = _create_owned_temp(directory)
+    attacker = None
+    invalid_handle = ctypes.c_void_p(-1).value
+    trusted_bytes = b"TRUSTED!"
+    attacker_bytes = b"ATTACKER"
+    try:
+        assert os.write(descriptor, trusted_bytes) == len(trusted_bytes)
+        os.fsync(descriptor)
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        attacker = create_file(
+            str(temp_path),
+            0x40000000 | 0x00010000,  # GENERIC_WRITE | DELETE (write/delete/rename authority)
+            0x1 | 0x2 | 0x4,
+            None,
+            3,  # OPEN_EXISTING
+            0x80,
+            None,
+        )
+        attacker_opened = attacker != invalid_handle
+
+        _replace_owned_temp(descriptor, temp_path, destination)
+        if attacker_opened:
+            set_pointer = ctypes.windll.kernel32.SetFilePointer
+            set_pointer.argtypes = (wintypes.HANDLE, ctypes.c_long, wintypes.LPVOID, wintypes.DWORD)
+            set_pointer.restype = wintypes.DWORD
+            assert set_pointer(attacker, 0, None, 0) == 0
+            written = wintypes.DWORD()
+            write_file = ctypes.windll.kernel32.WriteFile
+            write_file.argtypes = (
+                wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+            )
+            write_file.restype = wintypes.BOOL
+            buffer = ctypes.create_string_buffer(attacker_bytes)
+            assert write_file(attacker, buffer, len(attacker_bytes), ctypes.byref(written), None)
+            assert written.value == len(attacker_bytes)
+            assert ctypes.windll.kernel32.FlushFileBuffers(attacker)
+
+        assert not attacker_opened
+    finally:
+        if attacker is not None and attacker != invalid_handle:
+            ctypes.windll.kernel32.CloseHandle(attacker)
+        os.close(descriptor)
+
+    assert destination.read_bytes() == trusted_bytes
+
+
+def test_postcommit_identity_failure_never_reports_old_when_new_current_is_durable(tmp_path, monkeypatch) -> None:
+    # Break caught: a post-rename assertion returns storage_error/old while current is already new.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    old = report("trusted-storage-old")
+    new = report("trusted-storage-new")
+    publish(storage, old)
+    current_path = storage.trusted_snapshot_path("storage")
+    original_assert = storage._assert_directory_identities
+
+    def fail_only_after_new_current_is_durable(identities):
+        original_assert(identities)
+        document = json.loads(current_path.read_text(encoding="utf-8"))
+        if document["report"]["trusted_snapshot_id"] == "trusted-storage-new":
+            raise OSError("injected postcommit identity failure")
+
+    monkeypatch.setattr(storage, "_assert_directory_identities", fail_only_after_new_current_is_durable)
+    result = publish(storage, new)
+    persisted = storage.load_current("storage")
+
+    assert persisted is not None
+    assert persisted.trusted_snapshot_id == "trusted-storage-new"
+    assert result.error_code is None
+    assert result.published_trusted_snapshot_id == persisted.trusted_snapshot_id
+    assert result.displayed_report == persisted
 
 
 def test_industry_directories_are_isolated_and_cross_industry_publish_is_rejected(tmp_path) -> None:

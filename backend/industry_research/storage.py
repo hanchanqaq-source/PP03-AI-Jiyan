@@ -188,7 +188,7 @@ def _create_owned_temp(directory: Path) -> tuple[int, Path]:
         handle = create_file(
             _windows_extended_path(path),
             0x40000000 | 0x00010000,  # GENERIC_WRITE | DELETE
-            0x1 | 0x2 | 0x4,  # share read/write/delete; identity is the open handle
+            0,  # exclusive ownership: deny every competing read/write/delete/rename handle
             None,
             1,  # CREATE_NEW
             0x80 | 0x80000000,  # NORMAL | WRITE_THROUGH
@@ -511,7 +511,6 @@ class IndustryResearchStorage:
             captured = tuple(identities)
             self._assert_directory_identities(captured)
             yield captured
-            self._assert_directory_identities(captured)
         except OSError:
             raise OSError("storage_error") from None
         finally:
@@ -548,6 +547,9 @@ class IndustryResearchStorage:
                     or (current_temp.st_dev, current_temp.st_ino) != identity
                 ):
                     raise OSError("storage_error")
+                # COMMIT POINT: every fallible security/identity validation is complete.
+                # SetFileInformationByHandle either fails before commit or returns after
+                # the still-exclusively-owned temp is the durable current pathname.
                 _replace_owned_temp(descriptor, temp_path, path)
                 temp_path = None
         except OSError:
