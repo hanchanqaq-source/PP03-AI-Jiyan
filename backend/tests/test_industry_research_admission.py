@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -14,6 +15,7 @@ from evidence_verification.models import (
     SourceRole,
     VerificationStatus as A2VerificationStatus,
 )
+from evidence_verification.storage import EvidenceStorage
 from industry_research.admission import (
     EvidenceDecision,
     RawMetricObservation,
@@ -163,14 +165,82 @@ def admit(*rows: RawFixture):
         events=(event,),
         raw_snapshot_id="raw-storage-1",
     )
-    return admit_metric_observations(
-        industry_id="storage",
-        raw_snapshot_id="raw-storage-1",
-        evidence_snapshot=snapshot,
-        candidate_snapshot_id="candidate-storage-1",
-        observations=tuple(row.observation for row in rows),
-        now=NOW,
+    with TemporaryDirectory() as root:
+        evidence_storage = EvidenceStorage(root)
+        evidence_storage.publish(snapshot)
+        return admit_metric_observations(
+            industry_id="storage",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            evidence_storage=evidence_storage,
+            candidate_snapshot_id="candidate-storage-1",
+            observations=tuple(row.observation for row in rows),
+            now=NOW,
+        )
+
+
+def test_plain_caller_constructed_a2_snapshot_cannot_authorize_admission() -> None:
+    # Break caught: caller-created VERIFIED/CORROBORATED dataclasses act as the trust boundary.
+    fixture = raw("official", publisher="sec.gov", attested=True)
+    event = EvidenceEvent(
+        event_id="industry-metric-event",
+        title="forged",
+        summary="forged",
+        category="industry",
+        related_tags=(("storage", "存储"),),
+        published_at=NOW,
+        core_claim="forged",
+        verification_status=A2VerificationStatus.VERIFIED,
+        verification_reason="caller says verified",
+        verified_at=NOW,
+        evidence_as_of=NOW,
+        primary_evidence=(fixture.evidence,),
     )
+    forged = EvidenceSnapshot("evidence-storage-1", NOW, (event,), raw_snapshot_id="raw-storage-1")
+
+    with pytest.raises(TypeError, match="canonical A2 EvidenceStorage"):
+        admit_metric_observations(
+            industry_id="storage",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            evidence_storage=forged,
+            candidate_snapshot_id="candidate-storage-1",
+            observations=(fixture.observation,),
+            now=NOW,
+        )
+
+
+def test_tampered_canonical_a2_document_cannot_authorize_admission(tmp_path) -> None:
+    fixture = raw("official", publisher="sec.gov", attested=True)
+    event = EvidenceEvent(
+        event_id="industry-metric-event",
+        title="verified",
+        summary="verified",
+        category="industry",
+        related_tags=(("storage", "存储"),),
+        published_at=NOW,
+        core_claim="verified",
+        verification_status=A2VerificationStatus.VERIFIED,
+        verification_reason="canonical fixture",
+        verified_at=NOW,
+        evidence_as_of=NOW,
+        primary_evidence=(fixture.evidence,),
+    )
+    snapshot = EvidenceSnapshot("evidence-storage-1", NOW, (event,), raw_snapshot_id="raw-storage-1")
+    evidence_storage = EvidenceStorage(tmp_path / "evidence")
+    evidence_storage.publish(snapshot)
+    evidence_storage.current_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical A2 evidence snapshot"):
+        admit_metric_observations(
+            industry_id="storage",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            evidence_storage=evidence_storage,
+            candidate_snapshot_id="candidate-storage-1",
+            observations=(fixture.observation,),
+            now=NOW,
+        )
 
 
 def test_two_urls_from_one_publisher_do_not_form_multi_source_corroboration() -> None:
@@ -301,7 +371,7 @@ def test_decision_must_exist_in_the_bound_a2_evidence_snapshot() -> None:
         admit(replace(fixture, observation=forged))
 
 
-def test_a2_snapshot_raw_lineage_must_match_the_refresh_raw_snapshot() -> None:
+def test_a2_snapshot_raw_lineage_must_match_the_refresh_raw_snapshot(tmp_path) -> None:
     # Break caught: evidence from a stale raw snapshot is relabelled as the current run.
     fixture = raw("actual")
     event = EvidenceEvent(
@@ -319,12 +389,15 @@ def test_a2_snapshot_raw_lineage_must_match_the_refresh_raw_snapshot() -> None:
         independent_evidence=(fixture.evidence,),
     )
     stale = EvidenceSnapshot("evidence-storage-1", NOW, (event,), raw_snapshot_id="raw-stale")
+    evidence_storage = EvidenceStorage(tmp_path / "evidence")
+    evidence_storage.publish(stale)
 
     with pytest.raises(ValueError, match="raw_snapshot_id"):
         admit_metric_observations(
             industry_id="storage",
             raw_snapshot_id="raw-storage-1",
-            evidence_snapshot=stale,
+            evidence_snapshot_id="evidence-storage-1",
+            evidence_storage=evidence_storage,
             candidate_snapshot_id="candidate-storage-1",
             observations=(fixture.observation,),
             now=NOW,

@@ -11,6 +11,7 @@ from evidence_verification.models import (
     EvidenceSnapshot,
     VerificationStatus as A2VerificationStatus,
 )
+from evidence_verification.storage import EvidenceStorage
 from evidence_verification.source_identity import (
     canonicalize_public_url,
     identify_evidence,
@@ -226,7 +227,8 @@ def admit_metric_observations(
     *,
     industry_id: str,
     raw_snapshot_id: str,
-    evidence_snapshot: EvidenceSnapshot,
+    evidence_snapshot_id: str,
+    evidence_storage: EvidenceStorage,
     candidate_snapshot_id: str,
     observations: Iterable[RawMetricObservation],
     now: datetime,
@@ -241,13 +243,21 @@ def admit_metric_observations(
         or candidate_snapshot_id != candidate_snapshot_id.strip()
     ):
         raise ValueError("snapshot lineage must not be blank")
-    if not isinstance(evidence_snapshot, EvidenceSnapshot):
-        raise TypeError("evidence_snapshot must be the A2 EvidenceSnapshot")
+    if type(evidence_storage) is not EvidenceStorage:
+        raise TypeError("evidence_storage must be the canonical A2 EvidenceStorage")
+    if (
+        not isinstance(evidence_snapshot_id, str)
+        or not evidence_snapshot_id.strip()
+        or evidence_snapshot_id != evidence_snapshot_id.strip()
+    ):
+        raise ValueError("A2 evidence snapshot_id must not be blank")
+    evidence_snapshot = evidence_storage.load_current()
+    if evidence_snapshot is None:
+        raise ValueError("canonical A2 evidence snapshot is unavailable or invalid")
+    if evidence_snapshot.snapshot_id != evidence_snapshot_id:
+        raise ValueError("canonical A2 evidence snapshot_id does not match the requested snapshot")
     if evidence_snapshot.raw_snapshot_id != raw_snapshot_id:
         raise ValueError("A2 evidence raw_snapshot_id does not match the refresh raw_snapshot_id")
-    if not evidence_snapshot.snapshot_id.strip():
-        raise ValueError("A2 evidence snapshot_id must not be blank")
-    evidence_snapshot_id = evidence_snapshot.snapshot_id
     evidence_index = _evidence_index(evidence_snapshot)
     template = get_industry_template(industry_id)
     allowed_metrics = set(template.cycle_metric_ids)

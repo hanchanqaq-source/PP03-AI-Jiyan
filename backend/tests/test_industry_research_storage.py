@@ -8,13 +8,19 @@ import os
 import pytest
 
 from industry_research.models import (
+    AvailabilityStatus,
     ConclusionStatus,
     DataCompleteness,
     DisplayedTrustedReport,
+    EvidenceReference,
+    FreshnessStatus,
+    IndustryMetricObservation,
     ReportCounts,
     SourceCoverage,
+    SourceRunStatus,
     TemplateStatus,
     render_conclusion_text,
+    VerificationStatus,
 )
 from industry_research.storage import IndustryResearchStorage
 
@@ -62,6 +68,49 @@ def report(snapshot_id: str, *, industry_id: str = "storage") -> DisplayedTruste
     )
 
 
+def trusted_observation(metric_id: str, *, industry_id: str = "storage") -> IndustryMetricObservation:
+    evidence = EvidenceReference(
+        evidence_id=f"evidence-{metric_id}",
+        source_family_id="official-family",
+        content_source="sec.gov",
+        origin_cluster="publisher:sec.gov",
+        collector_source="sec.gov",
+        final_url=f"https://sec.gov/{metric_id}",
+        is_official=True,
+        is_official_attested=True,
+        supports_claim=True,
+        supports_fields=(metric_id,),
+        contradicts_claim=False,
+        as_of_date="2026-08-25",
+        verified_at=NOW.isoformat(),
+    )
+    return IndustryMetricObservation(
+        industry_id=industry_id,
+        metric_id=metric_id,
+        label=metric_id,
+        current_value=1,
+        unit="index",
+        change=None,
+        historical_position=None,
+        availability_status=AvailabilityStatus.AVAILABLE,
+        verification_status=VerificationStatus.VERIFIED,
+        freshness_status=FreshnessStatus.FRESH,
+        source_run_status=SourceRunStatus.HEALTHY,
+        empty_reason=None,
+        as_of_date="2026-08-25",
+        fetched_at=NOW.isoformat(),
+        methodology="official publication",
+        judgment_basis=("official source",),
+        invalidating_conditions=("official correction",),
+        evidence=(evidence,),
+        independent_source_families=(),
+        independent_content_sources=(),
+        independent_origin_clusters=(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+    )
+
+
 def publish(storage: IndustryResearchStorage, value: DisplayedTrustedReport):
     return storage.publish(
         value,
@@ -77,6 +126,7 @@ def test_trusted_snapshot_round_trips_as_one_checksummed_report(tmp_path) -> Non
     expected = report("trusted-storage-1")
 
     result = publish(storage, expected)
+    assert result.error_code is None, result.error_code
     document = json.loads(storage.trusted_snapshot_path("storage").read_text(encoding="utf-8"))
 
     assert result.displayed_report == expected
@@ -93,10 +143,10 @@ def test_refresh_write_failure_returns_and_preserves_previous_complete_snapshot(
     publish(storage, old)
     old_bytes = storage.trusted_snapshot_path("storage").read_bytes()
 
-    def fail_replace(_source, _destination):
+    def fail_replace(_descriptor, _source, _destination):
         raise OSError("injected final replace failure")
 
-    monkeypatch.setattr("industry_research.storage._replace_durable", fail_replace)
+    monkeypatch.setattr("industry_research.storage._replace_owned_temp", fail_replace)
     result = publish(storage, report("trusted-storage-new"))
 
     assert result.published_trusted_snapshot_id is None
@@ -128,16 +178,86 @@ def test_missing_required_section_does_not_replace_previous_snapshot(tmp_path) -
     assert storage.load_current("storage") == old
 
 
-def test_checksum_tampering_fails_closed_instead_of_loading_mixed_content(tmp_path) -> None:
-    # Break caught: edited report content is accepted under an old checksum.
+def test_current_checksum_tampering_recovers_previous_complete_snapshot(tmp_path) -> None:
+    # Break caught: current corruption destroys the only recoverable trusted report.
     storage = IndustryResearchStorage(root=tmp_path / "industry")
-    publish(storage, report("trusted-storage-1"))
+    old = report("trusted-storage-old")
+    publish(storage, old)
+    publish(storage, report("trusted-storage-current"))
     path = storage.trusted_snapshot_path("storage")
     document = json.loads(path.read_text(encoding="utf-8"))
     document["report"]["generated_at"] = "2099-01-01T00:00:00+00:00"
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    assert storage.load_current("storage") is None
+    assert storage.load_current("storage") == old
+    assert storage.previous_snapshot_path("storage").exists()
+
+
+def test_corrupt_current_and_failed_publication_preserve_recoverable_previous(tmp_path, monkeypatch) -> None:
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    old = report("trusted-storage-old")
+    publish(storage, old)
+    publish(storage, report("trusted-storage-current"))
+    storage.trusted_snapshot_path("storage").write_text("{}", encoding="utf-8")
+    previous_bytes = storage.previous_snapshot_path("storage").read_bytes()
+
+    monkeypatch.setattr("industry_research.storage._replace_owned_temp", lambda *_args: (_ for _ in ()).throw(OSError("injected")))
+    result = publish(storage, report("trusted-storage-next"))
+
+    assert result.displayed_report == old
+    assert result.previous_trusted_snapshot_id == "trusted-storage-old"
+    assert result.error_code == "storage_error"
+    assert storage.previous_snapshot_path("storage").read_bytes() == previous_bytes
+    assert storage.load_current("storage") == old
+
+
+@pytest.mark.parametrize("entrypoint", ("publish", "publish_document"))
+def test_storage_rejects_cross_template_metric_when_admission_is_bypassed(tmp_path, entrypoint) -> None:
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    cross_template = trusted_observation("orders")
+    invalid = replace(
+        report("trusted-storage-cross-template"),
+        counts=ReportCounts(1, 0),
+        cycle=(cross_template,),
+    )
+
+    with pytest.raises(ValueError, match="industry template"):
+        if entrypoint == "publish":
+            publish(storage, invalid)
+        else:
+            storage.publish_document(
+                invalid.to_dict(),
+                expected_industry_id="storage",
+                expected_raw_snapshot_id="raw-storage-1",
+                expected_evidence_snapshot_id="evidence-storage-1",
+            )
+    assert not storage.trusted_snapshot_path("storage").exists()
+
+
+def test_directory_identity_change_during_write_fails_closed_without_replacing_current(tmp_path, monkeypatch) -> None:
+    # Break caught: a directory/junction swap after the early pathname check redirects replace.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    old = report("trusted-storage-old")
+    publish(storage, old)
+    old_bytes = storage.trusted_snapshot_path("storage").read_bytes()
+    original = storage._directory_identity
+    probes = 0
+
+    def inject_identity_change(path):
+        nonlocal probes
+        identity = original(path)
+        probes += 1
+        if probes >= 5:
+            return (*identity[:-1], identity[-1] + 1)
+        return identity
+
+    monkeypatch.setattr(storage, "_directory_identity", inject_identity_change)
+    result = publish(storage, report("trusted-storage-new"))
+
+    assert result.error_code == "storage_error"
+    assert result.displayed_report == old
+    assert storage.trusted_snapshot_path("storage").read_bytes() == old_bytes
+    assert not list(storage.trusted_snapshot_path("storage").parent.glob("*.tmp"))
 
 
 def test_industry_directories_are_isolated_and_cross_industry_publish_is_rejected(tmp_path) -> None:

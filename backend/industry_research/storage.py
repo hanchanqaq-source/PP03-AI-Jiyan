@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -7,9 +8,10 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from cache_io_lock import CACHE_IO_LOCK
 from evidence_verification.storage import (
@@ -38,6 +40,7 @@ from .models import (
     TemplateStatus,
     VerificationStatus,
 )
+from .templates import get_industry_template
 
 
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
@@ -62,6 +65,147 @@ class TrustedPublicationResult:
     published_trusted_snapshot_id: str | None
     previous_trusted_snapshot_id: str | None
     error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedSnapshot:
+    report: DisplayedTrustedReport
+    payload: bytes
+
+
+def _windows_extended_path(path: Path) -> str:
+    value = os.path.abspath(path)
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _windows_nt_path(path: Path) -> str:
+    value = os.path.abspath(path)
+    if value.startswith("\\\\"):
+        return "\\??\\UNC\\" + value[2:]
+    return "\\??\\" + value
+
+
+def _open_locked_directory(path: Path) -> object:
+    """Hold a directory identity; Windows denies rename/delete while held."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            _windows_extended_path(path),
+            0x80,  # FILE_READ_ATTRIBUTES
+            0x1 | 0x2,  # share read/write, deliberately deny delete/rename
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise OSError("storage_error")
+        return handle
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
+
+
+def _close_locked_directory(resource: object) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        close_handle = ctypes.windll.kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        close_handle(resource)
+    else:
+        os.close(resource)  # type: ignore[arg-type]
+
+
+def _replace_owned_temp(descriptor: int, source: Path, destination: Path) -> None:
+    """Rename the still-open owned temp file, avoiding a source pathname race."""
+    if os.name != "nt":
+        _replace_durable(source, destination)
+        return
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    file_name = _windows_nt_path(destination).encode("utf-16-le")
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = (
+            ("ReplaceIfExists", ctypes.c_ubyte),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        )
+
+    name_offset = _FileRenameInfo.FileName.offset
+    # Keep a UTF-16 terminator in the backing buffer even though FileNameLength
+    # excludes it; older Windows filesystem drivers may inspect the terminator.
+    buffer = ctypes.create_string_buffer(name_offset + len(file_name) + 2)
+    header = _FileRenameInfo.from_buffer(buffer)
+    header.ReplaceIfExists = 1
+    header.RootDirectory = 0
+    header.FileNameLength = len(file_name)
+    ctypes.memmove(ctypes.addressof(buffer) + name_offset, file_name, len(file_name))
+    set_information = ctypes.windll.kernel32.SetFileInformationByHandle
+    set_information.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    set_information.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+    if not set_information(handle, 3, buffer, len(buffer)):  # FileRenameInfo
+        raise ctypes.WinError()
+
+
+def _create_owned_temp(directory: Path) -> tuple[int, Path]:
+    if os.name != "nt":
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix=".trusted_snapshot.", suffix=".tmp", dir=directory,
+        )
+        return descriptor, Path(raw_path)
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    for _attempt in range(32):
+        path = directory / f".trusted_snapshot.{secrets.token_hex(16)}.tmp"
+        handle = create_file(
+            _windows_extended_path(path),
+            0x40000000 | 0x00010000,  # GENERIC_WRITE | DELETE
+            0x1 | 0x2 | 0x4,  # share read/write/delete; identity is the open handle
+            None,
+            1,  # CREATE_NEW
+            0x80 | 0x80000000,  # NORMAL | WRITE_THROUGH
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            error = ctypes.windll.kernel32.GetLastError()
+            if error in {80, 183}:  # FILE_EXISTS / ALREADY_EXISTS
+                continue
+            raise ctypes.WinError(error)
+        try:
+            descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+        except BaseException:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            raise
+        return descriptor, path
+    raise OSError("storage_error")
 
 
 def _canonical(value: object) -> bytes:
@@ -238,6 +382,9 @@ def _validate_report(report: DisplayedTrustedReport) -> None:
     if generated.tzinfo is None or generated.utcoffset() is None:
         raise ValueError("trusted report generated_at must be timezone-aware")
     observations = report.cycle + report.metrics + report.capital
+    allowed_metrics = set(get_industry_template(report.industry_id).cycle_metric_ids)
+    if any(row.metric_id not in allowed_metrics for row in observations):
+        raise ValueError("trusted observation metric_id is not in the industry template")
     expected = ReportCounts(
         verified=sum(row.verification_status is VerificationStatus.VERIFIED for row in observations),
         corroborated=sum(row.verification_status is VerificationStatus.CORROBORATED for row in observations),
@@ -305,6 +452,12 @@ class IndustryResearchStorage:
             raise ValueError("industry storage path escapes root")
         return path
 
+    def previous_snapshot_path(self, industry_id: str) -> Path:
+        path = self.root / self._component(industry_id) / "previous_trusted_snapshot.json"
+        if os.path.commonpath((str(self.root), os.path.abspath(path))) != str(self.root):
+            raise ValueError("industry storage path escapes root")
+        return path
+
     def _inside_root(self, path: Path) -> bool:
         try:
             return os.path.commonpath((str(self.root), os.path.abspath(path))) == str(self.root)
@@ -328,6 +481,46 @@ class IndustryResearchStorage:
             raise OSError("storage_error")
         self._verify_directory_chain(path.parent)
 
+    def _directory_identity(self, path: Path) -> tuple[int, int, int, int]:
+        info = path.stat(follow_symlinks=False)
+        identity = (info.st_dev, info.st_ino, info.st_mode, getattr(info, "st_reparse_tag", 0))
+        if not stat.S_ISDIR(info.st_mode) or identity[-1]:
+            raise OSError("storage_error")
+        return identity
+
+    def _assert_directory_identities(
+        self,
+        identities: tuple[tuple[Path, tuple[int, int, int, int]], ...],
+    ) -> None:
+        for path, expected in identities:
+            if self._directory_identity(path) != expected:
+                raise OSError("storage_error")
+
+    @contextmanager
+    def _hold_directory_identities(
+        self,
+        directory: Path,
+    ) -> Iterator[tuple[tuple[Path, tuple[int, int, int, int]], ...]]:
+        resources: list[object] = []
+        identities: list[tuple[Path, tuple[int, int, int, int]]] = []
+        directories = (self.root,) if directory == self.root else (self.root, directory)
+        try:
+            for path in directories:
+                resources.append(_open_locked_directory(path))
+                identities.append((path, self._directory_identity(path)))
+            captured = tuple(identities)
+            self._assert_directory_identities(captured)
+            yield captured
+            self._assert_directory_identities(captured)
+        except OSError:
+            raise OSError("storage_error") from None
+        finally:
+            for resource in reversed(resources):
+                try:
+                    _close_locked_directory(resource)
+                except OSError:
+                    pass
+
     def _atomic_write(self, path: Path, payload: bytes) -> None:
         descriptor: int | None = None
         temp_path: Path | None = None
@@ -335,27 +528,28 @@ class IndustryResearchStorage:
         try:
             _ensure_directory(path.parent)
             self._verify_parent(path)
-            descriptor, raw_temp = tempfile.mkstemp(
-                prefix=".trusted_snapshot.", suffix=".tmp", dir=path.parent,
-            )
-            temp_path = Path(raw_temp)
-            opened = os.fstat(descriptor)
-            identity = (opened.st_dev, opened.st_ino)
-            try:
-                handle = os.fdopen(descriptor, "wb")
-            except BaseException:
-                _close_owned_descriptor(descriptor, identity)
-                descriptor = None
-                raise
-            descriptor = None
-            with handle:
-                written = handle.write(payload)
-                if written != len(payload):
+            with self._hold_directory_identities(path.parent) as directory_identities:
+                descriptor, temp_path = _create_owned_temp(path.parent)
+                opened = os.fstat(descriptor)
+                identity = (opened.st_dev, opened.st_ino)
+                offset = 0
+                while offset < len(payload):
+                    written = os.write(descriptor, payload[offset:])
+                    if written <= 0:
+                        raise OSError("storage_error")
+                    offset += written
+                os.fsync(descriptor)
+                self._assert_directory_identities(directory_identities)
+                current_temp = temp_path.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current_temp.st_mode)
+                    or getattr(current_temp, "st_reparse_tag", 0)
+                    or current_temp.st_nlink != 1
+                    or (current_temp.st_dev, current_temp.st_ino) != identity
+                ):
                     raise OSError("storage_error")
-                handle.flush()
-                os.fsync(handle.fileno())
-            _replace_durable(temp_path, path)
-            temp_path = None
+                _replace_owned_temp(descriptor, temp_path, path)
+                temp_path = None
         except OSError:
             raise OSError("storage_error") from None
         finally:
@@ -364,11 +558,11 @@ class IndustryResearchStorage:
                     os.close(descriptor)
                 except OSError:
                     pass
+                descriptor = None
             if temp_path is not None and identity is not None:
                 _cleanup_owned_temp(temp_path, identity)
 
-    def load_current(self, industry_id: str) -> DisplayedTrustedReport | None:
-        path = self.trusted_snapshot_path(industry_id)
+    def _load_snapshot_file(self, path: Path, industry_id: str) -> _LoadedSnapshot | None:
         descriptor: int | None = None
         identity: tuple[int, int] | None = None
         try:
@@ -425,7 +619,7 @@ class IndustryResearchStorage:
             )
             if expected_lineage != lineage or report.industry_id != industry_id:
                 return None
-            return report
+            return _LoadedSnapshot(report, raw)
         except (
             AttributeError,
             FileNotFoundError,
@@ -448,6 +642,15 @@ class IndustryResearchStorage:
                         pass
                 else:
                     _close_owned_descriptor(descriptor, identity)
+
+    def load_current(self, industry_id: str) -> DisplayedTrustedReport | None:
+        self._component(industry_id)
+        with CACHE_IO_LOCK:
+            current = self._load_snapshot_file(self.trusted_snapshot_path(industry_id), industry_id)
+            if current is not None:
+                return current.report
+            previous = self._load_snapshot_file(self.previous_snapshot_path(industry_id), industry_id)
+            return previous.report if previous is not None else None
 
     def publish(
         self,
@@ -494,7 +697,15 @@ class IndustryResearchStorage:
         lineage: dict[str, str],
     ) -> TrustedPublicationResult:
         with CACHE_IO_LOCK:
-            previous = self.load_current(report.industry_id)
+            current_path = self.trusted_snapshot_path(report.industry_id)
+            previous_path = self.previous_snapshot_path(report.industry_id)
+            current = self._load_snapshot_file(current_path, report.industry_id)
+            recoverable = (
+                current
+                if current is not None
+                else self._load_snapshot_file(previous_path, report.industry_id)
+            )
+            previous = recoverable.report if recoverable is not None else None
             previous_id = previous.trusted_snapshot_id if previous is not None else None
             report_document = report.to_dict()
             signed_payload = {"lineage": lineage, "report": report_document}
@@ -508,7 +719,9 @@ class IndustryResearchStorage:
             if len(payload) > _MAX_SNAPSHOT_BYTES:
                 raise ValueError("trusted snapshot is too large")
             try:
-                self._atomic_write(self.trusted_snapshot_path(report.industry_id), payload)
+                if current is not None:
+                    self._atomic_write(previous_path, current.payload)
+                self._atomic_write(current_path, payload)
             except OSError:
                 return TrustedPublicationResult(previous, None, previous_id, "storage_error")
             return TrustedPublicationResult(report, report.trusted_snapshot_id, previous_id, None)
