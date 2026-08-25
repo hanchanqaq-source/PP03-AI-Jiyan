@@ -22,7 +22,7 @@ from industry_research.admission import (
     SourceIdentity,
     admit_metric_observations,
 )
-from industry_research.models import FreshnessStatus, VerificationStatus
+from industry_research.models import FreshnessStatus, MetricChange, VerificationStatus
 from news_intelligence.models import NewsSourceItem
 
 
@@ -59,6 +59,7 @@ def raw(
     attested: bool = False,
     expires_at: datetime | None = None,
     unit: str = "USD",
+    change: MetricChange | None = None,
 ) -> RawFixture:
     provider_value = ProviderValue(
         value=value,
@@ -113,6 +114,7 @@ def raw(
         methodology="公开快照同口径比较",
         judgment_basis=("来源字段与指标定义一致",),
         invalidating_conditions=("来源更正或数据过期",),
+        change=change,
     )
     evidence = EvidenceItem(
         evidence_id=evidence_id,
@@ -413,6 +415,59 @@ def test_equal_scalars_with_incompatible_units_are_conflicting() -> None:
 
     assert projection.trusted == ()
     assert projection.candidate.counts.conflicting == 1
+
+
+@pytest.mark.parametrize(
+    ("left_change", "right_change"),
+    (
+        (MetricChange(2.0, "wow"), MetricChange(-2.0, "wow")),
+        (MetricChange(2.0, "wow"), MetricChange(2.0, "yoy")),
+        (MetricChange(2.0, "wow"), None),
+    ),
+)
+def test_change_value_basis_or_presence_disagreement_is_conflicting(
+    left_change: MetricChange | None,
+    right_change: MetricChange | None,
+) -> None:
+    # Break caught: equal current values hide a disagreement in structured change truth.
+    projection = admit(
+        raw("evidence-a", value=100, change=left_change),
+        raw(
+            "evidence-b",
+            value=100.0,
+            family="family-b",
+            publisher="publisher-b.example",
+            change=right_change,
+        ),
+    )
+
+    assert projection.trusted == ()
+    assert projection.candidate.counts.conflicting == 1
+    assert {
+        item.evidence_id: item.change
+        for item in projection.candidate.conflicting[0].source_values
+    } == {
+        "evidence-a": left_change,
+        "evidence-b": right_change,
+    }
+
+
+def test_equivalent_numeric_change_and_reversed_input_order_are_deterministic() -> None:
+    # Break caught: input order chooses supporting[0], or 2 and 2.0 form different claims.
+    left = raw("evidence-b", value=100, change=MetricChange(2, "wow"))
+    right = raw(
+        "evidence-a",
+        value=100.0,
+        family="family-b",
+        publisher="publisher-b.example",
+        change=MetricChange(2.0, "wow"),
+    )
+
+    forward = admit(left, right)
+    reverse = admit(right, left)
+
+    assert forward.candidate.conflicting == ()
+    assert forward == reverse
 
 
 def test_single_row_a2_contradiction_is_rejected_until_per_source_values_exist() -> None:

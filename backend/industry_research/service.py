@@ -204,6 +204,8 @@ def _empty_candidate(industry_id: str) -> CandidateEvidencePanel:
         conflicting=(),
         unverified_events=(),
         conflicting_events=(),
+        raw_snapshot_id=None,
+        evidence_snapshot_id=None,
     )
 
 
@@ -229,6 +231,8 @@ def _merge_candidates(
         conflicting=metric_candidates.conflicting,
         unverified_events=window.unverified,
         conflicting_events=window.conflicting,
+        raw_snapshot_id=metric_candidates.raw_snapshot_id,
+        evidence_snapshot_id=metric_candidates.evidence_snapshot_id,
     )
 
 
@@ -371,7 +375,6 @@ def _complete_metric_rows(
     current: Mapping[str, IndustryMetricObservation],
     candidates: CandidateEvidencePanel,
     expired: Mapping[str, IndustryMetricObservation],
-    empty_reasons: Mapping[str, EmptyReason],
 ) -> tuple[IndustryMetricObservation, ...]:
     unverified = {row.metric_id for row in candidates.unverified}
     conflicting = {row.metric_id for row in candidates.conflicting}
@@ -387,7 +390,7 @@ def _complete_metric_rows(
         elif metric_id in expired:
             reason = EmptyReason.EXPIRED
         else:
-            reason = empty_reasons.get(metric_id, EmptyReason.NO_RELIABLE_DATA)
+            reason = EmptyReason.NO_RELIABLE_DATA
         rows.append(_placeholder(
             industry_id=industry_id,
             metric_id=metric_id,
@@ -397,14 +400,26 @@ def _complete_metric_rows(
     return tuple(rows)
 
 
+def _has_structured_expiry_at_or_before(
+    observation: IndustryMetricObservation,
+    *,
+    now: datetime,
+) -> bool:
+    if observation.expires_at is None:
+        return False
+    expiry = datetime.fromisoformat(observation.expires_at.replace("Z", "+00:00"))
+    return expiry <= now
+
+
 def assemble_storage_report(
     *,
     trusted_snapshot_id: str,
+    raw_snapshot_id: str,
+    evidence_snapshot_id: str,
     generated_at: datetime,
     trusted_observations: Iterable[IndustryMetricObservation],
     expired_observations: Iterable[IndustryMetricObservation] = (),
     metric_candidates: CandidateEvidencePanel | None,
-    metric_empty_reasons: Mapping[str, EmptyReason] | None = None,
     news_snapshot: EvidenceSnapshot | None,
     now: datetime,
     source_coverage: SourceCoverage | None = None,
@@ -414,8 +429,17 @@ def assemble_storage_report(
     industry_id = "storage"
     _aware(generated_at, "generated_at")
     _aware(now, "now")
+    if any(
+        not isinstance(value, str) or not value.strip() or value != value.strip()
+        for value in (raw_snapshot_id, evidence_snapshot_id)
+    ):
+        raise ValueError("report raw/evidence lineage must not be blank")
     template = get_industry_template(industry_id)
     trusted_rows = tuple(trusted_observations)
+    if any(row.raw_snapshot_id != raw_snapshot_id for row in trusted_rows):
+        raise ValueError("trusted raw lineage mismatch")
+    if any(row.evidence_snapshot_id != evidence_snapshot_id for row in trusted_rows):
+        raise ValueError("trusted evidence lineage mismatch")
     current = select_current_trusted_observations(
         industry_id=industry_id,
         observations=trusted_rows,
@@ -430,23 +454,36 @@ def assemble_storage_report(
     candidates = metric_candidates or _empty_candidate(industry_id)
     if type(candidates) is not CandidateEvidencePanel or candidates.industry_id != industry_id:
         raise ValueError("metric candidate panel industry_id mismatch")
+    if metric_candidates is not None:
+        if candidates.raw_snapshot_id != raw_snapshot_id:
+            raise ValueError("candidate raw lineage mismatch")
+        if candidates.evidence_snapshot_id != evidence_snapshot_id:
+            raise ValueError("candidate evidence lineage mismatch")
     expired_rows = tuple(expired_observations)
     if any(type(row) is not IndustryMetricObservation or row.industry_id != industry_id for row in expired_rows):
         raise ValueError("expired observations must match the requested industry")
+    if any(row.raw_snapshot_id != raw_snapshot_id for row in expired_rows):
+        raise ValueError("expired raw lineage mismatch")
+    if any(row.evidence_snapshot_id != evidence_snapshot_id for row in expired_rows):
+        raise ValueError("expired evidence lineage mismatch")
+    for row in expired_rows:
+        if (
+            not _has_structured_expiry_at_or_before(row, now=now)
+            and row.freshness_status is FreshnessStatus.EXPIRED
+        ):
+            raise ValueError("expired observation requires structured expires_at at or before report time")
+    if any(observation_is_current(row, now=now) for row in expired_rows):
+        raise ValueError("expired observation is not expired at report time")
+    auto_expired = tuple(
+        row for row in trusted_rows if not observation_is_current(row, now=now)
+    )
+    if any(not _has_structured_expiry_at_or_before(row, now=now) for row in auto_expired):
+        raise ValueError("expired observation requires structured expires_at at or before report time")
     expired_by_id = {row.metric_id: row for row in expired_rows}
     expired_by_id.update({
         row.metric_id: row
-        for row in trusted_rows
-        if not observation_is_current(row, now=now)
+        for row in auto_expired
     })
-    reasons = dict(metric_empty_reasons or {})
-    allowed_report_metrics = set(
-        template.cycle_metric_ids + template.core_metric_ids + template.capital_metric_ids
-    )
-    if any(metric_id not in allowed_report_metrics for metric_id in reasons):
-        raise ValueError("empty reason metric_id is not in the report template")
-    if any(type(reason) is not EmptyReason for reason in reasons.values()):
-        raise TypeError("metric empty reasons must use EmptyReason")
     windows = (
         project_news_windows(industry_id=industry_id, snapshot=news_snapshot, now=now)
         if news_snapshot is not None
@@ -476,7 +513,6 @@ def assemble_storage_report(
         current=current_by_id,
         candidates=candidates,
         expired=expired_by_id,
-        empty_reasons=reasons,
     )
     coverage = source_coverage or SourceCoverage(
         unit="capability",
@@ -506,7 +542,6 @@ def assemble_storage_report(
         current=current_by_id,
         candidates=candidates,
         expired=expired_by_id,
-        empty_reasons=reasons,
     )
     capital_rows = _complete_metric_rows(
         industry_id=industry_id,
@@ -514,7 +549,6 @@ def assemble_storage_report(
         current=current_by_id,
         candidates=candidates,
         expired=expired_by_id,
-        empty_reasons=reasons,
     )
     report = DisplayedTrustedReport(
         industry_id=industry_id,
@@ -579,22 +613,24 @@ class IndustryResearchService:
         self,
         *,
         trusted_snapshot_id: str,
+        raw_snapshot_id: str,
+        evidence_snapshot_id: str,
         generated_at: datetime,
         trusted_observations: Iterable[IndustryMetricObservation],
         expired_observations: Iterable[IndustryMetricObservation] = (),
         metric_candidates: CandidateEvidencePanel | None,
-        metric_empty_reasons: Mapping[str, EmptyReason] | None = None,
         news_snapshot: EvidenceSnapshot | None,
         source_coverage: SourceCoverage | None = None,
         demo: bool = False,
     ) -> IndustryReportAssembly:
         assembly = assemble_storage_report(
             trusted_snapshot_id=trusted_snapshot_id,
+            raw_snapshot_id=raw_snapshot_id,
+            evidence_snapshot_id=evidence_snapshot_id,
             generated_at=generated_at,
             trusted_observations=trusted_observations,
             expired_observations=expired_observations,
             metric_candidates=metric_candidates,
-            metric_empty_reasons=metric_empty_reasons,
             news_snapshot=news_snapshot,
             now=self._clock(),
             source_coverage=source_coverage,

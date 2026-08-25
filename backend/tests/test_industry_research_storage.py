@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 
@@ -12,6 +13,7 @@ from industry_research.models import (
     ConclusionStatus,
     DataCompleteness,
     DisplayedTrustedReport,
+    EmptyReason,
     EvidenceReference,
     FreshnessStatus,
     IndustryMetricObservation,
@@ -24,15 +26,46 @@ from industry_research.models import (
 )
 from industry_research.storage import (
     IndustryResearchStorage,
+    _canonical,
     _create_owned_temp,
     _replace_owned_temp,
 )
+from industry_research.templates import get_industry_template
 
 
 NOW = datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)
 
 
+def empty_observation(metric_id: str, *, industry_id: str = "storage") -> IndustryMetricObservation:
+    return IndustryMetricObservation(
+        industry_id=industry_id,
+        metric_id=metric_id,
+        label=metric_id,
+        current_value=None,
+        unit=None,
+        change=None,
+        historical_position=None,
+        availability_status=AvailabilityStatus.UNAVAILABLE,
+        verification_status=VerificationStatus.NOT_EVALUATED,
+        freshness_status=FreshnessStatus.UNKNOWN,
+        source_run_status=SourceRunStatus.PARTIAL_FAILURE,
+        empty_reason=EmptyReason.NO_RELIABLE_DATA,
+        as_of_date=None,
+        fetched_at=None,
+        methodology="",
+        judgment_basis=(),
+        invalidating_conditions=(),
+        evidence=(),
+        independent_source_families=(),
+        independent_content_sources=(),
+        independent_origin_clusters=(),
+        raw_snapshot_id=None,
+        evidence_snapshot_id=None,
+    )
+
+
 def report(snapshot_id: str, *, industry_id: str = "storage") -> DisplayedTrustedReport:
+    template = get_industry_template(industry_id)
     conclusion_values = {
         "conclusion_id": f"conclusion-{snapshot_id}",
         "industry_id": industry_id,
@@ -55,16 +88,16 @@ def report(snapshot_id: str, *, industry_id: str = "storage") -> DisplayedTruste
         displayed_trusted_snapshot_id=snapshot_id,
         generated_at=NOW.isoformat(),
         demo=False,
-        source_coverage=SourceCoverage("capability", 0, 0, 0, 0, 0, 0),
+        source_coverage=SourceCoverage("capability", 8, 8, 0, 8, 0, 0),
         counts=ReportCounts(0, 0),
         overview=IndustryConclusion(
             **conclusion_values,
             text=render_conclusion_text(**conclusion_values),
         ),
-        cycle=(),
+        cycle=tuple(empty_observation(metric_id) for metric_id in template.cycle_metric_ids),
         chain=(),
-        metrics=(),
-        capital=(),
+        metrics=tuple(empty_observation(metric_id) for metric_id in template.core_metric_ids),
+        capital=tuple(empty_observation(metric_id) for metric_id in template.capital_metric_ids),
         companies=(),
         fund_selection=(),
         funds=(),
@@ -182,6 +215,52 @@ def test_missing_required_section_does_not_replace_previous_snapshot(tmp_path) -
     assert storage.load_current("storage") == old
 
 
+@pytest.mark.parametrize(
+    ("section", "mutate"),
+    (
+        ("cycle", lambda rows: []),
+        ("cycle", lambda rows: rows[:-1]),
+        ("cycle", lambda rows: [rows[0], rows[0], *rows[2:]]),
+        ("cycle", lambda rows: list(reversed(rows))),
+        ("metrics", lambda rows: []),
+        ("metrics", lambda rows: rows[:-1]),
+        ("capital", lambda rows: []),
+        ("capital", lambda rows: list(reversed(rows))),
+    ),
+)
+def test_publish_document_rejects_noncanonical_metric_section_shape(
+    tmp_path, section, mutate
+) -> None:
+    # Break caught: API/deserialization/checksum publication accepts a malformed fixed row set.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    document = report("trusted-storage-invalid-shape").to_dict()
+    document[section] = mutate(document[section])
+
+    with pytest.raises(ValueError, match="canonical metric rows"):
+        storage.publish_document(
+            document,
+            expected_industry_id="storage",
+            expected_raw_snapshot_id="raw-storage-1",
+            expected_evidence_snapshot_id="evidence-storage-1",
+        )
+
+    assert not storage.trusted_snapshot_path("storage").exists()
+
+
+def test_checksum_valid_load_still_rejects_noncanonical_metric_shape(tmp_path) -> None:
+    # Break caught: a checksum-valid cached API document bypasses canonical row validation.
+    storage = IndustryResearchStorage(root=tmp_path / "industry")
+    publish(storage, report("trusted-storage-invalid-cached-shape"))
+    path = storage.trusted_snapshot_path("storage")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["report"]["cycle"] = list(reversed(document["report"]["cycle"]))
+    signed = {"lineage": document["lineage"], "report": document["report"]}
+    document["checksum"] = hashlib.sha256(_canonical(signed)).hexdigest()
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert storage.load_current("storage") is None
+
+
 def test_current_checksum_tampering_recovers_previous_complete_snapshot(tmp_path) -> None:
     # Break caught: current corruption destroys the only recoverable trusted report.
     storage = IndustryResearchStorage(root=tmp_path / "industry")
@@ -215,26 +294,20 @@ def test_corrupt_current_and_failed_publication_preserve_recoverable_previous(tm
     assert storage.load_current("storage") == old
 
 
-@pytest.mark.parametrize("entrypoint", ("publish", "publish_document"))
-def test_storage_rejects_cross_template_metric_when_admission_is_bypassed(tmp_path, entrypoint) -> None:
+def test_storage_rejects_cross_template_metric_when_admission_is_bypassed(tmp_path) -> None:
     storage = IndustryResearchStorage(root=tmp_path / "industry")
     cross_template = trusted_observation("orders")
-    invalid = replace(
-        report("trusted-storage-cross-template"),
-        counts=ReportCounts(1, 0),
-        cycle=(cross_template,),
-    )
+    invalid = report("trusted-storage-cross-template").to_dict()
+    invalid["counts"] = {"verified": 1, "corroborated": 0}
+    invalid["cycle"][0] = cross_template.to_dict()
 
-    with pytest.raises(ValueError, match="industry template"):
-        if entrypoint == "publish":
-            publish(storage, invalid)
-        else:
-            storage.publish_document(
-                invalid.to_dict(),
-                expected_industry_id="storage",
-                expected_raw_snapshot_id="raw-storage-1",
-                expected_evidence_snapshot_id="evidence-storage-1",
-            )
+    with pytest.raises(ValueError, match="canonical metric rows"):
+        storage.publish_document(
+            invalid,
+            expected_industry_id="storage",
+            expected_raw_snapshot_id="raw-storage-1",
+            expected_evidence_snapshot_id="evidence-storage-1",
+        )
     assert not storage.trusted_snapshot_path("storage").exists()
 
 

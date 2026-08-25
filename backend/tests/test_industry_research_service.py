@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import inspect
+
+import pytest
 
 from evidence_verification.models import (
     EvidenceEvent,
@@ -13,6 +17,8 @@ from industry_research.models import (
     AvailabilityStatus,
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
+    ConflictingObservation,
+    ConflictingSourceValue,
     EmptyReason,
     EvidenceReference,
     FreshnessStatus,
@@ -141,6 +147,8 @@ def empty_candidate() -> CandidateEvidencePanel:
         conflicting=(),
         unverified_events=(),
         conflicting_events=(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
     )
 
 
@@ -166,6 +174,8 @@ def test_pending_and_conflicting_news_are_candidate_only_and_cannot_change_concl
     rows = (trusted_observation("dram_price"), trusted_observation("nand_price"))
     with_candidates = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=rows,
         metric_candidates=empty_candidate(),
@@ -180,6 +190,8 @@ def test_pending_and_conflicting_news_are_candidate_only_and_cannot_change_concl
     )
     without_candidates = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=rows,
         metric_candidates=empty_candidate(),
@@ -203,6 +215,8 @@ def test_pending_and_conflicting_news_are_candidate_only_and_cannot_change_concl
 def test_report_assembly_keeps_all_eight_sections_and_explicit_empty_reasons() -> None:
     assembly = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=(trusted_observation("dram_price"),),
         metric_candidates=empty_candidate(),
@@ -229,6 +243,8 @@ def test_assembly_uses_only_one_validated_snapshot_and_orders_metrics_by_templat
 
     assembly = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=rows,
         metric_candidates=empty_candidate(),
@@ -246,6 +262,8 @@ def test_assembly_uses_only_one_validated_snapshot_and_orders_metrics_by_templat
     assert assembly.report.displayed_trusted_snapshot_id == "trusted-storage-1"
     assert assembly.report == assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=rows,
         metric_candidates=empty_candidate(),
@@ -258,6 +276,8 @@ def test_public_service_facade_is_deterministic_and_rejects_demo_in_production()
     service = IndustryResearchService(now=lambda: NOW, production=True)
     arguments = dict(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=(
             trusted_observation("dram_price"),
@@ -274,3 +294,146 @@ def test_public_service_facade_is_deterministic_and_rejects_demo_in_production()
         assert str(error) == "production rejects demo=true trusted reports"
     else:
         raise AssertionError("production service accepted demo=true")
+
+
+@pytest.mark.parametrize(
+    ("lineage_field", "foreign_id"),
+    (
+        ("raw_snapshot_id", "raw-foreign"),
+        ("evidence_snapshot_id", "evidence-foreign"),
+    ),
+)
+def test_assembly_rejects_candidate_panel_from_foreign_lineage(
+    lineage_field: str,
+    foreign_id: str,
+) -> None:
+    # Break caught: a pending/conflict panel from another run mutates current placeholders.
+    panel_values = {
+        "industry_id": "storage",
+        "candidate_snapshot_id": "candidate-storage-foreign",
+        "counts": CandidateEvidenceCounts(0, 0, 0, 0),
+        "unverified": (),
+        "conflicting": (),
+        "unverified_events": (),
+        "conflicting_events": (),
+        "raw_snapshot_id": "raw-storage-1",
+        "evidence_snapshot_id": "evidence-storage-1",
+    }
+    panel_values[lineage_field] = foreign_id
+
+    with pytest.raises(ValueError, match="candidate .* lineage"):
+        assemble_storage_report(
+            trusted_snapshot_id="trusted-storage-1",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            generated_at=NOW,
+            trusted_observations=(trusted_observation("dram_price"),),
+            metric_candidates=CandidateEvidencePanel(**panel_values),
+            news_snapshot=None,
+            now=NOW,
+        )
+
+
+def test_assembly_rejects_expired_rows_from_foreign_or_current_lineage() -> None:
+    # Break caught: a foreign or still-current row asserts the expired empty reason.
+    expired = replace(
+        trusted_observation("nand_price"),
+        expires_at=(NOW - timedelta(seconds=1)).isoformat(),
+    )
+    foreign = replace(expired, raw_snapshot_id="raw-foreign")
+    still_current = replace(
+        trusted_observation("nand_price"),
+        expires_at=(NOW + timedelta(days=1)).isoformat(),
+    )
+    declared_expired_without_deadline = replace(
+        trusted_observation("nand_price"),
+        freshness_status=FreshnessStatus.EXPIRED,
+        expires_at=None,
+    )
+    declared_expired_before_deadline = replace(
+        trusted_observation("nand_price"),
+        freshness_status=FreshnessStatus.EXPIRED,
+        expires_at=(NOW + timedelta(days=1)).isoformat(),
+    )
+
+    for row, message in (
+        (foreign, "expired raw lineage"),
+        (still_current, "not expired"),
+        (declared_expired_without_deadline, "structured expires_at"),
+        (declared_expired_before_deadline, "structured expires_at"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            assemble_storage_report(
+                trusted_snapshot_id="trusted-storage-1",
+                raw_snapshot_id="raw-storage-1",
+                evidence_snapshot_id="evidence-storage-1",
+                generated_at=NOW,
+                trusted_observations=(),
+                expired_observations=(row,),
+                metric_candidates=empty_candidate(),
+                news_snapshot=None,
+                now=NOW,
+            )
+
+    with pytest.raises(ValueError, match="structured expires_at"):
+        assemble_storage_report(
+            trusted_snapshot_id="trusted-storage-1",
+            raw_snapshot_id="raw-storage-1",
+            evidence_snapshot_id="evidence-storage-1",
+            generated_at=NOW,
+            trusted_observations=(declared_expired_without_deadline,),
+            metric_candidates=empty_candidate(),
+            news_snapshot=None,
+            now=NOW,
+        )
+
+
+def test_placeholder_reasons_derive_only_from_bound_structured_inputs() -> None:
+    # Break caught: a free reason map fabricates expired/conflicting/verifying/source states.
+    assert "metric_empty_reasons" not in inspect.signature(assemble_storage_report).parameters
+    pending = replace(
+        trusted_observation("capacity_utilization"),
+        verification_status=VerificationStatus.UNVERIFIED,
+    )
+    conflict = ConflictingObservation(
+        industry_id="storage",
+        metric_id="manufacturer_capex",
+        aggregate_value=None,
+        source_values=(
+            ConflictingSourceValue("capex-a", "family-a", 1.0, "index", "2026-08-24"),
+            ConflictingSourceValue("capex-b", "family-b", -1.0, "index", "2026-08-24"),
+        ),
+    )
+    candidates = CandidateEvidencePanel(
+        industry_id="storage",
+        candidate_snapshot_id="candidate-storage-1",
+        counts=CandidateEvidenceCounts(1, 1, 0, 0),
+        unverified=(pending,),
+        conflicting=(conflict,),
+        unverified_events=(),
+        conflicting_events=(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+    )
+    expired = replace(
+        trusted_observation("nand_price"),
+        expires_at=(NOW - timedelta(seconds=1)).isoformat(),
+    )
+
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        expired_observations=(expired,),
+        metric_candidates=candidates,
+        news_snapshot=None,
+        now=NOW,
+    )
+    cycle = {row.metric_id: row for row in assembly.report.cycle}
+
+    assert cycle["nand_price"].empty_reason is EmptyReason.EXPIRED
+    assert cycle["capacity_utilization"].empty_reason is EmptyReason.VERIFYING
+    assert cycle["manufacturer_capex"].empty_reason is EmptyReason.CONFLICTING
+    assert cycle["hbm_demand"].empty_reason is EmptyReason.NO_RELIABLE_DATA

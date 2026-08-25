@@ -38,6 +38,7 @@ from industry_research.models import (
     render_conclusion_text,
     verification_display_label,
 )
+from industry_research.templates import get_industry_template
 
 
 def _official_evidence(**changes: object) -> EvidenceReference:
@@ -112,11 +113,11 @@ def _corroborated_observation(**changes: object) -> IndustryMetricObservation:
     return _verified_observation(**values)
 
 
-def _empty_observation() -> IndustryMetricObservation:
+def _empty_observation(metric_id: str = "hbm_demand") -> IndustryMetricObservation:
     return IndustryMetricObservation(
         industry_id="storage",
-        metric_id="hbm_demand",
-        label="HBM 需求",
+        metric_id=metric_id,
+        label=metric_id,
         current_value=None,
         unit=None,
         change=None,
@@ -165,7 +166,22 @@ def _conclusion() -> IndustryConclusion:
     )
 
 
-def _report(*, cycle: tuple[IndustryMetricObservation, ...] = ()) -> DisplayedTrustedReport:
+def _report(
+    *,
+    cycle: tuple[IndustryMetricObservation, ...] | None = None,
+    metrics: tuple[IndustryMetricObservation, ...] | None = None,
+    capital: tuple[IndustryMetricObservation, ...] | None = None,
+) -> DisplayedTrustedReport:
+    template = get_industry_template("storage")
+    cycle = cycle if cycle is not None else tuple(
+        _empty_observation(metric_id) for metric_id in template.cycle_metric_ids
+    )
+    metrics = metrics if metrics is not None else tuple(
+        _empty_observation(metric_id) for metric_id in template.core_metric_ids
+    )
+    capital = capital if capital is not None else tuple(
+        _empty_observation(metric_id) for metric_id in template.capital_metric_ids
+    )
     return DisplayedTrustedReport(
         industry_id="storage",
         template_status=TemplateStatus.COMPLETE_LAYOUT,
@@ -175,12 +191,12 @@ def _report(*, cycle: tuple[IndustryMetricObservation, ...] = ()) -> DisplayedTr
         demo=False,
         source_coverage=SourceCoverage(
             unit="capability",
-            total=1,
-            configured=1,
-            healthy=1,
+            total=8,
+            configured=0,
+            healthy=0,
             partial_failure=0,
             failed=0,
-            unconfigured=0,
+            unconfigured=8,
         ),
         counts=ReportCounts(
             verified=sum(
@@ -206,8 +222,8 @@ def _report(*, cycle: tuple[IndustryMetricObservation, ...] = ()) -> DisplayedTr
                 status=ConclusionStatus.VERIFIED if cycle else ConclusionStatus.UNAVAILABLE,
             ),
         ),
-        metrics=(),
-        capital=(),
+        metrics=metrics,
+        capital=capital,
         companies=(),
         fund_selection=(),
         funds=(),
@@ -398,14 +414,34 @@ def test_untrusted_or_expired_observation_cannot_enter_trusted_report(
 
 
 def test_explicit_empty_placeholder_can_enter_report_without_becoming_a_trusted_value() -> None:
-    placeholder = _empty_observation()
+    report = _report()
+    placeholder = next(row for row in report.cycle if row.metric_id == "hbm_demand")
 
-    report = _report(cycle=(placeholder,))
-
-    assert report.cycle == (placeholder,)
     assert report.counts == ReportCounts(verified=0, corroborated=0)
-    assert report.cycle[0].current_value is None
-    assert report.cycle[0].empty_reason is EmptyReason.SOURCE_UNCONFIGURED
+    assert placeholder.current_value is None
+    assert placeholder.empty_reason is EmptyReason.SOURCE_UNCONFIGURED
+
+
+@pytest.mark.parametrize(
+    ("section", "mutate"),
+    (
+        ("cycle", lambda rows: ()),
+        ("cycle", lambda rows: rows[:-1]),
+        ("cycle", lambda rows: (rows[0], rows[0], *rows[2:])),
+        ("cycle", lambda rows: tuple(reversed(rows))),
+        ("cycle", lambda rows: (_empty_observation("sector_fund_flow"), *rows[1:])),
+        ("metrics", lambda rows: ()),
+        ("metrics", lambda rows: rows[:-1]),
+        ("capital", lambda rows: ()),
+        ("capital", lambda rows: tuple(reversed(rows))),
+    ),
+)
+def test_report_rejects_noncanonical_fixed_metric_section_shape(section, mutate) -> None:
+    # Break caught: empty, missing, duplicate, moved or reordered metric rows enter the API model.
+    valid = _report()
+
+    with pytest.raises(ValueError, match="canonical metric rows"):
+        replace(valid, **{section: mutate(getattr(valid, section))})
 
 
 def test_trusted_report_rejects_cross_industry_observations() -> None:
@@ -703,7 +739,12 @@ def test_demo_fixture_is_rejected_in_production_mode() -> None:
 
 def test_wire_keys_remain_snake_case_for_nested_report() -> None:
     # Break caught: a serializer emits mixed camelCase/snake_case payloads.
-    payload = _report(cycle=(_verified_observation(),)).to_dict()
+    baseline = _report()
+    trusted = _verified_observation()
+    payload = _report(
+        cycle=(trusted, *baseline.cycle[1:]),
+        metrics=(trusted, *baseline.metrics[1:]),
+    ).to_dict()
 
     def keys(value: object) -> list[str]:
         if isinstance(value, dict):

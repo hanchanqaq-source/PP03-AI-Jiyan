@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 import re
 from typing import Iterable
 
@@ -188,6 +189,28 @@ def _scalar_value(value: object) -> str | int | float:
     return value
 
 
+def _normalized_claim_value(value: object) -> tuple[str, object]:
+    scalar = _scalar_value(value)
+    if isinstance(scalar, (int, float)):
+        return ("number", Decimal(str(scalar)).normalize())
+    return ("string", scalar)
+
+
+def _change_claim(change: MetricChange | None) -> tuple[str, Decimal, str] | None:
+    if change is None:
+        return None
+    return ("change", Decimal(str(change.value)).normalize(), change.basis)
+
+
+def _raw_order_key(row: RawMetricObservation) -> tuple[str, str, str, str]:
+    return (
+        row.metric_id,
+        row.decision.evidence_id,
+        row.identity.source_family_id,
+        row.identity.final_url,
+    )
+
+
 def _observation(
     row: RawMetricObservation,
     evidence: tuple[EvidenceReference, ...],
@@ -306,7 +329,10 @@ def admit_metric_observations(
     unverified: list[IndustryMetricObservation] = []
     conflicting: list[ConflictingObservation] = []
     for metric_id in sorted(groups):
-        metric_rows = groups[metric_id]
+        metric_rows = sorted(
+            groups[metric_id],
+            key=_raw_order_key,
+        )
         resolved_rows = [evidence_index[(row.decision.event_id, row.decision.evidence_id)] for row in metric_rows]
         evidence = tuple(
             _evidence_reference(row, resolved)
@@ -324,11 +350,12 @@ def admit_metric_observations(
         ]
         support_claims = {
             (
-                _scalar_value(row.provider_value.value),
+                _normalized_claim_value(row.provider_value.value),
                 row.provider_value.unit.strip().casefold(),
                 row.provider_value.as_of_date,
                 row.provider_value.frequency.strip().casefold(),
                 row.methodology.strip(),
+                _change_claim(row.change),
             )
             for row in supporting
         }
@@ -352,6 +379,7 @@ def admit_metric_observations(
                             row.provider_value.as_of_date.isoformat()
                             if row.provider_value.as_of_date else None
                         ),
+                        change=row.change,
                     )
                     for row in metric_rows
                 ),
@@ -418,5 +446,15 @@ def admit_metric_observations(
         conflicting=tuple(conflicting),
         unverified_events=(),
         conflicting_events=(),
+        raw_snapshot_id=raw_snapshot_id,
+        evidence_snapshot_id=evidence_snapshot_id,
     )
-    return AdmissionProjection(industry_id, rows, tuple(trusted), panel, tuple(expired))
+    ordered_raw = tuple(sorted(rows, key=_raw_order_key))
+    ordered_expired = tuple(sorted(
+        expired,
+        key=lambda row: (
+            row.metric_id,
+            tuple(item.evidence_id for item in row.evidence),
+        ),
+    ))
+    return AdmissionProjection(industry_id, ordered_raw, tuple(trusted), panel, ordered_expired)

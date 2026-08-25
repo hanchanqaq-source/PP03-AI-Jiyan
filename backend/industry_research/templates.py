@@ -156,3 +156,21 @@ def get_industry_template(industry_id: str) -> IndustryReportTemplate:
 
 def registered_industry_templates() -> tuple[IndustryReportTemplate, ...]:
     return tuple(_TEMPLATES.values())
+
+
+def validate_metric_section_shape(
+    *,
+    industry_id: str,
+    cycle_metric_ids: tuple[str, ...],
+    core_metric_ids: tuple[str, ...],
+    capital_metric_ids: tuple[str, ...],
+) -> None:
+    template = get_industry_template(industry_id)
+    actual = (cycle_metric_ids, core_metric_ids, capital_metric_ids)
+    expected = (
+        template.cycle_metric_ids,
+        template.core_metric_ids,
+        template.capital_metric_ids,
+    )
+    if actual != expected:
+        raise ValueError("report sections require exact canonical metric rows")

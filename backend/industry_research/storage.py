@@ -40,7 +40,7 @@ from .models import (
     TemplateStatus,
     VerificationStatus,
 )
-from .templates import get_industry_template
+from .templates import get_industry_template, validate_metric_section_shape
 
 
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
@@ -374,6 +374,12 @@ def _report_from_document(value: object) -> DisplayedTrustedReport:
 def _validate_report(report: DisplayedTrustedReport) -> None:
     if type(report) is not DisplayedTrustedReport:
         raise TypeError("trusted snapshot requires DisplayedTrustedReport")
+    validate_metric_section_shape(
+        industry_id=report.industry_id,
+        cycle_metric_ids=tuple(row.metric_id for row in report.cycle),
+        core_metric_ids=tuple(row.metric_id for row in report.metrics),
+        capital_metric_ids=tuple(row.metric_id for row in report.capital),
+    )
     if not report.trusted_snapshot_id or report.trusted_snapshot_id != report.displayed_trusted_snapshot_id:
         raise ValueError("trusted report snapshot identity mismatch")
     if not report.generated_at:

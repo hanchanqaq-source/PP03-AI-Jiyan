@@ -515,6 +515,7 @@ class ConflictingSourceValue(WireModel):
     value: str | int | float
     unit: str | None
     as_of_date: str | None
+    change: MetricChange | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,6 +620,14 @@ class DisplayedTrustedReport(WireModel):
                 raise ValueError("news event industry_id mismatch")
         if self.overview.industry_id != self.industry_id:
             raise ValueError("overview industry_id mismatch")
+        from .templates import validate_metric_section_shape
+
+        validate_metric_section_shape(
+            industry_id=self.industry_id,
+            cycle_metric_ids=tuple(row.metric_id for row in self.cycle),
+            core_metric_ids=tuple(row.metric_id for row in self.metrics),
+            capital_metric_ids=tuple(row.metric_id for row in self.capital),
+        )
 
     def validate_for_mode(self, *, production: bool) -> None:
         if production and self.demo:
@@ -642,6 +651,8 @@ class CandidateEvidencePanel(WireModel):
     conflicting: tuple[ConflictingObservation, ...]
     unverified_events: tuple[CandidateIndustryEvidenceEvent, ...]
     conflicting_events: tuple[CandidateIndustryEvidenceEvent, ...]
+    raw_snapshot_id: str | None = None
+    evidence_snapshot_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.counts, CandidateEvidenceCounts):
@@ -664,6 +675,23 @@ class CandidateEvidencePanel(WireModel):
             raise ValueError("unverified_events accepts only unverified events")
         if any(item.status is not VerificationStatus.CONFLICTING for item in self.conflicting_events):
             raise ValueError("conflicting_events accepts only conflicting events")
+        if (self.raw_snapshot_id is None) != (self.evidence_snapshot_id is None):
+            raise ValueError("candidate raw/evidence lineage must be provided together")
+        if self.unverified or self.conflicting:
+            if not self.raw_snapshot_id or not self.evidence_snapshot_id:
+                raise ValueError("metric candidates require raw/evidence lineage")
+        if self.raw_snapshot_id is not None and (
+            not self.raw_snapshot_id.strip()
+            or self.raw_snapshot_id != self.raw_snapshot_id.strip()
+            or not self.evidence_snapshot_id
+            or not self.evidence_snapshot_id.strip()
+            or self.evidence_snapshot_id != self.evidence_snapshot_id.strip()
+        ):
+            raise ValueError("candidate raw/evidence lineage must not be blank")
+        if any(item.raw_snapshot_id != self.raw_snapshot_id for item in self.unverified):
+            raise ValueError("candidate unverified raw lineage mismatch")
+        if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in self.unverified):
+            raise ValueError("candidate unverified evidence lineage mismatch")
         actual = (len(self.unverified), len(self.conflicting), len(self.unverified_events), len(self.conflicting_events))
         expected = (self.counts.unverified, self.counts.conflicting, self.counts.unverified_events, self.counts.conflicting_events)
         if actual != expected:

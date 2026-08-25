@@ -176,6 +176,8 @@ def test_provider_a2_admission_preserves_structured_change_and_expiry_for_rules(
         {"value": 1.0, "basis": "wow"},
     )
     assert {row.expires_at for row in projection.trusted} == {expiry.isoformat()}
+    assert projection.candidate.raw_snapshot_id == "raw-storage-1"
+    assert projection.candidate.evidence_snapshot_id == "evidence-storage-1"
     current = evaluate_storage_conclusion(
         industry_id="storage",
         trusted_snapshot_id="trusted-storage-1",
@@ -197,6 +199,8 @@ def test_provider_a2_admission_preserves_structured_change_and_expiry_for_rules(
 
     assembly = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW,
         trusted_observations=projection.trusted,
         metric_candidates=projection.candidate,
@@ -270,19 +274,16 @@ def test_full_placeholder_rows_and_empty_reasons_survive_storage_round_trip(tmp_
         conflicting=(conflict,),
         unverified_events=(),
         conflicting_events=(),
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
     )
-    reasons = {
-        "hbm_demand": EmptyReason.SOURCE_UNCONFIGURED,
-        "inventory_level": EmptyReason.SOURCE_FAILED,
-        "server_demand": EmptyReason.NO_RELIABLE_DATA,
-        "consumer_electronics_demand": EmptyReason.NO_RELIABLE_DATA,
-    }
     assembly = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
         generated_at=NOW + timedelta(days=2),
         trusted_observations=projection.trusted,
         metric_candidates=candidates,
-        metric_empty_reasons=reasons,
         news_snapshot=None,
         now=NOW + timedelta(days=2),
     )
@@ -297,16 +298,16 @@ def test_full_placeholder_rows_and_empty_reasons_survive_storage_round_trip(tmp_
     assert cycle["nand_price"].empty_reason is EmptyReason.EXPIRED
     assert cycle["capacity_utilization"].empty_reason is EmptyReason.VERIFYING
     assert cycle["manufacturer_capex"].empty_reason is EmptyReason.CONFLICTING
-    assert cycle["hbm_demand"].empty_reason is EmptyReason.SOURCE_UNCONFIGURED
-    assert cycle["inventory_level"].empty_reason is EmptyReason.SOURCE_FAILED
+    assert cycle["hbm_demand"].empty_reason is EmptyReason.NO_RELIABLE_DATA
+    assert cycle["inventory_level"].empty_reason is EmptyReason.NO_RELIABLE_DATA
     assert report.source_coverage.to_dict() == {
         "unit": "capability",
         "total": 8,
-        "configured": 7,
+        "configured": 8,
         "healthy": 4,
-        "partial_failure": 2,
-        "failed": 1,
-        "unconfigured": 1,
+        "partial_failure": 4,
+        "failed": 0,
+        "unconfigured": 0,
     }
     for row in report.cycle + report.metrics + report.capital:
         assert row.current_value is None
