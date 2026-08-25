@@ -613,10 +613,21 @@ function industrySameStringSet(left: string[], right: string[]): boolean {
     && left.every((item) => right.includes(item));
 }
 
+function industryPythonCasefold(value: string): string {
+  // NFKC handles compatibility forms (for example ligatures); the explicit
+  // expansions cover common Python casefold differences from JS lowercasing.
+  const normalized = value.normalize("NFKC").toLowerCase();
+  if (/[\uD800-\uDFFF]|[\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF]/u.test(normalized)) {
+    industryError();
+  }
+  return normalized.replace(/ß/g, "ss").replace(/ς/g, "σ");
+}
+
 function validateTrustedMetric(
   metric: IndustryMetric,
   rawSnapshotId: string,
   evidenceSnapshotId: string,
+  decodedAt: number,
 ): boolean {
   if (metric.currentValue === null) {
     if (metric.change !== null || metric.historicalPosition !== null
@@ -627,6 +638,7 @@ function validateTrustedMetric(
   if (!(["verified", "corroborated"] as const).includes(
     metric.verificationStatus as "verified" | "corroborated",
   ) || metric.freshnessStatus === "expired" || metric.evidence.length === 0
+    || (metric.expiresAt !== null && Date.parse(metric.expiresAt) <= decodedAt)
     || metric.rawSnapshotId !== rawSnapshotId || metric.evidenceSnapshotId !== evidenceSnapshotId
     || metric.asOfDate === null || metric.fetchedAt === null || metric.methodology.length === 0
     || metric.judgmentBasis.length === 0 || metric.invalidatingConditions.length === 0
@@ -804,11 +816,19 @@ function decodeConclusion(value: unknown): DisplayedIndustryReport["overview"] {
   return result;
 }
 
-function validateDisplayedReportSemantics(report: DisplayedIndustryReport): void {
+function validateDisplayedReportSemantics(
+  report: DisplayedIndustryReport,
+  decodedAt: number,
+): void {
   const trustedByMetric = new Map<string, IndustryMetric>();
   for (const metric of [...report.cycle, ...report.metrics, ...report.capital]) {
     if (metric.industryId !== report.industryId) industryError();
-    if (!validateTrustedMetric(metric, report.rawSnapshotId, report.evidenceSnapshotId)) continue;
+    if (!validateTrustedMetric(
+      metric,
+      report.rawSnapshotId,
+      report.evidenceSnapshotId,
+      decodedAt,
+    )) continue;
     const previous = trustedByMetric.get(metric.metricId);
     if (previous && JSON.stringify(previous) !== JSON.stringify(metric)) industryError();
     trustedByMetric.set(metric.metricId, metric);
@@ -844,7 +864,7 @@ function validateDisplayedReportSemantics(report: DisplayedIndustryReport): void
     || !industrySameStringSet(report.overview.invalidatingConditions, expectedConditions)) industryError();
 }
 
-function decodeDisplayedReport(value: unknown): DisplayedIndustryReport {
+function decodeDisplayedReport(value: unknown, decodedAt: number): DisplayedIndustryReport {
   const row = industryRecord(value, [
     "industry_id", "template_status", "trusted_snapshot_id", "displayed_trusted_snapshot_id",
     "raw_snapshot_id", "evidence_snapshot_id", "generated_at", "demo", "source_coverage",
@@ -873,10 +893,11 @@ function decodeDisplayedReport(value: unknown): DisplayedIndustryReport {
       "industry_id", "security_code", "company_name", "chain_node_id", "relation_type",
       "key_metric_ids", "evidence_ids", "as_of_date", "observation_only",
     ]);
-    if (item.observation_only !== true || !/^\d{6}$/.test(industryString(item.security_code, 6))) industryError();
+    if (item.observation_only !== true) industryError();
+    const securityCode = industryString(item.security_code, 128);
     return {
       industryId: industryId(item.industry_id),
-      securityCode: item.security_code as string,
+      securityCode,
       companyName: industryString(item.company_name, 512),
       chainNodeId: industryString(item.chain_node_id, 128),
       relationType: industryEnum(item.relation_type, ["official_disclosure", "public_classification"]),
@@ -921,7 +942,7 @@ function decodeDisplayedReport(value: unknown): DisplayedIndustryReport {
   if (report.sourceCoverage.total !== report.sourceCoverage.configured + report.sourceCoverage.unconfigured
     || report.sourceCoverage.configured !== report.sourceCoverage.healthy + report.sourceCoverage.partialFailure + report.sourceCoverage.failed
   ) industryError();
-  validateDisplayedReportSemantics(report);
+  validateDisplayedReportSemantics(report, decodedAt);
   return report;
 }
 
@@ -995,8 +1016,8 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
       || item.evidenceSnapshotId !== result.evidenceSnapshotId
       || new Set(item.sourceValues.map((source) => source.evidenceId)).size !== item.sourceValues.length
       || new Set(item.sourceValues.map((source) => JSON.stringify([
-        typeof source.value === "string" ? source.value.toLowerCase() : source.value,
-        source.unit?.toLowerCase() ?? null,
+        typeof source.value === "string" ? industryPythonCasefold(source.value) : source.value,
+        source.unit === null ? null : industryPythonCasefold(source.unit),
         source.asOfDate,
         source.change,
       ]))).size < 2)
@@ -1048,9 +1069,16 @@ function decodeRefresh(value: unknown): IndustryRefreshRun {
   return result;
 }
 
-export function decodeIndustryResearchResponse(value: unknown): IndustryResearchResponse {
+export function decodeIndustryResearchResponse(
+  value: unknown,
+  decodedAt: Date = new Date(),
+): IndustryResearchResponse {
   const row = industryRecord(value, INDUSTRY_RESPONSE_KEYS);
-  const displayedReport = row.displayed_trusted_report === null ? null : decodeDisplayedReport(row.displayed_trusted_report);
+  const decodedAtMs = decodedAt instanceof Date ? decodedAt.getTime() : Number.NaN;
+  if (!Number.isFinite(decodedAtMs)) industryError();
+  const displayedReport = row.displayed_trusted_report === null
+    ? null
+    : decodeDisplayedReport(row.displayed_trusted_report, decodedAtMs);
   const candidate = row.candidate_evidence === null ? null : decodeCandidate(row.candidate_evidence);
   const refresh = decodeRefresh(row.refresh_run);
   const requestedIndustryId = industryId(row.requested_industry_id);
@@ -1058,6 +1086,8 @@ export function decodeIndustryResearchResponse(value: unknown): IndustryResearch
   const templateStatus = industryEnum(row.template_status, ["complete_layout", "partial_layout", "building"]);
   if (refresh.industryId !== requestedIndustryId
     || (displayedReport === null) !== (displayedIndustryId === null)
+    || (displayedIndustryId !== null && displayedIndustryId !== requestedIndustryId)
+    || (displayedReport === null) !== (refresh.displayedTrustedSnapshotId === null)
     || (displayedReport && (displayedReport.industryId !== displayedIndustryId || displayedReport.templateStatus !== templateStatus))
     || (candidate && candidate.industryId !== requestedIndustryId)
     || (refresh.candidateSnapshotId === null) !== (candidate === null)
@@ -1085,7 +1115,11 @@ function validateIndustryRequest(industry: string, window?: number): string {
   return industry;
 }
 
-function decodeFundProjection(value: unknown, expectedIndustryId: string): IndustryFundProjection {
+function decodeFundProjection(
+  value: unknown,
+  expectedIndustryId: string,
+  expectedFundCodes: readonly string[],
+): IndustryFundProjection {
   const row = industryRecord(value, [
     "state", "fund_selection", "resolutions", "pending_lookthrough_selection_ids",
   ]);
@@ -1100,6 +1134,10 @@ function decodeFundProjection(value: unknown, expectedIndustryId: string): Indus
   };
   if (result.state === "no_holdings" && (fundSelection.length || resolutions.length || pending.length)) industryError();
   validateFundRows(fundSelection, resolutions, expectedIndustryId, pending);
+  if (!industrySameStringSet(
+    fundSelection.map((item) => item.fundCode),
+    [...expectedFundCodes],
+  )) industryError();
   return result;
 }
 
@@ -3164,12 +3202,13 @@ export const api = {
       return code;
     });
     if (normalized.length > 32) throw new ApiError("基金代码数量超出限制", 400);
+    const requestedFundCodes = [...new Set(normalized)];
     return request<unknown>(
       `/industry-research/${encodeURIComponent(requestedIndustryId)}/fund-relations/resolve`,
       "POST",
-      { fund_codes: [...new Set(normalized)] },
+      { fund_codes: requestedFundCodes },
       signal,
-    ).then((value) => decodeFundProjection(value, requestedIndustryId));
+    ).then((value) => decodeFundProjection(value, requestedIndustryId, requestedFundCodes));
   },
   myReports: () => get<MyReport[]>("/myreports"),
   uploadReport: (name: string, contentB64: string) =>

@@ -136,7 +136,7 @@ _INDUSTRY_RESEARCH_WRITE_PATH = re.compile(
     re.ASCII,
 )
 _INDUSTRY_RESEARCH_FUND_PATH = re.compile(
-    r"^/api/industry-research/.+/fund-relations/resolve$",
+    r"^/api/industry-research/.*/fund-relations/resolve/?$",
     re.ASCII,
 )
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -284,8 +284,19 @@ async def _protect_data_source_writes(request: Request, call_next):
 
 @app.middleware("http")
 async def _prevent_industry_fund_response_storage(request: Request, call_next):
-    response = await call_next(request)
-    if _INDUSTRY_RESEARCH_FUND_PATH.fullmatch(request.url.path) is not None:
+    is_fund_resolution = (
+        _INDUSTRY_RESEARCH_FUND_PATH.fullmatch(request.url.path) is not None
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        if not is_fund_resolution:
+            raise
+        response = JSONResponse(
+            {"detail": "fund_relation_resolution_failed"},
+            status_code=502,
+        )
+    if is_fund_resolution:
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
     return response

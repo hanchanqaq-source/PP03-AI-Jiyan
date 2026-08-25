@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import logging
@@ -522,6 +523,121 @@ def test_fund_path_shape_is_no_store_before_industry_id_validation(invalid_id: s
     assert response.status_code == 400
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
+    assert service.resolutions == []
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_status"),
+    [
+        ("/api/industry-research//fund-relations/resolve", 400),
+        ("/api/industry-research/storage/fund-relations/resolve/", 400),
+        ("/api/industry-research/%25/fund-relations/resolve", 400),
+        ("/api/industry-research/storage%2Fother/fund-relations/resolve", 400),
+    ],
+)
+def test_every_fund_resolution_path_shape_is_no_store(
+    path: str,
+    expected_status: int,
+) -> None:
+    # Break caught: invalid or redirecting fund path shapes bypass the privacy cache policy.
+    response = _client(RecordingService()).post(
+        path,
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == expected_status
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_unexpected_fund_resolver_exception_is_redacted_no_store(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Break caught: an unexpected resolver exception escapes the endpoint privacy middleware.
+    service = RecordingService()
+
+    def explode(*_args, **_kwargs):
+        raise KeyError("private-marker")
+
+    monkeypatch.setattr(service, "resolve_fund_relations", explode)
+    caplog.set_level(logging.DEBUG)
+    client = TestClient(
+        app_module.create_app(industry_research_service=service),
+        base_url="http://127.0.0.1:8900",
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "fund_relation_resolution_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert "private-marker" not in response.text
+    assert "KeyError" not in response.text
+    assert "Traceback" not in response.text
+    assert "private-marker" not in caplog.text
+
+
+def test_raw_asgi_disconnect_is_redacted_400_no_store() -> None:
+    # Break caught: ClientDisconnect escapes instead of becoming a bounded public request error.
+    service = RecordingService()
+    application = app_module.create_app(industry_research_service=service)
+    sent: list[dict[str, object]] = []
+    incoming = iter([
+        {
+            "type": "http.request",
+            "body": b'{"fund_codes":["900001"',
+            "more_body": True,
+        },
+        {"type": "http.disconnect"},
+    ])
+
+    async def receive() -> dict[str, object]:
+        return next(incoming, {"type": "http.disconnect"})
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/industry-research/storage/fund-relations/resolve",
+        "raw_path": b"/api/industry-research/storage/fund-relations/resolve",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"127.0.0.1:8900"),
+            (b"x-pp03-write-intent", b"1"),
+            (b"content-type", b"application/json"),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8900),
+    }
+
+    asyncio.run(application(scope, receive, send))
+
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    body = b"".join(
+        message.get("body", b"")
+        for message in sent
+        if message["type"] == "http.response.body"
+    )
+    assert start["status"] == 400
+    assert json.loads(body) == {"detail": "invalid_fund_relation_request"}
+    assert headers[b"cache-control"] == b"no-store"
+    assert headers[b"pragma"] == b"no-cache"
     assert service.resolutions == []
 
 

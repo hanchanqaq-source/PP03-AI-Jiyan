@@ -9,6 +9,7 @@ from typing import Any, Protocol, Sequence
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from starlette.requests import ClientDisconnect
 
 from .models import (
     CandidateEvidenceCounts,
@@ -316,6 +317,9 @@ async def _read_fund_relation_request(request: Request) -> FundRelationRequest:
     declared = _declared_fund_body_length(request)
     body = bytearray()
     try:
+        # request.stream() enforces the ASGI terminal message. Do not poll the
+        # private transport after more_body=false; the HTTP server owns framing
+        # beyond that standards-compliant application boundary.
         async for chunk in request.stream():
             observed = len(body) + len(chunk)
             if observed > _FUND_RELATION_BODY_MAX_BYTES:
@@ -325,7 +329,7 @@ async def _read_fund_relation_request(request: Request) -> FundRelationRequest:
             body.extend(chunk)
     except HTTPException:
         raise
-    except (OSError, RuntimeError):
+    except (ClientDisconnect, OSError, RuntimeError):
         raise HTTPException(400, "invalid_fund_relation_request") from None
     if declared is not None and len(body) != declared:
         raise HTTPException(400, "invalid_fund_relation_request")

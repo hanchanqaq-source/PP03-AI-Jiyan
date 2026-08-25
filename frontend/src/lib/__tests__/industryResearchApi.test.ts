@@ -197,6 +197,37 @@ function corroboratedMetricWire() {
   return value;
 }
 
+function responseWithConflictValues(left: string, right: string) {
+  const value = structuredClone(responseWire) as any;
+  value.candidate_evidence.counts.conflicting = 1;
+  value.candidate_evidence.conflicting = [{
+    industry_id: "storage",
+    metric_id: "manufacturer_capex",
+    aggregate_value: null,
+    source_values: [
+      {
+        evidence_id: "conflict-a",
+        source_family_id: "family-a",
+        value: left,
+        unit: "index",
+        as_of_date: "2026-08-24",
+        change: null,
+      },
+      {
+        evidence_id: "conflict-b",
+        source_family_id: "family-b",
+        value: right,
+        unit: "index",
+        as_of_date: "2026-08-24",
+        change: null,
+      },
+    ],
+    raw_snapshot_id: "raw-refresh-1",
+    evidence_snapshot_id: "evidence-refresh-1",
+  }];
+  return value;
+}
+
 function jsonResponse(value: unknown, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value), {
     status: 200,
@@ -273,6 +304,15 @@ describe("industry research API decoder", () => {
     }];
 
     expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
+  });
+
+  it.each([
+    ["German sharp s", "STRASSE", "STRAßE"],
+    ["Greek final sigma", "ΟΣ", "οσ"],
+    ["compatibility ligature", "office", "oﬃce"],
+  ])("rejects a false conflict under Python casefold: %s", (_label, left, right) => {
+    expect(() => decodeIndustryResearchResponse(responseWithConflictValues(left, right)))
+      .toThrow(ApiError);
   });
 
   it.each([
@@ -416,6 +456,33 @@ describe("industry research API decoder", () => {
     });
   });
 
+  it.each(["fresh", "stale"])(
+    "rejects a %s trusted value whose structured expiry has passed",
+    (freshnessStatus) => {
+      const value = responseWithTrustedMetric(trustedMetricWire({
+        freshness_status: freshnessStatus,
+        expires_at: "2026-08-25T07:59:59+00:00",
+      }));
+
+      expect(() => decodeIndustryResearchResponse(
+        value,
+        new Date("2026-08-25T08:00:00+00:00"),
+      )).toThrow(ApiError);
+    },
+  );
+
+  it("accepts a trusted value whose structured expiry is after the injected decode clock", () => {
+    const value = responseWithTrustedMetric(trustedMetricWire({
+      freshness_status: "stale",
+      expires_at: "2026-08-25T08:00:01+00:00",
+    }));
+
+    expect(decodeIndustryResearchResponse(
+      value,
+      new Date("2026-08-25T08:00:00+00:00"),
+    )).toMatchObject({ displayedTrustedReport: { counts: { verified: 1 } } });
+  });
+
   it("rejects completeness ratios that do not match their exact counts", () => {
     const value = structuredClone(responseWire);
     value.displayed_trusted_report.overview.data_completeness.ratio = 0.5;
@@ -490,6 +557,43 @@ describe("industry research API decoder", () => {
     }],
   ])("rejects refresh invariant: %s", (_label, fixture) => {
     expect(() => decodeIndustryResearchResponse(fixture())).toThrow(ApiError);
+  });
+
+  it("rejects a displayed report for an industry other than the requested industry", () => {
+    const value = structuredClone(responseWire) as any;
+    value.requested_industry_id = "semiconductor";
+    value.refresh_run.industry_id = "semiconductor";
+    value.candidate_evidence = null;
+    value.refresh_run.candidate_snapshot_id = null;
+
+    expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
+  });
+
+  it("rejects displayed refresh lineage when the report and displayed industry are absent", () => {
+    const value = structuredClone(responseWire) as any;
+    value.displayed_industry_id = null;
+    value.displayed_trusted_report = null;
+
+    expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
+  });
+
+  it("accepts a nonblank bounded company security code that is not a fund code", () => {
+    const value = structuredClone(responseWire) as any;
+    value.displayed_trusted_report.companies = [{
+      industry_id: "storage",
+      security_code: "NVDA",
+      company_name: "NVIDIA",
+      chain_node_id: "end_applications",
+      relation_type: "public_classification",
+      key_metric_ids: [],
+      evidence_ids: ["company-evidence"],
+      as_of_date: "2026-08-24",
+      observation_only: true,
+    }];
+
+    expect(decodeIndustryResearchResponse(value)).toMatchObject({
+      displayedTrustedReport: { companies: [{ securityCode: "NVDA" }] },
+    });
   });
 
   it("decodes the unknown-tag building state without fabricating a report", () => {
@@ -637,6 +741,36 @@ describe("industry research API client", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(fixture()));
 
     await expect(api.resolveIndustryFundRelations("storage", ["900001"]))
+      .rejects.toBeInstanceOf(ApiError);
+  });
+
+  it.each([
+    ["missing requested code", {
+      state: "resolved",
+      fund_selection: [
+        { selection_id: "selection-1", fund_code: "900001", selected_in_request: true },
+      ],
+      resolutions: [
+        { selection_id: "selection-1", fund_code: "900001", relation: null, empty_reason: "unknown" },
+      ],
+      pending_lookthrough_selection_ids: [],
+    }],
+    ["unrequested code", {
+      state: "resolved",
+      fund_selection: [
+        { selection_id: "selection-1", fund_code: "900001", selected_in_request: true },
+        { selection_id: "selection-2", fund_code: "900003", selected_in_request: true },
+      ],
+      resolutions: [
+        { selection_id: "selection-1", fund_code: "900001", relation: null, empty_reason: "unknown" },
+        { selection_id: "selection-2", fund_code: "900003", relation: null, empty_reason: "unknown" },
+      ],
+      pending_lookthrough_selection_ids: [],
+    }],
+  ])("rejects a fund response with %s", async (_label, projection) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(projection));
+
+    await expect(api.resolveIndustryFundRelations("storage", ["900001", "900001", "900002"]))
       .rejects.toBeInstanceOf(ApiError);
   });
 });
