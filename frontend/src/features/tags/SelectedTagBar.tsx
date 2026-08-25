@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import { ChevronLeft, ChevronRight, GripVertical, Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TagDefinition } from "./types";
@@ -7,13 +7,32 @@ interface SelectedTagBarProps {
   tags: TagDefinition[];
   activeId: string;
   onActivate: (id: string) => void;
-  onRemove: (id: string) => void;
+  onRemove: (id: string) => boolean | void;
   onReorder: (sourceId: string, targetId: string) => void;
+  onMove: (id: string, offset: -1 | 1) => void;
   onAdd: () => void;
 }
 
-export function SelectedTagBar({ tags, activeId, onActivate, onRemove, onReorder, onAdd }: SelectedTagBarProps) {
+export function SelectedTagBar({ tags, activeId, onActivate, onRemove, onReorder, onMove, onAdd }: SelectedTagBarProps) {
   const dragged = useRef<string | null>(null);
+  const activationRefs = useRef(new Map<string, HTMLButtonElement>());
+  const addRef = useRef<HTMLButtonElement | null>(null);
+  const pendingDeleteFocus = useRef<{
+    deletedId: string;
+    nextId?: string;
+    previousId?: string;
+  } | null>(null);
+
+  useLayoutEffect(() => {
+    const pending = pendingDeleteFocus.current;
+    if (!pending || tags.some((tag) => tag.id === pending.deletedId)) return;
+    pendingDeleteFocus.current = null;
+    const target = (pending.nextId && activationRefs.current.get(pending.nextId))
+      || (pending.previousId && activationRefs.current.get(pending.previousId))
+      || activationRefs.current.get(activeId)
+      || addRef.current;
+    target?.focus();
+  }, [activeId, tags]);
 
   return (
     <div aria-label="已选投研标签" className="flex min-w-0 items-center gap-2 border-y border-border/50 bg-background/80 py-2 backdrop-blur">
@@ -33,30 +52,45 @@ export function SelectedTagBar({ tags, activeId, onActivate, onRemove, onReorder
                 : "border-border bg-muted/20 text-muted-foreground hover:border-primary/50 hover:text-foreground",
             )}>
             <GripVertical className="ml-2 h-3 w-3 cursor-grab opacity-40" aria-hidden="true" />
-            <button onClick={() => onActivate(tag.id)} aria-label={`切换到${tag.name}`} aria-pressed={activeId === tag.id}
+            <button ref={(node) => {
+              if (node) activationRefs.current.set(tag.id, node);
+              else activationRefs.current.delete(tag.id);
+            }} onClick={() => onActivate(tag.id)} aria-label={`切换到${tag.name}`} aria-pressed={activeId === tag.id}
               className="min-h-11 px-2 py-1.5 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
               {tag.name}
             </button>
             {activeId === tag.id && <>
-              <button onClick={() => onReorder(tag.id, tags[index - 1]?.id || tag.id)} disabled={index === 0}
+              <button onClick={() => onMove(tag.id, -1)} disabled={index === 0}
                 aria-label={`将${tag.name}左移`}
                 className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-full opacity-70 hover:bg-black/10 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-25">
                 <ChevronLeft className="h-3.5 w-3.5" />
               </button>
-              <button onClick={() => onReorder(tag.id, tags[index + 1]?.id || tag.id)} disabled={index === tags.length - 1}
+              <button onClick={() => onMove(tag.id, 1)} disabled={index === tags.length - 1}
                 aria-label={`将${tag.name}右移`}
                 className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-full opacity-70 hover:bg-black/10 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-25">
                 <ChevronRight className="h-3.5 w-3.5" />
               </button>
             </>}
-            <button onClick={() => onRemove(tag.id)} aria-label={`删除${tag.name}`}
+            <button onClick={() => {
+              pendingDeleteFocus.current = {
+                deletedId: tag.id,
+                nextId: tags[index + 1]?.id,
+                previousId: tags[index - 1]?.id,
+              };
+              try {
+                if (onRemove(tag.id) === false) pendingDeleteFocus.current = null;
+              } catch (error) {
+                pendingDeleteFocus.current = null;
+                throw error;
+              }
+            }} aria-label={`删除${tag.name}`}
               className="mr-1 inline-flex min-h-11 min-w-11 items-center justify-center rounded-full p-1 opacity-60 hover:bg-black/10 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
               <X className="h-3 w-3" />
             </button>
           </div>
         ))}
       </div>
-      <button onClick={onAdd} aria-label="添加标签"
+      <button ref={addRef} onClick={onAdd} aria-label="添加标签"
         className="mr-1 inline-flex min-h-11 shrink-0 items-center gap-1 rounded-full border border-dashed border-primary/50 px-3 py-1.5 text-sm text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
         <Plus className="h-3.5 w-3.5" /> 添加标签
       </button>

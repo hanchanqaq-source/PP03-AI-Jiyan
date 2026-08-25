@@ -504,7 +504,7 @@ export function MarketNews() {
         <div className="flex flex-wrap gap-1 pb-3" aria-label="资讯模式">
           {MODES.map((item) => <button key={item.value} onClick={() => setMode(item.value)} aria-pressed={mode === item.value} className={cn("rounded-lg px-3 py-1.5 text-sm", mode === item.value ? "bg-primary/15 font-semibold text-primary" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground")}>{item.label}</button>)}
         </div>
-        <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={tags.activate} onRemove={tags.remove} onReorder={tags.reorder} onAdd={() => setSelectorOpen(true)} />
+        <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={tags.activate} onRemove={tags.remove} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
         <div className="mt-3 grid gap-2 lg:grid-cols-[1fr_auto_auto] lg:items-center">
           <div className="flex flex-wrap gap-1" aria-label="资讯分类">
             {CATEGORIES.map((item) => <button key={item.value} onClick={() => setCategory(item.value)} aria-pressed={category === item.value} className={cn("rounded-lg px-2.5 py-1 text-xs", category === item.value ? "bg-foreground text-background" : "text-muted-foreground hover:bg-muted/50")}>{item.label}</button>)}
@@ -517,6 +517,8 @@ export function MarketNews() {
           </div>
         </div>
       </section>
+
+      {tags.errorMessage && <div role="alert" className="mb-4 flex items-center gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4 shrink-0" />{tags.errorMessage}</div>}
 
       <NewsPipelineStatus status={pipelineStatus} />
 

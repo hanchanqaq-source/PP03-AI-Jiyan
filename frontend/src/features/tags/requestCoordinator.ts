@@ -1,11 +1,14 @@
 import { useEffect, useRef } from "react";
 import type { PageKey } from "./types";
 
+const PAGE_KEYS = new Set<PageKey>(["market_news", "industry_research"]);
+const INDUSTRY_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
 export interface TagRequestIdentity {
   pageKey: PageKey;
   industryId: string;
   queryKey: string;
-  sequence: number;
+  sequence: bigint;
 }
 
 export interface TagRequestContext extends TagRequestIdentity {
@@ -19,21 +22,37 @@ export interface TagRequestOptions<T> {
   commit: (value: T, context: TagRequestIdentity) => void;
 }
 
+export interface TagRequestCoordinatorOptions {
+  initialSequence?: bigint;
+}
+
 export type TagRequestResult = "committed" | "ignored";
 
 export interface TagRequestCoordinator<T> {
   run: (options: TagRequestOptions<T>) => Promise<TagRequestResult>;
   cancel: () => void;
+  dispose: () => void;
   current: () => TagRequestIdentity | null;
 }
 
-export function tagRequestKey(pageKey: PageKey, industryId: string): string {
-  return `${pageKey}:${industryId}`;
+function assertRequestIdentity(pageKey: unknown, industryId: unknown): asserts pageKey is PageKey {
+  if (typeof pageKey !== "string" || !PAGE_KEYS.has(pageKey as PageKey)
+    || typeof industryId !== "string" || !INDUSTRY_ID_PATTERN.test(industryId)) {
+    throw new Error("请求标签参数无效：页面或行业 ID 不符合约定");
+  }
 }
 
-export function createTagRequestCoordinator<T>(): TagRequestCoordinator<T> {
-  let sequence = 0;
-  let active: (TagRequestIdentity & { controller: AbortController }) | null = null;
+export function tagRequestKey(pageKey: PageKey, industryId: string): string {
+  assertRequestIdentity(pageKey, industryId);
+  return `${pageKey.length}:${pageKey}${industryId.length}:${industryId}`;
+}
+
+export function createTagRequestCoordinator<T>(
+  options: TagRequestCoordinatorOptions = {},
+): TagRequestCoordinator<T> {
+  let sequence = options.initialSequence ?? 0n;
+  let disposed = false;
+  let active: (TagRequestIdentity & { controller: AbortController; token: object }) | null = null;
 
   const current = (): TagRequestIdentity | null => active ? {
     pageKey: active.pageKey,
@@ -42,35 +61,44 @@ export function createTagRequestCoordinator<T>(): TagRequestCoordinator<T> {
     sequence: active.sequence,
   } : null;
 
+  const cancel = () => {
+    active?.controller.abort();
+    active = null;
+  };
+
   return {
     async run({ pageKey, industryId, request, commit }) {
+      if (disposed) throw new Error("请求协调器已释放，不能继续使用");
+      assertRequestIdentity(pageKey, industryId);
+      const queryKey = tagRequestKey(pageKey, industryId);
+
       active?.controller.abort();
       const controller = new AbortController();
+      const token = {};
       const identity: TagRequestIdentity = {
         pageKey,
         industryId,
-        queryKey: tagRequestKey(pageKey, industryId),
-        sequence: ++sequence,
+        queryKey,
+        sequence: sequence += 1n,
       };
-      active = { ...identity, controller };
+      active = { ...identity, controller, token };
       try {
         const value = await request({ ...identity, signal: controller.signal });
-        const isCurrent = active?.sequence === identity.sequence
-          && active.pageKey === pageKey
-          && active.industryId === industryId
-          && active.queryKey === identity.queryKey
-          && !controller.signal.aborted;
+        const isCurrent = active?.token === token && !controller.signal.aborted && !disposed;
         if (!isCurrent) return "ignored";
         commit(value, identity);
         return "committed";
       } catch (error) {
-        if (controller.signal.aborted || active?.sequence !== identity.sequence) return "ignored";
+        if (controller.signal.aborted || active?.token !== token || disposed) return "ignored";
+        active = null;
         throw error;
       }
     },
-    cancel() {
-      active?.controller.abort();
-      active = null;
+    cancel,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      cancel();
     },
     current,
   };
@@ -81,7 +109,7 @@ export function useTagRequestCoordinator<T>(): TagRequestCoordinator<T> {
   if (coordinatorRef.current === null) coordinatorRef.current = createTagRequestCoordinator<T>();
   useEffect(() => {
     const coordinator = coordinatorRef.current;
-    return () => coordinator?.cancel();
+    return () => coordinator?.dispose();
   }, []);
   return coordinatorRef.current;
 }

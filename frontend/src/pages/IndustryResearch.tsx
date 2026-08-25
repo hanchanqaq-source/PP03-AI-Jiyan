@@ -33,8 +33,9 @@ export function IndustryResearch() {
       <PageHeader title="行业研究" subtitle="连续产业研究报告；结论、依据、来源、更新时间和失效条件同时呈现" />
       <div className="sticky top-0 z-20 mb-5 bg-background/95 backdrop-blur">
         <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={tags.activate}
-          onRemove={tags.remove} onReorder={tags.reorder} onAdd={() => setSelectorOpen(true)} />
+          onRemove={tags.remove} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
       </div>
+      {tags.errorMessage && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{tags.errorMessage}</div>}
       {error && <div className="mb-4 flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/5 p-3 text-sm text-warning"><AlertCircle className="h-4 w-4" />{error}</div>}
       {template ? <IndustryReport template={template} liveNews={liveNews} /> : (
         <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center">
