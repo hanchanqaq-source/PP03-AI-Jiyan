@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -18,6 +19,7 @@ from industry_research.models import (
     EmptyReason,
     EvidenceReference,
     FreshnessStatus,
+    FundResolutionEmptyReason,
     IndustryChainNode,
     IndustryCompanyRelation,
     IndustryConclusion,
@@ -25,6 +27,7 @@ from industry_research.models import (
     IndustryFundRelation,
     IndustryFundRelationResolution,
     IndustryMetricObservation,
+    IndustryReportResponse,
     RefreshPhase,
     RefreshRun,
     ReportCounts,
@@ -85,6 +88,28 @@ def _verified_observation(**changes: object) -> IndustryMetricObservation:
     }
     values.update(changes)
     return IndustryMetricObservation(**values)
+
+
+def _corroborated_observation(**changes: object) -> IndustryMetricObservation:
+    second = _official_evidence(
+        evidence_id="ev-independent-2",
+        source_family_id="industry_media",
+        content_source="publisher.example",
+        origin_cluster="publisher-report-2026-q2",
+        collector_source="news_api",
+        final_url="https://publisher.example/report",
+        is_official=False,
+        is_official_attested=False,
+    )
+    values: dict[str, object] = {
+        "verification_status": VerificationStatus.CORROBORATED,
+        "evidence": (_official_evidence(), second),
+        "independent_source_families": ("sec", "industry_media"),
+        "independent_content_sources": ("sec.gov", "publisher.example"),
+        "independent_origin_clusters": ("sec-filing-2026-q2", "publisher-report-2026-q2"),
+    }
+    values.update(changes)
+    return _verified_observation(**values)
 
 
 def _empty_observation() -> IndustryMetricObservation:
@@ -179,6 +204,32 @@ def _report(*, cycle: tuple[IndustryMetricObservation, ...] = ()) -> DisplayedTr
     )
 
 
+def _candidate_panel(industry_id: str = "storage") -> CandidateEvidencePanel:
+    return CandidateEvidencePanel(
+        industry_id=industry_id,
+        candidate_snapshot_id=None,
+        counts=CandidateEvidenceCounts(0, 0, 0, 0),
+        unverified=(),
+        conflicting=(),
+        unverified_events=(),
+        conflicting_events=(),
+    )
+
+
+def _idle_refresh(industry_id: str = "storage") -> RefreshRun:
+    return RefreshRun(
+        industry_id=industry_id,
+        run_id=None,
+        raw_snapshot_id=None,
+        evidence_snapshot_id=None,
+        candidate_snapshot_id=None,
+        phase=RefreshPhase.IDLE,
+        error_code=None,
+        displayed_trusted_snapshot_id=None,
+        published_trusted_snapshot_id=None,
+    )
+
+
 def test_source_unconfigured_round_trips_as_empty_not_evaluated_with_null_lineage() -> None:
     # Break caught: a serializer that aliases an empty reason or fabricates lineage.
     observation = _empty_observation()
@@ -192,6 +243,24 @@ def test_source_unconfigured_round_trips_as_empty_not_evaluated_with_null_lineag
     assert payload["raw_snapshot_id"] is None
     assert payload["evidence_snapshot_id"] is None
     assert verification_display_label(VerificationStatus.UNVERIFIED) == "待核验"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "evidence_id",
+        "source_family_id",
+        "content_source",
+        "origin_cluster",
+        "collector_source",
+        "final_url",
+        "verified_at",
+    ),
+)
+def test_evidence_reference_rejects_blank_required_identity_fields(field_name: str) -> None:
+    # Break caught: blank identities are counted as independent evidence provenance.
+    with pytest.raises(ValueError, match=field_name):
+        _official_evidence(**{field_name: "  "})
 
 
 @pytest.mark.parametrize(
@@ -212,6 +281,19 @@ def test_verified_observation_rejects_missing_truth_contract_fields(
     # Break caught: verified admission that accepts an incomplete official fact.
     with pytest.raises(ValueError, match=reason):
         _verified_observation(**changes)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "raw_value"),
+    (
+        ("verification_status", "verified"),
+        ("freshness_status", "expired"),
+    ),
+)
+def test_observation_rejects_raw_string_enum_values(field_name: str, raw_value: str) -> None:
+    # Break caught: str/Enum equality passes membership while identity branches are bypassed.
+    with pytest.raises(TypeError, match=field_name):
+        _verified_observation(**{field_name: raw_value})
 
 
 def test_corroborated_requires_three_independently_counted_sets() -> None:
@@ -254,6 +336,18 @@ def test_corroborated_rejects_declared_independence_not_backed_by_evidence() -> 
             independent_content_sources=("sec.gov", "invented.example"),
             independent_origin_clusters=("sec-filing-2026-q2", "invented-origin"),
         )
+
+
+@pytest.mark.parametrize("factory", [_verified_observation, _corroborated_observation])
+def test_trusted_observation_rejects_any_contradicting_evidence(
+    factory: Callable[..., IndustryMetricObservation],
+) -> None:
+    # Break caught: positive support masks a valid contradiction and enters trusted truth.
+    observation = factory()
+    contradicting = replace(observation.evidence[0], contradicts_claim=True)
+
+    with pytest.raises(ValueError, match="contradicting evidence"):
+        replace(observation, evidence=(contradicting, *observation.evidence[1:]))
 
 
 def test_conflict_preserves_each_source_value_and_rejects_aggregate() -> None:
@@ -344,6 +438,85 @@ def test_candidate_events_are_type_isolated_from_trusted_news() -> None:
         replace(_report(), news_risk=(pending,))  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("field_name", "counts"),
+    (
+        ("unverified", CandidateEvidenceCounts(1, 0, 0, 0)),
+        ("conflicting", CandidateEvidenceCounts(0, 1, 0, 0)),
+        ("unverified_events", CandidateEvidenceCounts(0, 0, 1, 0)),
+        ("conflicting_events", CandidateEvidenceCounts(0, 0, 0, 1)),
+    ),
+)
+def test_candidate_panel_rejects_wrong_concrete_element_types(
+    field_name: str, counts: CandidateEvidenceCounts
+) -> None:
+    # Break caught: arbitrary objects enter candidate arrays or raise incidental AttributeError.
+    with pytest.raises(TypeError, match=field_name):
+        replace(_candidate_panel(), counts=counts, **{field_name: (object(),)})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "entry", "counts"),
+    (
+        (
+            "unverified",
+            _verified_observation(
+                industry_id="robotics",
+                verification_status=VerificationStatus.UNVERIFIED,
+            ),
+            CandidateEvidenceCounts(1, 0, 0, 0),
+        ),
+        (
+            "conflicting",
+            ConflictingObservation(
+                "robotics",
+                "orders",
+                None,
+                (
+                    ConflictingSourceValue("ev-r1", "family-r1", 1, None, None),
+                    ConflictingSourceValue("ev-r2", "family-r2", 2, None, None),
+                ),
+            ),
+            CandidateEvidenceCounts(0, 1, 0, 0),
+        ),
+        (
+            "unverified_events",
+            CandidateIndustryEvidenceEvent(
+                "robotics",
+                "event-r1",
+                VerificationStatus.UNVERIFIED,
+                "2026-08-25T00:00:00+08:00",
+                ("ev-r1",),
+                ("ev-r1",),
+                (),
+                ("news",),
+            ),
+            CandidateEvidenceCounts(0, 0, 1, 0),
+        ),
+        (
+            "conflicting_events",
+            CandidateIndustryEvidenceEvent(
+                "robotics",
+                "event-r2",
+                VerificationStatus.CONFLICTING,
+                "2026-08-25T00:00:00+08:00",
+                ("ev-r1", "ev-r2"),
+                ("ev-r1",),
+                ("ev-r2",),
+                ("risk",),
+            ),
+            CandidateEvidenceCounts(0, 0, 0, 1),
+        ),
+    ),
+)
+def test_candidate_panel_rejects_cross_industry_elements(
+    field_name: str, entry: object, counts: CandidateEvidenceCounts
+) -> None:
+    # Break caught: robotics candidates are returned under a storage panel.
+    with pytest.raises(ValueError, match="industry_id mismatch"):
+        replace(_candidate_panel(), counts=counts, **{field_name: (entry,)})
+
+
 def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:
     # Break caught: a failed refresh masquerades as a new trusted publication.
     success = RefreshRun(
@@ -374,6 +547,39 @@ def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:
     assert failure.displayed_trusted_snapshot_id == "trusted-2"
     with pytest.raises(ValueError, match="published_trusted_snapshot_id"):
         replace(failure, published_trusted_snapshot_id="trusted-3")
+
+
+def test_industry_report_response_enforces_composite_industry_and_null_display_contract() -> None:
+    # Break caught: a response can mix requested/displayed/report/candidate/refresh industries.
+    candidate = _candidate_panel()
+    refresh = _idle_refresh()
+    ready = IndustryReportResponse(
+        requested_industry_id="storage",
+        displayed_industry_id="storage",
+        displayed_trusted_report=_report(),
+        candidate_evidence=candidate,
+        refresh_run=refresh,
+    )
+    empty = IndustryReportResponse(
+        requested_industry_id="storage",
+        displayed_industry_id=None,
+        displayed_trusted_report=None,
+        candidate_evidence=candidate,
+        refresh_run=refresh,
+    )
+
+    assert ready.to_dict()["displayed_industry_id"] == "storage"
+    assert empty.to_dict()["displayed_trusted_report"] is None
+    invalid_values = (
+        {"displayed_industry_id": None, "displayed_trusted_report": _report()},
+        {"displayed_industry_id": "storage", "displayed_trusted_report": None},
+        {"displayed_industry_id": "robotics", "displayed_trusted_report": _report()},
+        {"candidate_evidence": _candidate_panel("robotics")},
+        {"refresh_run": _idle_refresh("robotics")},
+    )
+    for changes in invalid_values:
+        with pytest.raises(ValueError, match="industry|displayed"):
+            replace(ready, **changes)
 
 
 def test_structured_conclusion_is_authoritative_and_text_cannot_add_cycle_judgment() -> None:
@@ -443,9 +649,27 @@ def test_relation_objects_fail_closed_without_codes_or_disclosure_evidence() -> 
         selection_id="selection-1",
         fund_code="000001",
         relation=None,
-        empty_reason=EmptyReason.NOT_DISCLOSED,
+        empty_reason=FundResolutionEmptyReason.NOT_DISCLOSED,
     )
-    assert resolution.empty_reason is EmptyReason.NOT_DISCLOSED
+    assert resolution.empty_reason is FundResolutionEmptyReason.NOT_DISCLOSED
+
+
+def test_fund_resolution_uses_only_its_three_allowed_empty_reasons() -> None:
+    # Break caught: metric/provider empty reasons leak into fund relation resolution.
+    assert {reason.value for reason in FundResolutionEmptyReason} == {
+        "unknown",
+        "not_disclosed",
+        "source_unavailable",
+    }
+    resolution = IndustryFundRelationResolution(
+        selection_id="selection-unknown",
+        fund_code="000001",
+        relation=None,
+        empty_reason=FundResolutionEmptyReason.UNKNOWN,
+    )
+    assert resolution.empty_reason is FundResolutionEmptyReason.UNKNOWN
+    with pytest.raises(TypeError, match="FundResolutionEmptyReason"):
+        replace(resolution, empty_reason=EmptyReason.SOURCE_FAILED)
 
 
 def test_demo_fixture_is_rejected_in_production_mode() -> None:

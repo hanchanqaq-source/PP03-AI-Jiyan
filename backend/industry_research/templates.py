@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import TemplateStatus, WireModel
+from .models import TemplateStatus, WireModel, _require_enum
 
 
 REPORT_SECTION_IDS = (
@@ -28,6 +28,7 @@ class IndustryReportTemplate(WireModel):
     empty_reason: str | None = None
 
     def __post_init__(self) -> None:
+        _require_enum(self.status, TemplateStatus, "status")
         if self.status is TemplateStatus.BUILDING:
             if self.section_ids or self.cycle_metric_ids or self.chain_node_ids:
                 raise ValueError("building template must not inherit industry fields")

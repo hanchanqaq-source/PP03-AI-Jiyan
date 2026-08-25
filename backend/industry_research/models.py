@@ -49,6 +49,12 @@ class EmptyReason(str, Enum):
     INSUFFICIENT_HISTORY = "insufficient_history"
 
 
+class FundResolutionEmptyReason(str, Enum):
+    UNKNOWN = "unknown"
+    NOT_DISCLOSED = "not_disclosed"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+
+
 class ConclusionStatus(str, Enum):
     VERIFIED = "verified"
     CORROBORATED = "corroborated"
@@ -68,6 +74,11 @@ class RefreshPhase(str, Enum):
     VERIFYING = "verifying"
     FAILED = "failed"
     TRUSTED_PUBLISHED = "trusted_published"
+
+
+def _require_enum(value: object, enum_type: type[Enum], field_name: str) -> None:
+    if not isinstance(value, enum_type):
+        raise TypeError(f"{field_name} must be {enum_type.__name__}")
 
 
 def verification_display_label(status: VerificationStatus) -> str:
@@ -112,6 +123,21 @@ class EvidenceReference(WireModel):
     contradicts_claim: bool
     as_of_date: str | None
     verified_at: str
+
+    def __post_init__(self) -> None:
+        required_fields = (
+            "evidence_id",
+            "source_family_id",
+            "content_source",
+            "origin_cluster",
+            "collector_source",
+            "final_url",
+            "verified_at",
+        )
+        for field_name in required_fields:
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"evidence {field_name} must not be blank")
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> EvidenceReference:
@@ -164,6 +190,12 @@ class IndustryMetricObservation(WireModel):
     evidence_snapshot_id: str | None
 
     def __post_init__(self) -> None:
+        _require_enum(self.availability_status, AvailabilityStatus, "availability_status")
+        _require_enum(self.verification_status, VerificationStatus, "verification_status")
+        _require_enum(self.freshness_status, FreshnessStatus, "freshness_status")
+        _require_enum(self.source_run_status, SourceRunStatus, "source_run_status")
+        if self.empty_reason is not None:
+            _require_enum(self.empty_reason, EmptyReason, "empty_reason")
         if self.current_value is None and self.empty_reason is None:
             raise ValueError("current_value=null requires empty_reason")
         if self.current_value is not None and self.empty_reason is not None:
@@ -183,6 +215,8 @@ class IndustryMetricObservation(WireModel):
             raise ValueError("trusted observation requires current_value")
         if not self.evidence:
             raise ValueError("trusted observation requires evidence")
+        if any(item.contradicts_claim for item in self.evidence):
+            raise ValueError("trusted observation cannot contain contradicting evidence")
         if not self.raw_snapshot_id:
             raise ValueError("trusted observation requires raw_snapshot_id")
         if not self.evidence_snapshot_id:
@@ -310,6 +344,7 @@ class IndustryConclusion(WireModel):
     invalidating_conditions: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _require_enum(self.status, ConclusionStatus, "status")
         if self.cycle_stage not in {None, "recovery", "expansion", "peak", "contraction"}:
             raise ValueError("invalid cycle_stage")
         if self.outlook_direction not in {None, "improving", "stable", "weakening"}:
@@ -338,6 +373,9 @@ class IndustryChainNode(WireModel):
     observation_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
     status: ConclusionStatus
+
+    def __post_init__(self) -> None:
+        _require_enum(self.status, ConclusionStatus, "status")
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +428,7 @@ class IndustryFundRelation(WireModel):
     status: VerificationStatus
 
     def __post_init__(self) -> None:
+        _require_enum(self.status, VerificationStatus, "status")
         if not self.fund_code.strip():
             raise ValueError("trusted fund relation requires fund_code")
         if self.relation_layer not in {"official_allocation", "disclosed_lookthrough"}:
@@ -409,9 +448,11 @@ class IndustryFundRelationResolution(WireModel):
     selection_id: str
     fund_code: str
     relation: IndustryFundRelation | None
-    empty_reason: EmptyReason | None
+    empty_reason: FundResolutionEmptyReason | None
 
     def __post_init__(self) -> None:
+        if self.empty_reason is not None:
+            _require_enum(self.empty_reason, FundResolutionEmptyReason, "empty_reason")
         if self.relation is None and self.empty_reason is None:
             raise ValueError("missing fund relation requires empty_reason")
         if self.relation is not None and self.empty_reason is not None:
@@ -430,6 +471,7 @@ class IndustryEvidenceEvent(WireModel):
     roles: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _require_enum(self.status, VerificationStatus, "status")
         if self.status not in {VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED}:
             raise ValueError("IndustryEvidenceEvent requires trusted status")
         if not self.evidence_ids:
@@ -448,6 +490,7 @@ class CandidateIndustryEvidenceEvent(WireModel):
     roles: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _require_enum(self.status, VerificationStatus, "status")
         if self.status not in {VerificationStatus.UNVERIFIED, VerificationStatus.CONFLICTING}:
             raise ValueError("candidate event requires unverified or conflicting status")
         if self.status is VerificationStatus.CONFLICTING:
@@ -527,6 +570,7 @@ class DisplayedTrustedReport(WireModel):
     news_risk: tuple[IndustryEvidenceEvent, ...]
 
     def __post_init__(self) -> None:
+        _require_enum(self.template_status, TemplateStatus, "template_status")
         observations = self.cycle + self.metrics + self.capital
         for observation in observations:
             if not isinstance(observation, IndustryMetricObservation):
@@ -578,6 +622,20 @@ class CandidateEvidencePanel(WireModel):
     conflicting_events: tuple[CandidateIndustryEvidenceEvent, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.counts, CandidateEvidenceCounts):
+            raise TypeError("counts must be CandidateEvidenceCounts")
+        expected_types = {
+            "unverified": IndustryMetricObservation,
+            "conflicting": ConflictingObservation,
+            "unverified_events": CandidateIndustryEvidenceEvent,
+            "conflicting_events": CandidateIndustryEvidenceEvent,
+        }
+        for field_name, expected_type in expected_types.items():
+            items = getattr(self, field_name)
+            if any(not isinstance(item, expected_type) for item in items):
+                raise TypeError(f"{field_name} contains an invalid element type")
+            if any(item.industry_id != self.industry_id for item in items):
+                raise ValueError(f"{field_name} industry_id mismatch")
         if any(item.verification_status is not VerificationStatus.UNVERIFIED for item in self.unverified):
             raise ValueError("candidate unverified array accepts only unverified observations")
         if any(item.status is not VerificationStatus.UNVERIFIED for item in self.unverified_events):
@@ -603,6 +661,7 @@ class RefreshRun(WireModel):
     published_trusted_snapshot_id: str | None
 
     def __post_init__(self) -> None:
+        _require_enum(self.phase, RefreshPhase, "phase")
         if self.phase is RefreshPhase.TRUSTED_PUBLISHED:
             if not self.published_trusted_snapshot_id:
                 raise ValueError("trusted_published requires published_trusted_snapshot_id")
@@ -614,3 +673,36 @@ class RefreshRun(WireModel):
             raise ValueError("published_trusted_snapshot_id must be null until trusted_published")
         if self.phase is RefreshPhase.FAILED and not self.error_code:
             raise ValueError("failed refresh requires error_code")
+
+
+@dataclass(frozen=True, slots=True)
+class IndustryReportResponse(WireModel):
+    requested_industry_id: str
+    displayed_industry_id: str | None
+    displayed_trusted_report: DisplayedTrustedReport | None
+    candidate_evidence: CandidateEvidencePanel
+    refresh_run: RefreshRun
+
+    def __post_init__(self) -> None:
+        if not self.requested_industry_id.strip():
+            raise ValueError("requested_industry_id must not be blank")
+        if not isinstance(self.candidate_evidence, CandidateEvidencePanel):
+            raise TypeError("candidate_evidence must be CandidateEvidencePanel")
+        if not isinstance(self.refresh_run, RefreshRun):
+            raise TypeError("refresh_run must be RefreshRun")
+        if self.candidate_evidence.industry_id != self.requested_industry_id:
+            raise ValueError("candidate industry_id must match requested_industry_id")
+        if self.refresh_run.industry_id != self.requested_industry_id:
+            raise ValueError("refresh industry_id must match requested_industry_id")
+        if self.displayed_industry_id is None:
+            if self.displayed_trusted_report is not None:
+                raise ValueError("null displayed_industry_id requires null displayed_trusted_report")
+            return
+        if self.displayed_industry_id != self.requested_industry_id:
+            raise ValueError("displayed_industry_id must match requested_industry_id")
+        if self.displayed_trusted_report is None:
+            raise ValueError("displayed_industry_id requires displayed_trusted_report")
+        if not isinstance(self.displayed_trusted_report, DisplayedTrustedReport):
+            raise TypeError("displayed_trusted_report must be DisplayedTrustedReport")
+        if self.displayed_trusted_report.industry_id != self.displayed_industry_id:
+            raise ValueError("displayed report industry_id mismatch")
