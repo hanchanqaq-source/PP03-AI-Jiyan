@@ -21,6 +21,7 @@ def _verified_qualification():
         response_cap_bytes=500_000,
         response_bytes=480,
         target_fields=("product", "session_average", "date"),
+        observed_response_fields=("product", "session_average", "date"),
         field_shape="html_table:product,session_average,date",
         data_date_field="date",
         data_date=date(2026, 8, 24),
@@ -97,6 +98,7 @@ def test_catalog_registers_one_candidate_capability_without_claiming_availabilit
         ("response_cap_bytes", 0),
         ("response_bytes", None),
         ("target_fields", ()),
+        ("observed_response_fields", ()),
         ("field_shape", ""),
         ("data_date_field", ""),
         ("data_date", None),
@@ -157,11 +159,22 @@ def test_scheduling_allowlist_requires_free_no_key_empty_credentials_and_enabled
     ) is False
 
 
-def test_complete_public_snapshot_qualification_can_pass_the_explicit_allowlist():
-    """Catches the fail-closed gate becoming impossible to satisfy after every required check passes."""
+def test_complete_qualification_and_explicit_catalog_enablement_are_both_required():
+    """Catches the fail-closed gate omitting either source qualification or independent catalog enablement."""
     from industry_research.source_qualification import qualification_allows_enabled_adapter
 
     assert qualification_allows_enabled_adapter(_verified_qualification(), _enabled_descriptor()) is True
+
+
+def test_complete_qualification_cannot_enable_a_catalog_disabled_adapter():
+    """Catches source qualification completion mutating or bypassing the independent catalog gate."""
+    from industry_research.source_qualification import qualification_allows_enabled_adapter
+
+    catalog_descriptor = build_catalog({"sources": []}).adapter("trendforce-public-price")
+
+    assert catalog_descriptor.default_enabled is False
+    assert catalog_descriptor.catalog_status is CatalogStatus.UNCONFIGURED
+    assert qualification_allows_enabled_adapter(_verified_qualification(), catalog_descriptor) is False
 
 
 def test_company_level_official_disclosure_is_not_registered_as_an_industry_total_source():

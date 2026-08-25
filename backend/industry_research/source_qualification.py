@@ -36,6 +36,7 @@ class SourceQualificationResult:
     response_cap_bytes: int
     response_bytes: int | None
     target_fields: tuple[str, ...]
+    observed_response_fields: tuple[str, ...]
     field_shape: str
     data_date_field: str
     data_date: date | None
@@ -57,7 +58,8 @@ UNVERIFIED_PUBLIC_PRICE_QUALIFICATION = SourceQualificationResult(
     response_cap_bytes=PUBLIC_PRICE_RESPONSE_CAP_BYTES,
     response_bytes=None,
     target_fields=PUBLIC_PRICE_TARGET_FIELDS,
-    field_shape=PUBLIC_PRICE_FIELD_SHAPE,
+    observed_response_fields=(),
+    field_shape="",
     data_date_field="date",
     data_date=None,
     unit=None,
@@ -84,6 +86,7 @@ def qualification_metadata_complete(result: SourceQualificationResult) -> bool:
         and type(result.response_bytes) is int
         and 0 < result.response_bytes <= result.response_cap_bytes
         and result.target_fields == PUBLIC_PRICE_TARGET_FIELDS
+        and result.observed_response_fields == PUBLIC_PRICE_TARGET_FIELDS
         and result.field_shape == PUBLIC_PRICE_FIELD_SHAPE
         and result.data_date_field == "date"
         and isinstance(result.data_date, date)

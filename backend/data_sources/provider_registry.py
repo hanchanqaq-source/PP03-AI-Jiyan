@@ -16,6 +16,7 @@ class _ProviderFactory:
     class_name: str
     requires_http: bool = False
     requires_credentials: bool = False
+    requires_catalog_descriptor: bool = False
 
 
 _FACTORIES: Mapping[str, _ProviderFactory] = {
@@ -42,7 +43,8 @@ _FACTORIES: Mapping[str, _ProviderFactory] = {
     "trendforce-public-price": _ProviderFactory(
         "data_sources.providers.industry_price_public",
         "TrendForcePublicPriceAdapter",
-        True,
+        requires_http=True,
+        requires_catalog_descriptor=True,
     ),
 }
 
@@ -90,8 +92,10 @@ class ProviderRegistry:
                 module = importlib.import_module(factory.module_name)
                 adapter_type = getattr(module, factory.class_name)
                 kwargs = {"http": self._http_factory()} if factory.requires_http else {}
+                catalog_descriptor = self._catalog.adapter(normalized)
+                if factory.requires_catalog_descriptor:
+                    kwargs["catalog_descriptor"] = catalog_descriptor
                 if factory.requires_credentials:
-                    catalog_descriptor = self._catalog.adapter(normalized)
                     scope = {normalized: tuple(catalog_descriptor.credential_env_names)}
                     kwargs["credentials"] = (
                         self._credential_store

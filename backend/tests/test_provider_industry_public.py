@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
@@ -11,6 +12,8 @@ from requests.adapters import BaseAdapter
 from requests.structures import CaseInsensitiveDict
 
 from data_sources.http import SafeHttpClient
+from data_sources.catalog import build_catalog
+from data_sources.models import CatalogStatus
 from data_sources.provider_contract import ProviderRequest
 from data_sources.provider_errors import ProviderUnavailable
 
@@ -78,6 +81,7 @@ def verified_qualification():
         response_cap_bytes=500_000,
         response_bytes=len(recorded("valid_public_snapshot")["body"]),
         target_fields=("product", "session_average", "date"),
+        observed_response_fields=("product", "session_average", "date"),
         field_shape="html_table:product,session_average,date",
         data_date_field="date",
         data_date=date(2026, 8, 24),
@@ -102,6 +106,14 @@ def verified_qualification():
     )
 
 
+def enabled_catalog_descriptor():
+    return replace(
+        build_catalog({"sources": []}).adapter("trendforce-public-price"),
+        default_enabled=True,
+        catalog_status=CatalogStatus.CONFIGURED,
+    )
+
+
 def test_public_industry_provider_module_is_present():
     """Catches the only approved public price candidate adapter being omitted."""
     from data_sources.providers.industry_price_public import TrendForcePublicPriceAdapter
@@ -117,6 +129,7 @@ def test_recorded_public_snapshot_preserves_fields_date_unit_and_candidate_statu
     adapter = TrendForcePublicPriceAdapter(
         http=http,
         qualification=verified_qualification(),
+        catalog_descriptor=enabled_catalog_descriptor(),
         fetched_at=lambda: datetime(2026, 8, 25, tzinfo=timezone.utc),
     )
 
@@ -150,6 +163,8 @@ def test_qualification_records_complete_bounded_response_evidence_without_values
     assert result.http_status == 200
     assert result.response_bytes == len(recorded("valid_public_snapshot")["body"])
     assert result.response_bytes <= result.response_cap_bytes
+    assert result.target_fields == ("product", "session_average", "date")
+    assert result.observed_response_fields == ("product", "session_average", "date")
     assert result.field_shape == "html_table:product,session_average,date"
     assert result.data_date == date(2026, 8, 24)
     assert result.unit == "USD"
@@ -175,6 +190,7 @@ def test_recorded_public_page_failures_are_license_unverified_and_never_return_v
     adapter = TrendForcePublicPriceAdapter(
         http=FakeHttp(recorded(fixture_name)),
         qualification=verified_qualification(),
+        catalog_descriptor=enabled_catalog_descriptor(),
     )
     result = adapter.qualify()
 
@@ -191,6 +207,7 @@ def test_complete_recorded_response_over_cap_fails_closed_before_parsing():
     adapter = TrendForcePublicPriceAdapter(
         http=FakeHttp(recorded("oversized_response")),
         qualification=verified_qualification(),
+        catalog_descriptor=enabled_catalog_descriptor(),
         max_response_bytes=512,
     )
 
@@ -214,7 +231,8 @@ def test_schema_failure_keeps_observed_transport_evidence_but_clears_unverified_
     assert result.final_url == response["final_url"]
     assert result.http_status == 200
     assert result.response_bytes == len(response["body"])
-    assert result.target_fields == ()
+    assert result.target_fields == ("product", "session_average", "date")
+    assert result.observed_response_fields == ()
     assert result.field_shape == ""
     assert result.data_date is None
     assert result.unit is None
@@ -253,10 +271,12 @@ def test_unconfigured_default_registry_adapter_cannot_fetch_or_claim_connection(
     """Catches registry registration bypassing the unverified-license default."""
     from data_sources.provider_registry import ProviderRegistry
 
-    adapter = ProviderRegistry(http_factory=lambda: FakeHttp(recorded("valid_public_snapshot"))).adapter(
+    catalog = build_catalog({"sources": []})
+    adapter = ProviderRegistry(catalog, http_factory=lambda: FakeHttp(recorded("valid_public_snapshot"))).adapter(
         "trendforce-public-price"
     )
 
+    assert adapter.descriptor is catalog.adapter("trendforce-public-price")
     assert adapter.descriptor.default_enabled is False
     assert adapter.descriptor.catalog_status.value == "unconfigured"
     with pytest.raises(ProviderUnavailable, match="license_unverified"):
@@ -267,13 +287,31 @@ def test_unconfigured_default_registry_adapter_cannot_fetch_or_claim_connection(
     }
 
 
+def test_complete_qualification_cannot_mutate_or_bypass_catalog_disabled_descriptor():
+    """Catches an injected qualification deriving its own enabled descriptor instead of honoring Catalog."""
+    from data_sources.providers.industry_price_public import TrendForcePublicPriceAdapter
+
+    catalog_descriptor = build_catalog({"sources": []}).adapter("trendforce-public-price")
+    adapter = TrendForcePublicPriceAdapter(
+        http=FakeHttp(recorded("valid_public_snapshot")),
+        qualification=verified_qualification(),
+        catalog_descriptor=catalog_descriptor,
+    )
+
+    assert adapter.descriptor is catalog_descriptor
+    assert adapter.descriptor.default_enabled is False
+    assert adapter.descriptor.catalog_status is CatalogStatus.UNCONFIGURED
+    with pytest.raises(ProviderUnavailable, match="license_unverified"):
+        adapter.fetch(ProviderRequest("industry_price_snapshot", {}))
+
+
 def test_transport_failure_is_recorded_as_unavailable_without_substitute_source():
     """Catches a failed public page being silently replaced by another source or a fabricated success."""
     from data_sources.providers.industry_price_public import TrendForcePublicPriceAdapter
 
     result = TrendForcePublicPriceAdapter(
         http=FakeHttp(ProviderUnavailable("timeout")),
-        qualification=verified_qualification(),
+        qualification=replace(verified_qualification(), target_fields=()),
     ).qualify()
 
     assert result.license_conclusion == "license_unverified"
@@ -281,3 +319,6 @@ def test_transport_failure_is_recorded_as_unavailable_without_substitute_source(
     assert result.final_url is None
     assert result.http_status is None
     assert result.response_bytes is None
+    assert result.target_fields == ("product", "session_average", "date")
+    assert result.observed_response_fields == ()
+    assert result.field_shape == ""

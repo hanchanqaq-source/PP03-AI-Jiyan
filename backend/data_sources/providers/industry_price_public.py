@@ -30,7 +30,6 @@ from industry_research.source_qualification import (
     UNVERIFIED_LICENSE,
     UNVERIFIED_PUBLIC_PRICE_QUALIFICATION,
     qualification_allows_enabled_adapter,
-    qualification_metadata_complete,
 )
 
 from .base import BaseProvider
@@ -230,6 +229,7 @@ class TrendForcePublicPriceAdapter(BaseProvider):
         *,
         http: Any,
         qualification: SourceQualificationResult = UNVERIFIED_PUBLIC_PRICE_QUALIFICATION,
+        catalog_descriptor: AdapterDescriptor = _BASE_DESCRIPTOR,
         max_response_bytes: int = PUBLIC_PRICE_RESPONSE_CAP_BYTES,
         fetched_at: Callable[[], datetime] = _now,
     ) -> None:
@@ -239,15 +239,15 @@ class TrendForcePublicPriceAdapter(BaseProvider):
         self._qualification = qualification
         self._max_response_bytes = max_response_bytes
         self._fetched_at = fetched_at
-        if qualification_metadata_complete(qualification):
-            self.descriptor = replace(
-                _BASE_DESCRIPTOR,
-                default_enabled=True,
-                catalog_status=CatalogStatus.CONFIGURED,
-                license_note="Explicitly verified public current-snapshot license; no history or member use.",
-            )
-        else:
-            self.descriptor = _BASE_DESCRIPTOR
+        if (
+            not isinstance(catalog_descriptor, AdapterDescriptor)
+            or catalog_descriptor.adapter_id != _BASE_DESCRIPTOR.adapter_id
+            or catalog_descriptor.source_family_id != _BASE_DESCRIPTOR.source_family_id
+            or catalog_descriptor.capability_ids != _BASE_DESCRIPTOR.capability_ids
+            or catalog_descriptor.configured_reference != _BASE_DESCRIPTOR.configured_reference
+        ):
+            raise ValueError("catalog_descriptor does not match the industry-price adapter")
+        self.descriptor = catalog_descriptor
 
     @staticmethod
     def _redirect_allowed(_current: str, target: str) -> bool:
@@ -298,6 +298,9 @@ class TrendForcePublicPriceAdapter(BaseProvider):
                 http_status=None,
                 response_cap_bytes=self._max_response_bytes,
                 response_bytes=None,
+                target_fields=PUBLIC_PRICE_TARGET_FIELDS,
+                observed_response_fields=(),
+                field_shape="",
                 data_date=None,
                 unit=None,
                 license_conclusion=UNVERIFIED_LICENSE,
@@ -314,7 +317,8 @@ class TrendForcePublicPriceAdapter(BaseProvider):
                 http_status=None,
                 response_cap_bytes=self._max_response_bytes,
                 response_bytes=None,
-                target_fields=(),
+                target_fields=PUBLIC_PRICE_TARGET_FIELDS,
+                observed_response_fields=(),
                 field_shape="",
                 data_date=None,
                 unit=None,
@@ -332,7 +336,8 @@ class TrendForcePublicPriceAdapter(BaseProvider):
                 http_status=status,
                 response_cap_bytes=self._max_response_bytes,
                 response_bytes=len(body),
-                target_fields=(),
+                target_fields=PUBLIC_PRICE_TARGET_FIELDS,
+                observed_response_fields=(),
                 field_shape="",
                 data_date=None,
                 unit=None,
@@ -353,6 +358,7 @@ class TrendForcePublicPriceAdapter(BaseProvider):
             response_cap_bytes=self._max_response_bytes,
             response_bytes=len(body),
             target_fields=PUBLIC_PRICE_TARGET_FIELDS,
+            observed_response_fields=PUBLIC_PRICE_TARGET_FIELDS,
             field_shape=PUBLIC_PRICE_FIELD_SHAPE,
             data_date_field="date",
             data_date=observed_date,
