@@ -28,6 +28,7 @@ def observation(
     change: float | None = 1.0,
     status: VerificationStatus = VerificationStatus.VERIFIED,
     freshness: FreshnessStatus = FreshnessStatus.FRESH,
+    expires_at: str = "2026-09-01T00:00:00+00:00",
     invalidating_conditions: tuple[str, ...] | None = None,
 ) -> IndustryMetricObservation:
     evidence = EvidenceReference(
@@ -71,6 +72,7 @@ def observation(
         independent_origin_clusters=(),
         raw_snapshot_id="raw-storage-1",
         evidence_snapshot_id="evidence-storage-1",
+        expires_at=expires_at,
     )
 
 
@@ -138,7 +140,8 @@ def test_two_non_price_demand_signals_are_required_for_outlook() -> None:
 def test_expired_invalidation_condition_downgrades_the_conclusion() -> None:
     expired = observation(
         "nand_price",
-        invalidating_conditions=("expires_at=2026-08-25T07:59:59+00:00",),
+        expires_at="2026-08-25T07:59:59+00:00",
+        invalidating_conditions=("Source correction or expiry invalidates the metric.",),
     )
 
     conclusion = evaluate(observation("dram_price"), expired)

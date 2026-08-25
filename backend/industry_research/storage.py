@@ -382,17 +382,29 @@ def _validate_report(report: DisplayedTrustedReport) -> None:
     if generated.tzinfo is None or generated.utcoffset() is None:
         raise ValueError("trusted report generated_at must be timezone-aware")
     observations = report.cycle + report.metrics + report.capital
-    allowed_metrics = set(get_industry_template(report.industry_id).cycle_metric_ids)
+    template = get_industry_template(report.industry_id)
+    allowed_metrics = set(
+        template.cycle_metric_ids + template.core_metric_ids + template.capital_metric_ids
+    )
     if any(row.metric_id not in allowed_metrics for row in observations):
         raise ValueError("trusted observation metric_id is not in the industry template")
+    trusted_by_id: dict[str, IndustryMetricObservation] = {}
+    for row in observations:
+        if row.current_value is None:
+            continue
+        previous = trusted_by_id.get(row.metric_id)
+        if previous is not None and previous != row:
+            raise ValueError("duplicate report metric rows must be identical")
+        trusted_by_id[row.metric_id] = row
+    trusted = tuple(trusted_by_id.values())
     expected = ReportCounts(
-        verified=sum(row.verification_status is VerificationStatus.VERIFIED for row in observations),
-        corroborated=sum(row.verification_status is VerificationStatus.CORROBORATED for row in observations),
+        verified=sum(row.verification_status is VerificationStatus.VERIFIED for row in trusted),
+        corroborated=sum(row.verification_status is VerificationStatus.CORROBORATED for row in trusted),
     )
     if report.counts != expected:
         raise ValueError("trusted report counts do not match observations")
-    raw_ids = {row.raw_snapshot_id for row in observations}
-    evidence_ids = {row.evidence_snapshot_id for row in observations}
+    raw_ids = {row.raw_snapshot_id for row in trusted}
+    evidence_ids = {row.evidence_snapshot_id for row in trusted}
     if len(raw_ids) > 1 or len(evidence_ids) > 1:
         raise ValueError("trusted report observations must share one raw/evidence lineage")
 
@@ -417,7 +429,10 @@ def _lineage_document(
         raise ValueError("trusted publication lineage must not be blank")
     if report.industry_id != expected_industry_id:
         raise ValueError("trusted publication industry_id mismatch")
-    observations = report.cycle + report.metrics + report.capital
+    observations = tuple(
+        row for row in report.cycle + report.metrics + report.capital
+        if row.current_value is not None
+    )
     if any(row.raw_snapshot_id != expected_raw_snapshot_id for row in observations):
         raise ValueError("trusted observation raw lineage mismatch")
     if any(row.evidence_snapshot_id != expected_evidence_snapshot_id for row in observations):

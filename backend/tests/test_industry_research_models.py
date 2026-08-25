@@ -182,7 +182,18 @@ def _report(*, cycle: tuple[IndustryMetricObservation, ...] = ()) -> DisplayedTr
             failed=0,
             unconfigured=0,
         ),
-        counts=ReportCounts(verified=1, corroborated=0),
+        counts=ReportCounts(
+            verified=sum(
+                item.current_value is not None
+                and item.verification_status is VerificationStatus.VERIFIED
+                for item in cycle
+            ),
+            corroborated=sum(
+                item.current_value is not None
+                and item.verification_status is VerificationStatus.CORROBORATED
+                for item in cycle
+            ),
+        ),
         overview=_conclusion(),
         cycle=cycle,
         chain=(
@@ -370,7 +381,6 @@ def test_conflict_preserves_each_source_value_and_rejects_aggregate() -> None:
         (VerificationStatus.UNVERIFIED, FreshnessStatus.FRESH),
         (VerificationStatus.CONFLICTING, FreshnessStatus.FRESH),
         (VerificationStatus.VERIFIED, FreshnessStatus.EXPIRED),
-        (VerificationStatus.NOT_EVALUATED, FreshnessStatus.UNKNOWN),
     ],
 )
 def test_untrusted_or_expired_observation_cannot_enter_trusted_report(
@@ -385,6 +395,17 @@ def test_untrusted_or_expired_observation_cannot_enter_trusted_report(
     )
     with pytest.raises(ValueError, match="trusted_observations"):
         _report(cycle=(candidate,))
+
+
+def test_explicit_empty_placeholder_can_enter_report_without_becoming_a_trusted_value() -> None:
+    placeholder = _empty_observation()
+
+    report = _report(cycle=(placeholder,))
+
+    assert report.cycle == (placeholder,)
+    assert report.counts == ReportCounts(verified=0, corroborated=0)
+    assert report.cycle[0].current_value is None
+    assert report.cycle[0].empty_reason is EmptyReason.SOURCE_UNCONFIGURED
 
 
 def test_trusted_report_rejects_cross_industry_observations() -> None:

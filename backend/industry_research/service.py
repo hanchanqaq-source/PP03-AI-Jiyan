@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from evidence_verification.models import (
     EvidenceEvent as A2EvidenceEvent,
@@ -17,19 +17,40 @@ from .models import (
     ConclusionStatus,
     DisplayedTrustedReport,
     EmptyReason,
+    AvailabilityStatus,
+    FreshnessStatus,
     IndustryChainNode,
     IndustryEvidenceEvent,
     IndustryMetricObservation,
     ReportCounts,
     SourceCoverage,
+    SourceRunStatus,
     VerificationStatus,
     WireModel,
 )
-from .rules import evaluate_storage_conclusion, select_current_trusted_observations
+from .rules import (
+    evaluate_storage_conclusion,
+    observation_is_current,
+    select_current_trusted_observations,
+)
 from .templates import REPORT_SECTION_IDS, get_industry_template
 
 
 _NEWS_WINDOWS = (7, 30, 90)
+_METRIC_LABELS = {
+    "dram_price": "DRAM 价格",
+    "nand_price": "NAND 价格",
+    "hbm_demand": "HBM 需求",
+    "inventory_level": "库存水平",
+    "capacity_utilization": "产能利用率",
+    "manufacturer_capex": "厂商资本开支",
+    "server_demand": "服务器需求",
+    "consumer_electronics_demand": "消费电子需求",
+    "sector_fund_flow": "板块资金",
+    "etf_share": "ETF 份额",
+    "industry_valuation": "估值水平",
+    "historical_valuation_percentile": "历史分位",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +239,7 @@ def _section_states(
     report: DisplayedTrustedReport,
 ) -> tuple[ReportSectionState, ...]:
     template = get_industry_template(report.industry_id)
-    present = {row.metric_id for row in cycle}
+    present = {row.metric_id for row in cycle if row.current_value is not None}
     missing = tuple(metric_id for metric_id in template.cycle_metric_ids if metric_id not in present)
     values: dict[str, tuple[int | None, EmptyReason | None, tuple[str, ...]]] = {
         "overview": (
@@ -238,8 +259,18 @@ def _section_states(
             else EmptyReason.NO_RELIABLE_DATA,
             (),
         ),
-        "metrics": (len(report.metrics) or None, None if report.metrics else EmptyReason.NO_RELIABLE_DATA, ()),
-        "capital": (len(report.capital) or None, None if report.capital else EmptyReason.NO_RELIABLE_DATA, ()),
+        "metrics": (
+            sum(row.current_value is not None for row in report.metrics) or None,
+            None if any(row.current_value is not None for row in report.metrics)
+            else EmptyReason.NO_RELIABLE_DATA,
+            (),
+        ),
+        "capital": (
+            sum(row.current_value is not None for row in report.capital) or None,
+            None if any(row.current_value is not None for row in report.capital)
+            else EmptyReason.NO_RELIABLE_DATA,
+            (),
+        ),
         "companies": (len(report.companies) or None, None if report.companies else EmptyReason.NOT_DISCLOSED, ()),
         "funds": (len(report.funds) or None, None if report.funds else EmptyReason.NOT_DISCLOSED, ()),
         "news_risk": (len(report.news_risk) or None, None if report.news_risk else EmptyReason.NO_RELIABLE_DATA, ()),
@@ -247,12 +278,133 @@ def _section_states(
     return tuple(ReportSectionState(section_id, *values[section_id]) for section_id in REPORT_SECTION_IDS)
 
 
+def _empty_axes(reason: EmptyReason) -> tuple[
+    AvailabilityStatus, VerificationStatus, FreshnessStatus, SourceRunStatus
+]:
+    if reason in {
+        EmptyReason.SOURCE_UNCONFIGURED,
+        EmptyReason.USER_KEY_NOT_CONFIGURED,
+        EmptyReason.LICENSE_REQUIRED,
+    }:
+        return (
+            AvailabilityStatus.UNCONFIGURED,
+            VerificationStatus.NOT_EVALUATED,
+            FreshnessStatus.UNKNOWN,
+            SourceRunStatus.NOT_CONFIGURED,
+        )
+    if reason in {EmptyReason.SOURCE_FAILED, EmptyReason.SOURCE_UNAVAILABLE}:
+        return (
+            AvailabilityStatus.UNAVAILABLE,
+            VerificationStatus.NOT_EVALUATED,
+            FreshnessStatus.UNKNOWN,
+            SourceRunStatus.FAILED,
+        )
+    if reason is EmptyReason.VERIFYING:
+        return (
+            AvailabilityStatus.PARTIAL,
+            VerificationStatus.UNVERIFIED,
+            FreshnessStatus.UNKNOWN,
+            SourceRunStatus.HEALTHY,
+        )
+    if reason is EmptyReason.CONFLICTING:
+        return (
+            AvailabilityStatus.PARTIAL,
+            VerificationStatus.CONFLICTING,
+            FreshnessStatus.FRESH,
+            SourceRunStatus.HEALTHY,
+        )
+    if reason is EmptyReason.EXPIRED:
+        return (
+            AvailabilityStatus.UNAVAILABLE,
+            VerificationStatus.NOT_EVALUATED,
+            FreshnessStatus.EXPIRED,
+            SourceRunStatus.HEALTHY,
+        )
+    return (
+        AvailabilityStatus.UNAVAILABLE,
+        VerificationStatus.NOT_EVALUATED,
+        FreshnessStatus.UNKNOWN,
+        SourceRunStatus.PARTIAL_FAILURE,
+    )
+
+
+def _placeholder(
+    *,
+    industry_id: str,
+    metric_id: str,
+    reason: EmptyReason,
+    expires_at: str | None = None,
+) -> IndustryMetricObservation:
+    availability, verification, freshness, run_status = _empty_axes(reason)
+    return IndustryMetricObservation(
+        industry_id=industry_id,
+        metric_id=metric_id,
+        label=_METRIC_LABELS.get(metric_id, metric_id),
+        current_value=None,
+        unit=None,
+        change=None,
+        historical_position=None,
+        availability_status=availability,
+        verification_status=verification,
+        freshness_status=freshness,
+        source_run_status=run_status,
+        empty_reason=reason,
+        as_of_date=None,
+        fetched_at=None,
+        methodology="",
+        judgment_basis=(),
+        invalidating_conditions=(),
+        evidence=(),
+        independent_source_families=(),
+        independent_content_sources=(),
+        independent_origin_clusters=(),
+        raw_snapshot_id=None,
+        evidence_snapshot_id=None,
+        expires_at=expires_at,
+    )
+
+
+def _complete_metric_rows(
+    *,
+    industry_id: str,
+    metric_ids: tuple[str, ...],
+    current: Mapping[str, IndustryMetricObservation],
+    candidates: CandidateEvidencePanel,
+    expired: Mapping[str, IndustryMetricObservation],
+    empty_reasons: Mapping[str, EmptyReason],
+) -> tuple[IndustryMetricObservation, ...]:
+    unverified = {row.metric_id for row in candidates.unverified}
+    conflicting = {row.metric_id for row in candidates.conflicting}
+    rows: list[IndustryMetricObservation] = []
+    for metric_id in metric_ids:
+        if metric_id in current:
+            rows.append(current[metric_id])
+            continue
+        if metric_id in conflicting:
+            reason = EmptyReason.CONFLICTING
+        elif metric_id in unverified:
+            reason = EmptyReason.VERIFYING
+        elif metric_id in expired:
+            reason = EmptyReason.EXPIRED
+        else:
+            reason = empty_reasons.get(metric_id, EmptyReason.NO_RELIABLE_DATA)
+        rows.append(_placeholder(
+            industry_id=industry_id,
+            metric_id=metric_id,
+            reason=reason,
+            expires_at=expired[metric_id].expires_at if metric_id in expired else None,
+        ))
+    return tuple(rows)
+
+
 def assemble_storage_report(
     *,
     trusted_snapshot_id: str,
     generated_at: datetime,
     trusted_observations: Iterable[IndustryMetricObservation],
+    expired_observations: Iterable[IndustryMetricObservation] = (),
     metric_candidates: CandidateEvidencePanel | None,
+    metric_empty_reasons: Mapping[str, EmptyReason] | None = None,
     news_snapshot: EvidenceSnapshot | None,
     now: datetime,
     source_coverage: SourceCoverage | None = None,
@@ -263,9 +415,10 @@ def assemble_storage_report(
     _aware(generated_at, "generated_at")
     _aware(now, "now")
     template = get_industry_template(industry_id)
+    trusted_rows = tuple(trusted_observations)
     current = select_current_trusted_observations(
         industry_id=industry_id,
-        observations=trusted_observations,
+        observations=trusted_rows,
         now=now,
     )
     conclusion = evaluate_storage_conclusion(
@@ -277,6 +430,23 @@ def assemble_storage_report(
     candidates = metric_candidates or _empty_candidate(industry_id)
     if type(candidates) is not CandidateEvidencePanel or candidates.industry_id != industry_id:
         raise ValueError("metric candidate panel industry_id mismatch")
+    expired_rows = tuple(expired_observations)
+    if any(type(row) is not IndustryMetricObservation or row.industry_id != industry_id for row in expired_rows):
+        raise ValueError("expired observations must match the requested industry")
+    expired_by_id = {row.metric_id: row for row in expired_rows}
+    expired_by_id.update({
+        row.metric_id: row
+        for row in trusted_rows
+        if not observation_is_current(row, now=now)
+    })
+    reasons = dict(metric_empty_reasons or {})
+    allowed_report_metrics = set(
+        template.cycle_metric_ids + template.core_metric_ids + template.capital_metric_ids
+    )
+    if any(metric_id not in allowed_report_metrics for metric_id in reasons):
+        raise ValueError("empty reason metric_id is not in the report template")
+    if any(type(reason) is not EmptyReason for reason in reasons.values()):
+        raise TypeError("metric empty reasons must use EmptyReason")
     windows = (
         project_news_windows(industry_id=industry_id, snapshot=news_snapshot, now=now)
         if news_snapshot is not None
@@ -299,14 +469,52 @@ def assemble_storage_report(
         )
         for node_id in template.chain_node_ids
     )
+    current_by_id = {row.metric_id: row for row in current}
+    cycle_rows = _complete_metric_rows(
+        industry_id=industry_id,
+        metric_ids=template.cycle_metric_ids,
+        current=current_by_id,
+        candidates=candidates,
+        expired=expired_by_id,
+        empty_reasons=reasons,
+    )
     coverage = source_coverage or SourceCoverage(
         unit="capability",
-        total=len(template.cycle_metric_ids),
-        configured=len(current),
-        healthy=len(current),
-        partial_failure=0,
-        failed=0,
-        unconfigured=len(template.cycle_metric_ids) - len(current),
+        total=len(cycle_rows),
+        configured=sum(
+            row.source_run_status is not SourceRunStatus.NOT_CONFIGURED
+            for row in cycle_rows
+        ),
+        healthy=sum(
+            row.source_run_status is SourceRunStatus.HEALTHY for row in cycle_rows
+        ),
+        partial_failure=sum(
+            row.source_run_status is SourceRunStatus.PARTIAL_FAILURE
+            for row in cycle_rows
+        ),
+        failed=sum(
+            row.source_run_status is SourceRunStatus.FAILED for row in cycle_rows
+        ),
+        unconfigured=sum(
+            row.source_run_status is SourceRunStatus.NOT_CONFIGURED
+            for row in cycle_rows
+        ),
+    )
+    metric_rows = _complete_metric_rows(
+        industry_id=industry_id,
+        metric_ids=template.core_metric_ids,
+        current=current_by_id,
+        candidates=candidates,
+        expired=expired_by_id,
+        empty_reasons=reasons,
+    )
+    capital_rows = _complete_metric_rows(
+        industry_id=industry_id,
+        metric_ids=template.capital_metric_ids,
+        current=current_by_id,
+        candidates=candidates,
+        expired=expired_by_id,
+        empty_reasons=reasons,
     )
     report = DisplayedTrustedReport(
         industry_id=industry_id,
@@ -321,10 +529,10 @@ def assemble_storage_report(
             corroborated=sum(row.verification_status is VerificationStatus.CORROBORATED for row in current),
         ),
         overview=conclusion,
-        cycle=current,
+        cycle=cycle_rows,
         chain=chain,
-        metrics=(),
-        capital=(),
+        metrics=metric_rows,
+        capital=capital_rows,
         companies=(),
         fund_selection=(),
         funds=(),
@@ -334,7 +542,7 @@ def assemble_storage_report(
         report=report,
         candidate_evidence=candidate_evidence,
         news_windows=windows,
-        section_states=_section_states(cycle=current, chain=chain, report=report),
+        section_states=_section_states(cycle=cycle_rows, chain=chain, report=report),
     )
 
 
@@ -373,7 +581,9 @@ class IndustryResearchService:
         trusted_snapshot_id: str,
         generated_at: datetime,
         trusted_observations: Iterable[IndustryMetricObservation],
+        expired_observations: Iterable[IndustryMetricObservation] = (),
         metric_candidates: CandidateEvidencePanel | None,
+        metric_empty_reasons: Mapping[str, EmptyReason] | None = None,
         news_snapshot: EvidenceSnapshot | None,
         source_coverage: SourceCoverage | None = None,
         demo: bool = False,
@@ -382,7 +592,9 @@ class IndustryResearchService:
             trusted_snapshot_id=trusted_snapshot_id,
             generated_at=generated_at,
             trusted_observations=trusted_observations,
+            expired_observations=expired_observations,
             metric_candidates=metric_candidates,
+            metric_empty_reasons=metric_empty_reasons,
             news_snapshot=news_snapshot,
             now=self._clock(),
             source_coverage=source_coverage,

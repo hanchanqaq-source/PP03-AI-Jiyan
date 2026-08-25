@@ -236,10 +236,12 @@ def test_assembly_uses_only_one_validated_snapshot_and_orders_metrics_by_templat
         now=NOW,
     )
 
-    assert tuple(item.metric_id for item in assembly.report.cycle) == (
+    assert tuple(item.metric_id for item in assembly.report.cycle[:2]) == (
         "dram_price",
         "nand_price",
     )
+    assert len(assembly.report.cycle) == 8
+    assert all(item.current_value is None for item in assembly.report.cycle[2:])
     assert assembly.report.trusted_snapshot_id == "trusted-storage-1"
     assert assembly.report.displayed_trusted_snapshot_id == "trusted-storage-1"
     assert assembly.report == assemble_storage_report(

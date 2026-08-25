@@ -28,6 +28,7 @@ from .models import (
     EvidenceReference,
     FreshnessStatus,
     IndustryMetricObservation,
+    MetricChange,
     SourceRunStatus,
     VerificationStatus,
 )
@@ -91,6 +92,7 @@ class RawMetricObservation:
     methodology: str
     judgment_basis: tuple[str, ...]
     invalidating_conditions: tuple[str, ...]
+    change: MetricChange | None = None
 
     def __post_init__(self) -> None:
         if not self.industry_id.strip() or not self.metric_id.strip() or not self.label.strip():
@@ -105,6 +107,8 @@ class RawMetricObservation:
             raise ValueError("expires_at must be timezone-aware")
         if not self.methodology.strip() or not self.judgment_basis or not self.invalidating_conditions:
             raise ValueError("raw observation requires methodology, basis and invalidating conditions")
+        if self.change is not None and type(self.change) is not MetricChange:
+            raise TypeError("raw observation change must be MetricChange")
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +206,7 @@ def _observation(
         label=row.label,
         current_value=_scalar_value(row.provider_value.value),
         unit=row.provider_value.unit or None,
-        change=None,
+        change=row.change,
         historical_position=None,
         availability_status=AvailabilityStatus.AVAILABLE,
         verification_status=verification,
@@ -220,6 +224,7 @@ def _observation(
         independent_origin_clusters=independent_origin_clusters,
         raw_snapshot_id=raw_snapshot_id,
         evidence_snapshot_id=evidence_snapshot_id,
+        expires_at=row.expires_at.isoformat(),
     )
 
 

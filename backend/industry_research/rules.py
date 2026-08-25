@@ -26,7 +26,6 @@ _OUTLOOK_METRICS = (
     "server_demand",
     "consumer_electronics_demand",
 )
-_EXPIRY_PREFIXES = ("expires_at=", "valid_until=", "失效时间=")
 
 
 def _aware(value: datetime, name: str) -> None:
@@ -34,29 +33,15 @@ def _aware(value: datetime, name: str) -> None:
         raise ValueError(f"{name} must be timezone-aware")
 
 
-def _parse_expiry(condition: str) -> datetime | None:
-    normalized = condition.strip()
-    for prefix in _EXPIRY_PREFIXES:
-        if not normalized.startswith(prefix):
-            continue
-        raw = normalized[len(prefix):].strip()
-        try:
-            value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return value if value.tzinfo is not None and value.utcoffset() is not None else None
-    return None
-
-
 def observation_is_current(observation: IndustryMetricObservation, *, now: datetime) -> bool:
-    """Evaluate only explicit machine-readable invalidation deadlines."""
+    """Evaluate the structured expiry field; never parse methodology prose."""
     _aware(now, "now")
     if observation.freshness_status is FreshnessStatus.EXPIRED:
         return False
-    return not any(
-        expiry is not None and expiry <= now
-        for expiry in (_parse_expiry(item) for item in observation.invalidating_conditions)
-    )
+    if observation.expires_at is None:
+        return True
+    expiry = datetime.fromisoformat(observation.expires_at.replace("Z", "+00:00"))
+    return expiry > now
 
 
 def select_current_trusted_observations(

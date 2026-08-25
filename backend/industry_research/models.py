@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping
 
@@ -188,6 +189,7 @@ class IndustryMetricObservation(WireModel):
     independent_origin_clusters: tuple[str, ...]
     raw_snapshot_id: str | None
     evidence_snapshot_id: str | None
+    expires_at: str | None = None
 
     def __post_init__(self) -> None:
         _require_enum(self.availability_status, AvailabilityStatus, "availability_status")
@@ -196,6 +198,13 @@ class IndustryMetricObservation(WireModel):
         _require_enum(self.source_run_status, SourceRunStatus, "source_run_status")
         if self.empty_reason is not None:
             _require_enum(self.empty_reason, EmptyReason, "empty_reason")
+        if self.expires_at is not None:
+            try:
+                expiry = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+            except (AttributeError, ValueError) as error:
+                raise ValueError("expires_at must be an ISO-8601 datetime") from error
+            if expiry.tzinfo is None or expiry.utcoffset() is None:
+                raise ValueError("expires_at must be timezone-aware")
         if self.current_value is None and self.empty_reason is None:
             raise ValueError("current_value=null requires empty_reason")
         if self.current_value is not None and self.empty_reason is not None:
@@ -293,6 +302,7 @@ class IndustryMetricObservation(WireModel):
             "independent_origin_clusters",
         ):
             values[name] = tuple(values.get(name, ()))
+        values.setdefault("expires_at", None)
         return cls(**values)  # type: ignore[arg-type]
 
 
@@ -577,10 +587,22 @@ class DisplayedTrustedReport(WireModel):
                 raise TypeError("trusted_observations must contain IndustryMetricObservation")
             if observation.industry_id != self.industry_id:
                 raise ValueError("trusted observation industry_id mismatch")
+            if observation.current_value is None:
+                if (
+                    observation.change is not None
+                    or observation.historical_position is not None
+                    or observation.as_of_date is not None
+                    or observation.fetched_at is not None
+                    or observation.evidence
+                    or observation.raw_snapshot_id is not None
+                    or observation.evidence_snapshot_id is not None
+                ):
+                    raise ValueError("trusted_observations empty rows must not retain value provenance")
+                continue
             if observation.verification_status not in {
                 VerificationStatus.VERIFIED, VerificationStatus.CORROBORATED,
             } or observation.freshness_status is FreshnessStatus.EXPIRED:
-                raise ValueError("trusted_observations accept only current verified/corroborated values")
+                raise ValueError("trusted_observations values require current verified/corroborated observations")
         if any(node.industry_id != self.industry_id for node in self.chain):
             raise ValueError("chain node industry_id mismatch")
         if any(company.industry_id != self.industry_id for company in self.companies):
