@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import industry_research.fund_context as fund_context_module
 from industry_research.fund_context import TransientFundContext
 from industry_research.models import FundResolutionEmptyReason, VerificationStatus
 from industry_research.relationships import resolve_fund_relations
@@ -47,29 +48,49 @@ class DiskAdapter(MemoryAdapter):
         return super().get_fund_analysis(code, force_refresh=force_refresh)
 
 
+class FailingBindAdapter(DiskAdapter):
+    def __init__(self, failure: BaseException):
+        super().__init__({})
+        self.failure = failure
+
+    def bind_transient_root(self, root: Path) -> None:
+        self.bound_root = root
+        (root / "opened.tmp").write_text("request resource", encoding="utf-8")
+        raise self.failure
+
+
 def _analysis(
     *,
+    code: str = "900001",
     fund_name: str = "普通基金",
     holdings: dict[str, Any] | None = None,
     holdings_status: str = "disclosed",
+    holdings_reason: str | None = None,
     exposure: dict[str, Any] | None = None,
     exposure_status: str = "disclosed",
+    exposure_reason: str | None = None,
 ) -> dict[str, Any]:
+    holdings_meta = {
+        "status": holdings_status,
+        "source_name": "公开基金披露",
+        "source_reference": "https://example.test/fund/holdings",
+        "as_of_date": "2026-06-30",
+    }
+    exposure_meta = {"status": exposure_status}
+    if holdings_reason is not None:
+        holdings_meta["availability_reason"] = holdings_reason
+    if exposure_reason is not None:
+        exposure_meta["availability_reason"] = exposure_reason
     return {
-        "code": "900001",
+        "code": code,
         "profile": {"data": {"name": fund_name}, "meta": {"status": "disclosed"}},
         "holdings": {
             "data": holdings,
-            "meta": {
-                "status": holdings_status,
-                "source_name": "公开基金披露",
-                "source_reference": "https://example.test/fund/holdings",
-                "as_of_date": "2026-06-30",
-            },
+            "meta": holdings_meta,
         },
         "industry_exposure": {
             "data": exposure,
-            "meta": {"status": exposure_status},
+            "meta": exposure_meta,
         },
         "data_quality": {
             "holdings": {"status": holdings_status},
@@ -84,6 +105,17 @@ def _empty_exposure() -> dict[str, Any]:
         "lookthrough": {"status": "disclosed", "disclosure_date": "2026-06-30"},
         "industry_chain_tags": [],
         "holding_industry_evidence": [],
+    }
+
+
+def _official_config(
+    *,
+    allocation: dict[str, tuple[str, ...]] | None = None,
+    securities: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, object]:
+    return {
+        "official_allocation_name_to_industry_ids": allocation or {},
+        "security_code_to_industry_ids": securities or {},
     }
 
 
@@ -152,12 +184,19 @@ def test_name_keywords_without_disclosed_security_codes_remain_unknown(monkeypat
     [
         (
             "900001",
-            _analysis(holdings=None, holdings_status="unavailable", exposure=None, exposure_status="unavailable"),
+            _analysis(
+                code="900001",
+                holdings=None,
+                holdings_status="unavailable",
+                holdings_reason="not_disclosed",
+                exposure=None,
+                exposure_status="unavailable",
+            ),
             FundResolutionEmptyReason.NOT_DISCLOSED,
         ),
         (
             "900002",
-            _analysis(holdings=None, holdings_status="error", exposure=None, exposure_status="error"),
+            _analysis(code="900002", holdings=None, holdings_status="error", exposure=None, exposure_status="error"),
             FundResolutionEmptyReason.SOURCE_UNAVAILABLE,
         ),
         (
@@ -191,8 +230,8 @@ def test_broad_official_allocation_is_explicitly_pending_not_disclosed_lookthrou
         "source_name": "基金定期报告",
         "source_reference": "https://example.test/fund/allocation",
         "exposure": [{
-            "industry_id": "storage",
             "name": "制造业",
+            "display_name": "制造业（待穿透）",
             "weight_pct": 80.0,
             "requires_lookthrough": True,
         }],
@@ -205,7 +244,9 @@ def test_broad_official_allocation_is_explicitly_pending_not_disclosed_lookthrou
                 holdings={"holdings": [], "disclosure_date": "2026-06-30"},
                 exposure=exposure,
             )
-        })),
+        }), official_industry_config=_official_config(
+            allocation={"制造业": ("storage",)},
+        )),
     )
 
     relation = result.resolutions[0].relation
@@ -248,7 +289,9 @@ def test_disclosed_lookthrough_uses_exact_service_tag_and_security_code_evidence
                 holdings={"holdings": [{"stock_code": "688001"}], "disclosure_date": "2026-06-30"},
                 exposure=exposure,
             )
-        })),
+        }), official_industry_config=_official_config(
+            securities={"688001": ("storage",)},
+        )),
     )
 
     relation = result.resolutions[0].relation
@@ -258,6 +301,7 @@ def test_disclosed_lookthrough_uses_exact_service_tag_and_security_code_evidence
     assert relation.exposure_unit == "percent"
     assert relation.disclosure_date == "2026-06-30"
     assert relation.evidence_ids
+    assert relation.status is VerificationStatus.VERIFIED
     assert result.pending_lookthrough_selection_ids == ()
     _assert_no_private_fields(result.to_dict())
 
@@ -274,6 +318,7 @@ def test_disclosed_lookthrough_uses_exact_service_tag_and_security_code_evidence
 def test_disk_adapter_cleanup_is_finally_bound_for_all_exit_paths(tmp_path: Path, outcome: object) -> None:
     # Break caught: request-scoped fund codes remain on disk after success, failure, or cancellation.
     acceptance_root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    acceptance_root.mkdir(parents=True)
     adapter = DiskAdapter({"900001": outcome})
     context = TransientFundContext(adapter=adapter, acceptance_root=acceptance_root)
 
@@ -317,3 +362,325 @@ def test_request_contract_rejects_non_code_objects_before_any_adapter_access() -
 
     assert adapter.calls == []
     assert context.closed is True
+
+
+def test_analysis_identity_must_equal_the_requested_fund_code() -> None:
+    # Break caught: a cached analysis for another fund is projected under the requested code.
+    exposure = _empty_exposure()
+    exposure["official_allocation"] = {
+        "as_of_date": "2026-06-30",
+        "source_name": "基金定期报告",
+        "source_reference": "https://example.test/fund/allocation",
+        "exposure": [{"name": "制造业", "display_name": "制造业（待穿透）", "weight_pct": 80.0,
+                      "requires_lookthrough": True}],
+    }
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(code="900099", exposure=exposure)}),
+            official_industry_config=_official_config(allocation={"制造业": ("storage",)}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("holdings_status", "exposure_status", "reason"),
+    [
+        ("error", "disclosed", FundResolutionEmptyReason.SOURCE_UNAVAILABLE),
+        ("disclosed", "unavailable", FundResolutionEmptyReason.UNKNOWN),
+    ],
+)
+def test_unusable_consumed_section_status_never_forms_lookthrough_relation(
+    holdings_status: str,
+    exposure_status: str,
+    reason: FundResolutionEmptyReason,
+) -> None:
+    # Break caught: relation payload data is trusted even though its section meta reports failure.
+    exposure = _empty_exposure()
+    exposure.update({
+        "industry_chain_tags": [{"id": "storage", "weight_pct": 12.5,
+                                  "evidence_level": "disclosed_stock_classification"}],
+        "holding_industry_evidence": [{"stock_code": "688001", "source_reference": "https://example.test/c/1",
+                                        "holding_disclosure_date": "2026-06-30"}],
+    })
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                holdings={"holdings": [{"stock_code": "688001"}], "disclosure_date": "2026-06-30"},
+                holdings_status=holdings_status,
+                exposure=exposure,
+                exposure_status=exposure_status,
+            )}),
+            official_industry_config=_official_config(securities={"688001": ("storage",)}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is reason
+
+
+def test_ambiguous_unavailable_without_structured_reason_stays_unknown() -> None:
+    # Break caught: an ambiguous unavailable status is guessed to mean no disclosure.
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(adapter=MemoryAdapter({
+            "900001": _analysis(holdings=None, holdings_status="unavailable", exposure=None,
+                                exposure_status="unavailable")
+        })),
+    )
+
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("holdings", "status"),
+    [
+        (None, "disclosed"),
+        ({"holdings": [], "disclosure_date": "2026-06-30"}, "unavailable"),
+    ],
+    ids=("usable-status-conflict", "data-present-conflict"),
+)
+def test_not_disclosed_requires_consistent_structured_absence(
+    holdings: dict[str, Any] | None,
+    status: str,
+) -> None:
+    # Break caught: a contradictory reason marker is accepted as proof of disclosure absence.
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(adapter=MemoryAdapter({
+            "900001": _analysis(
+                holdings=holdings,
+                holdings_status=status,
+                holdings_reason="not_disclosed",
+                exposure=None,
+                exposure_status="unavailable",
+            )
+        })),
+    )
+
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+def test_structured_source_failure_blocks_conflicting_usable_payload() -> None:
+    # Break caught: a disclosed status masks an explicit source-failure reason and forms a relation.
+    exposure = _empty_exposure()
+    exposure["official_allocation"] = {
+        "as_of_date": "2026-06-30",
+        "source_name": "基金定期报告",
+        "source_reference": "https://example.test/fund/allocation",
+        "exposure": [{"name": "制造业", "display_name": "制造业（待穿透）", "weight_pct": 80.0,
+                      "requires_lookthrough": True}],
+    }
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                exposure=exposure,
+                exposure_status="disclosed",
+                exposure_reason="source_unavailable",
+            )}),
+            official_industry_config=_official_config(allocation={"制造业": ("storage",)}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.SOURCE_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    ("holdings_date", "lookthrough_date", "evidence_date", "security_industries"),
+    [
+        ("2026-03-31", "2026-06-30", "2026-06-30", ("storage",)),
+        ("2026-06-30", "2026-06-30", "2026-03-31", ("storage",)),
+        ("2026-06-30", "2026-06-30", "2026-06-30", ("semiconductor",)),
+    ],
+    ids=("holdings-date-mismatch", "evidence-date-mismatch", "foreign-industry"),
+)
+def test_lookthrough_rejects_mismatched_dates_or_foreign_industry_evidence(
+    holdings_date: str,
+    lookthrough_date: str,
+    evidence_date: str,
+    security_industries: tuple[str, ...],
+) -> None:
+    # Break caught: unrelated disclosure/classification evidence supports a storage relation.
+    exposure = _empty_exposure()
+    exposure.update({
+        "industry_chain_tags": [{"id": "storage", "weight_pct": 12.5,
+                                  "evidence_level": "disclosed_stock_classification"}],
+        "holding_industry_evidence": [{"stock_code": "688001", "source_reference": "https://example.test/c/1",
+                                        "holding_disclosure_date": evidence_date}],
+        "lookthrough": {"status": "disclosed", "disclosure_date": lookthrough_date},
+    })
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                holdings={"holdings": [{"stock_code": "688001"}], "disclosure_date": holdings_date},
+                exposure=exposure,
+            )}),
+            official_industry_config=_official_config(securities={"688001": security_industries}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+def test_lookthrough_rejects_foreign_security_and_fund_evidence() -> None:
+    # Break caught: evidence for another fund/security is admitted under the selected fund.
+    exposure = _empty_exposure()
+    exposure.update({
+        "fund_code": "900099",
+        "industry_chain_tags": [{"id": "storage", "weight_pct": 12.5,
+                                  "evidence_level": "disclosed_stock_classification"}],
+        "holding_industry_evidence": [{"fund_code": "900099", "stock_code": "688002",
+                                        "source_reference": "https://example.test/c/2",
+                                        "holding_disclosure_date": "2026-06-30"}],
+    })
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                holdings={"fund_code": "900001", "holdings": [{"stock_code": "688001"}],
+                          "disclosure_date": "2026-06-30"},
+                exposure=exposure,
+            )}),
+            official_industry_config=_official_config(securities={"688002": ("storage",)}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("bind failed"), asyncio.CancelledError()],
+                         ids=("exception", "cancellation"))
+def test_constructor_bind_failure_closes_adapter_before_removing_temp(
+    tmp_path: Path,
+    failure: BaseException,
+) -> None:
+    # Break caught: an already-open request adapter leaks when bind raises BaseException.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = FailingBindAdapter(failure)
+
+    with pytest.raises(type(failure)) as raised:
+        TransientFundContext(adapter=adapter, acceptance_root=root)
+
+    assert raised.value is failure
+    assert adapter.closed == 1
+    assert not any(root.iterdir())
+
+
+def test_nonexistent_acceptance_parent_is_rejected_and_adapter_is_closed(tmp_path: Path) -> None:
+    # Break caught: the context creates an unvalidated parent chain before checking its identity.
+    root = tmp_path / ".tmp" / "acceptance" / "missing"
+    adapter = DiskAdapter({})
+    context = None
+    try:
+        with pytest.raises(ValueError, match="must already exist"):
+            context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    finally:
+        if context is not None:
+            context.close()
+
+    assert adapter.closed == 1
+    assert not root.exists()
+
+
+def test_directory_identity_swap_refuses_delete_then_allows_safe_retry(tmp_path: Path, monkeypatch) -> None:
+    # Break caught: a replaced request directory is recursively deleted by pathname alone.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    original = getattr(context, "_directory_identity", lambda _path: (1, 1, 0, 0))
+
+    def swapped(path: Path):
+        identity = original(path)
+        return (identity[0], identity[1] + 1, *identity[2:]) if path == context.temp_root else identity
+
+    monkeypatch.setattr(context, "_directory_identity", swapped, raising=False)
+    try:
+        with pytest.raises(RuntimeError, match="identity"):
+            context.close()
+        assert context.closed is False
+        assert adapter.closed == 1
+        assert context.temp_root is not None and context.temp_root.exists()
+    finally:
+        monkeypatch.setattr(context, "_directory_identity", original, raising=False)
+        if not context.closed:
+            context.close()
+
+    assert context.closed is True
+    assert adapter.closed == 1
+
+
+def test_reparse_detection_refuses_delete_then_allows_safe_retry(tmp_path: Path, monkeypatch) -> None:
+    # Break caught: a junction/reparse target is followed during recursive cleanup.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    original = getattr(context, "_directory_identity", lambda _path: (1, 1, 0, 0))
+
+    def reparse(path: Path):
+        if path == context.temp_root:
+            raise RuntimeError("reparse directory rejected")
+        return original(path)
+
+    monkeypatch.setattr(context, "_directory_identity", reparse, raising=False)
+    try:
+        with pytest.raises(RuntimeError, match="reparse"):
+            context.close()
+        assert context.closed is False
+        assert context.temp_root is not None and context.temp_root.exists()
+    finally:
+        monkeypatch.setattr(context, "_directory_identity", original, raising=False)
+        if not context.closed:
+            context.close()
+
+
+def test_rmtree_failure_keeps_context_retryable_without_double_closing_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Break caught: a failed delete marks the context closed and prevents residue cleanup retry.
+    root = tmp_path / ".tmp" / "acceptance" / "v0.2-w3"
+    root.mkdir(parents=True)
+    adapter = DiskAdapter({})
+    context = TransientFundContext(adapter=adapter, acceptance_root=root)
+    original = fund_context_module.shutil.rmtree
+    calls = 0
+
+    def fail_once(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected rmtree failure")
+        return original(path)
+
+    monkeypatch.setattr(fund_context_module.shutil, "rmtree", fail_once)
+    with pytest.raises(OSError, match="injected rmtree failure"):
+        context.close()
+
+    assert context.closed is False
+    assert adapter.closed == 1
+    assert context.temp_root is not None and context.temp_root.exists()
+
+    context.close()
+
+    assert context.closed is True
+    assert adapter.closed == 1
+    assert context.temp_root is not None and not context.temp_root.exists()

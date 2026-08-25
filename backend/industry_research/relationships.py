@@ -20,6 +20,7 @@ from .models import (
 
 _SIX_DIGIT_CODE = re.compile(r"^[0-9]{6}$")
 _SOURCE_FAILURE_STATUSES = {"error", "failed", "source_failure", "source_unavailable"}
+_USABLE_SECTION_STATUSES = {"disclosed", "official", "verified", "corroborated"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,26 +134,62 @@ def _holdings_codes(analysis: Mapping[str, Any]) -> set[str]:
     return codes
 
 
+def _section_status(section: Mapping[str, Any]) -> str:
+    return str(_mapping(section.get("meta")).get("status") or "").strip().casefold()
+
+
+def _section_is_usable(section: Mapping[str, Any]) -> bool:
+    meta = _mapping(section.get("meta"))
+    return (
+        _section_status(section) in _USABLE_SECTION_STATUSES
+        and not _nonblank(meta.get("availability_reason"))
+    )
+
+
+def _matching_optional_fund_code(value: Mapping[str, Any], fund_code: str) -> bool:
+    declared = value.get("fund_code")
+    return declared is None or declared == fund_code
+
+
+def _analysis_identity_matches(analysis: Mapping[str, Any], fund_code: str) -> bool:
+    if analysis.get("code") != fund_code:
+        return False
+    holdings = _mapping(_mapping(analysis.get("holdings")).get("data"))
+    exposure = _mapping(_mapping(analysis.get("industry_exposure")).get("data"))
+    return (
+        _matching_optional_fund_code(holdings, fund_code)
+        and _matching_optional_fund_code(exposure, fund_code)
+    )
+
+
 def _lookthrough_relation(
     *,
     industry_id: str,
     fund_code: str,
     analysis: Mapping[str, Any],
+    context: TransientFundContext,
 ) -> IndustryFundRelation | None:
-    exposure = _mapping(_mapping(analysis.get("industry_exposure")).get("data"))
+    holdings_section = _mapping(analysis.get("holdings"))
+    exposure_section = _mapping(analysis.get("industry_exposure"))
+    if not _section_is_usable(holdings_section) or not _section_is_usable(exposure_section):
+        return None
+    holdings = _mapping(holdings_section.get("data"))
+    exposure = _mapping(exposure_section.get("data"))
+    if not _matching_optional_fund_code(holdings, fund_code) or not _matching_optional_fund_code(exposure, fund_code):
+        return None
     lookthrough = _mapping(exposure.get("lookthrough"))
     if lookthrough.get("status") != "disclosed":
         return None
     disclosure_date = _nonblank(lookthrough.get("disclosure_date"))
-    if disclosure_date is None:
-        disclosure_date = _nonblank(_mapping(_mapping(analysis.get("holdings")).get("data")).get("disclosure_date"))
-    if disclosure_date is None:
+    holdings_date = _nonblank(holdings.get("disclosure_date"))
+    if disclosure_date is None or holdings_date != disclosure_date:
         return None
     tag = next((
         _mapping(item)
         for item in _sequence(exposure.get("industry_chain_tags"))
         if _mapping(item).get("id") == industry_id
         and _mapping(item).get("evidence_level") == "disclosed_stock_classification"
+        and _matching_optional_fund_code(_mapping(item), fund_code)
     ), None)
     if not tag:
         return None
@@ -162,7 +199,7 @@ def _lookthrough_relation(
     disclosed_codes = _holdings_codes(analysis)
     if not disclosed_codes:
         return None
-    holding_meta = _mapping(_mapping(analysis.get("holdings")).get("meta"))
+    holding_meta = _mapping(holdings_section.get("meta"))
     holdings_reference = _nonblank(holding_meta.get("source_reference"))
     if holdings_reference is None:
         return None
@@ -171,7 +208,10 @@ def _lookthrough_relation(
     }
     classification_references: set[str] = set()
     evidenced_codes: set[str] = set()
-    for item in _sequence(exposure.get("holding_industry_evidence")):
+    evidence_rows = _sequence(exposure.get("holding_industry_evidence"))
+    if not evidence_rows:
+        return None
+    for item in evidence_rows:
         row = _mapping(item)
         code = _nonblank(row.get("stock_code"))
         reference = _nonblank(row.get("source_reference"))
@@ -182,15 +222,15 @@ def _lookthrough_relation(
             or _SIX_DIGIT_CODE.fullmatch(code) is None
             or reference is None
             or evidence_date != disclosure_date
+            or not _matching_optional_fund_code(row, fund_code)
+            or not context.security_matches(industry_id=industry_id, security_code=code)
         ):
-            continue
+            return None
         classification_references.add(reference)
         evidenced_codes.add(code)
         evidence_ids.add(_evidence_id("security-classification", reference, code, disclosure_date))
     if not evidenced_codes:
         return None
-    source_count = len(classification_references | {holdings_reference})
-    status = VerificationStatus.CORROBORATED if source_count >= 2 else VerificationStatus.VERIFIED
     return IndustryFundRelation(
         industry_id=industry_id,
         fund_code=fund_code,
@@ -199,7 +239,7 @@ def _lookthrough_relation(
         exposure_unit="percent",
         disclosure_date=disclosure_date,
         evidence_ids=tuple(sorted(evidence_ids)),
-        status=status,
+        status=VerificationStatus.VERIFIED,
     )
 
 
@@ -208,20 +248,32 @@ def _official_allocation_relation(
     industry_id: str,
     fund_code: str,
     analysis: Mapping[str, Any],
+    context: TransientFundContext,
 ) -> tuple[IndustryFundRelation | None, bool]:
-    exposure = _mapping(_mapping(analysis.get("industry_exposure")).get("data"))
+    exposure_section = _mapping(analysis.get("industry_exposure"))
+    if not _section_is_usable(exposure_section):
+        return None, False
+    exposure = _mapping(exposure_section.get("data"))
+    if not _matching_optional_fund_code(exposure, fund_code):
+        return None, False
     allocation = _mapping(exposure.get("official_allocation"))
     as_of_date = _nonblank(allocation.get("as_of_date"))
     source_reference = _nonblank(allocation.get("source_reference"))
     if as_of_date is None or source_reference is None:
         return None, False
-    row = next((
-        _mapping(item)
-        for item in _sequence(allocation.get("exposure"))
-        if _mapping(item).get("industry_id") == industry_id
-    ), None)
-    if not row:
+    matching_rows = tuple(
+        _mapping(item) for item in _sequence(allocation.get("exposure"))
+        if _matching_optional_fund_code(_mapping(item), fund_code)
+        and _mapping(item).get("industry_id") in {None, industry_id}
+        and isinstance(_mapping(item).get("name"), str)
+        and context.official_allocation_matches(
+            industry_id=industry_id,
+            official_name=str(_mapping(item).get("name")),
+        )
+    )
+    if len(matching_rows) != 1:
         return None, False
+    row = matching_rows[0]
     value = _finite_percent(row.get("weight_pct"))
     if value is None:
         return None, False
@@ -240,14 +292,22 @@ def _official_allocation_relation(
 
 def _unresolved_reason(analysis: Mapping[str, Any]) -> FundResolutionEmptyReason:
     holdings_section = _mapping(analysis.get("holdings"))
-    holdings_data = holdings_section.get("data")
-    holdings_status = str(_mapping(holdings_section.get("meta")).get("status") or "").casefold()
-    exposure_status = str(
-        _mapping(_mapping(analysis.get("industry_exposure")).get("meta")).get("status") or ""
-    ).casefold()
+    exposure_section = _mapping(analysis.get("industry_exposure"))
+    holdings_meta = _mapping(holdings_section.get("meta"))
+    exposure_meta = _mapping(exposure_section.get("meta"))
+    holdings_status = _section_status(holdings_section)
+    exposure_status = _section_status(exposure_section)
+    holdings_reason = str(holdings_meta.get("availability_reason") or "").casefold()
+    exposure_reason = str(exposure_meta.get("availability_reason") or "").casefold()
     if holdings_status in _SOURCE_FAILURE_STATUSES or exposure_status in _SOURCE_FAILURE_STATUSES:
         return FundResolutionEmptyReason.SOURCE_UNAVAILABLE
-    if holdings_data is None or holdings_status == "not_disclosed":
+    if "source_unavailable" in {holdings_reason, exposure_reason}:
+        return FundResolutionEmptyReason.SOURCE_UNAVAILABLE
+    if (
+        holdings_reason == "not_disclosed"
+        and holdings_status in {"unavailable", "not_disclosed"}
+        and holdings_section.get("data") is None
+    ):
         return FundResolutionEmptyReason.NOT_DISCLOSED
     return FundResolutionEmptyReason.UNKNOWN
 
@@ -295,10 +355,19 @@ def resolve_fund_relations(
                     empty_reason=FundResolutionEmptyReason.SOURCE_UNAVAILABLE,
                 ))
                 continue
+            if not _analysis_identity_matches(analysis, selection.fund_code):
+                resolutions.append(IndustryFundRelationResolution(
+                    selection_id=selection.selection_id,
+                    fund_code=selection.fund_code,
+                    relation=None,
+                    empty_reason=FundResolutionEmptyReason.UNKNOWN,
+                ))
+                continue
             relation = _lookthrough_relation(
                 industry_id=industry_id,
                 fund_code=selection.fund_code,
                 analysis=analysis,
+                context=context,
             )
             requires_lookthrough = False
             if relation is None:
@@ -306,6 +375,7 @@ def resolve_fund_relations(
                     industry_id=industry_id,
                     fund_code=selection.fund_code,
                     analysis=analysis,
+                    context=context,
                 )
             if relation is not None:
                 resolutions.append(IndustryFundRelationResolution(
