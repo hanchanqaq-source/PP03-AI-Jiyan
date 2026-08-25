@@ -105,11 +105,42 @@ export function createTagRequestCoordinator<T>(
 }
 
 export function useTagRequestCoordinator<T>(): TagRequestCoordinator<T> {
-  const coordinatorRef = useRef<TagRequestCoordinator<T> | null>(null);
-  if (coordinatorRef.current === null) coordinatorRef.current = createTagRequestCoordinator<T>();
+  const activeRef = useRef<TagRequestCoordinator<T> | null>(null);
+  const sequenceRef = useRef(0n);
+  const facadeRef = useRef<TagRequestCoordinator<T> | null>(null);
+  if (facadeRef.current === null) {
+    facadeRef.current = {
+      async run(options) {
+        const coordinator = activeRef.current;
+        if (coordinator === null) throw new Error("请求协调器已释放，不能继续使用");
+        return coordinator.run({
+          ...options,
+          request: (context) => {
+            sequenceRef.current = context.sequence;
+            return options.request(context);
+          },
+        });
+      },
+      cancel() {
+        activeRef.current?.cancel();
+      },
+      dispose() {
+        const coordinator = activeRef.current;
+        activeRef.current = null;
+        coordinator?.dispose();
+      },
+      current() {
+        return activeRef.current?.current() ?? null;
+      },
+    };
+  }
   useEffect(() => {
-    const coordinator = coordinatorRef.current;
-    return () => coordinator?.dispose();
+    const coordinator = createTagRequestCoordinator<T>({ initialSequence: sequenceRef.current });
+    activeRef.current = coordinator;
+    return () => {
+      coordinator.dispose();
+      if (activeRef.current === coordinator) activeRef.current = null;
+    };
   }, []);
-  return coordinatorRef.current;
+  return facadeRef.current;
 }

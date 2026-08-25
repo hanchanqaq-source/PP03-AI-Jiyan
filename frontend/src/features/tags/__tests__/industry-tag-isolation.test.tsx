@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
-import { createTagRequestCoordinator, tagRequestKey } from "../requestCoordinator";
+import { createTagRequestCoordinator, tagRequestKey, useTagRequestCoordinator } from "../requestCoordinator";
 import { loadCustomTagCatalog } from "../preferences";
 import { TagSelector } from "../TagSelector";
 import { usePageTags } from "../usePageTags";
@@ -301,6 +301,171 @@ describe("industry tag state and request isolation", () => {
       commit: vi.fn(),
     })).rejects.toThrow("sync failure");
     expect(coordinator.current()).toBeNull();
+  });
+
+  it("rebuilds the hook coordinator for the second StrictMode effect setup", async () => {
+    const commit = vi.fn();
+    const outcomes: Array<Promise<{
+      status: "resolved" | "rejected";
+      value: string;
+    }>> = [];
+    let effectRun = 0;
+    function Harness() {
+      const coordinator = useTagRequestCoordinator<ReportObject>();
+      useEffect(() => {
+        const run = effectRun += 1;
+        outcomes.push(coordinator.run({
+          pageKey: "industry_research",
+          industryId: run === 1 ? "storage" : "robotics",
+          request: async () => ({
+            industryId: run === 1 ? "storage" : "robotics",
+            snapshotId: `strict-${run}`,
+            metrics: [],
+          }),
+          commit,
+        }).then(
+          (value) => ({ status: "resolved" as const, value }),
+          (error: unknown) => ({
+            status: "rejected" as const,
+            value: error instanceof Error ? error.message : String(error),
+          }),
+        ));
+      }, [coordinator]);
+      return null;
+    }
+
+    render(<StrictMode><Harness /></StrictMode>);
+    const settled = await Promise.all(outcomes);
+
+    expect(effectRun).toBe(2);
+    expect.soft(settled).toEqual([
+      { status: "resolved", value: "ignored" },
+      { status: "resolved", value: "committed" },
+    ]);
+    expect.soft(commit).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledWith(
+      { industryId: "robotics", snapshotId: "strict-2", metrics: [] },
+      expect.objectContaining({ industryId: "robotics", sequence: 2n }),
+    );
+  });
+
+  it("aborts hook work on real unmount and fails closed afterward", async () => {
+    let coordinator!: ReturnType<typeof useTagRequestCoordinator<ReportObject>>;
+    function Harness() {
+      coordinator = useTagRequestCoordinator<ReportObject>();
+      return null;
+    }
+    const view = render(<Harness />);
+    const pending = deferred<ReportObject>();
+    const commit = vi.fn();
+    let signal!: AbortSignal;
+    const run = coordinator.run({
+      pageKey: "industry_research",
+      industryId: "storage",
+      request: (context) => { signal = context.signal; return pending.promise; },
+      commit,
+    });
+
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+    pending.resolve({ industryId: "storage", snapshotId: "late-after-unmount", metrics: [] });
+
+    await expect(run).resolves.toBe("ignored");
+    expect(commit).not.toHaveBeenCalled();
+    expect(coordinator.current()).toBeNull();
+    await expect(coordinator.run({
+      pageKey: "industry_research",
+      industryId: "robotics",
+      request: async () => ({ industryId: "robotics", snapshotId: "unused", metrics: [] }),
+      commit,
+    })).rejects.toThrow("请求协调器已释放");
+  });
+
+  it("routes current and cancel through the mounted StrictMode generation", async () => {
+    let coordinator!: ReturnType<typeof useTagRequestCoordinator<ReportObject>>;
+    function Harness() {
+      coordinator = useTagRequestCoordinator<ReportObject>();
+      return null;
+    }
+    render(<StrictMode><Harness /></StrictMode>);
+    const pending = deferred<ReportObject>();
+    const commit = vi.fn();
+    let signal: AbortSignal | undefined;
+    const run = coordinator.run({
+      pageKey: "industry_research",
+      industryId: "storage",
+      request: (context) => { signal = context.signal; return pending.promise; },
+      commit,
+    }).then(
+      (value) => ({ status: "resolved" as const, value }),
+      (error: unknown) => ({
+        status: "rejected" as const,
+        value: error instanceof Error ? error.message : String(error),
+      }),
+    );
+
+    expect.soft(coordinator.current()).toEqual({
+      pageKey: "industry_research",
+      industryId: "storage",
+      queryKey: "17:industry_research7:storage",
+      sequence: 1n,
+    });
+    coordinator.cancel();
+    expect.soft(signal?.aborted).toBe(true);
+    expect.soft(coordinator.current()).toBeNull();
+    pending.resolve({ industryId: "storage", snapshotId: "late-after-cancel", metrics: [] });
+
+    expect.soft(await run).toEqual({ status: "resolved", value: "ignored" });
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it("keeps stale late responses isolated after StrictMode replay", async () => {
+    let coordinator!: ReturnType<typeof useTagRequestCoordinator<ReportObject>>;
+    function Harness() {
+      coordinator = useTagRequestCoordinator<ReportObject>();
+      return null;
+    }
+    render(<StrictMode><Harness /></StrictMode>);
+    const stale = deferred<ReportObject>();
+    const latest = deferred<ReportObject>();
+    const commit = vi.fn();
+    let staleSignal: AbortSignal | undefined;
+    const staleRun = coordinator.run({
+      pageKey: "industry_research",
+      industryId: "storage",
+      request: ({ signal }) => { staleSignal = signal; return stale.promise; },
+      commit,
+    }).then(
+      (value) => ({ status: "resolved" as const, value }),
+      (error: unknown) => ({
+        status: "rejected" as const,
+        value: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    const latestRun = coordinator.run({
+      pageKey: "industry_research",
+      industryId: "robotics",
+      request: () => latest.promise,
+      commit,
+    }).then(
+      (value) => ({ status: "resolved" as const, value }),
+      (error: unknown) => ({
+        status: "rejected" as const,
+        value: error instanceof Error ? error.message : String(error),
+      }),
+    );
+
+    expect.soft(staleSignal?.aborted).toBe(true);
+    latest.resolve({ industryId: "robotics", snapshotId: "latest-after-replay", metrics: [] });
+    stale.resolve({ industryId: "storage", snapshotId: "stale-after-replay", metrics: [] });
+
+    expect.soft(await staleRun).toEqual({ status: "resolved", value: "ignored" });
+    expect.soft(await latestRun).toEqual({ status: "resolved", value: "committed" });
+    expect.soft(commit).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledWith(
+      { industryId: "robotics", snapshotId: "latest-after-replay", metrics: [] },
+      expect.objectContaining({ industryId: "robotics", sequence: 2n }),
+    );
   });
 
   it("disposes pending work and refuses reuse", async () => {
