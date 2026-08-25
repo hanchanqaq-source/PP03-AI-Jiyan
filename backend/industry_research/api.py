@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 import re
 from typing import Any, Protocol, Sequence
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from .models import (
     CandidateEvidenceCounts,
@@ -30,6 +31,7 @@ router = APIRouter(prefix="/api/industry-research", tags=["industry-research"])
 _INDUSTRY_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$", re.ASCII)
 _FUND_CODE = re.compile(r"^[0-9]{6}$", re.ASCII)
 _WINDOWS = frozenset({7, 30, 90})
+_FUND_RELATION_BODY_MAX_BYTES = 4096
 
 
 class IndustryResearchService(Protocol):
@@ -263,13 +265,94 @@ class FundRelationRequest(BaseModel):
         return tuple(normalized)
 
 
+class _InvalidFundRelationRequest(ValueError):
+    pass
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _InvalidFundRelationRequest
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise _InvalidFundRelationRequest
+
+
+def _raw_header_values(request: Request, name: bytes) -> list[bytes]:
+    return [
+        value
+        for key, value in request.scope.get("headers", ())
+        if key.lower() == name
+    ]
+
+
+def _declared_fund_body_length(request: Request) -> int | None:
+    values = _raw_header_values(request, b"content-length")
+    transfer_encoding = _raw_header_values(request, b"transfer-encoding")
+    if len(values) > 1 or len(transfer_encoding) > 1:
+        raise HTTPException(400, "invalid_fund_relation_request")
+    if transfer_encoding:
+        if values or transfer_encoding[0].strip().lower() != b"chunked":
+            raise HTTPException(400, "invalid_fund_relation_request")
+    if not values:
+        return None
+    try:
+        value = values[0].decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "invalid_fund_relation_request") from None
+    if re.fullmatch(r"[0-9]+", value, re.ASCII) is None:
+        raise HTTPException(400, "invalid_fund_relation_request")
+    declared = int(value)
+    if declared > _FUND_RELATION_BODY_MAX_BYTES:
+        raise HTTPException(413, "fund_relation_request_too_large")
+    return declared
+
+
+async def _read_fund_relation_request(request: Request) -> FundRelationRequest:
+    declared = _declared_fund_body_length(request)
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            observed = len(body) + len(chunk)
+            if observed > _FUND_RELATION_BODY_MAX_BYTES:
+                raise HTTPException(413, "fund_relation_request_too_large")
+            if declared is not None and observed > declared:
+                raise HTTPException(400, "invalid_fund_relation_request")
+            body.extend(chunk)
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError):
+        raise HTTPException(400, "invalid_fund_relation_request") from None
+    if declared is not None and len(body) != declared:
+        raise HTTPException(400, "invalid_fund_relation_request")
+    try:
+        text = bytes(body).decode("utf-8")
+        document = json.loads(
+            text,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _InvalidFundRelationRequest):
+        raise HTTPException(400, "invalid_fund_relation_request") from None
+    if type(document) is not dict:
+        raise HTTPException(400, "invalid_fund_relation_request")
+    try:
+        return FundRelationRequest.model_validate(document)
+    except (TypeError, ValueError, ValidationError):
+        raise HTTPException(422, "invalid_fund_relation_request") from None
+
+
 @router.post("/{industry_id}/fund-relations/resolve")
-def resolve_fund_relations(
+async def resolve_fund_relations(
     request: Request,
-    payload: FundRelationRequest,
     industry_id: str,
 ):
     industry_id = _industry_id(industry_id)
+    payload = await _read_fund_relation_request(request)
     service = _service(request)
     try:
         projection = service.resolve_fund_relations(industry_id, payload.fund_codes)

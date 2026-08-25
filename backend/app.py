@@ -136,7 +136,7 @@ _INDUSTRY_RESEARCH_WRITE_PATH = re.compile(
     re.ASCII,
 )
 _INDUSTRY_RESEARCH_FUND_PATH = re.compile(
-    r"^/api/industry-research/[a-z0-9][a-z0-9_-]{0,63}/fund-relations/resolve$",
+    r"^/api/industry-research/.+/fund-relations/resolve$",
     re.ASCII,
 )
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 import threading
 
@@ -470,7 +471,174 @@ def test_fund_resolution_rejects_private_or_malformed_input_before_service() -> 
     assert malformed.status_code == 422
     assert private.headers["cache-control"] == "no-store"
     assert malformed.headers["cache-control"] == "no-store"
+    assert private.json() == {"detail": "invalid_fund_relation_request"}
+    assert malformed.json() == {"detail": "invalid_fund_relation_request"}
+    assert "account" not in private.text
+    assert "private" not in private.text
     assert service.resolutions == []
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_status"),
+    [
+        (b'{"fund_codes":["900001"],"private_note":"private-marker"}', 422),
+        (b'{"fund_codes":["900001"],"fund_codes":["900002"]}', 400),
+        (b'{"fund_codes":["900001"],"broken":"private-marker"', 400),
+        (b'{"fund_codes":["900001"],"broken":"\xff"}', 400),
+    ],
+)
+def test_fund_body_errors_are_exact_generic_redacted_and_no_store(
+    body: bytes,
+    expected_status: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = RecordingService()
+    caplog.set_level(logging.DEBUG)
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers={**WRITE_HEADERS, "Content-Type": "application/json"},
+        content=body,
+    )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": "invalid_fund_relation_request"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert "private-marker" not in response.text
+    assert "private-marker" not in caplog.text
+    assert service.resolutions == []
+
+
+@pytest.mark.parametrize("invalid_id", ["Storage", "storage%2Fother"])
+def test_fund_path_shape_is_no_store_before_industry_id_validation(invalid_id: str) -> None:
+    service = RecordingService()
+    response = _client(service).post(
+        f"/api/industry-research/{invalid_id}/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 400
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert service.resolutions == []
+
+
+def test_fund_request_rejects_declared_oversize_before_model_validation(monkeypatch) -> None:
+    service = RecordingService()
+    validation_calls = 0
+
+    def forbidden_validation(_cls, _payload):
+        nonlocal validation_calls
+        validation_calls += 1
+        raise AssertionError("oversize body reached model validation")
+
+    monkeypatch.setattr(
+        industry_api.FundRelationRequest,
+        "model_validate",
+        classmethod(forbidden_validation),
+    )
+    marker = "private-marker"
+    body = json.dumps(
+        {"fund_codes": ["900001"], "padding": marker * 16_384},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers={**WRITE_HEADERS, "Content-Type": "application/json"},
+        content=body,
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "fund_relation_request_too_large"}
+    assert response.headers["cache-control"] == "no-store"
+    assert marker not in response.text
+    assert validation_calls == 0
+    assert service.resolutions == []
+
+
+def test_fund_request_stream_is_bounded_without_content_length() -> None:
+    service = RecordingService()
+
+    def chunks():
+        yield b'{"fund_codes":["900001"],"padding":"'
+        for _ in range(128):
+            yield b"private-marker" * 128
+        yield b'"}'
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers={**WRITE_HEADERS, "Content-Type": "application/json"},
+        content=chunks(),
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "fund_relation_request_too_large"}
+    assert response.headers["cache-control"] == "no-store"
+    assert "private-marker" not in response.text
+    assert service.resolutions == []
+
+
+def test_fund_request_accepts_small_chunked_body_without_content_length() -> None:
+    service = RecordingService()
+
+    def chunks():
+        yield b'{"fund_'
+        yield b'codes":["900001"]}'
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers={**WRITE_HEADERS, "Content-Type": "application/json"},
+        content=chunks(),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert service.resolutions == [("storage", ("900001",))]
+
+
+@pytest.mark.parametrize(
+    "content_length_headers",
+    [
+        [("Content-Length", "not-a-number")],
+        [("Content-Length", "1, 2")],
+        [("Content-Length", "1"), ("Content-Length", "2")],
+        [("Content-Length", "1")],
+    ],
+)
+def test_fund_request_rejects_malformed_duplicate_or_mismatched_content_length(
+    content_length_headers: list[tuple[str, str]],
+) -> None:
+    service = RecordingService()
+    headers = [
+        ("X-PP03-Write-Intent", "1"),
+        ("Content-Type", "application/json"),
+        *content_length_headers,
+    ]
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=headers,
+        content=b'{"fund_codes":["900001"]}',
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid_fund_relation_request"}
+    assert response.headers["cache-control"] == "no-store"
+    assert service.resolutions == []
+
+
+def test_fund_write_gate_rejection_is_also_no_store() -> None:
+    response = _client(RecordingService()).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 403
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
 
 
 def test_service_cannot_return_private_fund_fields(monkeypatch) -> None:

@@ -447,6 +447,7 @@ const INDUSTRY_ERROR_CODES = new Set([
   "refresh_cancelled", "refresh_interrupted", "refresh_shutdown",
   "source_industry_mismatch", "storage_error",
 ]);
+const INDUSTRY_CONCLUSION_REQUIRED_METRIC_IDS = ["dram_price", "nand_price"] as const;
 
 function industryError(): never {
   throw new ApiError("行业研究响应无效", 502);
@@ -605,6 +606,74 @@ function decodeMetric(value: unknown): IndustryMetric {
   };
 }
 
+function industrySameStringSet(left: string[], right: string[]): boolean {
+  return left.length === new Set(left).size
+    && right.length === new Set(right).size
+    && left.length === right.length
+    && left.every((item) => right.includes(item));
+}
+
+function validateTrustedMetric(
+  metric: IndustryMetric,
+  rawSnapshotId: string,
+  evidenceSnapshotId: string,
+): boolean {
+  if (metric.currentValue === null) {
+    if (metric.change !== null || metric.historicalPosition !== null
+      || metric.asOfDate !== null || metric.fetchedAt !== null || metric.evidence.length > 0
+      || metric.rawSnapshotId !== null || metric.evidenceSnapshotId !== null) industryError();
+    return false;
+  }
+  if (!(["verified", "corroborated"] as const).includes(
+    metric.verificationStatus as "verified" | "corroborated",
+  ) || metric.freshnessStatus === "expired" || metric.evidence.length === 0
+    || metric.rawSnapshotId !== rawSnapshotId || metric.evidenceSnapshotId !== evidenceSnapshotId
+    || metric.asOfDate === null || metric.fetchedAt === null || metric.methodology.length === 0
+    || metric.judgmentBasis.length === 0 || metric.invalidatingConditions.length === 0
+    || metric.evidence.some((item) => item.contradictsClaim)) industryError();
+  if (metric.verificationStatus === "verified") {
+    if (!metric.evidence.some((item) => item.isOfficial && item.isOfficialAttested
+      && item.supportsClaim && item.supportsFields.includes(metric.metricId)
+      && item.asOfDate !== null)) industryError();
+    return true;
+  }
+  const supporting = metric.evidence.filter(
+    (item) => item.supportsClaim && item.supportsFields.includes(metric.metricId),
+  );
+  const evidenceFamilies = [...new Set(supporting.map((item) => item.sourceFamilyId))];
+  const evidenceContents = [...new Set(supporting.map((item) => item.contentSource))];
+  const evidenceOrigins = [...new Set(supporting.map((item) => item.originCluster))];
+  if (supporting.length < 2
+    || !industrySameStringSet(metric.independentSourceFamilies, evidenceFamilies)
+    || !industrySameStringSet(metric.independentContentSources, evidenceContents)
+    || !industrySameStringSet(metric.independentOriginClusters, evidenceOrigins)
+    || evidenceFamilies.length < 2 || evidenceContents.length < 2 || evidenceOrigins.length < 2) industryError();
+  return true;
+}
+
+function validateFundRows(
+  selections: Array<{ selectionId: string; fundCode: string; selectedInRequest: true }>,
+  resolutions: IndustryFundResolution[],
+  expectedIndustryId: string,
+  pending: string[] = [],
+): void {
+  const selectionIds = selections.map((item) => item.selectionId);
+  const selectionCodes = selections.map((item) => item.fundCode);
+  const resolutionIds = resolutions.map((item) => item.selectionId);
+  if (selections.length !== resolutions.length
+    || new Set(selectionIds).size !== selectionIds.length
+    || new Set(selectionCodes).size !== selectionCodes.length
+    || new Set(resolutionIds).size !== resolutionIds.length
+    || new Set(pending).size !== pending.length
+    || pending.some((item) => !selectionIds.includes(item))) industryError();
+  const byId = new Map(selections.map((item) => [item.selectionId, item]));
+  for (const resolution of resolutions) {
+    const selection = byId.get(resolution.selectionId);
+    if (!selection || selection.fundCode !== resolution.fundCode
+      || (resolution.relation && resolution.relation.industryId !== expectedIndustryId)) industryError();
+  }
+}
+
 function decodeFundRelation(value: unknown): IndustryFundRelation {
   const row = industryRecord(value, [
     "industry_id", "fund_code", "relation_layer", "exposure_value", "exposure_unit",
@@ -612,7 +681,7 @@ function decodeFundRelation(value: unknown): IndustryFundRelation {
   ]);
   const fundCode = industryString(row.fund_code, 6);
   if (!/^\d{6}$/.test(fundCode)) industryError();
-  return {
+  const result: IndustryFundRelation = {
     industryId: industryId(row.industry_id),
     fundCode,
     relationLayer: industryEnum(row.relation_layer, ["official_allocation", "disclosed_lookthrough"]),
@@ -622,6 +691,9 @@ function decodeFundRelation(value: unknown): IndustryFundRelation {
     evidenceIds: industryStrings(row.evidence_ids),
     status: industryEnum(row.status, ["verified", "corroborated"]),
   };
+  if (result.evidenceIds.length === 0
+    || (result.exposureValue === null) !== (result.exposureUnit === null)) industryError();
+  return result;
 }
 
 function decodeSelection(value: unknown) {
@@ -705,8 +777,11 @@ function decodeConclusion(value: unknown): DisplayedIndustryReport["overview"] {
   const verifiedMetricCount = industryCount(completeness.verified_metric_count);
   const requiredMetricCount = industryCount(completeness.required_metric_count);
   const ratio = completeness.ratio === null ? null : industryNumber(completeness.ratio);
-  if (verifiedMetricCount > requiredMetricCount || (ratio !== null && (ratio < 0 || ratio > 1))) industryError();
-  return {
+  const expectedRatio = requiredMetricCount === 0 ? null : verifiedMetricCount / requiredMetricCount;
+  if (verifiedMetricCount > requiredMetricCount
+    || (expectedRatio === null) !== (ratio === null)
+    || (expectedRatio !== null && ratio !== null && Math.abs(expectedRatio - ratio) > 1e-9)) industryError();
+  const result: DisplayedIndustryReport["overview"] = {
     conclusionId: industryString(row.conclusion_id, 128),
     industryId: industryId(row.industry_id),
     ruleVersion: industryString(row.rule_version, 128),
@@ -720,6 +795,53 @@ function decodeConclusion(value: unknown): DisplayedIndustryReport["overview"] {
     evidenceIds: industryStrings(row.evidence_ids),
     invalidatingConditions: industryStrings(row.invalidating_conditions),
   };
+  if (result.dataCompleteness.verifiedMetricCount < result.dataCompleteness.requiredMetricCount
+    && (result.cycleStage !== null || result.outlookDirection !== null || result.confidenceLevel !== null)) industryError();
+  const renderedRatio = ratio === null ? "暂无可靠数据" : ratio.toFixed(2);
+  const renderedEvidence = result.evidenceIds.length ? result.evidenceIds.join(",") : "无";
+  const expectedText = `规则=${result.ruleVersion}；状态=${result.status}；周期=${result.cycleStage ?? "暂无可靠数据"}；方向=${result.outlookDirection ?? "暂无可靠数据"}；可信度=${result.confidenceLevel ?? "暂无可靠数据"}；完整度=${renderedRatio}；证据=${renderedEvidence}`;
+  if (result.text !== expectedText) industryError();
+  return result;
+}
+
+function validateDisplayedReportSemantics(report: DisplayedIndustryReport): void {
+  const trustedByMetric = new Map<string, IndustryMetric>();
+  for (const metric of [...report.cycle, ...report.metrics, ...report.capital]) {
+    if (metric.industryId !== report.industryId) industryError();
+    if (!validateTrustedMetric(metric, report.rawSnapshotId, report.evidenceSnapshotId)) continue;
+    const previous = trustedByMetric.get(metric.metricId);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(metric)) industryError();
+    trustedByMetric.set(metric.metricId, metric);
+  }
+  const trusted = [...trustedByMetric.values()];
+  const requiredTrustedIds = INDUSTRY_CONCLUSION_REQUIRED_METRIC_IDS.filter(
+    (metricId) => trustedByMetric.has(metricId),
+  );
+  if (report.counts.verified !== trusted.filter((item) => item.verificationStatus === "verified").length
+    || report.counts.corroborated !== trusted.filter((item) => item.verificationStatus === "corroborated").length
+    || report.overview.dataCompleteness.requiredMetricCount !== INDUSTRY_CONCLUSION_REQUIRED_METRIC_IDS.length
+    || report.overview.dataCompleteness.verifiedMetricCount !== requiredTrustedIds.length
+    || new Set(report.overview.basisMetricIds).size !== report.overview.basisMetricIds.length
+    || requiredTrustedIds.some((metricId) => !report.overview.basisMetricIds.includes(metricId))
+    || report.chain.some((item) => item.industryId !== report.industryId)
+    || report.companies.some((item) => item.industryId !== report.industryId || item.evidenceIds.length === 0)
+    || report.newsRisk.some((item) => item.industryId !== report.industryId)
+    || report.overview.industryId !== report.industryId) industryError();
+  validateFundRows(report.fundSelection, report.funds, report.industryId);
+
+  const basis = report.overview.basisMetricIds.map((metricId) => {
+    const metric = trustedByMetric.get(metricId);
+    if (!metric) industryError();
+    return metric;
+  });
+  const expectedEvidence = [...new Set(basis.flatMap(
+    (metric) => metric.evidence.map((item) => item.evidenceId),
+  ))];
+  const expectedConditions = [...new Set(basis.flatMap(
+    (metric) => metric.invalidatingConditions,
+  ))];
+  if (!industrySameStringSet(report.overview.evidenceIds, expectedEvidence)
+    || !industrySameStringSet(report.overview.invalidatingConditions, expectedConditions)) industryError();
 }
 
 function decodeDisplayedReport(value: unknown): DisplayedIndustryReport {
@@ -798,9 +920,8 @@ function decodeDisplayedReport(value: unknown): DisplayedIndustryReport {
   };
   if (report.sourceCoverage.total !== report.sourceCoverage.configured + report.sourceCoverage.unconfigured
     || report.sourceCoverage.configured !== report.sourceCoverage.healthy + report.sourceCoverage.partialFailure + report.sourceCoverage.failed
-    || report.overview.industryId !== report.industryId
-    || [...report.cycle, ...report.metrics, ...report.capital].some((item) => item.industryId !== report.industryId)
-    || report.newsRisk.some((item) => item.industryId !== report.industryId)) industryError();
+  ) industryError();
+  validateDisplayedReportSemantics(report);
   return report;
 }
 
@@ -863,7 +984,28 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
     || result.counts.conflictingEvents !== conflictingEvents.length
     || result.unverified.some((item) => item.verificationStatus !== "unverified")
     || result.unverifiedEvents.some((item) => item.status !== "unverified")
-    || result.conflictingEvents.some((item) => item.status !== "conflicting")) industryError();
+    || result.conflictingEvents.some((item) => item.status !== "conflicting")
+    || (result.candidateSnapshotId === null) !== (result.rawSnapshotId === null)
+    || (result.rawSnapshotId === null) !== (result.evidenceSnapshotId === null)
+    || result.unverified.some((item) => item.industryId !== result.industryId
+      || item.rawSnapshotId !== result.rawSnapshotId
+      || item.evidenceSnapshotId !== result.evidenceSnapshotId)
+    || result.conflicting.some((item) => item.industryId !== result.industryId
+      || item.rawSnapshotId !== result.rawSnapshotId
+      || item.evidenceSnapshotId !== result.evidenceSnapshotId
+      || new Set(item.sourceValues.map((source) => source.evidenceId)).size !== item.sourceValues.length
+      || new Set(item.sourceValues.map((source) => JSON.stringify([
+        typeof source.value === "string" ? source.value.toLowerCase() : source.value,
+        source.unit?.toLowerCase() ?? null,
+        source.asOfDate,
+        source.change,
+      ]))).size < 2)
+    || [...result.unverifiedEvents, ...result.conflictingEvents].some(
+      (item) => item.industryId !== result.industryId
+        || item.candidateSnapshotId !== result.candidateSnapshotId
+        || item.rawSnapshotId !== result.rawSnapshotId
+        || item.evidenceSnapshotId !== result.evidenceSnapshotId,
+    )) industryError();
   return result;
 }
 
@@ -876,7 +1018,7 @@ function decodeRefresh(value: unknown): IndustryRefreshRun {
   const phase = industryEnum(row.phase, ["idle", "collecting", "verifying", "failed", "trusted_published"]);
   const errorCode = row.error_code === null ? null : industryEnum(row.error_code, [...INDUSTRY_ERROR_CODES]);
   if ((phase === "failed") !== (errorCode !== null)) industryError();
-  return {
+  const result: IndustryRefreshRun = {
     industryId: industryId(row.industry_id),
     runId: industryNullableString(row.run_id, 128),
     rawSnapshotId: industryNullableString(row.raw_snapshot_id, 128),
@@ -889,6 +1031,21 @@ function decodeRefresh(value: unknown): IndustryRefreshRun {
     displayedRawSnapshotId: industryNullableString(row.displayed_raw_snapshot_id, 128),
     displayedEvidenceSnapshotId: industryNullableString(row.displayed_evidence_snapshot_id, 128),
   };
+  if ((result.displayedRawSnapshotId === null) !== (result.displayedEvidenceSnapshotId === null)
+    || (result.candidateSnapshotId !== null
+      && (result.rawSnapshotId === null || result.evidenceSnapshotId === null))
+    || (result.displayedTrustedSnapshotId === null
+      && (result.displayedRawSnapshotId !== null || result.displayedEvidenceSnapshotId !== null))
+    || (result.displayedTrustedSnapshotId !== null
+      && (result.displayedRawSnapshotId === null || result.displayedEvidenceSnapshotId === null))) industryError();
+  if (phase === "trusted_published") {
+    if (result.publishedTrustedSnapshotId === null
+      || result.displayedTrustedSnapshotId !== result.publishedTrustedSnapshotId
+      || result.rawSnapshotId === null || result.evidenceSnapshotId === null
+      || result.displayedRawSnapshotId !== result.rawSnapshotId
+      || result.displayedEvidenceSnapshotId !== result.evidenceSnapshotId) industryError();
+  } else if (result.publishedTrustedSnapshotId !== null) industryError();
+  return result;
 }
 
 export function decodeIndustryResearchResponse(value: unknown): IndustryResearchResponse {
@@ -928,7 +1085,7 @@ function validateIndustryRequest(industry: string, window?: number): string {
   return industry;
 }
 
-function decodeFundProjection(value: unknown): IndustryFundProjection {
+function decodeFundProjection(value: unknown, expectedIndustryId: string): IndustryFundProjection {
   const row = industryRecord(value, [
     "state", "fund_selection", "resolutions", "pending_lookthrough_selection_ids",
   ]);
@@ -941,8 +1098,8 @@ function decodeFundProjection(value: unknown): IndustryFundProjection {
     resolutions,
     pendingLookthroughSelectionIds: pending,
   };
-  if (fundSelection.length !== resolutions.length
-    || (result.state === "no_holdings" && (fundSelection.length || pending.length))) industryError();
+  if (result.state === "no_holdings" && (fundSelection.length || resolutions.length || pending.length)) industryError();
+  validateFundRows(fundSelection, resolutions, expectedIndustryId, pending);
   return result;
 }
 
@@ -3001,17 +3158,18 @@ export const api = {
     fundCodes: string[],
     signal?: AbortSignal,
   ) => {
+    const requestedIndustryId = validateIndustryRequest(industry);
     const normalized = fundCodes.map((code) => {
       if (!/^\d{6}$/.test(code)) throw new ApiError("基金代码必须是 6 位数字", 400);
       return code;
     });
     if (normalized.length > 32) throw new ApiError("基金代码数量超出限制", 400);
     return request<unknown>(
-      `/industry-research/${encodeURIComponent(validateIndustryRequest(industry))}/fund-relations/resolve`,
+      `/industry-research/${encodeURIComponent(requestedIndustryId)}/fund-relations/resolve`,
       "POST",
       { fund_codes: [...new Set(normalized)] },
       signal,
-    ).then(decodeFundProjection);
+    ).then((value) => decodeFundProjection(value, requestedIndustryId));
   },
   myReports: () => get<MyReport[]>("/myreports"),
   uploadReport: (name: string, contentB64: string) =>
