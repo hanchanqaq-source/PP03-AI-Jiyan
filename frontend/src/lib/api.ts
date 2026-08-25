@@ -134,6 +134,7 @@ export class ArchiveSnapshotChangedError extends ApiError {
 
 const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MARKET_NEWS_SOURCE_RETRY_WRITE_PATH = /^\/market-news\/sources\/[a-f0-9]{16}\/retry(?:\?|$)/;
+const INDUSTRY_RESEARCH_WRITE_PATH = /^\/industry-research\/[a-z0-9][a-z0-9_-]{0,63}\/(?:refresh|fund-relations\/resolve)(?:\?|$)/;
 
 async function readBoundedJsonResponse(resp: Response): Promise<any> {
   const declaredLength = resp.headers.get("Content-Length");
@@ -190,6 +191,7 @@ async function request<T>(
     || MARKET_NEWS_SOURCE_RETRY_WRITE_PATH.test(path)
     || path === "/evidence/refresh"
     || path === "/radar/refresh"
+    || INDUSTRY_RESEARCH_WRITE_PATH.test(path)
   )) {
     headers["X-PP03-Write-Intent"] = "1";
   }
@@ -221,6 +223,728 @@ async function request<T>(
 }
 
 const get = <T>(path: string, signal?: AbortSignal) => request<T>(path, "GET", undefined, signal);
+
+export type IndustryWindowDays = 7 | 30 | 90;
+export type IndustryTemplateStatus = "complete_layout" | "partial_layout" | "building";
+export type IndustryVerificationStatus = "verified" | "corroborated" | "unverified" | "conflicting" | "not_evaluated";
+export type IndustryRefreshPhase = "idle" | "collecting" | "verifying" | "failed" | "trusted_published";
+
+export interface IndustryEvidenceReference {
+  evidenceId: string;
+  sourceFamilyId: string;
+  contentSource: string;
+  originCluster: string;
+  collectorSource: string;
+  finalUrl: string;
+  isOfficial: boolean;
+  isOfficialAttested: boolean;
+  supportsClaim: boolean;
+  supportsFields: string[];
+  contradictsClaim: boolean;
+  asOfDate: string | null;
+  verifiedAt: string;
+}
+
+export interface IndustryMetric {
+  industryId: string;
+  metricId: string;
+  label: string;
+  currentValue: string | number | null;
+  unit: string | null;
+  change: { value: number; basis: "mom" | "yoy" | "wow" } | null;
+  historicalPosition: { value: number; window: string; method: string } | null;
+  availabilityStatus: "available" | "partial" | "unavailable" | "unconfigured";
+  verificationStatus: IndustryVerificationStatus;
+  freshnessStatus: "fresh" | "stale" | "expired" | "unknown";
+  sourceRunStatus: "healthy" | "partial_failure" | "failed" | "not_configured";
+  emptyReason: string | null;
+  asOfDate: string | null;
+  fetchedAt: string | null;
+  methodology: string;
+  judgmentBasis: string[];
+  invalidatingConditions: string[];
+  evidence: IndustryEvidenceReference[];
+  independentSourceFamilies: string[];
+  independentContentSources: string[];
+  independentOriginClusters: string[];
+  rawSnapshotId: string | null;
+  evidenceSnapshotId: string | null;
+  expiresAt: string | null;
+}
+
+export interface IndustryTrustedEvent {
+  industryId: string;
+  eventId: string;
+  status: "verified" | "corroborated";
+  occurredAt: string;
+  evidenceIds: string[];
+  roles: Array<"news" | "catalyst" | "risk" | "reverse_signal">;
+}
+
+export interface IndustryCandidateEvent {
+  industryId: string;
+  eventId: string;
+  status: "unverified" | "conflicting";
+  occurredAt: string;
+  evidenceIds: string[];
+  supportingEvidenceIds: string[];
+  contradictingEvidenceIds: string[];
+  roles: Array<"news" | "catalyst" | "risk" | "reverse_signal">;
+  candidateSnapshotId: string;
+  rawSnapshotId: string;
+  evidenceSnapshotId: string;
+}
+
+export interface IndustryFundRelation {
+  industryId: string;
+  fundCode: string;
+  relationLayer: "official_allocation" | "disclosed_lookthrough";
+  exposureValue: number | null;
+  exposureUnit: "percent" | null;
+  disclosureDate: string | null;
+  evidenceIds: string[];
+  status: "verified" | "corroborated";
+}
+
+export interface IndustryFundResolution {
+  selectionId: string;
+  fundCode: string;
+  relation: IndustryFundRelation | null;
+  emptyReason: "unknown" | "not_disclosed" | "source_unavailable" | null;
+}
+
+export interface DisplayedIndustryReport {
+  industryId: string;
+  templateStatus: IndustryTemplateStatus;
+  trustedSnapshotId: string | null;
+  displayedTrustedSnapshotId: string | null;
+  rawSnapshotId: string;
+  evidenceSnapshotId: string;
+  generatedAt: string | null;
+  demo: boolean;
+  sourceCoverage: {
+    unit: "capability";
+    total: number;
+    configured: number;
+    healthy: number;
+    partialFailure: number;
+    failed: number;
+    unconfigured: number;
+  };
+  counts: { verified: number; corroborated: number };
+  overview: {
+    conclusionId: string;
+    industryId: string;
+    ruleVersion: string;
+    status: "verified" | "corroborated" | "partial" | "unavailable";
+    cycleStage: "recovery" | "expansion" | "peak" | "contraction" | null;
+    outlookDirection: "improving" | "stable" | "weakening" | null;
+    confidenceLevel: "high" | "medium" | "low" | null;
+    dataCompleteness: { verifiedMetricCount: number; requiredMetricCount: number; ratio: number | null };
+    text: string;
+    basisMetricIds: string[];
+    evidenceIds: string[];
+    invalidatingConditions: string[];
+  };
+  cycle: IndustryMetric[];
+  chain: Array<{
+    industryId: string;
+    nodeId: string;
+    label: string;
+    observationIds: string[];
+    evidenceIds: string[];
+    status: "verified" | "corroborated" | "partial" | "unavailable";
+  }>;
+  metrics: IndustryMetric[];
+  capital: IndustryMetric[];
+  companies: Array<{
+    industryId: string;
+    securityCode: string;
+    companyName: string;
+    chainNodeId: string;
+    relationType: "official_disclosure" | "public_classification";
+    keyMetricIds: string[];
+    evidenceIds: string[];
+    asOfDate: string;
+    observationOnly: true;
+  }>;
+  fundSelection: Array<{ selectionId: string; fundCode: string; selectedInRequest: true }>;
+  funds: IndustryFundResolution[];
+  newsRisk: IndustryTrustedEvent[];
+}
+
+export interface CandidateIndustryEvidence {
+  industryId: string;
+  candidateSnapshotId: string | null;
+  counts: { unverified: number; conflicting: number; unverifiedEvents: number; conflictingEvents: number };
+  unverified: IndustryMetric[];
+  conflicting: Array<{
+    industryId: string;
+    metricId: string;
+    aggregateValue: null;
+    sourceValues: Array<{
+      evidenceId: string;
+      sourceFamilyId: string;
+      value: string | number;
+      unit: string | null;
+      asOfDate: string | null;
+      change: { value: number; basis: "mom" | "yoy" | "wow" } | null;
+    }>;
+    rawSnapshotId: string;
+    evidenceSnapshotId: string;
+  }>;
+  unverifiedEvents: IndustryCandidateEvent[];
+  conflictingEvents: IndustryCandidateEvent[];
+  rawSnapshotId: string | null;
+  evidenceSnapshotId: string | null;
+}
+
+export interface IndustryRefreshRun {
+  industryId: string;
+  runId: string | null;
+  rawSnapshotId: string | null;
+  evidenceSnapshotId: string | null;
+  candidateSnapshotId: string | null;
+  phase: IndustryRefreshPhase;
+  errorCode: string | null;
+  displayedTrustedSnapshotId: string | null;
+  publishedTrustedSnapshotId: string | null;
+  displayedRawSnapshotId: string | null;
+  displayedEvidenceSnapshotId: string | null;
+}
+
+export interface IndustryResearchResponse {
+  requestedIndustryId: string;
+  displayedIndustryId: string | null;
+  displayedTrustedReport: DisplayedIndustryReport | null;
+  candidateEvidence: CandidateIndustryEvidence | null;
+  refreshRun: IndustryRefreshRun;
+  templateStatus: IndustryTemplateStatus;
+}
+
+export interface IndustryFundProjection {
+  state: "no_holdings" | "resolved";
+  fundSelection: Array<{ selectionId: string; fundCode: string; selectedInRequest: true }>;
+  resolutions: IndustryFundResolution[];
+  pendingLookthroughSelectionIds: string[];
+}
+
+const INDUSTRY_RESPONSE_KEYS = [
+  "requested_industry_id", "displayed_industry_id", "displayed_trusted_report",
+  "candidate_evidence", "refresh_run", "template_status",
+] as const;
+const INDUSTRY_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const INDUSTRY_EMPTY_REASONS = new Set([
+  "source_unconfigured", "source_unavailable", "source_failed", "verifying",
+  "not_applicable", "not_disclosed", "user_key_not_configured", "license_required",
+  "expired", "conflicting", "no_reliable_data", "insufficient_history",
+]);
+const INDUSTRY_ERROR_CODES = new Set([
+  "admission_failed", "all_sources_failed", "assembly_failed", "conflicting_evidence",
+  "evidence_verification_failed", "internal_error", "no_eligible_provider",
+  "no_trusted_observations", "partial_source_failure", "publication_failed",
+  "publication_proof_invalid", "raw_build_failed", "raw_industry_mismatch",
+  "refresh_cancelled", "refresh_interrupted", "refresh_shutdown",
+  "source_industry_mismatch", "storage_error",
+]);
+
+function industryError(): never {
+  throw new ApiError("行业研究响应无效", 502);
+}
+
+function industryRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) industryError();
+  const row = value as Record<string, unknown>;
+  const actual = Object.keys(row);
+  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) industryError();
+  return row;
+}
+
+function industryArray(value: unknown): unknown[] {
+  if (!Array.isArray(value)) industryError();
+  return value;
+}
+
+function industryString(value: unknown, max = 4096, allowEmpty = false): string {
+  if (typeof value !== "string" || value.length > max || (!allowEmpty && value.length === 0)
+    || value !== value.trim() || /[\u0000-\u001F\u007F]/.test(value)) industryError();
+  return value;
+}
+
+function industryId(value: unknown): string {
+  const result = industryString(value, 64);
+  if (!INDUSTRY_ID_PATTERN.test(result)) industryError();
+  return result;
+}
+
+function industryNullableString(value: unknown, max = 4096): string | null {
+  return value === null ? null : industryString(value, max);
+}
+
+function industryBoolean(value: unknown): boolean {
+  if (typeof value !== "boolean") industryError();
+  return value;
+}
+
+function industryNumber(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) industryError();
+  return value;
+}
+
+function industryCount(value: unknown): number {
+  const result = industryNumber(value);
+  if (!Number.isSafeInteger(result) || result < 0 || result > 1_000_000_000) industryError();
+  return result;
+}
+
+function industryEnum<T extends string>(value: unknown, allowed: readonly T[]): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) industryError();
+  return value as T;
+}
+
+function industryTimestamp(value: unknown): string {
+  const result = industryString(value, 64);
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(result) || Number.isNaN(Date.parse(result))) industryError();
+  return result;
+}
+
+function industryNullableTimestamp(value: unknown): string | null {
+  return value === null ? null : industryTimestamp(value);
+}
+
+function industryStrings(value: unknown): string[] {
+  return industryArray(value).map((item) => industryString(item, 512));
+}
+
+function decodeChange(value: unknown): { value: number; basis: "mom" | "yoy" | "wow" } | null {
+  if (value === null) return null;
+  const row = industryRecord(value, ["value", "basis"]);
+  return {
+    value: industryNumber(row.value),
+    basis: industryEnum(row.basis, ["mom", "yoy", "wow"]),
+  };
+}
+
+function decodeEvidence(value: unknown): IndustryEvidenceReference {
+  const row = industryRecord(value, [
+    "evidence_id", "source_family_id", "content_source", "origin_cluster",
+    "collector_source", "final_url", "is_official", "is_official_attested",
+    "supports_claim", "supports_fields", "contradicts_claim", "as_of_date", "verified_at",
+  ]);
+  return {
+    evidenceId: industryString(row.evidence_id, 128),
+    sourceFamilyId: industryString(row.source_family_id, 128),
+    contentSource: industryString(row.content_source, 512),
+    originCluster: industryString(row.origin_cluster, 128),
+    collectorSource: industryString(row.collector_source, 128),
+    finalUrl: industryString(row.final_url, 4096),
+    isOfficial: industryBoolean(row.is_official),
+    isOfficialAttested: industryBoolean(row.is_official_attested),
+    supportsClaim: industryBoolean(row.supports_claim),
+    supportsFields: industryStrings(row.supports_fields),
+    contradictsClaim: industryBoolean(row.contradicts_claim),
+    asOfDate: industryNullableString(row.as_of_date, 64),
+    verifiedAt: industryTimestamp(row.verified_at),
+  };
+}
+
+function decodeMetric(value: unknown): IndustryMetric {
+  const row = industryRecord(value, [
+    "industry_id", "metric_id", "label", "current_value", "unit", "change",
+    "historical_position", "availability_status", "verification_status", "freshness_status",
+    "source_run_status", "empty_reason", "as_of_date", "fetched_at", "methodology",
+    "judgment_basis", "invalidating_conditions", "evidence", "independent_source_families",
+    "independent_content_sources", "independent_origin_clusters", "raw_snapshot_id",
+    "evidence_snapshot_id", "expires_at",
+  ]);
+  let currentValue: string | number | null;
+  if (row.current_value === null) currentValue = null;
+  else if (typeof row.current_value === "number") currentValue = industryNumber(row.current_value);
+  else currentValue = industryString(row.current_value, 4096);
+  const historical = row.historical_position === null ? null : industryRecord(
+    row.historical_position, ["value", "window", "method"],
+  );
+  const verificationStatus = industryEnum(row.verification_status, [
+    "verified", "corroborated", "unverified", "conflicting", "not_evaluated",
+  ]);
+  const emptyReason = row.empty_reason === null
+    ? null
+    : industryEnum(row.empty_reason, [...INDUSTRY_EMPTY_REASONS]);
+  if ((currentValue === null) !== (emptyReason !== null)) industryError();
+  if (["verified", "corroborated"].includes(verificationStatus)
+    && (currentValue === null || row.raw_snapshot_id === null || row.evidence_snapshot_id === null)) industryError();
+  return {
+    industryId: industryId(row.industry_id),
+    metricId: industryString(row.metric_id, 128),
+    label: industryString(row.label, 512),
+    currentValue,
+    unit: industryNullableString(row.unit, 64),
+    change: decodeChange(row.change),
+    historicalPosition: historical === null ? null : {
+      value: industryNumber(historical.value),
+      window: industryString(historical.window, 128),
+      method: industryString(historical.method, 512),
+    },
+    availabilityStatus: industryEnum(row.availability_status, ["available", "partial", "unavailable", "unconfigured"]),
+    verificationStatus,
+    freshnessStatus: industryEnum(row.freshness_status, ["fresh", "stale", "expired", "unknown"]),
+    sourceRunStatus: industryEnum(row.source_run_status, ["healthy", "partial_failure", "failed", "not_configured"]),
+    emptyReason,
+    asOfDate: industryNullableString(row.as_of_date, 64),
+    fetchedAt: industryNullableTimestamp(row.fetched_at),
+    methodology: industryString(row.methodology, 4096, true),
+    judgmentBasis: industryStrings(row.judgment_basis),
+    invalidatingConditions: industryStrings(row.invalidating_conditions),
+    evidence: industryArray(row.evidence).map(decodeEvidence),
+    independentSourceFamilies: industryStrings(row.independent_source_families),
+    independentContentSources: industryStrings(row.independent_content_sources),
+    independentOriginClusters: industryStrings(row.independent_origin_clusters),
+    rawSnapshotId: industryNullableString(row.raw_snapshot_id, 128),
+    evidenceSnapshotId: industryNullableString(row.evidence_snapshot_id, 128),
+    expiresAt: industryNullableTimestamp(row.expires_at),
+  };
+}
+
+function decodeFundRelation(value: unknown): IndustryFundRelation {
+  const row = industryRecord(value, [
+    "industry_id", "fund_code", "relation_layer", "exposure_value", "exposure_unit",
+    "disclosure_date", "evidence_ids", "status",
+  ]);
+  const fundCode = industryString(row.fund_code, 6);
+  if (!/^\d{6}$/.test(fundCode)) industryError();
+  return {
+    industryId: industryId(row.industry_id),
+    fundCode,
+    relationLayer: industryEnum(row.relation_layer, ["official_allocation", "disclosed_lookthrough"]),
+    exposureValue: row.exposure_value === null ? null : industryNumber(row.exposure_value),
+    exposureUnit: row.exposure_unit === null ? null : industryEnum(row.exposure_unit, ["percent"] as const),
+    disclosureDate: industryNullableString(row.disclosure_date, 64),
+    evidenceIds: industryStrings(row.evidence_ids),
+    status: industryEnum(row.status, ["verified", "corroborated"]),
+  };
+}
+
+function decodeSelection(value: unknown) {
+  const row = industryRecord(value, ["selection_id", "fund_code", "selected_in_request"]);
+  const fundCode = industryString(row.fund_code, 6);
+  if (!/^\d{6}$/.test(fundCode) || row.selected_in_request !== true) industryError();
+  return {
+    selectionId: industryString(row.selection_id, 128),
+    fundCode,
+    selectedInRequest: true as const,
+  };
+}
+
+function decodeFundResolution(value: unknown): IndustryFundResolution {
+  const row = industryRecord(value, ["selection_id", "fund_code", "relation", "empty_reason"]);
+  const fundCode = industryString(row.fund_code, 6);
+  if (!/^\d{6}$/.test(fundCode)) industryError();
+  const relation = row.relation === null ? null : decodeFundRelation(row.relation);
+  const emptyReason = row.empty_reason === null
+    ? null
+    : industryEnum(row.empty_reason, ["unknown", "not_disclosed", "source_unavailable"]);
+  if ((relation === null) !== (emptyReason !== null) || (relation && relation.fundCode !== fundCode)) industryError();
+  return {
+    selectionId: industryString(row.selection_id, 128),
+    fundCode,
+    relation,
+    emptyReason,
+  };
+}
+
+function decodeTrustedEvent(value: unknown): IndustryTrustedEvent {
+  const row = industryRecord(value, [
+    "industry_id", "event_id", "status", "occurred_at", "evidence_ids", "roles",
+  ]);
+  const evidenceIds = industryStrings(row.evidence_ids);
+  if (evidenceIds.length === 0) industryError();
+  return {
+    industryId: industryId(row.industry_id),
+    eventId: industryString(row.event_id, 128),
+    status: industryEnum(row.status, ["verified", "corroborated"]),
+    occurredAt: industryTimestamp(row.occurred_at),
+    evidenceIds,
+    roles: industryArray(row.roles).map((role) => industryEnum(role, ["news", "catalyst", "risk", "reverse_signal"])),
+  };
+}
+
+function decodeCandidateEvent(value: unknown): IndustryCandidateEvent {
+  const row = industryRecord(value, [
+    "industry_id", "event_id", "status", "occurred_at", "evidence_ids",
+    "supporting_evidence_ids", "contradicting_evidence_ids", "roles",
+    "candidate_snapshot_id", "raw_snapshot_id", "evidence_snapshot_id",
+  ]);
+  const status = industryEnum(row.status, ["unverified", "conflicting"]);
+  const supporting = industryStrings(row.supporting_evidence_ids);
+  const contradicting = industryStrings(row.contradicting_evidence_ids);
+  if (status === "conflicting" && (!supporting.length || !contradicting.length)) industryError();
+  return {
+    industryId: industryId(row.industry_id),
+    eventId: industryString(row.event_id, 128),
+    status,
+    occurredAt: industryTimestamp(row.occurred_at),
+    evidenceIds: industryStrings(row.evidence_ids),
+    supportingEvidenceIds: supporting,
+    contradictingEvidenceIds: contradicting,
+    roles: industryArray(row.roles).map((role) => industryEnum(role, ["news", "catalyst", "risk", "reverse_signal"])),
+    candidateSnapshotId: industryString(row.candidate_snapshot_id, 128),
+    rawSnapshotId: industryString(row.raw_snapshot_id, 128),
+    evidenceSnapshotId: industryString(row.evidence_snapshot_id, 128),
+  };
+}
+
+function decodeConclusion(value: unknown): DisplayedIndustryReport["overview"] {
+  const row = industryRecord(value, [
+    "conclusion_id", "industry_id", "rule_version", "status", "cycle_stage",
+    "outlook_direction", "confidence_level", "data_completeness", "text",
+    "basis_metric_ids", "evidence_ids", "invalidating_conditions",
+  ]);
+  const completeness = industryRecord(
+    row.data_completeness, ["verified_metric_count", "required_metric_count", "ratio"],
+  );
+  const verifiedMetricCount = industryCount(completeness.verified_metric_count);
+  const requiredMetricCount = industryCount(completeness.required_metric_count);
+  const ratio = completeness.ratio === null ? null : industryNumber(completeness.ratio);
+  if (verifiedMetricCount > requiredMetricCount || (ratio !== null && (ratio < 0 || ratio > 1))) industryError();
+  return {
+    conclusionId: industryString(row.conclusion_id, 128),
+    industryId: industryId(row.industry_id),
+    ruleVersion: industryString(row.rule_version, 128),
+    status: industryEnum(row.status, ["verified", "corroborated", "partial", "unavailable"]),
+    cycleStage: row.cycle_stage === null ? null : industryEnum(row.cycle_stage, ["recovery", "expansion", "peak", "contraction"] as const),
+    outlookDirection: row.outlook_direction === null ? null : industryEnum(row.outlook_direction, ["improving", "stable", "weakening"] as const),
+    confidenceLevel: row.confidence_level === null ? null : industryEnum(row.confidence_level, ["high", "medium", "low"] as const),
+    dataCompleteness: { verifiedMetricCount, requiredMetricCount, ratio },
+    text: industryString(row.text, 8192),
+    basisMetricIds: industryStrings(row.basis_metric_ids),
+    evidenceIds: industryStrings(row.evidence_ids),
+    invalidatingConditions: industryStrings(row.invalidating_conditions),
+  };
+}
+
+function decodeDisplayedReport(value: unknown): DisplayedIndustryReport {
+  const row = industryRecord(value, [
+    "industry_id", "template_status", "trusted_snapshot_id", "displayed_trusted_snapshot_id",
+    "raw_snapshot_id", "evidence_snapshot_id", "generated_at", "demo", "source_coverage",
+    "counts", "overview", "cycle", "chain", "metrics", "capital", "companies",
+    "fund_selection", "funds", "news_risk",
+  ]);
+  const coverage = industryRecord(row.source_coverage, [
+    "unit", "total", "configured", "healthy", "partial_failure", "failed", "unconfigured",
+  ]);
+  const counts = industryRecord(row.counts, ["verified", "corroborated"]);
+  const chain = industryArray(row.chain).map((value) => {
+    const item = industryRecord(value, [
+      "industry_id", "node_id", "label", "observation_ids", "evidence_ids", "status",
+    ]);
+    return {
+      industryId: industryId(item.industry_id),
+      nodeId: industryString(item.node_id, 128),
+      label: industryString(item.label, 512),
+      observationIds: industryStrings(item.observation_ids),
+      evidenceIds: industryStrings(item.evidence_ids),
+      status: industryEnum(item.status, ["verified", "corroborated", "partial", "unavailable"]),
+    };
+  });
+  const companies = industryArray(row.companies).map((value) => {
+    const item = industryRecord(value, [
+      "industry_id", "security_code", "company_name", "chain_node_id", "relation_type",
+      "key_metric_ids", "evidence_ids", "as_of_date", "observation_only",
+    ]);
+    if (item.observation_only !== true || !/^\d{6}$/.test(industryString(item.security_code, 6))) industryError();
+    return {
+      industryId: industryId(item.industry_id),
+      securityCode: item.security_code as string,
+      companyName: industryString(item.company_name, 512),
+      chainNodeId: industryString(item.chain_node_id, 128),
+      relationType: industryEnum(item.relation_type, ["official_disclosure", "public_classification"]),
+      keyMetricIds: industryStrings(item.key_metric_ids),
+      evidenceIds: industryStrings(item.evidence_ids),
+      asOfDate: industryString(item.as_of_date, 64),
+      observationOnly: true as const,
+    };
+  });
+  const report: DisplayedIndustryReport = {
+    industryId: industryId(row.industry_id),
+    templateStatus: industryEnum(row.template_status, ["complete_layout", "partial_layout", "building"]),
+    trustedSnapshotId: industryNullableString(row.trusted_snapshot_id, 128),
+    displayedTrustedSnapshotId: industryNullableString(row.displayed_trusted_snapshot_id, 128),
+    rawSnapshotId: industryString(row.raw_snapshot_id, 128),
+    evidenceSnapshotId: industryString(row.evidence_snapshot_id, 128),
+    generatedAt: industryNullableTimestamp(row.generated_at),
+    demo: industryBoolean(row.demo),
+    sourceCoverage: {
+      unit: industryEnum(coverage.unit, ["capability"]),
+      total: industryCount(coverage.total),
+      configured: industryCount(coverage.configured),
+      healthy: industryCount(coverage.healthy),
+      partialFailure: industryCount(coverage.partial_failure),
+      failed: industryCount(coverage.failed),
+      unconfigured: industryCount(coverage.unconfigured),
+    },
+    counts: {
+      verified: industryCount(counts.verified),
+      corroborated: industryCount(counts.corroborated),
+    },
+    overview: decodeConclusion(row.overview),
+    cycle: industryArray(row.cycle).map(decodeMetric),
+    chain,
+    metrics: industryArray(row.metrics).map(decodeMetric),
+    capital: industryArray(row.capital).map(decodeMetric),
+    companies,
+    fundSelection: industryArray(row.fund_selection).map(decodeSelection),
+    funds: industryArray(row.funds).map(decodeFundResolution),
+    newsRisk: industryArray(row.news_risk).map(decodeTrustedEvent),
+  };
+  if (report.sourceCoverage.total !== report.sourceCoverage.configured + report.sourceCoverage.unconfigured
+    || report.sourceCoverage.configured !== report.sourceCoverage.healthy + report.sourceCoverage.partialFailure + report.sourceCoverage.failed
+    || report.overview.industryId !== report.industryId
+    || [...report.cycle, ...report.metrics, ...report.capital].some((item) => item.industryId !== report.industryId)
+    || report.newsRisk.some((item) => item.industryId !== report.industryId)) industryError();
+  return report;
+}
+
+function decodeCandidate(value: unknown): CandidateIndustryEvidence {
+  const row = industryRecord(value, [
+    "industry_id", "candidate_snapshot_id", "counts", "unverified", "conflicting",
+    "unverified_events", "conflicting_events", "raw_snapshot_id", "evidence_snapshot_id",
+  ]);
+  const countsRow = industryRecord(row.counts, [
+    "unverified", "conflicting", "unverified_events", "conflicting_events",
+  ]);
+  const conflicting = industryArray(row.conflicting).map((value) => {
+    const item = industryRecord(value, [
+      "industry_id", "metric_id", "aggregate_value", "source_values", "raw_snapshot_id", "evidence_snapshot_id",
+    ]);
+    if (item.aggregate_value !== null) industryError();
+    const sourceValues = industryArray(item.source_values).map((value) => {
+      const source = industryRecord(value, ["evidence_id", "source_family_id", "value", "unit", "as_of_date", "change"]);
+      const sourceValue = typeof source.value === "number" ? industryNumber(source.value) : industryString(source.value, 4096);
+      return {
+        evidenceId: industryString(source.evidence_id, 128),
+        sourceFamilyId: industryString(source.source_family_id, 128),
+        value: sourceValue,
+        unit: industryNullableString(source.unit, 64),
+        asOfDate: industryNullableString(source.as_of_date, 64),
+        change: decodeChange(source.change),
+      };
+    });
+    if (sourceValues.length < 2) industryError();
+    return {
+      industryId: industryId(item.industry_id),
+      metricId: industryString(item.metric_id, 128),
+      aggregateValue: null,
+      sourceValues,
+      rawSnapshotId: industryString(item.raw_snapshot_id, 128),
+      evidenceSnapshotId: industryString(item.evidence_snapshot_id, 128),
+    };
+  });
+  const unverified = industryArray(row.unverified).map(decodeMetric);
+  const unverifiedEvents = industryArray(row.unverified_events).map(decodeCandidateEvent);
+  const conflictingEvents = industryArray(row.conflicting_events).map(decodeCandidateEvent);
+  const result: CandidateIndustryEvidence = {
+    industryId: industryId(row.industry_id),
+    candidateSnapshotId: industryNullableString(row.candidate_snapshot_id, 128),
+    counts: {
+      unverified: industryCount(countsRow.unverified),
+      conflicting: industryCount(countsRow.conflicting),
+      unverifiedEvents: industryCount(countsRow.unverified_events),
+      conflictingEvents: industryCount(countsRow.conflicting_events),
+    },
+    unverified,
+    conflicting,
+    unverifiedEvents,
+    conflictingEvents,
+    rawSnapshotId: industryNullableString(row.raw_snapshot_id, 128),
+    evidenceSnapshotId: industryNullableString(row.evidence_snapshot_id, 128),
+  };
+  if (result.counts.unverified !== unverified.length || result.counts.conflicting !== conflicting.length
+    || result.counts.unverifiedEvents !== unverifiedEvents.length
+    || result.counts.conflictingEvents !== conflictingEvents.length
+    || result.unverified.some((item) => item.verificationStatus !== "unverified")
+    || result.unverifiedEvents.some((item) => item.status !== "unverified")
+    || result.conflictingEvents.some((item) => item.status !== "conflicting")) industryError();
+  return result;
+}
+
+function decodeRefresh(value: unknown): IndustryRefreshRun {
+  const row = industryRecord(value, [
+    "industry_id", "run_id", "raw_snapshot_id", "evidence_snapshot_id", "candidate_snapshot_id",
+    "phase", "error_code", "displayed_trusted_snapshot_id", "published_trusted_snapshot_id",
+    "displayed_raw_snapshot_id", "displayed_evidence_snapshot_id",
+  ]);
+  const phase = industryEnum(row.phase, ["idle", "collecting", "verifying", "failed", "trusted_published"]);
+  const errorCode = row.error_code === null ? null : industryEnum(row.error_code, [...INDUSTRY_ERROR_CODES]);
+  if ((phase === "failed") !== (errorCode !== null)) industryError();
+  return {
+    industryId: industryId(row.industry_id),
+    runId: industryNullableString(row.run_id, 128),
+    rawSnapshotId: industryNullableString(row.raw_snapshot_id, 128),
+    evidenceSnapshotId: industryNullableString(row.evidence_snapshot_id, 128),
+    candidateSnapshotId: industryNullableString(row.candidate_snapshot_id, 128),
+    phase,
+    errorCode,
+    displayedTrustedSnapshotId: industryNullableString(row.displayed_trusted_snapshot_id, 128),
+    publishedTrustedSnapshotId: industryNullableString(row.published_trusted_snapshot_id, 128),
+    displayedRawSnapshotId: industryNullableString(row.displayed_raw_snapshot_id, 128),
+    displayedEvidenceSnapshotId: industryNullableString(row.displayed_evidence_snapshot_id, 128),
+  };
+}
+
+export function decodeIndustryResearchResponse(value: unknown): IndustryResearchResponse {
+  const row = industryRecord(value, INDUSTRY_RESPONSE_KEYS);
+  const displayedReport = row.displayed_trusted_report === null ? null : decodeDisplayedReport(row.displayed_trusted_report);
+  const candidate = row.candidate_evidence === null ? null : decodeCandidate(row.candidate_evidence);
+  const refresh = decodeRefresh(row.refresh_run);
+  const requestedIndustryId = industryId(row.requested_industry_id);
+  const displayedIndustryId = row.displayed_industry_id === null ? null : industryId(row.displayed_industry_id);
+  const templateStatus = industryEnum(row.template_status, ["complete_layout", "partial_layout", "building"]);
+  if (refresh.industryId !== requestedIndustryId
+    || (displayedReport === null) !== (displayedIndustryId === null)
+    || (displayedReport && (displayedReport.industryId !== displayedIndustryId || displayedReport.templateStatus !== templateStatus))
+    || (candidate && candidate.industryId !== requestedIndustryId)
+    || (refresh.candidateSnapshotId === null) !== (candidate === null)
+    || (candidate && (candidate.candidateSnapshotId !== refresh.candidateSnapshotId
+      || candidate.rawSnapshotId !== refresh.rawSnapshotId
+      || candidate.evidenceSnapshotId !== refresh.evidenceSnapshotId))
+    || (displayedReport && (displayedReport.trustedSnapshotId !== refresh.displayedTrustedSnapshotId
+      || displayedReport.displayedTrustedSnapshotId !== refresh.displayedTrustedSnapshotId
+      || displayedReport.rawSnapshotId !== refresh.displayedRawSnapshotId
+      || displayedReport.evidenceSnapshotId !== refresh.displayedEvidenceSnapshotId))) industryError();
+  return {
+    requestedIndustryId,
+    displayedIndustryId,
+    displayedTrustedReport: displayedReport,
+    candidateEvidence: candidate,
+    refreshRun: refresh,
+    templateStatus,
+  };
+}
+
+function validateIndustryRequest(industry: string, window?: number): string {
+  if (!INDUSTRY_ID_PATTERN.test(industry) || (window !== undefined && ![7, 30, 90].includes(window))) {
+    throw new ApiError("行业研究请求无效", 400);
+  }
+  return industry;
+}
+
+function decodeFundProjection(value: unknown): IndustryFundProjection {
+  const row = industryRecord(value, [
+    "state", "fund_selection", "resolutions", "pending_lookthrough_selection_ids",
+  ]);
+  const fundSelection = industryArray(row.fund_selection).map(decodeSelection);
+  const resolutions = industryArray(row.resolutions).map(decodeFundResolution);
+  const pending = industryStrings(row.pending_lookthrough_selection_ids);
+  const result: IndustryFundProjection = {
+    state: industryEnum(row.state, ["no_holdings", "resolved"]),
+    fundSelection,
+    resolutions,
+    pendingLookthroughSelectionIds: pending,
+  };
+  if (fundSelection.length !== resolutions.length
+    || (result.state === "no_holdings" && (fundSelection.length || pending.length))) industryError();
+  return result;
+}
 
 const PIPELINE_PHASES = new Set<NewsPipelinePhase>([
   "queued", "fetching", "raw_saved", "verifying", "evidence_saved",
@@ -2258,6 +2982,37 @@ export const api = {
   hotConcepts: (code: string) => get<HotConcept[]>(`/hot-concepts?code=${code}`),
   investorQa: (code: string) => get<QaRow[]>(`/investor-qa?code=${code}`),
   industry: (top = 20) => get<IndustryData>(`/industry?top=${top}`),
+  industryResearchReport: async (
+    industry: string,
+    windowDays: IndustryWindowDays = 7,
+    signal?: AbortSignal,
+  ) => get<unknown>(
+    `/industry-research/${encodeURIComponent(validateIndustryRequest(industry, windowDays))}?window_days=${windowDays}`,
+    signal,
+  ).then(decodeIndustryResearchResponse),
+  industryResearchRefresh: async (industry: string, signal?: AbortSignal) => request<unknown>(
+    `/industry-research/${encodeURIComponent(validateIndustryRequest(industry))}/refresh`,
+    "POST",
+    undefined,
+    signal,
+  ).then(decodeRefresh),
+  resolveIndustryFundRelations: async (
+    industry: string,
+    fundCodes: string[],
+    signal?: AbortSignal,
+  ) => {
+    const normalized = fundCodes.map((code) => {
+      if (!/^\d{6}$/.test(code)) throw new ApiError("基金代码必须是 6 位数字", 400);
+      return code;
+    });
+    if (normalized.length > 32) throw new ApiError("基金代码数量超出限制", 400);
+    return request<unknown>(
+      `/industry-research/${encodeURIComponent(validateIndustryRequest(industry))}/fund-relations/resolve`,
+      "POST",
+      { fund_codes: [...new Set(normalized)] },
+      signal,
+    ).then(decodeFundProjection);
+  },
   myReports: () => get<MyReport[]>("/myreports"),
   uploadReport: (name: string, contentB64: string) =>
     request<MyReport>("/myreports", "POST", { name, content_b64: contentB64 }),

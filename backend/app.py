@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -37,6 +38,8 @@ from data_sources.api import router as data_sources_router
 from evidence_verification import service as evidence_service
 from evidence_verification.storage import event_document, event_summary_document
 from fund_data import service as fund_service
+import industry_research.api as industry_research_api
+from industry_research.api import IndustryResearchService
 from news_intelligence import service as market_news_service
 from news_pipeline.api import router as news_pipeline_router
 from news_pipeline import service as news_pipeline_service
@@ -91,6 +94,7 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
 app.include_router(data_sources_router)
 app.include_router(news_pipeline_router)
+app.include_router(industry_research_api.router)
 
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)
@@ -125,6 +129,14 @@ _PIPELINE_REFRESH_PATHS = {
 }
 _MARKET_NEWS_SOURCE_RETRY_PATH = re.compile(
     r"^/api/market-news/sources/[a-f0-9]{16}/retry$",
+    re.ASCII,
+)
+_INDUSTRY_RESEARCH_WRITE_PATH = re.compile(
+    r"^/api/industry-research/[a-z0-9][a-z0-9_-]{0,63}/(?:refresh|fund-relations/resolve)$",
+    re.ASCII,
+)
+_INDUSTRY_RESEARCH_FUND_PATH = re.compile(
+    r"^/api/industry-research/[a-z0-9][a-z0-9_-]{0,63}/fund-relations/resolve$",
     re.ASCII,
 )
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -187,10 +199,14 @@ def _local_browser_origin(value: str | None) -> bool:
 
 def _protected_local_write_request(request: Request) -> bool:
     is_source_retry = _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
+    is_industry_research_write = (
+        _INDUSTRY_RESEARCH_WRITE_PATH.fullmatch(request.url.path) is not None
+    )
     is_protected_path = (
         request.url.path.startswith("/api/data-sources/")
         or request.url.path in _PIPELINE_REFRESH_PATHS
         or is_source_retry
+        or is_industry_research_write
     )
     if not is_protected_path:
         return False
@@ -198,7 +214,7 @@ def _protected_local_write_request(request: Request) -> bool:
         return True
     if request.method != "OPTIONS":
         return False
-    if is_source_retry:
+    if is_source_retry or is_industry_research_write:
         return True
     requested_methods = _request_header_values(request, "access-control-request-method")
     return len(requested_methods) == 1 and requested_methods[0].upper() in _DATA_SOURCE_WRITE_METHODS
@@ -235,10 +251,17 @@ async def _protect_data_source_writes(request: Request, call_next):
         if len(requested_methods) != 1 or len(requested_header_values) != 1:
             return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
         is_source_retry = _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
+        is_industry_research_write = (
+            _INDUSTRY_RESEARCH_WRITE_PATH.fullmatch(request.url.path) is not None
+        )
         requested_method = requested_methods[0].upper()
         if (
-            (is_source_retry and requested_method != "POST")
-            or (not is_source_retry and requested_method not in _DATA_SOURCE_WRITE_METHODS)
+            ((is_source_retry or is_industry_research_write) and requested_method != "POST")
+            or (
+                not is_source_retry
+                and not is_industry_research_write
+                and requested_method not in _DATA_SOURCE_WRITE_METHODS
+            )
         ):
             return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
         header_names = {
@@ -257,6 +280,15 @@ async def _protect_data_source_writes(request: Request, call_next):
     if origin is not None and not _local_browser_origin(origin):
         return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _prevent_industry_fund_response_storage(request: Request, call_next):
+    response = await call_next(request)
+    if _INDUSTRY_RESEARCH_FUND_PATH.fullmatch(request.url.path) is not None:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 _CODE_RE = r"^\d{6}$"
 
@@ -1219,3 +1251,57 @@ def industry(top: int = Query(20, ge=5, le=50)):
         return {"data": data}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"行业排名异常：{e}") from e
+
+
+# Route decorators above populate this private template once.  Factory-created
+# apps copy those immutable route objects, middleware definitions and handlers,
+# while keeping service state and lifespan ownership per app instance.
+_legacy_route_app = app
+
+
+def create_app(
+    industry_research_service: IndustryResearchService | None = None,
+) -> FastAPI:
+    explicit_injection = industry_research_service is not None
+    service = (
+        industry_research_service
+        if explicit_injection
+        else industry_research_api.create_production_industry_research_service()
+    )
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        async with _lifespan(application):
+            try:
+                yield
+            finally:
+                shutdown = getattr(service, "shutdown", None)
+                if callable(shutdown):
+                    result = shutdown()
+                    if inspect.isawaitable(result):
+                        await result
+
+    application = FastAPI(
+        title=_legacy_route_app.title,
+        description=_legacy_route_app.description,
+        version=_legacy_route_app.version,
+        lifespan=lifespan,
+    )
+    for route in _legacy_route_app.router.routes:
+        if getattr(route, "path", "") not in {
+            "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
+        }:
+            application.router.routes.append(route)
+    for middleware in reversed(_legacy_route_app.user_middleware):
+        application.add_middleware(
+            middleware.cls,
+            *getattr(middleware, "args", ()),
+            **middleware.kwargs,
+        )
+    application.exception_handlers.update(_legacy_route_app.exception_handlers)
+    application.state.industry_research_service = service
+    application.state.industry_research_allow_demo = explicit_injection
+    return application
+
+
+app = create_app()
