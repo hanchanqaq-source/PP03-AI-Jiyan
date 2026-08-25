@@ -214,16 +214,19 @@ def _lookthrough_relation(
     for item in evidence_rows:
         row = _mapping(item)
         code = _nonblank(row.get("stock_code"))
+        if (
+            code is None
+            or _SIX_DIGIT_CODE.fullmatch(code) is None
+            or code not in disclosed_codes
+            or not context.security_matches(industry_id=industry_id, security_code=code)
+        ):
+            continue
         reference = _nonblank(row.get("source_reference"))
         evidence_date = _nonblank(row.get("holding_disclosure_date"))
         if (
-            code is None
-            or code not in disclosed_codes
-            or _SIX_DIGIT_CODE.fullmatch(code) is None
-            or reference is None
+            reference is None
             or evidence_date != disclosure_date
             or not _matching_optional_fund_code(row, fund_code)
-            or not context.security_matches(industry_id=industry_id, security_code=code)
         ):
             return None
         classification_references.add(reference)
@@ -261,16 +264,33 @@ def _official_allocation_relation(
     source_reference = _nonblank(allocation.get("source_reference"))
     if as_of_date is None or source_reference is None:
         return None, False
-    matching_rows = tuple(
-        _mapping(item) for item in _sequence(allocation.get("exposure"))
-        if _matching_optional_fund_code(_mapping(item), fund_code)
-        and _mapping(item).get("industry_id") in {None, industry_id}
-        and isinstance(_mapping(item).get("name"), str)
-        and context.official_allocation_matches(
+    normalized_industry_id = industry_id.strip().casefold()
+    normalized_row_names: set[str] = set()
+    matching: list[Mapping[str, Any]] = []
+    for item in _sequence(allocation.get("exposure")):
+        row = _mapping(item)
+        official_name = _nonblank(row.get("name"))
+        if official_name is None:
+            return None, False
+        normalized_name = official_name.casefold()
+        if normalized_name in normalized_row_names:
+            return None, False
+        normalized_row_names.add(normalized_name)
+        declared_industry = row.get("industry_id")
+        if declared_industry is not None:
+            declared_industry = _nonblank(declared_industry)
+            if declared_industry is None:
+                return None, False
+            if declared_industry.casefold() != normalized_industry_id:
+                continue
+        if not _matching_optional_fund_code(row, fund_code):
+            continue
+        if context.official_allocation_matches(
             industry_id=industry_id,
-            official_name=str(_mapping(item).get("name")),
-        )
-    )
+            official_name=official_name,
+        ):
+            matching.append(row)
+    matching_rows = tuple(matching)
     if len(matching_rows) != 1:
         return None, False
     row = matching_rows[0]
