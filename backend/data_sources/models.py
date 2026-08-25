@@ -102,6 +102,7 @@ class AdapterDescriptor:
     configured_reference: str
     current_provider_priority: int
     catalog_status: CatalogStatus
+    supported_industry_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -54,6 +54,7 @@ _BASE_DESCRIPTOR = AdapterDescriptor(
     PUBLIC_PRICE_URL,
     200,
     CatalogStatus.UNCONFIGURED,
+    ("storage",),
 )
 
 
@@ -244,6 +245,7 @@ class TrendForcePublicPriceAdapter(BaseProvider):
             or catalog_descriptor.adapter_id != _BASE_DESCRIPTOR.adapter_id
             or catalog_descriptor.source_family_id != _BASE_DESCRIPTOR.source_family_id
             or catalog_descriptor.capability_ids != _BASE_DESCRIPTOR.capability_ids
+            or catalog_descriptor.supported_industry_ids != _BASE_DESCRIPTOR.supported_industry_ids
             or catalog_descriptor.configured_reference != _BASE_DESCRIPTOR.configured_reference
         ):
             raise ValueError("catalog_descriptor does not match the industry-price adapter")
@@ -372,8 +374,16 @@ class TrendForcePublicPriceAdapter(BaseProvider):
         )
 
     def fetch(self, request: ProviderRequest) -> tuple[ProviderValue, ...]:
-        if request.capability_id != "industry_price_snapshot" or request.parameters:
+        if (
+            request.capability_id != "industry_price_snapshot"
+            or type(request.parameters) is not dict
+            or set(request.parameters) != {"industry_id"}
+            or type(request.parameters.get("industry_id")) is not str
+        ):
             raise ProviderUnavailable("invalid_request_parameter", reference=PUBLIC_PRICE_URL)
+        industry_id = request.parameters["industry_id"]
+        if industry_id not in self.descriptor.supported_industry_ids:
+            raise ProviderUnavailable("unsupported_industry", reference=PUBLIC_PRICE_URL)
         if not qualification_allows_enabled_adapter(self._qualification, self.descriptor):
             raise ProviderUnavailable("license_unverified", reference=PUBLIC_PRICE_URL)
         final_url, _status, _headers, _body, rows, _observed_date, unit = self._observed()
@@ -394,6 +404,7 @@ class TrendForcePublicPriceAdapter(BaseProvider):
                 "current_snapshot",
                 {
                     "product": product,
+                    "industry_id": industry_id,
                     "public_reference": final_url,
                     "report_value_status": "not_verified",
                 },

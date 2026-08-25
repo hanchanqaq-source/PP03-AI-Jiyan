@@ -22,7 +22,7 @@ from evidence_verification.models import (
 )
 from evidence_verification.storage import EvidenceStorage
 from industry_research.admission import EvidenceDecision, RawMetricObservation, SourceIdentity
-from industry_research.models import RefreshPhase
+from industry_research.models import RefreshPhase, RefreshRun
 from industry_research.refresh import IndustryResearchRefreshOrchestrator, RefreshRawSnapshot
 from industry_research.service import IndustryResearchService
 from industry_research.source_qualification import SourceQualificationResult
@@ -78,7 +78,12 @@ def _descriptor(adapter_id: str = "trendforce-public-price", **changes: object):
     return replace(value, **changes)
 
 
-def _provider_value(adapter_id: str, value: float = 100.0) -> ProviderValue:
+def _provider_value(
+    adapter_id: str,
+    value: float = 100.0,
+    *,
+    industry_id: str = "storage",
+) -> ProviderValue:
     return ProviderValue(
         value=value,
         source_family_id="trendforce_public_price",
@@ -92,7 +97,7 @@ def _provider_value(adapter_id: str, value: float = 100.0) -> ProviderValue:
         difference_from_primary=Decimal("0"),
         unit="USD",
         frequency="current_snapshot",
-        source_metadata={"product": "dram_price"},
+        source_metadata={"product": "dram_price", "industry_id": industry_id},
     )
 
 
@@ -112,21 +117,31 @@ class FakeRegistry:
 
 
 class FakeProvider:
-    def __init__(self, descriptor, *, values=(), error: str | None = None) -> None:
+    def __init__(
+        self,
+        descriptor,
+        *,
+        values=(),
+        error: str | None = None,
+        echo_request_industry: bool = False,
+    ) -> None:
         self.descriptor = descriptor
         self.values = tuple(values)
         self.error = error
+        self.echo_request_industry = echo_request_industry
         self.calls = 0
         self.started = threading.Event()
         self.release = threading.Event()
         self.block = False
         self.active = 0
         self.max_active = 0
+        self.requested_industries: list[str] = []
         self._lock = threading.Lock()
 
     def fetch(self, request):
         assert request.capability_id == "industry_price_snapshot"
-        assert request.parameters == {}
+        assert type(request.parameters) is dict
+        self.requested_industries.append(request.parameters.get("industry_id"))
         with self._lock:
             self.calls += 1
             self.active += 1
@@ -137,6 +152,12 @@ class FakeProvider:
                 assert self.release.wait(5)
             if self.error:
                 raise ProviderUnavailable(self.error)
+            if self.echo_request_industry:
+                industry_id = request.parameters["industry_id"]
+                return tuple(replace(
+                    value,
+                    source_metadata={**dict(value.source_metadata), "industry_id": industry_id},
+                ) for value in self.values)
             return self.values
         finally:
             with self._lock:
@@ -148,16 +169,20 @@ class RawBuilder:
         self,
         *,
         invalid: bool = False,
+        raise_error: bool = False,
         official: bool = True,
         barrier: threading.Barrier | None = None,
     ) -> None:
         self.invalid = invalid
+        self.raise_error = raise_error
         self.official = official
         self.barrier = barrier
         self.calls: list[str] = []
 
     def __call__(self, industry_id: str, run_id: str, values: tuple[ProviderValue, ...]):
         self.calls.append(industry_id)
+        if self.raise_error:
+            raise ValueError("raw transformation failed")
         if self.barrier is not None:
             self.barrier.wait(5)
         observations = []
@@ -363,13 +388,42 @@ def _orchestrator(
 
 def test_get_current_history_and_construction_never_trigger_refresh(tmp_path) -> None:
     descriptor = _descriptor()
-    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    provider = FakeProvider(
+        descriptor,
+        values=(_provider_value(descriptor.adapter_id),),
+    )
     orchestrator = _orchestrator(tmp_path, providers={descriptor.adapter_id: provider})
 
     assert orchestrator.current_run("storage") is None
     assert orchestrator.current_candidate("storage") is None
     assert provider.calls == 0
     orchestrator.shutdown()
+
+
+@pytest.mark.parametrize(
+    "malicious_run_id",
+    (".", "..", "../escape", "a/b", "a\\b", "x:y", "x\ncontrol", " leading"),
+)
+def test_malicious_factory_run_id_is_rejected_before_storage_or_provider_use(
+    tmp_path, malicious_run_id
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        descriptors=(descriptor,),
+        providers={descriptor.adapter_id: provider},
+        run_ids=(malicious_run_id,),
+    )
+
+    try:
+        with pytest.raises(ValueError, match="run_id"):
+            orchestrator.request_refresh("storage")
+
+        assert provider.calls == 0
+        assert not (tmp_path / "run-state" / "storage" / "refresh_run.json").exists()
+    finally:
+        orchestrator.shutdown()
 
 
 def test_success_runs_provider_raw_canonical_evidence_admission_assembly_then_atomic_publish(tmp_path) -> None:
@@ -460,6 +514,134 @@ def test_same_industry_requests_return_the_same_future_and_call_provider_once(tm
     orchestrator.shutdown()
 
 
+def test_two_orchestrator_instances_share_one_same_industry_owner_run(tmp_path) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    provider.block = True
+    first = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("owner-first",),
+    )
+    second = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("owner-second",),
+    )
+    try:
+        owner_future = first.request_refresh("storage")
+        assert provider.started.wait(2)
+        follower_future = second.request_refresh("storage")
+        time.sleep(0.15)
+        assert provider.calls == 1
+
+        provider.release.set()
+        owner = owner_future.result(5)
+        follower = follower_future.result(5)
+        assert follower == owner
+        assert owner.run_id == "owner-first"
+        assert provider.calls == 1
+    finally:
+        provider.release.set()
+        first.shutdown()
+        second.shutdown()
+
+
+def test_stale_nonterminal_run_is_failed_before_a_later_request_can_collect(tmp_path) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    seed = _orchestrator(tmp_path, providers={descriptor.adapter_id: provider})
+    stale = RefreshRun(
+        industry_id="storage",
+        run_id="stale-owner",
+        raw_snapshot_id=None,
+        evidence_snapshot_id=None,
+        candidate_snapshot_id=None,
+        phase=RefreshPhase.COLLECTING,
+        error_code=None,
+        displayed_trusted_snapshot_id=None,
+        published_trusted_snapshot_id=None,
+        displayed_raw_snapshot_id=None,
+        displayed_evidence_snapshot_id=None,
+    )
+    seed._state.write(stale, None)
+    seed.shutdown()
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("after-interruption",),
+    )
+
+    interrupted = orchestrator.request_refresh("storage").result(5)
+
+    assert interrupted.run_id == "stale-owner"
+    assert interrupted.phase is RefreshPhase.FAILED
+    assert interrupted.error_code == "refresh_interrupted"
+    assert provider.calls == 0
+
+    completed = orchestrator.request_refresh("storage").result(5)
+    assert completed.run_id == "after-interruption"
+    assert completed.phase is RefreshPhase.TRUSTED_PUBLISHED
+    assert provider.calls == 1
+    orchestrator.shutdown()
+
+
+def test_owner_setup_write_failure_releases_lease_for_another_orchestrator(
+    tmp_path, monkeypatch
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    broken = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("broken-owner",),
+    )
+    successor = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("successor-owner",),
+    )
+
+    def fail_initial_write(*_args, **_kwargs):
+        raise OSError("storage_error")
+
+    monkeypatch.setattr(broken._state, "write", fail_initial_write)
+    try:
+        with pytest.raises(OSError, match="storage_error"):
+            broken.request_refresh("storage")
+
+        completed = successor.request_refresh("storage").result(2)
+        assert completed.run_id == "successor-owner"
+        assert completed.phase is RefreshPhase.TRUSTED_PUBLISHED
+        assert provider.calls == 1
+    finally:
+        broken.shutdown()
+        successor.shutdown()
+
+
+def test_unsafe_lease_parent_fails_request_synchronously_instead_of_polling(
+    tmp_path, monkeypatch
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("unsafe-lease",),
+    )
+
+    def reject_parent(_path) -> None:
+        raise OSError("storage_error")
+
+    monkeypatch.setattr(orchestrator._state._writer, "_verify_parent", reject_parent)
+    try:
+        with pytest.raises(OSError, match="storage_error"):
+            orchestrator.request_refresh("storage")
+        assert provider.calls == 0
+    finally:
+        orchestrator.shutdown()
+
+
 def test_allowlist_never_resolves_or_calls_key_paid_login_cookie_or_member_providers(tmp_path) -> None:
     cases = {
         "good": (_descriptor("good"), _qualification()),
@@ -488,6 +670,51 @@ def test_allowlist_never_resolves_or_calls_key_paid_login_cookie_or_member_provi
     for name in ("free-key", "paid", "login", "cookie", "member"):
         assert providers[name].calls == 0
     assert orchestrator.provider_resolution_ids == ("good",)
+    orchestrator.shutdown()
+
+
+def test_storage_only_provider_is_not_scheduled_for_an_unsupported_industry(tmp_path) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("unsupported-industry",),
+    )
+
+    result = orchestrator.request_refresh("robotics").result(5)
+
+    assert result.error_code == "no_eligible_provider"
+    assert result.published_trusted_snapshot_id is None
+    assert provider.calls == 0
+    assert orchestrator.provider_resolution_ids == ()
+    orchestrator.shutdown()
+
+
+@pytest.mark.parametrize("echoed_industry", ("robotics", ""))
+def test_provider_output_with_wrong_or_missing_industry_echo_is_rejected_before_raw_build(
+    tmp_path, echoed_industry
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(
+        descriptor,
+        values=(_provider_value(descriptor.adapter_id, industry_id=echoed_industry),),
+    )
+    raw_builder = RawBuilder()
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        raw_builder=raw_builder,
+        run_ids=("wrong-provider-industry",),
+    )
+
+    result = orchestrator.request_refresh("storage").result(5)
+
+    assert result.error_code == "source_industry_mismatch"
+    assert result.raw_snapshot_id is None
+    assert result.published_trusted_snapshot_id is None
+    assert raw_builder.calls == []
+    assert provider.requested_industries == ["storage"]
     orchestrator.shutdown()
 
 
@@ -551,6 +778,8 @@ def test_evidence_verification_failure_retains_old_display_without_candidate(tmp
         ("partial", "partial_source_failure", True),
         ("all", "all_sources_failed", False),
         ("conflict", "conflicting_evidence", True),
+        ("raw-mismatch", "raw_industry_mismatch", False),
+        ("raw-build", "raw_build_failed", False),
         ("admission", "admission_failed", True),
         ("assembly", "assembly_failed", True),
         ("write", "storage_error", True),
@@ -588,7 +817,15 @@ def test_failure_matrix_retains_old_display_and_never_publishes_candidate(
             return original(path, payload)
 
         monkeypatch.setattr(storage, "_atomic_write", fail_new_current)
-    raw_builder = RawBuilder(invalid=case == "admission")
+    raw_builder = RawBuilder(
+        invalid=case == "raw-mismatch",
+        raise_error=case == "raw-build",
+    )
+    if case == "admission":
+        def fail_admission(**_kwargs):
+            raise ValueError("admission failed")
+
+        monkeypatch.setattr(refresh_module, "admit_metric_observations", fail_admission)
     service = FailingService() if case == "assembly" else None
     orchestrator = _orchestrator(
         tmp_path,
@@ -618,12 +855,19 @@ def test_failure_matrix_retains_old_display_and_never_publishes_candidate(
 
 
 def test_cross_industry_work_is_bounded_and_run_state_never_crosses_industries(tmp_path) -> None:
-    descriptor = _descriptor()
-    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    descriptor = _descriptor(
+        supported_industry_ids=("storage", "robotics", "semiconductor"),
+    )
+    provider = FakeProvider(
+        descriptor,
+        values=(_provider_value(descriptor.adapter_id),),
+        echo_request_industry=True,
+    )
     provider.block = True
     raw_builder = RawBuilder(invalid=True)
     orchestrator = _orchestrator(
         tmp_path,
+        descriptors=(descriptor,),
         providers={descriptor.adapter_id: provider},
         raw_builder=raw_builder,
         max_workers=2,
@@ -646,7 +890,7 @@ def test_cross_industry_work_is_bounded_and_run_state_never_crosses_industries(t
     assert provider.max_active == 2
     assert set(raw_builder.calls) == {"storage", "robotics", "semiconductor"}
     assert (storage_run.industry_id, storage_run.run_id, storage_run.error_code) == (
-        "storage", "storage-run", "admission_failed"
+        "storage", "storage-run", "raw_industry_mismatch"
     )
     assert (robotics_run.industry_id, robotics_run.run_id, robotics_run.error_code) == (
         "robotics", "robotics-run", "admission_failed"
@@ -655,7 +899,7 @@ def test_cross_industry_work_is_bounded_and_run_state_never_crosses_industries(t
         semiconductor_run.industry_id,
         semiconductor_run.run_id,
         semiconductor_run.error_code,
-    ) == ("semiconductor", "semiconductor-run", "admission_failed")
+    ) == ("semiconductor", "semiconductor-run", "raw_industry_mismatch")
     assert orchestrator.current_run("storage") == storage_run
     assert orchestrator.current_run("robotics") == robotics_run
     assert orchestrator.current_run("semiconductor") == semiconductor_run
@@ -682,7 +926,7 @@ def test_run_and_candidate_state_are_checksum_bound_and_reload_without_provider_
     reloaded.shutdown()
 
 
-def test_postcommit_run_state_failure_never_reports_old_when_new_report_is_durable(
+def test_postcommit_state_failure_does_not_recover_without_run_bound_publication_proof(
     tmp_path, monkeypatch
 ) -> None:
     descriptor = _descriptor()
@@ -697,23 +941,94 @@ def test_postcommit_run_state_failure_never_reports_old_when_new_report_is_durab
     )
     original_write = orchestrator._state.write
 
-    def fail_completed_state(run, candidate) -> None:
+    def fail_completed_state(run, candidate, **kwargs) -> None:
         if run.phase is RefreshPhase.TRUSTED_PUBLISHED:
             raise OSError("storage_error")
-        original_write(run, candidate)
+        original_write(run, candidate, **kwargs)
 
     monkeypatch.setattr(orchestrator._state, "write", fail_completed_state)
 
     result = orchestrator.request_refresh("storage").result(5)
     loaded = storage.load_current("storage")
-    recovered = orchestrator.current_run("storage")
+    persisted = orchestrator.current_run("storage")
 
     assert loaded is not None and loaded.trusted_snapshot_id == "trusted-postcommit"
     assert result.phase is RefreshPhase.TRUSTED_PUBLISHED
     assert result.published_trusted_snapshot_id == "trusted-postcommit"
-    assert recovered is not None and recovered.phase is RefreshPhase.TRUSTED_PUBLISHED
-    assert recovered.displayed_trusted_snapshot_id == "trusted-postcommit"
-    assert recovered.published_trusted_snapshot_id == "trusted-postcommit"
+    assert persisted is not None and persisted.phase is RefreshPhase.VERIFYING
+    assert persisted.displayed_trusted_snapshot_id == "trusted-old"
+    assert persisted.published_trusted_snapshot_id is None
+    orchestrator.shutdown()
+
+
+def test_invalid_publication_proof_keeps_previous_trusted_display_without_promotion(
+    tmp_path
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    storage = RecordingStorage(root=tmp_path / "reports")
+    _seed_old_report(storage)
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_storage=storage,
+        run_ids=("proof-fallback",),
+    )
+    completed = orchestrator.request_refresh("storage").result(5)
+    assert completed.published_trusted_snapshot_id == "trusted-proof-fallback"
+    storage._atomic_write(storage.trusted_snapshot_path("storage"), b"{}\n")
+    fallback = storage.load_current("storage")
+    assert fallback is not None and fallback.trusted_snapshot_id == "trusted-old"
+
+    current = orchestrator.current_run("storage")
+
+    assert current is not None and current.phase is RefreshPhase.FAILED
+    assert current.error_code == "publication_proof_invalid"
+    assert current.published_trusted_snapshot_id is None
+    assert current.displayed_trusted_snapshot_id == "trusted-old"
+    assert current.displayed_raw_snapshot_id == "raw-old"
+    assert current.displayed_evidence_snapshot_id == "evidence-old"
+    orchestrator.shutdown()
+
+
+def test_failed_run_is_never_promoted_by_a_report_that_reuses_raw_and_evidence_lineage(
+    tmp_path
+) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    storage = RecordingStorage(root=tmp_path / "reports")
+    _seed_old_report(storage)
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        report_service=FailingService(),
+        report_storage=storage,
+        run_ids=("failed-lineage",),
+    )
+    failed = orchestrator.request_refresh("storage").result(5)
+    assert failed.error_code == "assembly_failed"
+    unrelated = IndustryResearchService(now=lambda: NOW).assemble_storage_report(
+        trusted_snapshot_id="trusted-unrelated",
+        raw_snapshot_id=failed.raw_snapshot_id,
+        evidence_snapshot_id=failed.evidence_snapshot_id,
+        generated_at=NOW,
+        trusted_observations=(),
+        metric_candidates=None,
+        news_snapshot=None,
+    ).report
+    publication = storage.publish(
+        unrelated,
+        expected_industry_id="storage",
+        expected_raw_snapshot_id=failed.raw_snapshot_id,
+        expected_evidence_snapshot_id=failed.evidence_snapshot_id,
+    )
+    assert publication.published_trusted_snapshot_id == "trusted-unrelated"
+
+    persisted = orchestrator.current_run("storage")
+
+    assert persisted == failed
+    assert persisted.phase is RefreshPhase.FAILED
+    assert persisted.published_trusted_snapshot_id is None
     orchestrator.shutdown()
 
 
@@ -781,6 +1096,61 @@ def test_refresh_state_read_rejects_checksum_valid_cross_industry_candidate(tmp_
     }
     orchestrator._state._writer._atomic_write(
         orchestrator._state._path("storage"),
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert orchestrator.current_run("storage") is None
+    assert orchestrator.current_candidate("storage") is None
+    orchestrator.shutdown()
+
+
+def test_refresh_state_read_rejects_checksum_valid_forged_derived_candidate_id(tmp_path) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("derived-lineage",),
+    )
+    orchestrator.request_refresh("storage").result(5)
+    path = orchestrator._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    document["state"]["run"]["candidate_snapshot_id"] = "candidate-forged"
+    document["state"]["candidate"]["candidate_snapshot_id"] = "candidate-forged"
+    document["state"]["publication"]["candidate_snapshot_id"] = "candidate-forged"
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    orchestrator._state._writer._atomic_write(
+        path,
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert orchestrator.current_run("storage") is None
+    assert orchestrator.current_candidate("storage") is None
+    orchestrator.shutdown()
+
+
+def test_refresh_state_decoder_rejects_unknown_persisted_error_code(tmp_path) -> None:
+    descriptor = _descriptor()
+    provider = FakeProvider(descriptor, values=(_provider_value(descriptor.adapter_id),))
+    orchestrator = _orchestrator(
+        tmp_path,
+        providers={descriptor.adapter_id: provider},
+        run_ids=("unknown-error",),
+    )
+    orchestrator.request_refresh("storage").result(5)
+    path = orchestrator._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    document["state"]["run"]["phase"] = "failed"
+    document["state"]["run"]["error_code"] = "made_up_error"
+    document["state"]["run"]["published_trusted_snapshot_id"] = None
+    document["state"]["publication"] = None
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    orchestrator._state._writer._atomic_write(
+        path,
         refresh_module._canonical(document) + b"\n",
     )
 

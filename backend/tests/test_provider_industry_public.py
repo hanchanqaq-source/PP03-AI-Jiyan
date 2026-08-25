@@ -133,7 +133,7 @@ def test_recorded_public_snapshot_preserves_fields_date_unit_and_candidate_statu
         fetched_at=lambda: datetime(2026, 8, 25, tzinfo=timezone.utc),
     )
 
-    rows = adapter.fetch(ProviderRequest("industry_price_snapshot", {}))
+    rows = adapter.fetch(ProviderRequest("industry_price_snapshot", {"industry_id": "storage"}))
 
     assert [row.value for row in rows] == [Decimal("6.742"), Decimal("3.215")]
     assert {row.as_of_date for row in rows} == {date(2026, 8, 24)}
@@ -141,6 +141,7 @@ def test_recorded_public_snapshot_preserves_fields_date_unit_and_candidate_statu
     assert {row.frequency for row in rows} == {"current_snapshot"}
     assert {row.data_status for row in rows} == {"candidate_snapshot"}
     assert {row.source_family_id for row in rows} == {"trendforce_public_price"}
+    assert {row.source_metadata["industry_id"] for row in rows} == {"storage"}
     assert {row.source_metadata["report_value_status"] for row in rows} == {"not_verified"}
     assert [row.source_metadata["product"] for row in rows] == [
         "DDR5 16G (2Gx8) 4800/5600",
@@ -149,6 +150,23 @@ def test_recorded_public_snapshot_preserves_fields_date_unit_and_candidate_statu
     assert len(http.calls) == 1
     assert http.calls[0][0] == "https://www.trendforce.com/price/dram/dram_spot"
     assert http.calls[0][1] == {"Accept": "text/html,application/xhtml+xml"}
+
+
+def test_public_industry_provider_declares_storage_only_and_rejects_robotics_before_http():
+    from data_sources.providers.industry_price_public import TrendForcePublicPriceAdapter
+
+    http = FakeHttp(recorded("valid_public_snapshot"))
+    descriptor = enabled_catalog_descriptor()
+    adapter = TrendForcePublicPriceAdapter(
+        http=http,
+        qualification=verified_qualification(),
+        catalog_descriptor=descriptor,
+    )
+
+    assert descriptor.supported_industry_ids == ("storage",)
+    with pytest.raises(ProviderUnavailable, match="unsupported_industry"):
+        adapter.fetch(ProviderRequest("industry_price_snapshot", {"industry_id": "robotics"}))
+    assert http.calls == []
 
 
 def test_qualification_records_complete_bounded_response_evidence_without_values():
@@ -197,7 +215,7 @@ def test_recorded_public_page_failures_are_license_unverified_and_never_return_v
     assert result.license_conclusion == "license_unverified"
     assert result.failure_reason == failure_code
     with pytest.raises(ProviderUnavailable, match=failure_code):
-        adapter.fetch(ProviderRequest("industry_price_snapshot", {}))
+        adapter.fetch(ProviderRequest("industry_price_snapshot", {"industry_id": "storage"}))
 
 
 def test_complete_recorded_response_over_cap_fails_closed_before_parsing():
@@ -215,7 +233,7 @@ def test_complete_recorded_response_over_cap_fails_closed_before_parsing():
     assert result.license_conclusion == "license_unverified"
     assert result.failure_reason == "response_too_large"
     with pytest.raises(ProviderUnavailable, match="response_too_large"):
-        adapter.fetch(ProviderRequest("industry_price_snapshot", {}))
+        adapter.fetch(ProviderRequest("industry_price_snapshot", {"industry_id": "storage"}))
 
 
 def test_schema_failure_keeps_observed_transport_evidence_but_clears_unverified_shape():
@@ -280,7 +298,7 @@ def test_unconfigured_default_registry_adapter_cannot_fetch_or_claim_connection(
     assert adapter.descriptor.default_enabled is False
     assert adapter.descriptor.catalog_status.value == "unconfigured"
     with pytest.raises(ProviderUnavailable, match="license_unverified"):
-        adapter.fetch(ProviderRequest("industry_price_snapshot", {}))
+        adapter.fetch(ProviderRequest("industry_price_snapshot", {"industry_id": "storage"}))
     assert adapter.probe("industry_price_snapshot") == {
         "status": "license_unverified",
         "connected": False,
@@ -302,7 +320,7 @@ def test_complete_qualification_cannot_mutate_or_bypass_catalog_disabled_descrip
     assert adapter.descriptor.default_enabled is False
     assert adapter.descriptor.catalog_status is CatalogStatus.UNCONFIGURED
     with pytest.raises(ProviderUnavailable, match="license_unverified"):
-        adapter.fetch(ProviderRequest("industry_price_snapshot", {}))
+        adapter.fetch(ProviderRequest("industry_price_snapshot", {"industry_id": "storage"}))
 
 
 def test_transport_failure_is_recorded_as_unavailable_without_substitute_source():
