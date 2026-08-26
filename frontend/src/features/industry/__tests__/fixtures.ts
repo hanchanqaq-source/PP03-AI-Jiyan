@@ -150,6 +150,7 @@ function candidateWire(industryId: string): Wire {
     ],
     conflicting_events: [{ industry_id: industryId, event_id: `${prefix}-CONFLICT-30`, status: "conflicting", occurred_at: "2026-08-05T00:00:00+00:00", evidence_ids: ["E-CONFLICT-A", "E-CONFLICT-B"], supporting_evidence_ids: ["E-CONFLICT-A"], contradicting_evidence_ids: ["E-CONFLICT-B"], roles: ["risk"], candidate_snapshot_id: `CANDIDATE-${prefix}-1`, raw_snapshot_id: `RAW-${industryId}-2`, evidence_snapshot_id: `EVIDENCE-${industryId}-2` }],
     raw_snapshot_id: `RAW-${industryId}-2`, evidence_snapshot_id: `EVIDENCE-${industryId}-2`,
+    external_lineages: [],
   };
 }
 

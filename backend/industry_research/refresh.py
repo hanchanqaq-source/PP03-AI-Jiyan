@@ -23,6 +23,7 @@ from .admission import RawMetricObservation, admit_metric_observations
 from .models import (
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
+    CandidateExternalLineage,
     CandidateIndustryEvidenceEvent,
     ConflictingObservation,
     ConflictingSourceValue,
@@ -31,6 +32,7 @@ from .models import (
     RefreshPhase,
     RefreshRun,
     VerificationStatus,
+    _candidate_panel_with_canonical_a2_lineage,
     _conflicting_truth_key,
     _verified_conflicting_observation,
 )
@@ -189,13 +191,22 @@ def _run_from_dict(value: object) -> RefreshRun:
     return run
 
 
-def _candidate_from_dict(value: object) -> CandidateEvidencePanel:
+def _candidate_from_dict(
+    value: object,
+    *,
+    restore_canonical_external_lineage: bool = False,
+) -> CandidateEvidencePanel:
     required = {
         "industry_id", "candidate_snapshot_id", "counts", "unverified", "conflicting",
         "unverified_events", "conflicting_events", "raw_snapshot_id", "evidence_snapshot_id",
     }
-    if type(value) is not dict or set(value) != required:
+    if type(value) is not dict:
         raise ValueError("invalid candidate state schema")
+    has_external = "external_lineages" in value
+    if set(value) != required | ({"external_lineages"} if has_external else set()):
+        raise ValueError("invalid candidate state schema")
+    if has_external and not restore_canonical_external_lineage:
+        raise ValueError("external candidate lineage requires verified state envelope")
     row = value
     counts = row["counts"]
     if type(counts) is not dict or set(counts) != {
@@ -261,7 +272,24 @@ def _candidate_from_dict(value: object) -> CandidateEvidencePanel:
             evidence_snapshot_id=item["evidence_snapshot_id"],
         )
 
-    return CandidateEvidencePanel(
+    external_lineages: tuple[CandidateExternalLineage, ...] = ()
+    if has_external:
+        if type(row["external_lineages"]) is not list:
+            raise ValueError("invalid external candidate lineage schema")
+        parsed: list[CandidateExternalLineage] = []
+        for item in row["external_lineages"]:
+            if type(item) is not dict or set(item) != {
+                "kind", "candidate_snapshot_id", "raw_snapshot_id", "evidence_snapshot_id",
+            }:
+                raise ValueError("invalid external candidate lineage schema")
+            parsed.append(CandidateExternalLineage(**item))
+        external_lineages = tuple(parsed)
+    constructor = (
+        _candidate_panel_with_canonical_a2_lineage
+        if external_lineages
+        else CandidateEvidencePanel
+    )
+    return constructor(
         industry_id=row["industry_id"],
         candidate_snapshot_id=row["candidate_snapshot_id"],
         counts=CandidateEvidenceCounts(**counts),
@@ -271,6 +299,7 @@ def _candidate_from_dict(value: object) -> CandidateEvidencePanel:
         conflicting_events=tuple(candidate_event(item) for item in row["conflicting_events"]),
         raw_snapshot_id=row["raw_snapshot_id"],
         evidence_snapshot_id=row["evidence_snapshot_id"],
+        external_lineages=external_lineages,
     )
 
 
@@ -497,7 +526,7 @@ class _RefreshStateStore:
                 "publication": publication.to_dict() if publication is not None else None,
             }
             document = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "checksum": hashlib.sha256(_canonical(state)).hexdigest(),
                 "state": state,
             }
@@ -548,7 +577,7 @@ class _RefreshStateStore:
             document = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
             if type(document) is not dict or set(document) != {"schema_version", "checksum", "state"}:
                 return None
-            if document["schema_version"] not in {1, 2, 3, 4} or type(document["checksum"]) is not str:
+            if document["schema_version"] not in {1, 2, 3, 4, 5} or type(document["checksum"]) is not str:
                 return None
             state = document["state"]
             expected_keys = (
@@ -564,7 +593,31 @@ class _RefreshStateStore:
             if type(generation) is not int or generation <= 0:
                 return None
             run = _run_from_dict(state["run"])
-            candidate = _candidate_from_dict(state["candidate"]) if state["candidate"] is not None else None
+            if state["candidate"] is not None:
+                candidate_row = state["candidate"]
+                if type(candidate_row) is not dict or (
+                    candidate_row.get("industry_id"),
+                    candidate_row.get("candidate_snapshot_id"),
+                    candidate_row.get("raw_snapshot_id"),
+                    candidate_row.get("evidence_snapshot_id"),
+                ) != (
+                    run.industry_id,
+                    run.candidate_snapshot_id,
+                    run.raw_snapshot_id,
+                    run.evidence_snapshot_id,
+                ):
+                    return None
+                if (
+                    document["schema_version"] == 5
+                    and "external_lineages" not in candidate_row
+                ):
+                    return None
+                candidate = _candidate_from_dict(
+                    candidate_row,
+                    restore_canonical_external_lineage=document["schema_version"] == 5,
+                )
+            else:
+                candidate = None
             if run.industry_id != industry_id:
                 return None
             if (run.candidate_snapshot_id is None) != (candidate is None):
@@ -588,7 +641,7 @@ class _RefreshStateStore:
             elif document["schema_version"] == 3 and state["publication"] is not None:
                 if not _legacy_v3_publication_is_valid(state["publication"]):
                     return None
-            elif document["schema_version"] == 4 and state["publication"] is not None:
+            elif document["schema_version"] in {4, 5} and state["publication"] is not None:
                 publication = _publication_from_dict(state["publication"])
             if publication is not None:
                 if not _proof_matches_run(publication, run):
@@ -607,7 +660,7 @@ class _RefreshStateStore:
                     or publication.prepared_generation != generation - 1
                 ):
                     return None
-            if document["schema_version"] == 4 and (
+            if document["schema_version"] in {4, 5} and (
                 run.phase is RefreshPhase.TRUSTED_PUBLISHED
             ) != (publication is not None and publication.phase == "committed"):
                 return None

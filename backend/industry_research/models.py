@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import InitVar, dataclass, fields, is_dataclass
+from dataclasses import InitVar, dataclass, field, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
 import math
@@ -97,7 +97,11 @@ def _wire_value(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _wire_value(getattr(value, field.name)) for field in fields(value)}
+        return {
+            item.name: _wire_value(getattr(value, item.name))
+            for item in fields(value)
+            if not item.name.startswith("_")
+        }
     if isinstance(value, Mapping):
         return {str(key): _wire_value(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
@@ -777,6 +781,32 @@ class CandidateEvidenceCounts(WireModel):
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateExternalLineage(WireModel):
+    """A declared, canonical external candidate lineage carried on the wire."""
+
+    kind: str
+    candidate_snapshot_id: str
+    raw_snapshot_id: str
+    evidence_snapshot_id: str
+
+    def __post_init__(self) -> None:
+        if self.kind != "a2_news":
+            raise ValueError("unsupported external candidate lineage kind")
+        values = (
+            self.candidate_snapshot_id,
+            self.raw_snapshot_id,
+            self.evidence_snapshot_id,
+        )
+        if any(type(value) is not str or not value.strip() or value != value.strip() for value in values):
+            raise ValueError("external candidate lineage IDs must not be blank")
+        if self.candidate_snapshot_id != self.evidence_snapshot_id:
+            raise ValueError("canonical A2 candidate/evidence snapshots must match")
+
+
+_CANONICAL_A2_LINEAGE_PROOF = object()
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateEvidencePanel(WireModel):
     industry_id: str
     candidate_snapshot_id: str | None
@@ -787,6 +817,12 @@ class CandidateEvidencePanel(WireModel):
     conflicting_events: tuple[CandidateIndustryEvidenceEvent, ...]
     raw_snapshot_id: str | None = None
     evidence_snapshot_id: str | None = None
+    external_lineages: tuple[CandidateExternalLineage, ...] = ()
+    _canonical_external_lineage_proof: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.counts, CandidateEvidenceCounts):
@@ -841,10 +877,16 @@ class CandidateEvidencePanel(WireModel):
             raise ValueError("candidate conflicting raw lineage mismatch")
         if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in self.conflicting):
             raise ValueError("candidate conflicting evidence lineage mismatch")
-        # Metric candidates use the panel lineage. Independently signed A2 news
-        # candidates may retain a second raw lineage, but their canonical
-        # evidence snapshot is also their candidate snapshot. No arbitrary third
-        # lineage shape is accepted.
+        if any(not isinstance(item, CandidateExternalLineage) for item in self.external_lineages):
+            raise TypeError("external_lineages contains an invalid element type")
+        external = {
+            (item.candidate_snapshot_id, item.raw_snapshot_id, item.evidence_snapshot_id)
+            for item in self.external_lineages
+        }
+        if len(external) != len(self.external_lineages):
+            raise ValueError("duplicate external candidate lineage")
+        if self.external_lineages and self._canonical_external_lineage_proof is not _CANONICAL_A2_LINEAGE_PROOF:
+            raise ValueError("external candidate lineage lacks canonical A2 proof")
         events = self.unverified_events + self.conflicting_events
         panel_lineage = (
             self.candidate_snapshot_id,
@@ -857,14 +899,35 @@ class CandidateEvidencePanel(WireModel):
                 item.raw_snapshot_id,
                 item.evidence_snapshot_id,
             )
-            if item_lineage != panel_lineage and (
-                item.candidate_snapshot_id != item.evidence_snapshot_id
-            ):
-                raise ValueError("candidate event lineage is neither panel-bound nor canonical A2")
+            if item_lineage != panel_lineage and item_lineage not in external:
+                raise ValueError("candidate event lineage is neither panel-bound nor declared canonical A2 lineage")
+        used_external = {
+            (
+                item.candidate_snapshot_id,
+                item.raw_snapshot_id,
+                item.evidence_snapshot_id,
+            )
+            for item in events
+            if (
+                item.candidate_snapshot_id,
+                item.raw_snapshot_id,
+                item.evidence_snapshot_id,
+            ) != panel_lineage
+        }
+        if used_external != external:
+            raise ValueError("declared external candidate lineage does not match events")
         actual = (len(self.unverified), len(self.conflicting), len(self.unverified_events), len(self.conflicting_events))
         expected = (self.counts.unverified, self.counts.conflicting, self.counts.unverified_events, self.counts.conflicting_events)
         if actual != expected:
             raise ValueError("candidate evidence counts do not match arrays")
+
+
+def _candidate_panel_with_canonical_a2_lineage(**values: object) -> CandidateEvidencePanel:
+    """Private construction boundary for a lineage verified by canonical A2 state."""
+    return CandidateEvidencePanel(
+        **values,
+        _canonical_external_lineage_proof=_CANONICAL_A2_LINEAGE_PROOF,
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,9 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 from fastapi import HTTPException, Request
@@ -363,6 +365,335 @@ def test_default_public_fund_adapter_binds_existing_service_only_to_request_temp
     assert cache_paths[0].name == "fund-cache"
     assert cache_paths[0].parent.parent == root
     assert cache_paths[0].parent.name.startswith("fund-context-")
+    assert tuple(root.iterdir()) == ()
+
+
+def test_default_public_fund_adapter_builds_exact_dynamic_mapping_from_disclosed_classification(
+    tmp_path, monkeypatch,
+) -> None:
+    class FakeCache:
+        def __init__(self, _path) -> None:
+            pass
+
+    class FakeFundDataService:
+        def __init__(self, *, cache) -> None:
+            assert isinstance(cache, FakeCache)
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            assert force_refresh is False
+            return {
+                "code": code,
+                "holdings": {
+                    "data": {
+                        "fund_code": code,
+                        "holdings": [{"stock_code": "688001"}],
+                        "disclosure_date": "2026-06-30",
+                    },
+                    "meta": {
+                        "status": "disclosed",
+                        "source_reference": "https://public.example/holdings/900001",
+                    },
+                },
+                "industry_exposure": {
+                    "data": {
+                        "fund_code": code,
+                        "lookthrough": {"status": "disclosed", "disclosure_date": "2026-06-30"},
+                        "industry_chain_tags": [{
+                            "id": "storage",
+                            "name": "存储",
+                            "weight_pct": 12.5,
+                            "evidence_level": "disclosed_stock_classification",
+                        }],
+                        "holding_industry_evidence": [{
+                            "stock_code": "688001",
+                            "primary_industry": "制造业",
+                            "detail_industry": "存储芯片制造",
+                            "source_reference": "https://public.example/classification/688001",
+                            "holding_disclosure_date": "2026-06-30",
+                        }],
+                        "official_allocation": {"exposure": []},
+                    },
+                    "meta": {"status": "disclosed"},
+                },
+            }
+
+    monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
+    monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        now=lambda: NOW,
+        fund_acceptance_root=root,
+    )
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 200
+    relation = response.json()["resolutions"][0]["relation"]
+    assert relation["relation_layer"] == "disclosed_lookthrough"
+    assert relation["exposure_value"] == 12.5
+    assert tuple(root.iterdir()) == ()
+
+
+@pytest.mark.parametrize("invalid_field", ("source_reference", "holding_disclosure_date"))
+def test_default_public_fund_mapping_rejects_incomplete_classification_evidence(
+    tmp_path, monkeypatch, invalid_field: str,
+) -> None:
+    class FakeCache:
+        def __init__(self, _path) -> None:
+            return None
+
+    class FakeFundDataService:
+        def __init__(self, *, cache) -> None:
+            assert isinstance(cache, FakeCache)
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            evidence_row = {
+                "stock_code": "688001",
+                "detail_industry": "存储芯片制造",
+                "source_reference": "https://public.example/classification/688001",
+                "holding_disclosure_date": "2026-06-30",
+            }
+            evidence_row[invalid_field] = (
+                "" if invalid_field == "source_reference" else "2026-03-31"
+            )
+            return {
+                "code": code,
+                "holdings": {
+                    "data": {
+                        "fund_code": code,
+                        "holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
+                        "disclosure_date": "2026-06-30",
+                    },
+                    "meta": {
+                        "status": "disclosed",
+                        "source_reference": "https://public.example/holdings/900001",
+                    },
+                },
+                "industry_exposure": {
+                    "data": {
+                        "fund_code": code,
+                        "lookthrough": {"status": "disclosed", "disclosure_date": "2026-06-30"},
+                        "industry_chain_tags": [{
+                            "id": "storage",
+                            "weight_pct": 12.5,
+                            "evidence_level": "disclosed_stock_classification",
+                        }],
+                        "holding_industry_evidence": [evidence_row],
+                        "official_allocation": {"exposure": []},
+                    },
+                    "meta": {"status": "disclosed"},
+                },
+            }
+
+    monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
+    monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_acceptance_root=root,
+    )
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["resolutions"][0] == {
+        "selection_id": "selection-1",
+        "fund_code": "900001",
+        "relation": None,
+        "empty_reason": "unknown",
+    }
+    assert tuple(root.iterdir()) == ()
+
+
+def test_invalid_acceptance_root_is_rejected_before_adapter_creation(tmp_path) -> None:
+    created = 0
+
+    def factory():
+        nonlocal created
+        created += 1
+        raise AssertionError("invalid root reached adapter factory")
+
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_analysis_adapter_factory=factory,
+        fund_acceptance_root=Path(tmp_path.anchor) / "outside-acceptance",
+    )
+
+    with pytest.raises(ValueError, match=".tmp/acceptance"):
+        service.resolve_fund_relations("storage", ("900001",))
+
+    assert created == 0
+    assert not (tmp_path / "outside-acceptance").exists()
+
+
+def test_acceptance_root_mkdir_failure_happens_before_adapter_creation(
+    tmp_path, monkeypatch,
+) -> None:
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    created = 0
+    original_mkdir = Path.mkdir
+
+    def fail_target(path: Path, *args, **kwargs):
+        if path == root:
+            raise OSError("fixture mkdir failure")
+        return original_mkdir(path, *args, **kwargs)
+
+    def factory():
+        nonlocal created
+        created += 1
+        raise AssertionError("mkdir failure reached adapter factory")
+
+    monkeypatch.setattr(Path, "mkdir", fail_target)
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_analysis_adapter_factory=factory,
+        fund_acceptance_root=root,
+    )
+
+    with pytest.raises(OSError, match="fixture mkdir failure"):
+        service.resolve_fund_relations("storage", ("900001",))
+
+    assert created == 0
+
+
+def test_context_initialization_failure_closes_request_adapter_once(tmp_path) -> None:
+    class InvalidAdapter:
+        storage_mode = "invalid"
+        requires_transient_disk = False
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    adapter = InvalidAdapter()
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_analysis_adapter_factory=lambda: adapter,
+        fund_acceptance_root=root,
+    )
+
+    with pytest.raises(ValueError, match="storage_mode"):
+        service.resolve_fund_relations("storage", ("900001",))
+
+    assert adapter.closed == 1
+
+
+def test_fund_post_runs_sync_resolution_off_the_event_loop() -> None:
+    class SlowService(RecordingService):
+        def resolve_fund_relations(self, industry_id: str, fund_codes: tuple[str, ...]):
+            time.sleep(0.1)
+            return super().resolve_fund_relations(industry_id, fund_codes)
+
+    service = SlowService()
+    body = b'{"fund_codes":["900001"]}'
+    delivered = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/api/industry-research/storage/fund-relations/resolve",
+        "headers": [(b"content-length", str(len(body)).encode("ascii"))],
+        "app": SimpleNamespace(state=SimpleNamespace(industry_research_service=service)),
+    }, receive=receive)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(industry_api.resolve_fund_relations(request, "storage"))
+        await asyncio.sleep(0.02)
+        assert not task.done(), "sync resolver blocked the event loop until completion"
+        response = await task
+        assert response.status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_fund_post_waits_for_worker_and_cleans_transient_context(tmp_path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingAdapter:
+        storage_mode = "request_temp"
+        requires_transient_disk = True
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def bind_transient_root(self, _root: Path) -> None:
+            return None
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            assert code == "900001"
+            assert force_refresh is False
+            started.set()
+            assert release.wait(5)
+            return {
+                "code": code,
+                "holdings": {"data": None, "meta": {"status": "error"}},
+                "industry_exposure": {"data": None, "meta": {"status": "error"}},
+            }
+
+        def close(self) -> None:
+            self.closed += 1
+
+    adapter = BlockingAdapter()
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_analysis_adapter_factory=lambda: adapter,
+        fund_acceptance_root=root,
+    )
+    body = b'{"fund_codes":["900001"]}'
+    delivered = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/api/industry-research/storage/fund-relations/resolve",
+        "headers": [(b"content-length", str(len(body)).encode("ascii"))],
+        "app": SimpleNamespace(state=SimpleNamespace(industry_research_service=service)),
+    }, receive=receive)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(industry_api.resolve_fund_relations(request, "storage"))
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done(), "cancelled endpoint abandoned the request worker"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert adapter.closed == 1
     assert tuple(root.iterdir()) == ()
 
 

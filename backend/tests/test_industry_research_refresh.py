@@ -534,7 +534,7 @@ def test_refresh_publishes_canonical_a2_news_and_projected_official_companies(tm
                 "relation_type": "official_disclosure",
                 "key_metric_ids": ("dram_price",),
                 "evidence_ids": (evidence.events[0].primary_evidence[0].evidence_id,),
-                "as_of_date": "2026-06-30",
+                "as_of_date": "2026-08-25",
                 "official_evidence": True,
             },
             {
@@ -544,14 +544,35 @@ def test_refresh_publishes_canonical_a2_news_and_projected_official_companies(tm
                 "chain_node_id": "memory_design_manufacturing",
                 "relation_type": "official_disclosure",
                 "evidence_ids": ("wrong-industry",),
-                "as_of_date": "2026-06-30",
+                "as_of_date": "2026-08-25",
                 "official_evidence": True,
             },
+        )
+
+    verifier = EvidenceVerifier()
+
+    def verify_with_company_binding(raw: RefreshRawSnapshot) -> EvidenceSnapshot:
+        snapshot = verifier(raw)
+        source_event = snapshot.events[0]
+        source_item = source_event.primary_evidence[0]
+        company_item = replace(
+            source_item,
+            supports_fields=source_item.supports_fields + (
+                "metric:dram_price",
+                "security_code:688001",
+                "chain_node:memory_design_manufacturing",
+                "relation_type:official_disclosure",
+            ),
+        )
+        return replace(
+            snapshot,
+            events=(replace(source_event, primary_evidence=(company_item,)),),
         )
 
     orchestrator = _orchestrator(
         tmp_path,
         report_storage=storage,
+        evidence_verifier=verify_with_company_binding,
         canonical_news_snapshot_loader=load_news,
         company_candidate_loader=load_companies,
     )

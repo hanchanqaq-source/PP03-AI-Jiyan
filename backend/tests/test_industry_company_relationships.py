@@ -1,12 +1,33 @@
 from __future__ import annotations
 
-from industry_research.relationships import project_company_relations
+from industry_research.relationships import CompanyEvidenceBinding, project_company_relations
 
 
 PROJECTION_SCOPE = {
     "allowed_chain_node_ids": ("memory_design_manufacturing",),
     "allowed_metric_ids": ("dram_price",),
-    "allowed_evidence_ids": ("evidence-company-1", "evidence-classification-1"),
+    "evidence_bindings": {
+        "evidence-company-1": CompanyEvidenceBinding(
+            "evidence-company-1",
+            frozenset({
+                "security_code:688001",
+                "chain_node:memory_design_manufacturing",
+                "relation_type:official_disclosure",
+                "metric:dram_price",
+            }),
+            "2026-06-30",
+        ),
+        "evidence-classification-1": CompanyEvidenceBinding(
+            "evidence-classification-1",
+            frozenset({
+                "security_code:688001",
+                "chain_node:memory_design_manufacturing",
+                "relation_type:public_classification",
+                "metric:dram_price",
+            }),
+            "2026-06-30",
+        ),
+    },
 }
 
 
@@ -80,6 +101,22 @@ def test_company_projection_rejects_foreign_template_and_evidence_bindings() -> 
             _candidate(security_code="688003", evidence_ids=("foreign-evidence",)),
         ),
         **PROJECTION_SCOPE,
+    )
+
+    assert result == ()
+
+
+def test_company_projection_rejects_wrong_date_and_incomplete_semantic_proof() -> None:
+    result = project_company_relations(
+        industry_id="storage",
+        candidates=(
+            _candidate(as_of_date="2026-07-01"),
+            _candidate(security_code="688002"),
+            _candidate(key_metric_ids=("dram_price", "nand_price")),
+        ),
+        allowed_chain_node_ids=("memory_design_manufacturing",),
+        allowed_metric_ids=("dram_price", "nand_price"),
+        evidence_bindings=PROJECTION_SCOPE["evidence_bindings"],
     )
 
     assert result == ()

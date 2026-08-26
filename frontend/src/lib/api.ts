@@ -397,6 +397,12 @@ export interface CandidateIndustryEvidence {
   conflictingEvents: IndustryCandidateEvent[];
   rawSnapshotId: string | null;
   evidenceSnapshotId: string | null;
+  externalLineages: Array<{
+    kind: "a2_news";
+    candidateSnapshotId: string;
+    rawSnapshotId: string;
+    evidenceSnapshotId: string;
+  }>;
 }
 
 export interface IndustryRefreshRun {
@@ -941,6 +947,7 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
   const row = industryRecord(value, [
     "industry_id", "candidate_snapshot_id", "counts", "unverified", "conflicting",
     "unverified_events", "conflicting_events", "raw_snapshot_id", "evidence_snapshot_id",
+    "external_lineages",
   ]);
   const countsRow = industryRecord(row.counts, [
     "unverified", "conflicting", "unverified_events", "conflicting_events",
@@ -975,6 +982,20 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
   const unverified = industryArray(row.unverified).map(decodeMetric);
   const unverifiedEvents = industryArray(row.unverified_events).map(decodeCandidateEvent);
   const conflictingEvents = industryArray(row.conflicting_events).map(decodeCandidateEvent);
+  const externalLineages = industryArray(row.external_lineages).map((value) => {
+    const item = industryRecord(value, [
+      "kind", "candidate_snapshot_id", "raw_snapshot_id", "evidence_snapshot_id",
+    ]);
+    const candidateSnapshotId = industryString(item.candidate_snapshot_id, 128);
+    const evidenceSnapshotId = industryString(item.evidence_snapshot_id, 128);
+    if (candidateSnapshotId !== evidenceSnapshotId) industryError();
+    return {
+      kind: industryEnum(item.kind, ["a2_news"] as const),
+      candidateSnapshotId,
+      rawSnapshotId: industryString(item.raw_snapshot_id, 128),
+      evidenceSnapshotId,
+    };
+  });
   const result: CandidateIndustryEvidence = {
     industryId: industryId(row.industry_id),
     candidateSnapshotId: industryNullableString(row.candidate_snapshot_id, 128),
@@ -990,7 +1011,15 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
     conflictingEvents,
     rawSnapshotId: industryNullableString(row.raw_snapshot_id, 128),
     evidenceSnapshotId: industryNullableString(row.evidence_snapshot_id, 128),
+    externalLineages,
   };
+  const panelLineage = `${result.candidateSnapshotId}\u0000${result.rawSnapshotId}\u0000${result.evidenceSnapshotId}`;
+  const externalKeys = externalLineages.map((item) => (
+    `${item.candidateSnapshotId}\u0000${item.rawSnapshotId}\u0000${item.evidenceSnapshotId}`
+  ));
+  const eventExternalKeys = [...result.unverifiedEvents, ...result.conflictingEvents]
+    .map((item) => `${item.candidateSnapshotId}\u0000${item.rawSnapshotId}\u0000${item.evidenceSnapshotId}`)
+    .filter((lineage) => lineage !== panelLineage);
   if (result.counts.unverified !== unverified.length || result.counts.conflicting !== conflicting.length
     || result.counts.unverifiedEvents !== unverifiedEvents.length
     || result.counts.conflictingEvents !== conflictingEvents.length
@@ -1006,14 +1035,15 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
       || item.rawSnapshotId !== result.rawSnapshotId
       || item.evidenceSnapshotId !== result.evidenceSnapshotId
       || new Set(item.sourceValues.map((source) => source.evidenceId)).size !== item.sourceValues.length)
+    || new Set(externalKeys).size !== externalKeys.length
     || [...result.unverifiedEvents, ...result.conflictingEvents].some(
       (item) => item.industryId !== result.industryId
-        || (!(
-          item.candidateSnapshotId === result.candidateSnapshotId
-          && item.rawSnapshotId === result.rawSnapshotId
-          && item.evidenceSnapshotId === result.evidenceSnapshotId
-        ) && item.candidateSnapshotId !== item.evidenceSnapshotId),
-    )) industryError();
+        || ![panelLineage, ...externalKeys].includes(
+          `${item.candidateSnapshotId}\u0000${item.rawSnapshotId}\u0000${item.evidenceSnapshotId}`,
+        ),
+    )
+    || new Set(eventExternalKeys).size !== new Set(externalKeys).size
+    || externalKeys.some((lineage) => !eventExternalKeys.includes(lineage))) industryError();
   return result;
 }
 

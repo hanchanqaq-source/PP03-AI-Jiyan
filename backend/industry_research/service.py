@@ -14,6 +14,7 @@ from evidence_verification.storage import EvidenceStorage
 from .models import (
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
+    CandidateExternalLineage,
     CandidateIndustryEvidenceEvent,
     ConflictingObservation,
     ConclusionStatus,
@@ -29,6 +30,7 @@ from .models import (
     SourceRunStatus,
     VerificationStatus,
     WireModel,
+    _candidate_panel_with_canonical_a2_lineage,
     _conflicting_truth_key,
 )
 from .rules import (
@@ -36,7 +38,7 @@ from .rules import (
     observation_is_current,
     select_current_trusted_observations,
 )
-from .relationships import project_company_relations
+from .relationships import CompanyEvidenceBinding, project_company_relations
 from .templates import REPORT_SECTION_IDS, get_industry_template
 
 
@@ -99,6 +101,38 @@ def _event_evidence(event: A2EvidenceEvent):
         + event.syndicated_copies
         + event.contradicting_evidence
     )
+
+
+def _company_evidence_bindings(snapshot: EvidenceSnapshot) -> Mapping[str, CompanyEvidenceBinding]:
+    admitted: dict[str, CompanyEvidenceBinding] = {}
+    rejected_ids: set[str] = set()
+    for event in snapshot.events:
+        if event.verification_status not in {
+            A2VerificationStatus.VERIFIED,
+            A2VerificationStatus.CORROBORATED,
+        }:
+            continue
+        for evidence in _event_evidence(event):
+            if (
+                not evidence.is_official
+                or not evidence.supports_claim
+                or evidence.contradicts_claim
+            ):
+                continue
+            as_of = evidence.published_at or event.evidence_as_of
+            binding = CompanyEvidenceBinding(
+                evidence_id=evidence.evidence_id,
+                supports_fields=frozenset(evidence.supports_fields),
+                as_of_date=as_of.date().isoformat(),
+            )
+            previous = admitted.get(binding.evidence_id)
+            if previous is not None and previous != binding:
+                rejected_ids.add(binding.evidence_id)
+            else:
+                admitted[binding.evidence_id] = binding
+    for evidence_id in rejected_ids:
+        admitted.pop(evidence_id, None)
+    return admitted
 
 
 def _event_roles(event: A2EvidenceEvent) -> tuple[str, ...]:
@@ -258,7 +292,19 @@ def _merge_candidates(
             candidate_snapshot_id, raw_snapshot_id, evidence_snapshot_id = news_lineage
     unverified_events = metric_candidates.unverified_events + window.unverified
     conflicting_events = metric_candidates.conflicting_events + window.conflicting
-    return CandidateEvidencePanel(
+    external_lineages = ()
+    if news_items_present and news_lineage != (
+        candidate_snapshot_id,
+        raw_snapshot_id,
+        evidence_snapshot_id,
+    ):
+        external_lineages = (CandidateExternalLineage("a2_news", *news_lineage),)
+    constructor = (
+        _candidate_panel_with_canonical_a2_lineage
+        if external_lineages
+        else CandidateEvidencePanel
+    )
+    return constructor(
         industry_id=metric_candidates.industry_id,
         candidate_snapshot_id=candidate_snapshot_id,
         counts=CandidateEvidenceCounts(
@@ -273,6 +319,7 @@ def _merge_candidates(
         conflicting_events=conflicting_events,
         raw_snapshot_id=raw_snapshot_id,
         evidence_snapshot_id=evidence_snapshot_id,
+        external_lineages=external_lineages,
     )
 
 
@@ -652,11 +699,6 @@ def assemble_storage_report(
             or company_evidence_snapshot.snapshot_id != evidence_snapshot_id
         ):
             raise ValueError("company evidence snapshot lineage mismatch")
-        company_evidence_ids = {
-            evidence.evidence_id
-            for event in company_evidence_snapshot.events
-            for evidence in _event_evidence(event)
-        }
         companies = project_company_relations(
             industry_id=industry_id,
             candidates=company_rows,
@@ -666,7 +708,7 @@ def assemble_storage_report(
                 + template.core_metric_ids
                 + template.capital_metric_ids
             ),
-            allowed_evidence_ids=company_evidence_ids,
+            evidence_bindings=_company_evidence_bindings(company_evidence_snapshot),
         )
     report = DisplayedTrustedReport(
         industry_id=industry_id,

@@ -177,7 +177,7 @@ describe("industry research page data boundary", () => {
     const scrollIntoView = vi.fn();
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
     localStorage.setItem("vr-page-tags:industry_research", JSON.stringify({ version: 2, ids: ["storage"], activeId: "storage", order: ["storage"] }));
-    history.replaceState(null, "", "/industry-research#metrics");
+    history.replaceState(null, "", "/industry-research?industry=storage&window=30#metrics");
     const pending = deferred<Response>();
     let signal: AbortSignal | undefined;
     vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
@@ -193,6 +193,7 @@ describe("industry research page data boundary", () => {
     expect(screen.queryByText(/正在读取存储/)).not.toBeInTheDocument();
     expect(screen.queryByRole("article", { name: /行业研究报告/ })).not.toBeInTheDocument();
     expect(screen.getByText("当前未选择行业标签；暂无可显示的可信快照。")).toBeInTheDocument();
+    expect(location.search).toBe("");
     expect(location.hash).toBe("");
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
   });
@@ -382,6 +383,24 @@ describe("industry research page data boundary", () => {
     expect(screen.getByRole("button", { name: "最近 30 天" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
     expect(location.hash).toBe("#metrics");
+  });
+
+  it("replaces a popstate URL for a tag that was deleted instead of displaying another industry", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/robotics?") ? "robotics" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+    render(<IndustryResearch />);
+    await screen.findByRole("article", { name: "存储行业研究报告" });
+    await user.click(screen.getByRole("button", { name: "删除机器人" }));
+
+    history.replaceState(null, "", "/industry-research?industry=robotics&window=30#metrics");
+    act(() => window.dispatchEvent(new PopStateEvent("popstate")));
+
+    await waitFor(() => expect(location.search).toBe("?industry=storage&window=30"));
+    expect(screen.getByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "最近 30 天" })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("keeps unknown custom tags in an explicit building state without fabricated report content", async () => {

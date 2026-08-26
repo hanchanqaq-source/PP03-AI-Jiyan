@@ -10,6 +10,7 @@ from industry_research.models import (
     AvailabilityStatus,
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
+    CandidateExternalLineage,
     CandidateIndustryEvidenceEvent,
     ConclusionStatus,
     ConflictingObservation,
@@ -736,6 +737,55 @@ def test_candidate_panel_and_refresh_require_complete_candidate_lineage_and_boun
         )
     with pytest.raises(ValueError, match="candidate.*raw/evidence"):
         replace(_idle_refresh(), candidate_snapshot_id="candidate-1")
+
+
+def test_candidate_panel_rejects_id_equal_foreign_event_without_canonical_declaration() -> None:
+    # Break caught: any caller forges an external A2 event by making candidate == evidence.
+    foreign = CandidateIndustryEvidenceEvent(
+        "storage",
+        "foreign-a2-shaped-event",
+        VerificationStatus.UNVERIFIED,
+        "2026-08-25T00:00:00+08:00",
+        ("foreign-evidence",),
+        ("foreign-evidence",),
+        (),
+        ("news",),
+        "foreign-evidence-snapshot",
+        "foreign-raw-snapshot",
+        "foreign-evidence-snapshot",
+    )
+
+    with pytest.raises(ValueError, match="declared canonical A2 lineage"):
+        CandidateEvidencePanel(
+            industry_id="storage",
+            candidate_snapshot_id="candidate-1",
+            counts=CandidateEvidenceCounts(0, 0, 1, 0),
+            unverified=(),
+            conflicting=(),
+            unverified_events=(foreign,),
+            conflicting_events=(),
+            raw_snapshot_id="raw-1",
+            evidence_snapshot_id="evidence-1",
+        )
+
+    with pytest.raises(ValueError, match="canonical A2 proof"):
+        CandidateEvidencePanel(
+            industry_id="storage",
+            candidate_snapshot_id="candidate-1",
+            counts=CandidateEvidenceCounts(0, 0, 1, 0),
+            unverified=(),
+            conflicting=(),
+            unverified_events=(foreign,),
+            conflicting_events=(),
+            raw_snapshot_id="raw-1",
+            evidence_snapshot_id="evidence-1",
+            external_lineages=(CandidateExternalLineage(
+                "a2_news",
+                "foreign-evidence-snapshot",
+                "foreign-raw-snapshot",
+                "foreign-evidence-snapshot",
+            ),),
+        )
 
 
 def test_refresh_publish_lineage_is_explicit_on_success_and_failure() -> None:

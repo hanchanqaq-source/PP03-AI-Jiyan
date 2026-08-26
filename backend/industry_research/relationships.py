@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 import hashlib
 import math
 import re
@@ -44,6 +45,25 @@ class FundRelationProjection(WireModel):
             raise ValueError("pending lookthrough must reference a request selection")
 
 
+@dataclass(frozen=True, slots=True)
+class CompanyEvidenceBinding:
+    evidence_id: str
+    supports_fields: frozenset[str]
+    as_of_date: str
+
+    def __post_init__(self) -> None:
+        if type(self.evidence_id) is not str or not self.evidence_id.strip():
+            raise ValueError("company evidence_id must not be blank")
+        if any(type(item) is not str or not item.strip() for item in self.supports_fields):
+            raise ValueError("company supports_fields must contain non-blank strings")
+        try:
+            parsed = date.fromisoformat(self.as_of_date)
+        except (TypeError, ValueError) as error:
+            raise ValueError("company evidence as_of_date must be an ISO date") from error
+        if parsed.isoformat() != self.as_of_date:
+            raise ValueError("company evidence as_of_date must be canonical")
+
+
 def _nonblank(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -63,13 +83,20 @@ def project_company_relations(
     candidates: Iterable[Mapping[str, object]],
     allowed_chain_node_ids: Iterable[str],
     allowed_metric_ids: Iterable[str],
-    allowed_evidence_ids: Iterable[str],
+    evidence_bindings: Mapping[str, CompanyEvidenceBinding],
 ) -> tuple[IndustryCompanyRelation, ...]:
     """Admit only exact-code company relations backed by official evidence."""
     chain_ids = frozenset(allowed_chain_node_ids)
     metric_ids = frozenset(allowed_metric_ids)
-    evidence_allowlist = frozenset(allowed_evidence_ids)
-    if any(type(item) is not str or not item for item in chain_ids | metric_ids | evidence_allowlist):
+    if not isinstance(evidence_bindings, Mapping) or any(
+        type(evidence_id) is not str
+        or not evidence_id
+        or not isinstance(binding, CompanyEvidenceBinding)
+        or binding.evidence_id != evidence_id
+        for evidence_id, binding in evidence_bindings.items()
+    ):
+        raise ValueError("company evidence bindings are invalid")
+    if any(type(item) is not str or not item for item in chain_ids | metric_ids):
         raise ValueError("company projection allowlists require non-blank string IDs")
     projected: list[IndustryCompanyRelation] = []
     seen: set[tuple[str, str, str]] = set()
@@ -90,14 +117,33 @@ def project_company_relations(
         if (
             relation_type not in {"official_disclosure", "public_classification"}
             or not evidence_ids
-            or not key_metric_ids
             or company_name is None
             or chain_node_id is None
             or as_of_date is None
             or chain_node_id not in chain_ids
             or not set(key_metric_ids).issubset(metric_ids)
-            or not set(evidence_ids).issubset(evidence_allowlist)
         ):
+            continue
+        try:
+            candidate_date = date.fromisoformat(as_of_date)
+        except ValueError:
+            continue
+        if candidate_date.isoformat() != as_of_date:
+            continue
+        selected_bindings = tuple(evidence_bindings.get(item) for item in evidence_ids)
+        if any(binding is None for binding in selected_bindings):
+            continue
+        bindings = tuple(binding for binding in selected_bindings if binding is not None)
+        if any(binding.as_of_date != as_of_date for binding in bindings):
+            continue
+        required_fields = {
+            f"security_code:{security_code}",
+            f"chain_node:{chain_node_id}",
+            f"relation_type:{relation_type}",
+            *(f"metric:{metric_id}" for metric_id in key_metric_ids),
+        }
+        supported_fields = set().union(*(binding.supports_fields for binding in bindings))
+        if not required_fields.issubset(supported_fields):
             continue
         key = (security_code, chain_node_id, relation_type)
         if key in seen:

@@ -84,6 +84,7 @@ const candidateWire = {
   conflicting_events: [],
   raw_snapshot_id: "raw-refresh-1",
   evidence_snapshot_id: "evidence-refresh-1",
+  external_lineages: [],
 };
 
 const responseWire = {
@@ -286,8 +287,29 @@ describe("industry research API decoder", () => {
     value.candidate_evidence.unverified_events[0].candidate_snapshot_id = "news-evidence-1";
     value.candidate_evidence.unverified_events[0].raw_snapshot_id = "news-raw-1";
     value.candidate_evidence.unverified_events[0].evidence_snapshot_id = "news-evidence-1";
+    value.candidate_evidence.external_lineages = [{
+      kind: "a2_news",
+      candidate_snapshot_id: "news-evidence-1",
+      raw_snapshot_id: "news-raw-1",
+      evidence_snapshot_id: "news-evidence-1",
+    }];
 
     expect(() => decodeIndustryResearchResponse(value)).not.toThrow();
+  });
+
+  it("rejects a tampered declared A2 lineage", () => {
+    const value = structuredClone(responseWire) as any;
+    value.candidate_evidence.unverified_events[0].candidate_snapshot_id = "news-evidence-1";
+    value.candidate_evidence.unverified_events[0].raw_snapshot_id = "news-raw-1";
+    value.candidate_evidence.unverified_events[0].evidence_snapshot_id = "news-evidence-1";
+    value.candidate_evidence.external_lineages = [{
+      kind: "a2_news",
+      candidate_snapshot_id: "news-evidence-1",
+      raw_snapshot_id: "tampered-raw",
+      evidence_snapshot_id: "news-evidence-1",
+    }];
+
+    expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
   });
 
   it("accepts a backend-admitted conflict whose display values differ only by case", () => {

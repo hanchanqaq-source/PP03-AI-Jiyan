@@ -300,14 +300,37 @@ def test_metric_and_news_candidates_keep_independent_per_item_lineage() -> None:
         (event.candidate_snapshot_id, event.raw_snapshot_id, event.evidence_snapshot_id)
         for event in panel.unverified_events + panel.conflicting_events
     } == {("news-evidence-1", "news-raw-1", "news-evidence-1")}
+    assert [lineage.to_dict() for lineage in panel.external_lineages] == [{
+        "kind": "a2_news",
+        "candidate_snapshot_id": "news-evidence-1",
+        "raw_snapshot_id": "news-raw-1",
+        "evidence_snapshot_id": "news-evidence-1",
+    }]
 
 
 def test_assembly_projects_only_official_exact_code_company_candidates() -> None:
+    company_date = datetime(2026, 6, 30, tzinfo=timezone.utc)
+    company_item = replace(
+        evidence_item("company-proof", "a"),
+        published_at=company_date,
+        supports_fields=(
+            "security_code:688001",
+            "chain_node:memory_design_manufacturing",
+            "relation_type:official_disclosure",
+            "metric:dram_price",
+        ),
+    )
+    company_event = replace(
+        event("company-proof", A2VerificationStatus.VERIFIED, 1),
+        published_at=company_date,
+        evidence_as_of=company_date,
+        primary_evidence=(company_item,),
+    )
     company_evidence = EvidenceSnapshot(
         snapshot_id="evidence-storage-1",
         raw_snapshot_id="raw-storage-1",
         generated_at=NOW,
-        events=(event("company-proof", A2VerificationStatus.VERIFIED, 1),),
+        events=(company_event,),
     )
     assembly = assemble_storage_report(
         trusted_snapshot_id="trusted-storage-1",
@@ -355,6 +378,95 @@ def test_assembly_projects_only_official_exact_code_company_candidates() -> None
     )
 
     assert [company.security_code for company in assembly.report.companies] == ["688001"]
+
+
+def test_company_candidate_flag_cannot_admit_irrelevant_official_core_claim() -> None:
+    # Break caught: official_evidence=True plus an unrelated A2 evidence ID creates a company relation.
+    irrelevant = EvidenceSnapshot(
+        snapshot_id="evidence-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        generated_at=NOW,
+        events=(event("unrelated-dram-news", A2VerificationStatus.VERIFIED, 0),),
+    )
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        metric_candidates=None,
+        news_snapshot=None,
+        company_candidates=({
+            "industry_id": "storage",
+            "security_code": "688001",
+            "company_name": "示例存储公司",
+            "chain_node_id": "memory_design_manufacturing",
+            "relation_type": "official_disclosure",
+            "key_metric_ids": ("dram_price",),
+            "evidence_ids": ("unrelated-dram-news-a",),
+            "as_of_date": "2026-08-25",
+            "official_evidence": True,
+        },),
+        company_evidence_snapshot=irrelevant,
+        now=NOW,
+    )
+
+    assert assembly.report.companies == ()
+
+
+@pytest.mark.parametrize("failure", ("unverified", "non_official", "contradicting"))
+def test_company_evidence_requires_trusted_official_noncontradicting_status(failure: str) -> None:
+    company_item = replace(
+        evidence_item("company-proof", "a"),
+        supports_fields=(
+            "security_code:688001",
+            "chain_node:memory_design_manufacturing",
+            "relation_type:official_disclosure",
+            "metric:dram_price",
+        ),
+        is_official=failure != "non_official",
+        supports_claim=failure != "contradicting",
+        contradicts_claim=failure == "contradicting",
+    )
+    company_event = replace(
+        event("company-proof", A2VerificationStatus.VERIFIED, 0),
+        verification_status=(
+            A2VerificationStatus.UNVERIFIED
+            if failure == "unverified"
+            else A2VerificationStatus.VERIFIED
+        ),
+        primary_evidence=(company_item,),
+    )
+    snapshot = EvidenceSnapshot(
+        snapshot_id="evidence-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        generated_at=NOW,
+        events=(company_event,),
+    )
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        metric_candidates=None,
+        news_snapshot=None,
+        company_candidates=({
+            "industry_id": "storage",
+            "security_code": "688001",
+            "company_name": "示例存储公司",
+            "chain_node_id": "memory_design_manufacturing",
+            "relation_type": "official_disclosure",
+            "key_metric_ids": ("dram_price",),
+            "evidence_ids": ("company-proof-a",),
+            "as_of_date": "2026-08-25",
+            "official_evidence": True,
+        },),
+        company_evidence_snapshot=snapshot,
+        now=NOW,
+    )
+
+    assert assembly.report.companies == ()
 
 
 def test_forged_equal_value_conflict_cannot_set_placeholder_without_canonical_a2_proof(

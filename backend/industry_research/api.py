@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from starlette.requests import ClientDisconnect
+from starlette.concurrency import run_in_threadpool
 
 from .models import (
     CandidateEvidenceCounts,
@@ -21,7 +23,7 @@ from .models import (
     RefreshRun,
     TemplateStatus,
 )
-from .fund_context import FundAnalysisAdapter, TransientFundContext
+from .fund_context import FundAnalysisAdapter, TransientFundContext, validate_acceptance_root
 from .relationships import (
     FundRelationProjection,
     resolve_fund_relations as resolve_explicit_fund_relations,
@@ -158,6 +160,7 @@ class _RequestScopedFundDataAdapter:
 
     def __init__(self) -> None:
         self._service: Any | None = None
+        self._security_industry_ids: dict[str, frozenset[str]] = {}
 
     def bind_transient_root(self, root: Path) -> None:
         if self._service is not None:
@@ -170,10 +173,72 @@ class _RequestScopedFundDataAdapter:
     def get_fund_analysis(self, code: str, force_refresh: bool = False) -> Mapping[str, Any]:
         if self._service is None:
             raise RuntimeError("fund adapter has no request temp root")
-        return self._service.get_fund_analysis(code, force_refresh=force_refresh)
+        self._security_industry_ids.clear()
+        analysis = self._service.get_fund_analysis(code, force_refresh=force_refresh)
+        self._capture_exact_classification_mappings(analysis)
+        return analysis
+
+    def _capture_exact_classification_mappings(self, analysis: object) -> None:
+        if not isinstance(analysis, Mapping):
+            return
+        holdings_section = analysis.get("holdings")
+        exposure_section = analysis.get("industry_exposure")
+        if not isinstance(holdings_section, Mapping) or not isinstance(exposure_section, Mapping):
+            return
+        holdings = holdings_section.get("data")
+        exposure = exposure_section.get("data")
+        if not isinstance(holdings, Mapping) or not isinstance(exposure, Mapping):
+            return
+        disclosure_date = holdings.get("disclosure_date")
+        lookthrough = exposure.get("lookthrough")
+        if (
+            type(disclosure_date) is not str
+            or not disclosure_date.strip()
+            or not isinstance(lookthrough, Mapping)
+            or lookthrough.get("disclosure_date") != disclosure_date
+        ):
+            return
+        disclosed: set[str] = set()
+        holding_rows = holdings.get("holdings")
+        if isinstance(holding_rows, (list, tuple)):
+            for item in holding_rows:
+                if not isinstance(item, Mapping):
+                    continue
+                stock_code = item.get("stock_code")
+                if type(stock_code) is str and _FUND_CODE.fullmatch(stock_code):
+                    disclosed.add(stock_code)
+        evidence_rows = exposure.get("holding_industry_evidence")
+        if not isinstance(evidence_rows, (list, tuple)):
+            return
+        from fund_data.service import _industry_chain_tags
+
+        captured: dict[str, set[str]] = {}
+        for item in evidence_rows:
+            if not isinstance(item, Mapping):
+                continue
+            stock_code = item.get("stock_code")
+            source_reference = item.get("source_reference")
+            if (
+                type(stock_code) is not str
+                or _FUND_CODE.fullmatch(stock_code) is None
+                or stock_code not in disclosed
+                or type(source_reference) is not str
+                or not source_reference.strip()
+                or item.get("holding_disclosure_date") != disclosure_date
+            ):
+                continue
+            tags = _industry_chain_tags(dict(item))
+            if tags:
+                captured.setdefault(stock_code, set()).update(tag_id for tag_id, _ in tags)
+        for stock_code, tag_ids in captured.items():
+            self._security_industry_ids[stock_code] = frozenset(tag_ids)
+
+    def security_industry_ids(self, security_code: str) -> frozenset[str]:
+        return self._security_industry_ids.get(security_code, frozenset())
 
     def close(self) -> None:
         self._service = None
+        self._security_industry_ids.clear()
 
 
 def _create_request_scoped_fund_adapter() -> FundAnalysisAdapter:
@@ -262,12 +327,12 @@ class ProductionIndustryResearchService:
     ) -> FundRelationProjection:
         if not fund_codes:
             return FundRelationProjection("no_holdings", (), (), ())
+        acceptance_root = validate_acceptance_root(self._fund_acceptance_root)
+        acceptance_root.mkdir(parents=True, exist_ok=True)
         adapter = self._fund_analysis_adapter_factory()
-        if getattr(adapter, "requires_transient_disk", None) is True:
-            self._fund_acceptance_root.mkdir(parents=True, exist_ok=True)
         context = TransientFundContext(
             adapter=adapter,
-            acceptance_root=self._fund_acceptance_root,
+            acceptance_root=acceptance_root,
             official_industry_config=self._official_industry_config,
         )
         return resolve_explicit_fund_relations(
@@ -427,8 +492,18 @@ async def resolve_fund_relations(
     industry_id = _industry_id(industry_id)
     payload = await _read_fund_relation_request(request)
     service = _service(request)
+    worker = asyncio.create_task(run_in_threadpool(
+        service.resolve_fund_relations,
+        industry_id,
+        payload.fund_codes,
+    ))
     try:
-        projection = service.resolve_fund_relations(industry_id, payload.fund_codes)
+        projection = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        finally:
+            raise
     except Exception:
         raise HTTPException(502, "fund_relation_resolution_failed") from None
     if type(projection) is not FundRelationProjection:

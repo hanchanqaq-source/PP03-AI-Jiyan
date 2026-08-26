@@ -200,6 +200,14 @@ def _is_acceptance_root(path: Path) -> bool:
     )
 
 
+def validate_acceptance_root(path: str | os.PathLike[str]) -> Path:
+    """Validate the lexical request-cache boundary before any filesystem write."""
+    root = Path(os.path.abspath(path))
+    if not _is_acceptance_root(root):
+        raise ValueError("request_temp adapter root must be under .tmp/acceptance")
+    return root
+
+
 def _is_child(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -310,9 +318,7 @@ class TransientFundContext:
                 raise RuntimeError("POSIX disk-backed transient fund context is unsupported")
             if acceptance_root is None:
                 raise ValueError("request_temp adapter requires an acceptance_root")
-            root = Path(acceptance_root).absolute()
-            if not _is_acceptance_root(root):
-                raise ValueError("request_temp adapter root must be under .tmp/acceptance")
+            root = validate_acceptance_root(acceptance_root)
             if not root.exists():
                 raise ValueError("request_temp acceptance_root must already exist")
             self._acceptance_root = root
@@ -378,9 +384,21 @@ class TransientFundContext:
         security_code = security_code.strip()
         if _FUND_CODE.fullmatch(security_code) is None:
             return False
-        return industry_id.strip().casefold() in self._security_industry_ids.get(
-            security_code, frozenset()
-        )
+        expected = industry_id.strip().casefold()
+        if expected in self._security_industry_ids.get(security_code, frozenset()):
+            return True
+        dynamic = getattr(self._adapter, "security_industry_ids", None)
+        if not callable(dynamic):
+            return False
+        try:
+            values = dynamic(security_code)
+        except Exception:
+            return False
+        if not isinstance(values, (tuple, list, set, frozenset)) or any(
+            type(value) is not str or not value.strip() for value in values
+        ):
+            return False
+        return expected in {value.strip().casefold() for value in values}
 
     def __enter__(self) -> TransientFundContext:
         if self._closed:

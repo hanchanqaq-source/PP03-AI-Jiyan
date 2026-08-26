@@ -44,6 +44,16 @@ function writeNavigation(
   else window.history.replaceState(state, "", url);
 }
 
+function clearNavigation() {
+  if (typeof window === "undefined") return;
+  const parameters = new URLSearchParams(window.location.search);
+  parameters.delete("industry");
+  parameters.delete("window");
+  const query = parameters.toString();
+  const url = `${window.location.pathname}${query ? `?${query}` : ""}`;
+  window.history.replaceState(null, "", url);
+}
+
 export function IndustryResearch() {
   const tags = usePageTags("industry_research");
   const coordinator = useTagRequestCoordinator<IndustryResearchResponse>();
@@ -77,6 +87,7 @@ export function IndustryResearch() {
     setLoading(false);
     setError(null);
     setWindowDays(90);
+    clearNavigation();
     completeUserNavigation();
   }, [completeUserNavigation, coordinator]);
 
@@ -165,12 +176,23 @@ export function IndustryResearch() {
     const restore = () => {
       const navigation = navigationFromUrl();
       const target = tagsRef.current.tags.find((tag) => tag.id === navigation.industryId);
-      if (!target) return;
+      if (!target) {
+        const active = tagsRef.current.tags.find(
+          (tag) => tag.id === tagsRef.current.state.activeId,
+        );
+        if (!active) {
+          clearForEmptySelection();
+          return;
+        }
+        writeNavigation(active.id, navigation.windowDays, "replace", true);
+        loadReport(active.id, active.name, false, false, navigation.windowDays, "none");
+        return;
+      }
       loadReport(target.id, target.name, false, false, navigation.windowDays, "none");
     };
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
-  }, [loadReport]);
+  }, [clearForEmptySelection, loadReport]);
 
   const changeWindow = useCallback((nextWindow: IndustryWindowDays) => {
     const industryId = response?.displayedIndustryId ?? requested?.id ?? tagsRef.current.state.activeId;
