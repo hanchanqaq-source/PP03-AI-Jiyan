@@ -1033,6 +1033,38 @@ def test_relation_objects_fail_closed_without_codes_or_disclosure_evidence() -> 
     assert resolution.empty_reason is FundResolutionEmptyReason.NOT_DISCLOSED
 
 
+@pytest.mark.parametrize("metric_ids", ((), ("dram_price", "dram_price")))
+def test_company_relation_model_requires_nonempty_unique_key_metrics(
+    metric_ids: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError, match="key_metric_ids"):
+        IndustryCompanyRelation(
+            industry_id="storage",
+            security_code="688001",
+            company_name="示例存储公司",
+            chain_node_id="memory_design_manufacturing",
+            relation_type="official_disclosure",
+            key_metric_ids=metric_ids,
+            evidence_ids=("ev-1",),
+            as_of_date="2026-06-30",
+            observation_only=True,
+        )
+
+
+def test_fund_relation_model_rejects_noncanonical_disclosure_date() -> None:
+    with pytest.raises(ValueError, match="disclosure_date"):
+        IndustryFundRelation(
+            industry_id="storage",
+            fund_code="000001",
+            relation_layer="official_allocation",
+            exposure_value=12.3,
+            exposure_unit="percent",
+            disclosure_date="2026-6-30",
+            evidence_ids=("ev-1",),
+            status=VerificationStatus.VERIFIED,
+        )
+
+
 def test_fund_resolution_uses_only_its_three_allowed_empty_reasons() -> None:
     # Break caught: metric/provider empty reasons leak into fund relation resolution.
     assert {reason.value for reason in FundResolutionEmptyReason} == {

@@ -421,6 +421,7 @@ def test_default_public_fund_adapter_builds_exact_dynamic_mapping_from_disclosed
     monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
     monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
     root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    root.mkdir(parents=True)
     service = industry_api.ProductionIndustryResearchService(
         storage=IndustryResearchStorage(tmp_path / "reports"),
         now=lambda: NOW,
@@ -494,6 +495,7 @@ def test_default_public_fund_mapping_rejects_incomplete_classification_evidence(
     monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
     monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
     root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    root.mkdir(parents=True)
     service = industry_api.ProductionIndustryResearchService(
         storage=IndustryResearchStorage(tmp_path / "reports"),
         fund_acceptance_root=root,
@@ -621,6 +623,77 @@ def test_memory_fund_adapter_never_creates_acceptance_root(tmp_path) -> None:
     assert not root.exists()
 
 
+def test_disk_fund_adapter_requires_preprovisioned_root_and_closes_once(tmp_path) -> None:
+    class DiskAdapter:
+        storage_mode = "request_temp"
+        requires_transient_disk = True
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    adapter = DiskAdapter()
+    root = tmp_path / ".tmp" / "acceptance" / "missing"
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_analysis_adapter_factory=lambda: adapter,
+        fund_acceptance_root=root,
+    )
+
+    with pytest.raises(FileNotFoundError, match="preprovisioned"):
+        service.resolve_fund_relations("storage", ("900001",))
+
+    assert adapter.closed == 1
+    assert not root.exists()
+
+
+def test_production_fund_resolution_uses_request_clock_for_future_dates(tmp_path) -> None:
+    class MemoryAdapter:
+        storage_mode = "memory"
+        requires_transient_disk = False
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            return {
+                "code": code,
+                "holdings": {
+                    "data": {"fund_code": code, "holdings": [], "disclosure_date": "2026-06-30"},
+                    "meta": {"status": "disclosed", "source_reference": "https://public.test/h"},
+                },
+                "industry_exposure": {
+                    "data": {
+                        "fund_code": code,
+                        "official_allocation": {
+                            "as_of_date": "2026-08-26",
+                            "source_reference": "https://public.test/a",
+                            "exposure": [{"name": "存储", "weight_pct": 12.5}],
+                        },
+                        "lookthrough": {"status": "unavailable"},
+                    },
+                    "meta": {"status": "disclosed"},
+                },
+            }
+
+        def close(self) -> None:
+            return None
+
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        now=lambda: NOW,
+        fund_analysis_adapter_factory=MemoryAdapter,
+        fund_acceptance_root=tmp_path / ".tmp" / "acceptance" / "unused",
+        official_industry_config={
+            "official_allocation_name_to_industry_ids": {"存储": ("storage",)},
+            "security_code_to_industry_ids": {},
+        },
+    )
+
+    result = service.resolve_fund_relations("storage", ("900001",))
+
+    assert result.resolutions[0].relation is None
+
+
 def test_context_initialization_failure_closes_request_adapter_once(tmp_path) -> None:
     class InvalidAdapter:
         storage_mode = "invalid"
@@ -711,6 +784,7 @@ def test_cancelled_fund_post_waits_for_worker_and_cleans_transient_context(tmp_p
 
     adapter = BlockingAdapter()
     root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    root.mkdir(parents=True)
     service = industry_api.ProductionIndustryResearchService(
         storage=IndustryResearchStorage(tmp_path / "reports"),
         fund_analysis_adapter_factory=lambda: adapter,

@@ -229,29 +229,17 @@ def _existing_directory_identity(path: Path) -> tuple[int, int]:
 
 
 def prepare_acceptance_root(path: str | os.PathLike[str]) -> Path:
-    """Safely create a validated request-cache root without following reparses."""
+    """Verify a preprovisioned request-cache root without performing any write."""
     root = validate_acceptance_root(path)
     chain = tuple(reversed(root.parents)) + (root,)
-    created: list[tuple[Path, tuple[int, int]]] = []
-    try:
-        for candidate in chain:
-            try:
-                _existing_directory_identity(candidate)
-                continue
-            except FileNotFoundError:
-                pass
-            candidate.mkdir()
-            identity = _existing_directory_identity(candidate)
-            created.append((candidate, identity))
-        return root
-    except BaseException:
-        for candidate, expected in reversed(created):
-            try:
-                if _existing_directory_identity(candidate) == expected:
-                    candidate.rmdir()
-            except (FileNotFoundError, OSError, RuntimeError):
-                pass
-        raise
+    for candidate in chain:
+        try:
+            _existing_directory_identity(candidate)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(
+                "request_temp acceptance_root must be preprovisioned"
+            ) from error
+    return root
 
 
 def _is_child(path: Path, parent: Path) -> bool:

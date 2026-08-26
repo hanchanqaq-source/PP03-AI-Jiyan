@@ -313,9 +313,8 @@ def _candidate_from_dict(
     if external_lineages:
         if canonical_snapshot_lookup is None:
             raise ValueError("external candidate lineage requires canonical durable lookup")
-        from .service import _candidate_event
+        from .service import _canonical_candidate_events
 
-        candidate_events = unverified_events + conflicting_events
         for lineage in external_lineages:
             try:
                 snapshot = canonical_snapshot_lookup(lineage.raw_snapshot_id)
@@ -328,35 +327,31 @@ def _candidate_from_dict(
                 or lineage.candidate_snapshot_id != snapshot.snapshot_id
             ):
                 raise ValueError("external candidate lineage is not canonical")
-            expected: dict[str, CandidateIndustryEvidenceEvent] = {}
-            for event in snapshot.events:
-                if (
-                    event.verification_status.value not in {"unverified", "conflicting"}
-                    or not any(tag_id == row["industry_id"] for tag_id, _label in event.related_tags)
-                ):
-                    continue
-                projected = _candidate_event(
-                    row["industry_id"],
-                    event,
-                    candidate_snapshot_id=snapshot.snapshot_id,
-                    raw_snapshot_id=snapshot.raw_snapshot_id,
-                    evidence_snapshot_id=snapshot.snapshot_id,
-                )
-                expected[projected.event_id] = projected
-            actual = tuple(
-                event for event in candidate_events
-                if (
-                    event.candidate_snapshot_id,
-                    event.raw_snapshot_id,
-                    event.evidence_snapshot_id,
-                ) == (
-                    lineage.candidate_snapshot_id,
-                    lineage.raw_snapshot_id,
-                    lineage.evidence_snapshot_id,
-                )
+            expected_unverified, expected_conflicting = _canonical_candidate_events(
+                row["industry_id"], snapshot,
             )
-            if not actual or any(expected.get(event.event_id) != event for event in actual):
-                raise ValueError("external candidate event is not canonical")
+
+            def actual_events(
+                events: tuple[CandidateIndustryEvidenceEvent, ...],
+            ) -> tuple[CandidateIndustryEvidenceEvent, ...]:
+                return tuple(
+                    event for event in events
+                    if (
+                        event.candidate_snapshot_id,
+                        event.raw_snapshot_id,
+                        event.evidence_snapshot_id,
+                    ) == (
+                        lineage.candidate_snapshot_id,
+                        lineage.raw_snapshot_id,
+                        lineage.evidence_snapshot_id,
+                    )
+                )
+
+            if (
+                actual_events(unverified_events) != expected_unverified
+                or actual_events(conflicting_events) != expected_conflicting
+            ):
+                raise ValueError("external candidate projection is not canonical and complete")
     constructor = (
         _candidate_panel_with_canonical_a2_lineage
         if external_lineages

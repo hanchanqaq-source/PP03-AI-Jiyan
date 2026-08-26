@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from industry_research.relationships import CompanyEvidenceBinding, project_company_relations
 
 
@@ -134,6 +136,20 @@ def test_company_projection_rejects_invented_name_and_future_candidate() -> None
             _candidate(company_name="伪造公司"),
             _candidate(as_of_date="2026-08-26"),
         ),
+        report_date=date(2026, 8, 25),
+        **PROJECTION_SCOPE,
+    )
+
+    assert result == ()
+
+
+@pytest.mark.parametrize("key_metric_ids", ((), ("dram_price", "dram_price")))
+def test_company_projection_requires_nonempty_unique_key_metrics(
+    key_metric_ids: tuple[str, ...],
+) -> None:
+    result = project_company_relations(
+        industry_id="storage",
+        candidates=(_candidate(key_metric_ids=key_metric_ids),),
         report_date=date(2026, 8, 25),
         **PROJECTION_SCOPE,
     )

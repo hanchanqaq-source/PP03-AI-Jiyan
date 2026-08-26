@@ -31,7 +31,6 @@ from .fund_context import (
 )
 from .relationships import (
     FundRelationProjection,
-    FUND_WEIGHT_TOLERANCE,
     decimal_percent,
     resolve_fund_relations as resolve_explicit_fund_relations,
 )
@@ -244,7 +243,7 @@ class _RequestScopedFundDataAdapter:
             if (
                 stock_code in seen_evidence_codes
                 or evidence_weight is None
-                or abs(evidence_weight - disclosed[stock_code]) > FUND_WEIGHT_TOLERANCE
+                or evidence_weight != disclosed[stock_code]
                 or type(source_reference) is not str
                 or not source_reference.strip()
                 or item.get("holding_disclosure_date") != disclosure_date
@@ -377,6 +376,7 @@ class ProductionIndustryResearchService:
             industry_id=industry_id,
             fund_codes=fund_codes,
             context=context,
+            now=self._now(),
         )
 
     def shutdown(self) -> None:

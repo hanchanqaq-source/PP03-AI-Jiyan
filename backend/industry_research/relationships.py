@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import math
@@ -123,6 +123,8 @@ def project_company_relations(
             or chain_node_id is None
             or as_of_date is None
             or chain_node_id not in chain_ids
+            or not key_metric_ids
+            or len(set(key_metric_ids)) != len(key_metric_ids)
             or not set(key_metric_ids).issubset(metric_ids)
         ):
             continue
@@ -181,9 +183,6 @@ def _finite_percent(value: object) -> float | None:
         return None
     result = float(value)
     return result if math.isfinite(result) and 0 <= result <= 100 else None
-
-
-FUND_WEIGHT_TOLERANCE = Decimal("0.0001")
 
 
 def decimal_percent(value: object) -> Decimal | None:
@@ -255,6 +254,7 @@ def _lookthrough_relation(
     fund_code: str,
     analysis: Mapping[str, Any],
     context: TransientFundContext,
+    report_date: date,
 ) -> IndustryFundRelation | None:
     holdings_section = _mapping(analysis.get("holdings"))
     exposure_section = _mapping(analysis.get("industry_exposure"))
@@ -272,7 +272,11 @@ def _lookthrough_relation(
     if disclosure_date is None or holdings_date != disclosure_date:
         return None
     try:
-        if date.fromisoformat(disclosure_date).isoformat() != disclosure_date:
+        parsed_disclosure_date = date.fromisoformat(disclosure_date)
+        if (
+            parsed_disclosure_date.isoformat() != disclosure_date
+            or parsed_disclosure_date > report_date
+        ):
             return None
     except ValueError:
         return None
@@ -299,6 +303,12 @@ def _lookthrough_relation(
         _evidence_id("holding-disclosure", holdings_reference, fund_code, disclosure_date)
     }
     evidenced_codes: set[str] = set()
+    target_codes = {
+        code for code in disclosed_weights
+        if context.security_matches(industry_id=industry_id, security_code=code)
+    }
+    if not target_codes:
+        return None
     evidence_rows = _sequence(exposure.get("holding_industry_evidence"))
     if not evidence_rows:
         return None
@@ -316,7 +326,7 @@ def _lookthrough_relation(
             code not in disclosed_weights
             or code in evidenced_codes
             or evidence_weight is None
-            or abs(evidence_weight - disclosed_weights[code]) > FUND_WEIGHT_TOLERANCE
+            or evidence_weight != disclosed_weights[code]
             or reference is None
             or evidence_date != disclosure_date
             or not _matching_optional_fund_code(row, fund_code)
@@ -324,10 +334,10 @@ def _lookthrough_relation(
             return None
         evidenced_codes.add(code)
         evidence_ids.add(_evidence_id("security-classification", reference, code, disclosure_date))
-    if not evidenced_codes:
+    if evidenced_codes != target_codes:
         return None
     computed_weight = sum((disclosed_weights[code] for code in evidenced_codes), Decimal("0"))
-    if abs(computed_weight - tag_weight) > FUND_WEIGHT_TOLERANCE:
+    if computed_weight != tag_weight:
         return None
     return IndustryFundRelation(
         industry_id=industry_id,
@@ -347,6 +357,7 @@ def _official_allocation_relation(
     fund_code: str,
     analysis: Mapping[str, Any],
     context: TransientFundContext,
+    report_date: date,
 ) -> tuple[IndustryFundRelation | None, bool]:
     exposure_section = _mapping(analysis.get("industry_exposure"))
     if not _section_is_usable(exposure_section):
@@ -358,6 +369,12 @@ def _official_allocation_relation(
     as_of_date = _nonblank(allocation.get("as_of_date"))
     source_reference = _nonblank(allocation.get("source_reference"))
     if as_of_date is None or source_reference is None:
+        return None, False
+    try:
+        parsed_as_of_date = date.fromisoformat(as_of_date)
+    except ValueError:
+        return None, False
+    if parsed_as_of_date.isoformat() != as_of_date or parsed_as_of_date > report_date:
         return None, False
     normalized_industry_id = industry_id.strip().casefold()
     normalized_row_names: set[str] = set()
@@ -445,10 +462,19 @@ def resolve_fund_relations(
     industry_id: str,
     fund_codes: Sequence[str],
     context: TransientFundContext,
+    now: datetime | None = None,
 ) -> FundRelationProjection:
     """Resolve only explicitly selected codes through the injected public-analysis adapter."""
     if not isinstance(context, TransientFundContext):
         raise TypeError("context must be TransientFundContext")
+    request_now = now or datetime.now(timezone.utc)
+    if (
+        not isinstance(request_now, datetime)
+        or request_now.tzinfo is None
+        or request_now.utcoffset() is None
+    ):
+        raise ValueError("fund relation now must be timezone-aware")
+    report_date = request_now.date()
     with context:
         codes = _normalize_codes(fund_codes)
         if not codes:
@@ -483,6 +509,7 @@ def resolve_fund_relations(
                 fund_code=selection.fund_code,
                 analysis=analysis,
                 context=context,
+                report_date=report_date,
             )
             requires_lookthrough = False
             if relation is None:
@@ -491,6 +518,7 @@ def resolve_fund_relations(
                     fund_code=selection.fund_code,
                     analysis=analysis,
                     context=context,
+                    report_date=report_date,
                 )
             if relation is not None:
                 resolutions.append(IndustryFundRelationResolution(

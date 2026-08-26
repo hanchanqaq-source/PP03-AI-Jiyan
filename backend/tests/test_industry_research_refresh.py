@@ -709,6 +709,49 @@ def test_checksum_recomputed_forged_external_a2_state_still_fails_closed(
     owner.shutdown()
 
 
+@pytest.mark.parametrize("tamper", ("missing", "duplicate", "extra", "cross_array"))
+def test_persisted_a2_projection_rejects_incomplete_or_duplicate_events_even_with_counts(
+    tmp_path, tamper: str,
+) -> None:
+    snapshot = _canonical_news_snapshot()
+    lookup = lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("projection-completeness",),
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lookup,
+    )
+    owner.request_refresh("storage").result(5)
+    path = owner._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    candidate = document["state"]["candidate"]
+    if tamper == "missing":
+        candidate["unverified_events"].pop()
+    elif tamper == "duplicate":
+        candidate["unverified_events"].append(dict(candidate["unverified_events"][0]))
+    elif tamper == "extra":
+        extra = dict(candidate["unverified_events"][0])
+        extra["event_id"] = "foreign-extra-event"
+        candidate["unverified_events"].append(extra)
+    else:
+        moved = candidate["unverified_events"].pop()
+        moved["status"] = "conflicting"
+        candidate["conflicting_events"].append(moved)
+    candidate["counts"]["unverified_events"] = len(candidate["unverified_events"])
+    candidate["counts"]["conflicting_events"] = len(candidate["conflicting_events"])
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    owner._state._writer._atomic_write(
+        path,
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert owner.current_run("storage") is None
+    assert owner.current_candidate("storage") is None
+    owner.shutdown()
+
+
 @pytest.mark.parametrize(
     "malicious_run_id",
     (".", "..", "../escape", "a/b", "a\\b", "x:y", "x\ncontrol", " leading"),

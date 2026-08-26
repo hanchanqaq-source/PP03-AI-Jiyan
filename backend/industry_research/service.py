@@ -222,6 +222,41 @@ def _candidate_event(
     )
 
 
+def _canonical_candidate_events(
+    industry_id: str,
+    snapshot: EvidenceSnapshot,
+) -> tuple[tuple[CandidateIndustryEvidenceEvent, ...], tuple[CandidateIndustryEvidenceEvent, ...]]:
+    """Project the complete canonical A2 candidate set at snapshot generation time."""
+    _aware(snapshot.generated_at, "snapshot.generated_at")
+    relevant = tuple(
+        event for event in snapshot.events
+        if industry_id in {tag_id for tag_id, _label in event.related_tags}
+        and (event.published_at or event.evidence_as_of) <= snapshot.generated_at
+    )
+
+    def projected(status: A2VerificationStatus) -> tuple[CandidateIndustryEvidenceEvent, ...]:
+        return tuple(sorted(
+            (
+                _candidate_event(
+                    industry_id,
+                    event,
+                    candidate_snapshot_id=snapshot.snapshot_id,
+                    raw_snapshot_id=snapshot.raw_snapshot_id,
+                    evidence_snapshot_id=snapshot.snapshot_id,
+                )
+                for event in relevant
+                if event.verification_status is status
+            ),
+            key=lambda item: (item.occurred_at, item.event_id),
+            reverse=True,
+        ))
+
+    return (
+        projected(A2VerificationStatus.UNVERIFIED),
+        projected(A2VerificationStatus.CONFLICTING),
+    )
+
+
 def project_news_windows(
     *,
     industry_id: str,
@@ -298,10 +333,14 @@ def _merge_candidates(
     metric_candidates: CandidateEvidencePanel,
     *,
     news_snapshot: EvidenceSnapshot | None,
-    window: NewsWindowProjection,
+    news_events: tuple[
+        tuple[CandidateIndustryEvidenceEvent, ...],
+        tuple[CandidateIndustryEvidenceEvent, ...],
+    ],
 ) -> CandidateEvidencePanel:
     metric_batch_present = metric_candidates.candidate_snapshot_id is not None
-    news_items_present = bool(window.unverified or window.conflicting)
+    news_unverified, news_conflicting = news_events
+    news_items_present = bool(news_unverified or news_conflicting)
     candidate_snapshot_id = metric_candidates.candidate_snapshot_id
     raw_snapshot_id = metric_candidates.raw_snapshot_id
     evidence_snapshot_id = metric_candidates.evidence_snapshot_id
@@ -315,8 +354,8 @@ def _merge_candidates(
         )
         if not metric_batch_present:
             candidate_snapshot_id, raw_snapshot_id, evidence_snapshot_id = news_lineage
-    unverified_events = metric_candidates.unverified_events + window.unverified
-    conflicting_events = metric_candidates.conflicting_events + window.conflicting
+    unverified_events = metric_candidates.unverified_events + news_unverified
+    conflicting_events = metric_candidates.conflicting_events + news_conflicting
     external_lineages = ()
     if news_items_present and news_lineage != (
         candidate_snapshot_id,
@@ -657,7 +696,11 @@ def assemble_storage_report(
     candidate_evidence = _merge_candidates(
         candidates,
         news_snapshot=news_snapshot,
-        window=news_window,
+        news_events=(
+            _canonical_candidate_events(industry_id, news_snapshot)
+            if news_snapshot is not None
+            else ((), ())
+        ),
     )
     chain = tuple(
         IndustryChainNode(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import gc
 import os
 import shutil
@@ -514,6 +515,79 @@ def test_disclosed_lookthrough_rejects_unreconciled_weights(
     assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
 
 
+def test_disclosed_lookthrough_requires_complete_target_security_evidence() -> None:
+    exposure = _empty_exposure()
+    exposure.update({
+        "industry_chain_tags": [{
+            "id": "storage",
+            "weight_pct": 10.0,
+            "evidence_level": "disclosed_stock_classification",
+        }],
+        "holding_industry_evidence": [{
+            "stock_code": "688001",
+            "weight_pct": 10.0,
+            "source_reference": "https://example.test/classification/688001",
+            "holding_disclosure_date": "2026-06-30",
+        }],
+    })
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                holdings={
+                    "holdings": [
+                        {"stock_code": "688001", "weight_pct": 10.0},
+                        {"stock_code": "688002", "weight_pct": 5.0},
+                    ],
+                    "disclosure_date": "2026-06-30",
+                },
+                exposure=exposure,
+            )}),
+            official_industry_config=_official_config(securities={
+                "688001": ("storage",),
+                "688002": ("storage",),
+            }),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+def test_disclosed_lookthrough_requires_exact_decimal_weight_equality() -> None:
+    exposure = _empty_exposure()
+    exposure.update({
+        "industry_chain_tags": [{
+            "id": "storage",
+            "weight_pct": 12.50005,
+            "evidence_level": "disclosed_stock_classification",
+        }],
+        "holding_industry_evidence": [{
+            "stock_code": "688001",
+            "weight_pct": 12.5,
+            "source_reference": "https://example.test/classification/688001",
+            "holding_disclosure_date": "2026-06-30",
+        }],
+    })
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                holdings={
+                    "holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
+                    "disclosure_date": "2026-06-30",
+                },
+                exposure=exposure,
+            )}),
+            official_industry_config=_official_config(securities={"688001": ("storage",)}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
 @pytest.mark.parametrize(
     "outcome",
@@ -579,6 +653,25 @@ def test_prepare_acceptance_root_rejects_reparse_before_first_write(
         prepare_acceptance_root(root)
 
     assert observed_writes == []
+    assert not root.exists()
+
+
+def test_prepare_acceptance_root_requires_preprovisioned_root_without_writing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = tmp_path / ".tmp" / "acceptance" / "missing"
+    writes: list[Path] = []
+
+    def reject_write(path: Path, *args, **kwargs):
+        writes.append(path)
+        raise AssertionError("prepare attempted a pathname write")
+
+    monkeypatch.setattr(Path, "mkdir", reject_write)
+
+    with pytest.raises(FileNotFoundError, match="preprovisioned"):
+        prepare_acceptance_root(root)
+
+    assert writes == []
     assert not root.exists()
 
 
@@ -750,7 +843,8 @@ def test_lookthrough_rejects_mismatched_dates_or_foreign_industry_evidence(
     exposure.update({
         "industry_chain_tags": [{"id": "storage", "weight_pct": 12.5,
                                   "evidence_level": "disclosed_stock_classification"}],
-        "holding_industry_evidence": [{"stock_code": "688001", "source_reference": "https://example.test/c/1",
+        "holding_industry_evidence": [{"stock_code": "688001", "weight_pct": 12.5,
+                                        "source_reference": "https://example.test/c/1",
                                         "holding_disclosure_date": evidence_date}],
         "lookthrough": {"status": "disclosed", "disclosure_date": lookthrough_date},
     })
@@ -759,7 +853,8 @@ def test_lookthrough_rejects_mismatched_dates_or_foreign_industry_evidence(
         fund_codes=["900001"],
         context=TransientFundContext(
             adapter=MemoryAdapter({"900001": _analysis(
-                holdings={"holdings": [{"stock_code": "688001"}], "disclosure_date": holdings_date},
+                holdings={"holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
+                          "disclosure_date": holdings_date},
                 exposure=exposure,
             )}),
             official_industry_config=_official_config(securities={"688001": security_industries}),
@@ -778,6 +873,7 @@ def test_lookthrough_rejects_foreign_security_and_fund_evidence() -> None:
         "industry_chain_tags": [{"id": "storage", "weight_pct": 12.5,
                                   "evidence_level": "disclosed_stock_classification"}],
         "holding_industry_evidence": [{"fund_code": "900099", "stock_code": "688002",
+                                        "weight_pct": 12.5,
                                         "source_reference": "https://example.test/c/2",
                                         "holding_disclosure_date": "2026-06-30"}],
     })
@@ -786,7 +882,8 @@ def test_lookthrough_rejects_foreign_security_and_fund_evidence() -> None:
         fund_codes=["900001"],
         context=TransientFundContext(
             adapter=MemoryAdapter({"900001": _analysis(
-                holdings={"fund_code": "900001", "holdings": [{"stock_code": "688001"}],
+                holdings={"fund_code": "900001",
+                          "holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
                           "disclosure_date": "2026-06-30"},
                 exposure=exposure,
             )}),
@@ -796,6 +893,55 @@ def test_lookthrough_rejects_foreign_security_and_fund_evidence() -> None:
 
     assert result.resolutions[0].relation is None
     assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
+
+
+@pytest.mark.parametrize("relation_layer", ("lookthrough", "official_allocation"))
+def test_fund_relations_reject_future_disclosure_dates(
+    relation_layer: str,
+) -> None:
+    future_date = "2026-08-26"
+    exposure = _empty_exposure()
+    holdings = {"holdings": [], "disclosure_date": "2026-06-30"}
+    config = _official_config()
+    if relation_layer == "lookthrough":
+        holdings = {
+            "holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
+            "disclosure_date": future_date,
+        }
+        exposure.update({
+            "lookthrough": {"status": "disclosed", "disclosure_date": future_date},
+            "industry_chain_tags": [{
+                "id": "storage",
+                "weight_pct": 12.5,
+                "evidence_level": "disclosed_stock_classification",
+            }],
+            "holding_industry_evidence": [{
+                "stock_code": "688001",
+                "weight_pct": 12.5,
+                "source_reference": "https://example.test/classification/688001",
+                "holding_disclosure_date": future_date,
+            }],
+        })
+        config = _official_config(securities={"688001": ("storage",)})
+    else:
+        exposure["official_allocation"] = {
+            "as_of_date": future_date,
+            "source_reference": "https://example.test/allocation",
+            "exposure": [{"name": "存储", "weight_pct": 12.5}],
+        }
+        config = _official_config(allocation={"存储": ("storage",)})
+
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(holdings=holdings, exposure=exposure)}),
+            official_industry_config=config,
+        ),
+        now=datetime(2026, 8, 25, 8, tzinfo=timezone.utc),
+    )
+
+    assert result.resolutions[0].relation is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")

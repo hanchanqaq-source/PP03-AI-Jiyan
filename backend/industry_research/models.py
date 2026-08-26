@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import InitVar, dataclass, field, fields, is_dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 import math
 from typing import Any, Mapping
@@ -433,6 +433,12 @@ class IndustryCompanyRelation(WireModel):
             raise ValueError("invalid relation_type")
         if not self.evidence_ids:
             raise ValueError("trusted company relation requires evidence_ids")
+        if (
+            not self.key_metric_ids
+            or any(type(metric_id) is not str or not metric_id.strip() for metric_id in self.key_metric_ids)
+            or len(set(self.key_metric_ids)) != len(self.key_metric_ids)
+        ):
+            raise ValueError("company key_metric_ids must be nonempty and unique")
         if not self.as_of_date:
             raise ValueError("trusted company relation requires as_of_date")
         if self.observation_only is not True:
@@ -477,6 +483,14 @@ class IndustryFundRelation(WireModel):
             raise ValueError("empty exposure_value requires null exposure_unit")
         if self.exposure_value is not None and self.exposure_unit != "percent":
             raise ValueError("fund exposure_unit must be percent")
+        if self.disclosure_date is None:
+            raise ValueError("fund disclosure_date is required")
+        try:
+            parsed_date = date.fromisoformat(self.disclosure_date)
+        except (TypeError, ValueError) as error:
+            raise ValueError("fund disclosure_date must be a canonical ISO date") from error
+        if parsed_date.isoformat() != self.disclosure_date:
+            raise ValueError("fund disclosure_date must be a canonical ISO date")
 
 
 @dataclass(frozen=True, slots=True)
