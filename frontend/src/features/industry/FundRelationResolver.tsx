@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { SearchCheck } from "lucide-react";
 import { api, type IndustryFundProjection, type IndustryFundResolution } from "@/lib/api";
-import { IndustryTruthBadge } from "./IndustryTruthBadge";
+import { VerificationBadge } from "./IndustryTruthBadge";
 
 function relationRow(item: IndustryFundResolution, pending: Set<string>) {
   const relation = item.relation;
   return <article key={item.selectionId} className="border-b border-border/50 py-3 last:border-0">
-    <div className="flex flex-wrap items-center justify-between gap-2"><p className="font-mono text-sm font-semibold">{item.fundCode}</p>{relation && <IndustryTruthBadge label={relation.status === "verified" ? "已核验" : "多源印证"} tone="success" />}</div>
+    <div className="flex flex-wrap items-center justify-between gap-2"><p className="font-mono text-sm font-semibold">{item.fundCode}</p>{relation && <VerificationBadge status={relation.status} />}</div>
     {relation ? <dl className="mt-2 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2"><div><dt>数据日期</dt><dd className="mt-1 text-foreground">{relation.disclosureDate ?? "尚未披露"}</dd></div><div><dt>证据层级</dt><dd className="mt-1 text-foreground">{relation.relationLayer === "official_allocation" ? "官方行业配置" : "披露持仓穿透"}</dd></div><div><dt>行业暴露</dt><dd className="mt-1 text-foreground">{relation.exposureValue == null ? "待穿透" : `${relation.exposureValue}${relation.exposureUnit === "percent" ? "%" : ""}`}</dd></div><div><dt>对应证据</dt><dd className="mt-1 font-mono text-foreground">{relation.evidenceIds.join(" · ")}</dd></div></dl> : <p className="mt-2 text-xs text-muted-foreground">{item.emptyReason === "not_disclosed" ? "尚未披露" : item.emptyReason === "source_unavailable" ? "来源暂不可用" : "关系未知"}</p>}
     {pending.has(item.selectionId) && <p className="mt-2 text-xs text-warning">待穿透，不等同于当前行业暴露</p>}
   </article>;
@@ -24,6 +24,7 @@ export function FundRelationResolver({ industryId }: { industryId: string }) {
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       generationRef.current += 1;
@@ -94,7 +95,7 @@ export function FundRelationResolver({ industryId }: { industryId: string }) {
     {submittedCodes && <p className="mt-3 font-mono text-xs text-foreground">{`已提交代码：${submittedCodes.join("、")}`}</p>}
     {inputChanged && !submittedCodes && !error && <p className="mt-3 text-xs text-warning">输入已变化，请重新提交本次选择</p>}
     {error && <div role="alert" className="mt-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"><p>{error}</p><p className="mt-1 font-medium">暂无可靠数据</p></div>}
-    {!projection && !error && !loading && <div className="mt-4 rounded-xl border border-dashed border-border/70 p-5 text-center"><p className="font-medium">还没有基金持仓</p><p className="mt-1 text-xs text-muted-foreground">仅在你显式输入基金代码并提交后解析本次关系。</p></div>}
-    {projection && <div className="mt-5 grid gap-5 lg:grid-cols-2"><section aria-labelledby="official-funds"><h3 id="official-funds" className="text-sm font-semibold">官方行业配置</h3><div className="mt-2 rounded-xl border border-border/70 px-4">{official.length ? official.map((item) => relationRow(item, pending)) : <p className="py-4 text-xs text-muted-foreground">暂无可靠数据</p>}</div></section><section aria-labelledby="lookthrough-funds"><h3 id="lookthrough-funds" className="text-sm font-semibold">披露持仓穿透</h3><div className="mt-2 rounded-xl border border-border/70 px-4">{lookthrough.length ? lookthrough.map((item) => relationRow(item, pending)) : <p className="py-4 text-xs text-muted-foreground">暂无可靠数据</p>}</div></section>{unresolved.length > 0 && <section className="lg:col-span-2"><h3 className="text-sm font-semibold">未解析关系</h3><div className="mt-2 rounded-xl border border-border/70 px-4">{unresolved.map((item) => relationRow(item, pending))}</div></section>}</div>}
+    {!projection && !error && !loading && <div className="mt-4 rounded-xl border border-dashed border-border/70 p-5 text-center"><p className="font-medium">尚未提交公开披露基金代码</p><p className="mt-1 text-xs leading-5 text-muted-foreground">仅在你显式输入基金代码并提交后解析本次公开关系。</p></div>}
+    {projection && <div className="mt-5 grid gap-5 lg:grid-cols-2"><section aria-labelledby="official-funds"><h4 id="official-funds" className="text-sm font-semibold">官方行业配置</h4><div className="mt-2 rounded-xl border border-border/70 px-4">{official.length ? official.map((item) => relationRow(item, pending)) : <p className="py-4 text-xs leading-5 text-muted-foreground">暂无可靠数据</p>}</div></section><section aria-labelledby="lookthrough-funds"><h4 id="lookthrough-funds" className="text-sm font-semibold">披露持仓穿透</h4><div className="mt-2 rounded-xl border border-border/70 px-4">{lookthrough.length ? lookthrough.map((item) => relationRow(item, pending)) : <p className="py-4 text-xs leading-5 text-muted-foreground">暂无可靠数据</p>}</div></section><section className="lg:col-span-2" aria-labelledby="unresolved-funds"><h4 id="unresolved-funds" className="text-sm font-semibold">未解析关联</h4><div className="mt-2 rounded-xl border border-border/70 px-4">{unresolved.length ? unresolved.map((item) => relationRow(item, pending)) : <p className="py-4 text-xs leading-5 text-muted-foreground">暂无未解析关联</p>}</div></section></div>}
   </div>;
 }

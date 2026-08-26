@@ -1,7 +1,9 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { FundRelationResolver } from "../FundRelationResolver";
+import { FundSection } from "../sections/FundSection";
 import { jsonResponse } from "./fixtures";
 
 function projectionWire(codes = ["000001", "000002"]) {
@@ -38,7 +40,7 @@ describe("explicit transient fund relation resolver", () => {
     const request = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(projectionWire()));
     render(<FundRelationResolver industryId="storage" />);
     expect(request).not.toHaveBeenCalled();
-    expect(screen.getByText("还没有基金持仓")).toBeInTheDocument();
+    expect(screen.getByText("尚未提交公开披露基金代码")).toBeInTheDocument();
     await user.type(screen.getByRole("textbox", { name: "基金代码" }), "000001, 000002, 000001");
     expect(request).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "解析本次选择" }));
@@ -51,6 +53,39 @@ describe("explicit transient fund relation resolver", () => {
     expect(screen.getByText("待穿透，不等同于当前行业暴露")).toBeInTheDocument();
     expect(screen.getByText(/多源印证/)).toBeInTheDocument();
     expect(JSON.stringify(localStorage)).not.toContain("000001");
+  });
+
+  it("recovers from StrictMode effect replay and completes the current request", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(projectionWire(["000007"])));
+    render(<StrictMode><FundRelationResolver industryId="storage" /></StrictMode>);
+    await user.type(screen.getByRole("textbox", { name: "基金代码" }), "000007");
+    await user.click(screen.getByRole("button", { name: "解析本次选择" }));
+
+    expect(await screen.findByText("已提交代码：000007")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "解析本次选择" })).toBeEnabled();
+    expect(screen.getByText("000007")).toBeInTheDocument();
+  });
+
+  it("keeps holdings and public-disclosure product groups fixed and never mixes explicit codes into holdings", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(projectionWire()));
+    render(<FundSection industryId="storage" />);
+    const holdings = screen.getByRole("region", { name: "我的持仓关联" });
+    const disclosed = screen.getByRole("region", { name: "公开披露关联基金" });
+    expect(within(holdings).getByText(/本 Work 不读取真实持仓/)).toBeInTheDocument();
+    expect(within(holdings).getByText("暂无可靠数据")).toBeInTheDocument();
+    expect(within(disclosed).getByText("尚未提交公开披露基金代码")).toBeInTheDocument();
+
+    await user.type(within(disclosed).getByRole("textbox", { name: "基金代码" }), "000001,000002");
+    await user.click(within(disclosed).getByRole("button", { name: "解析本次选择" }));
+    expect(await within(disclosed).findByText("已提交代码：000001、000002")).toBeInTheDocument();
+    expect(within(disclosed).getByRole("heading", { name: "官方行业配置" })).toBeInTheDocument();
+    expect(within(disclosed).getByRole("heading", { name: "披露持仓穿透" })).toBeInTheDocument();
+    expect(within(disclosed).getByRole("heading", { name: "未解析关联" })).toBeInTheDocument();
+    expect(within(disclosed).getByText("暂无未解析关联")).toBeInTheDocument();
+    expect(within(holdings).queryByText(/000001|000002/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/基金排行榜|建议买入|推荐基金/)).not.toBeInTheDocument();
   });
 
   it("clears a resolved projection as soon as the input differs from the submitted selection", async () => {
@@ -68,7 +103,7 @@ describe("explicit transient fund relation resolver", () => {
   it("validates code format and the 32-code limit before networking with distinct messages", async () => {
     const user = userEvent.setup();
     const request = vi.spyOn(globalThis, "fetch");
-    const view = render(<FundRelationResolver industryId="storage" />);
+    const view = render(<StrictMode><FundRelationResolver industryId="storage" /></StrictMode>);
     await user.type(screen.getByRole("textbox", { name: "基金代码" }), "123");
     await user.click(screen.getByRole("button", { name: "解析本次选择" }));
     expect(screen.getByRole("alert")).toHaveTextContent("基金代码格式无效");

@@ -16,9 +16,9 @@ export function ReportSection({ id, index, title, eyebrow, children }: PropsWith
     <section id={id} role="region" aria-label={title} className="relative scroll-mt-40 border-b border-border/60 px-5 py-9 pl-10 last:border-0 sm:px-8 sm:pl-14">
       <span aria-hidden="true" className="absolute bottom-0 left-5 top-0 w-px bg-border/80 sm:left-7" />
       <header className="relative mb-6 flex items-start gap-4">
-        <span className="absolute -left-[1.85rem] inline-flex h-5 w-5 items-center justify-center rounded-full border border-primary/50 bg-background font-mono text-[9px] font-semibold text-primary sm:-left-[2.35rem]">{index}</span>
+        <span className="absolute -left-[1.85rem] inline-flex h-5 w-5 items-center justify-center rounded-full border border-primary/50 bg-background font-mono text-xs font-semibold text-primary sm:-left-[2.35rem]">{index}</span>
         <div>
-          <p className="text-[10px] uppercase tracking-[0.24em] text-muted-foreground">{eyebrow}</p>
+          <p className="text-xs uppercase leading-5 tracking-[0.24em] text-muted-foreground">{eyebrow}</p>
           <h2 className="mt-1 text-xl font-bold tracking-tight sm:text-2xl">{title}</h2>
         </div>
       </header>
@@ -65,7 +65,7 @@ export function MetricRows({ metrics, compact = false }: { metrics: IndustryMetr
       {metrics.map((metric) => (
         <article key={`${metric.industryId}-${metric.metricId}`} data-industry-id={metric.industryId} className={`bg-background/40 ${compact ? "p-3" : "p-4 sm:p-5"}`}>
           <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-            <div className="min-w-0"><p className="text-sm font-semibold">{metric.label}</p><p className="mt-1 font-mono text-[10px] text-muted-foreground">{metric.metricId}</p></div>
+            <div className="min-w-0"><p className="text-sm font-semibold">{metric.label}</p><p className="mt-1 font-mono text-xs leading-5 text-muted-foreground">{metric.metricId}</p></div>
             <TruthAxes metric={metric} />
           </div>
           <div className="mt-4 grid gap-4 text-xs sm:grid-cols-2 xl:grid-cols-[1fr_0.7fr_1.2fr]">
@@ -73,7 +73,7 @@ export function MetricRows({ metrics, compact = false }: { metrics: IndustryMetr
             <dl><dt className="text-muted-foreground">环比或同比</dt><dd className={`mt-1 font-mono ${metric.change && metric.change.value > 0 ? "text-destructive" : metric.change && metric.change.value < 0 ? "text-success" : ""}`}>{metric.change ? `${metric.change.value > 0 ? "+" : ""}${metric.change.value}% · ${metric.change.basis.toUpperCase()}` : "暂无可靠数据"}</dd></dl>
             <dl><dt className="text-muted-foreground">历史位置</dt><dd className="mt-1">{historicalPosition(metric)}</dd></dl>
           </div>
-          {metric.verificationStatus === "corroborated" && <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 rounded-lg border border-success/20 bg-success/5 px-3 py-2 text-[10px] text-muted-foreground">
+          {metric.verificationStatus === "corroborated" && <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 rounded-lg border border-purple-400/30 bg-purple-500/5 px-3 py-2 text-xs leading-5 text-muted-foreground">
             <span>{metric.independentSourceFamilies.length} 个独立来源族</span>
             <span>{metric.independentContentSources.length} 个独立内容来源</span>
             <span>{metric.independentOriginClusters.length} 个独立起源集群</span>

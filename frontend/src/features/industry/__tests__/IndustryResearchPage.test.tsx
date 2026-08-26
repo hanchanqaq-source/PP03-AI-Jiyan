@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { IndustryResearch } from "@/pages/IndustryResearch";
@@ -16,6 +16,43 @@ describe("industry research page data boundary", () => {
     localStorage.clear();
     history.replaceState(null, "", "/industry-research");
     vi.restoreAllMocks();
+  });
+
+  it("preserves a legal initial hash but clears it and scrolls only after a successful user switch", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    history.replaceState(null, "", "/industry-research#metrics");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/robotics?") ? "robotics" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+    const { container } = render(<IndustryResearch />);
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    expect(location.hash).toBe("#metrics");
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(container.querySelector("[data-industry-report-top]")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+    expect(location.hash).toBe("");
+  });
+
+  it("still completes a user switch when the host has no scrollIntoView capability", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: undefined });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/robotics?") ? "robotics" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+    render(<IndustryResearch />);
+    await screen.findByRole("article", { name: "存储行业研究报告" });
+    history.replaceState(null, "", "/industry-research#metrics");
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
+    await act(async () => { await new Promise((done) => requestAnimationFrame(done)); });
+    expect(location.hash).toBe("");
   });
 
   it("loads one atomic 90-day report and removes the Radar bypass", async () => {
@@ -86,6 +123,8 @@ describe("industry research page data boundary", () => {
 
   it("keeps unknown custom tags in an explicit building state without fabricated report content", async () => {
     const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const match = String(input).match(/industry-research\/([^?]+)/);
       const industryId = match ? decodeURIComponent(match[1]) : "storage";
@@ -93,6 +132,7 @@ describe("industry research page data boundary", () => {
     });
     render(<IndustryResearch />);
     await screen.findByRole("article", { name: "存储行业研究报告" });
+    history.replaceState(null, "", "/industry-research#metrics");
     await user.click(screen.getByRole("button", { name: "添加标签" }));
     const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
     await user.type(within(dialog).getByRole("textbox", { name: "自定义行业名称" }), "先进封装观察");
@@ -101,6 +141,8 @@ describe("industry research page data boundary", () => {
 
     expect(await screen.findByText("标签已保存，报告模板建设中；系统不会根据标签名称自动补造行业数据")).toBeInTheDocument();
     expect(screen.queryByText("DRAM 价格")).not.toBeInTheDocument();
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+    expect(location.hash).toBe("");
   });
 
   it("exposes the four truth axes and opens evidence from the keyboard", async () => {
@@ -121,12 +163,15 @@ describe("industry research page data boundary", () => {
 
   it("keeps the old active tag and old report when atomic activation persistence is refused", async () => {
     const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
     const robotics = deferred<Response>();
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => String(input).includes("/storage?")
       ? jsonResponse(industryResponseWire("storage")) : robotics.promise);
     render(<IndustryResearch />);
     expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
 
+    history.replaceState(null, "", "/industry-research#metrics");
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
     localStorage.setItem("vr-page-tags:industry_research", "{broken");
     await act(async () => robotics.resolve(jsonResponse(industryResponseWire("robotics"))));
@@ -135,5 +180,7 @@ describe("industry research page data boundary", () => {
     expect(screen.queryByRole("article", { name: "机器人行业研究报告" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getAllByRole("alert").find((node) => node.textContent?.includes("页面标签存储已损坏，无法安全修改"))).toBeDefined();
+    expect(location.hash).toBe("#metrics");
+    expect(scrollIntoView).not.toHaveBeenCalled();
   });
 });

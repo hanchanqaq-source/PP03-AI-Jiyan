@@ -42,9 +42,9 @@ export function IndustryReport({ report, candidate, industryName, refreshRun, wi
       {showsOldSnapshot && <div role={refreshRun.phase === "failed" ? "alert" : "status"} className="border-b border-warning/40 bg-warning/5 px-5 py-3 text-sm text-warning sm:px-8">{refreshRun.phase === "failed" ? "来源失败；" : "刷新仍在进行；"}当前显示的旧可信快照 <span className="font-mono">{snapshotId}</span>，不会标记为最新。</div>}
       {report.demo && <div className="border-b border-warning/40 bg-warning/5 px-5 py-3 text-sm text-warning sm:px-8"><strong className="font-mono">{`隔离演示快照 ${snapshotId}`}</strong>：不代表真实市场、基金或公司数据。</div>}
       <div className="border-b border-border/60 bg-[radial-gradient(circle_at_top_right,rgba(255,90,31,0.15),transparent_42%)] px-5 py-8 sm:px-8">
-        <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-primary">PP03 Industry dossier</p>
-        <div className="mt-3 flex flex-wrap items-start justify-between gap-4"><div><h1 className="text-3xl font-black tracking-tight sm:text-4xl">{industryName}<span className="ml-2 font-normal text-muted-foreground">行业研究</span></h1><p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">{template?.subtitle ?? "只展示已准入证据；缺失即为空。"}</p></div><dl className="text-right text-[10px] text-muted-foreground"><dt>当前可信快照</dt><dd className="mt-1 font-mono text-foreground">{report.displayedTrustedSnapshotId ?? "暂无可靠数据"}</dd><dt className="mt-2">数据更新时间</dt><dd className="mt-1 font-mono text-foreground">{report.generatedAt ?? "暂无可靠数据"}</dd></dl></div>
-        <dl className="mt-6 grid gap-px overflow-hidden rounded-xl border border-border/60 bg-border/60 sm:grid-cols-2 xl:grid-cols-5"><div className="bg-background/80 p-3"><dt className="text-[10px] text-muted-foreground">来源覆盖</dt><dd className="mt-1 font-mono text-sm">{report.sourceCoverage.healthy}/{report.sourceCoverage.total}</dd></div><div className="bg-background/80 p-3"><dt className="text-[10px] text-muted-foreground">已核验</dt><dd className="mt-1 font-mono text-sm">{report.counts.verified}</dd></div><div className="bg-background/80 p-3"><dt className="text-[10px] text-muted-foreground">多源印证</dt><dd className="mt-1 font-mono text-sm">{report.counts.corroborated}</dd></div><div className="bg-background/80 p-3"><dt className="text-[10px] text-muted-foreground">待核验</dt><dd className="mt-1 font-mono text-sm">{candidate?.counts.unverified ?? 0}</dd></div><div className="bg-background/80 p-3"><dt className="text-[10px] text-muted-foreground">冲突</dt><dd className="mt-1 font-mono text-sm">{candidate?.counts.conflicting ?? 0}</dd></div></dl>
+        <p className="font-mono text-xs uppercase leading-5 tracking-[0.3em] text-primary">PP03 Industry dossier</p>
+        <div className="mt-3 flex flex-wrap items-start justify-between gap-4"><div><h1 className="text-3xl font-black tracking-tight sm:text-4xl">{industryName}<span className="ml-2 font-normal text-muted-foreground">行业研究</span></h1><p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">{template?.subtitle ?? "只展示已准入证据；缺失即为空。"}</p></div><dl className="text-right text-xs leading-5 text-muted-foreground"><dt>当前可信快照</dt><dd className="mt-1 font-mono text-foreground">{report.displayedTrustedSnapshotId ?? "暂无可靠数据"}</dd><dt className="mt-2">数据更新时间</dt><dd className="mt-1 font-mono text-foreground">{report.generatedAt ?? "暂无可靠数据"}</dd></dl></div>
+        <dl className="mt-6 grid gap-px overflow-hidden rounded-xl border border-border/60 bg-border/60 sm:grid-cols-2 xl:grid-cols-5"><div className="bg-background/80 p-3"><dt className="text-xs leading-5 text-muted-foreground">来源覆盖</dt><dd className="mt-1 font-mono text-sm">{report.sourceCoverage.healthy}/{report.sourceCoverage.total}</dd></div><div className="bg-background/80 p-3"><dt className="text-xs leading-5 text-muted-foreground">已核验</dt><dd className="mt-1 font-mono text-sm">{report.counts.verified}</dd></div><div className="bg-background/80 p-3"><dt className="text-xs leading-5 text-muted-foreground">多源印证</dt><dd className="mt-1 font-mono text-sm">{report.counts.corroborated}</dd></div><div className="bg-background/80 p-3"><dt className="text-xs leading-5 text-muted-foreground">待核验</dt><dd className="mt-1 font-mono text-sm">{candidate?.counts.unverified ?? 0}</dd></div><div className="bg-background/80 p-3"><dt className="text-xs leading-5 text-muted-foreground">冲突</dt><dd className="mt-1 font-mono text-sm">{candidate?.counts.conflicting ?? 0}</dd></div></dl>
       </div>
       <SummarySection report={report} />
       <CycleSection metrics={report.cycle} />
@@ -59,8 +59,13 @@ export function IndustryReport({ report, candidate, industryName, refreshRun, wi
 }
 
 export function IndustryReportAnchors() {
-  const [active, setActive] = useState(() => sectionIds.has(window.location.hash.slice(1)) ? window.location.hash.slice(1) : "overview");
+  const [active, setActive] = useState(() => {
+    if (typeof window === "undefined") return "overview";
+    const hashId = window.location.hash.slice(1);
+    return sectionIds.has(hashId) ? hashId : "overview";
+  });
   useEffect(() => {
+    if (typeof window === "undefined") return;
     const syncHash = () => {
       const id = window.location.hash.slice(1);
       if (sectionIds.has(id)) setActive(id);

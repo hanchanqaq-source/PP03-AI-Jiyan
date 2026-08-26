@@ -1,10 +1,16 @@
+/// <reference types="vite/client" />
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { renderToString } from "react-dom/server";
 import { vi } from "vitest";
 import { decodeIndustryResearchResponse, type IndustryResearchResponse } from "@/lib/api";
 import { EvidenceDrawer } from "../EvidenceDrawer";
 import { IndustryReport, IndustryReportAnchors } from "../IndustryReport";
 import { industryResponseWire, researchResponse } from "./fixtures";
+
+const industryUiSources = import.meta.glob(["../**/*.tsx", "../../../pages/IndustryResearch.tsx"], {
+  eager: true, import: "default", query: "?raw",
+}) as Record<string, string>;
 
 function reportView(response: IndustryResearchResponse = researchResponse(), days: 7 | 30 | 90 = 7, now?: () => Date) {
   return <IndustryReport report={response.displayedTrustedReport!} candidate={response.candidateEvidence}
@@ -142,9 +148,30 @@ describe("continuous evidence-bound industry report", () => {
     expect(screen.getByText("观察对象，不构成推荐")).toBeInTheDocument();
     expect(screen.queryByText(/建议买入|建议卖出|基金排行榜/)).not.toBeInTheDocument();
   });
+
+  it("keeps all industry auxiliary text at twelve pixels or larger", () => {
+    const undersizedHelperClass = `text-[${10}px]`;
+    const productionSources = Object.entries(industryUiSources).filter(([path]) => !path.includes("/__tests__/"));
+    expect(productionSources.filter(([, source]) => source.includes(undersizedHelperClass)).map(([path]) => path)).toEqual([]);
+    const { container } = render(reportView(researchResponse(), 90));
+    const undersized = Array.from(container.querySelectorAll<HTMLElement>("[class]"))
+      .filter((node) => (node.getAttribute("class") ?? "").split(/\s+/u).includes(undersizedHelperClass));
+    expect(undersized).toHaveLength(0);
+    expect(screen.getByText(/DRAM、NAND 与 HBM/)).toHaveClass("text-sm");
+  });
 });
 
 describe("industry report navigation and evidence dismissal", () => {
+  it("renders anchors without accessing window during SSR", () => {
+    const currentWindow = globalThis.window;
+    vi.stubGlobal("window", undefined);
+    try {
+      expect(() => renderToString(<IndustryReportAnchors />)).not.toThrow();
+    } finally {
+      vi.stubGlobal("window", currentWindow);
+    }
+  });
+
   it("updates aria-current from intersection and browser hash navigation, then cleans observers", () => {
     let callback!: IntersectionObserverCallback;
     const disconnect = vi.fn();

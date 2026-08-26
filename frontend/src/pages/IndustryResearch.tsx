@@ -3,6 +3,7 @@ import { AlertCircle, LoaderCircle } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { api, type IndustryResearchResponse, type IndustryWindowDays } from "@/lib/api";
 import { IndustryReport, IndustryReportAnchors } from "@/features/industry/IndustryReport";
+import { REPORT_SECTIONS } from "@/features/industry/sections/shared";
 import { INCOMPLETE_REPORT_MESSAGE } from "@/features/industry/templates";
 import { SelectedTagBar } from "@/features/tags/SelectedTagBar";
 import { TagSelector } from "@/features/tags/TagSelector";
@@ -14,6 +15,8 @@ export function IndustryResearch() {
   const coordinator = useTagRequestCoordinator<IndustryResearchResponse>();
   const tagsRef = useRef(tags);
   tagsRef.current = tags;
+  const reportTopRef = useRef<HTMLDivElement>(null);
+  const pendingUserIndustryRef = useRef<string | null>(null);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [response, setResponse] = useState<IndustryResearchResponse | null>(null);
   const [requested, setRequested] = useState<{ id: string; name: string } | null>(null);
@@ -21,7 +24,7 @@ export function IndustryResearch() {
   const [error, setError] = useState<string | null>(null);
   const [windowDays, setWindowDays] = useState<IndustryWindowDays>(90);
 
-  const loadReport = useCallback((industryId: string, industryName?: string) => {
+  const loadReport = useCallback((industryId: string, industryName?: string, userInitiated = false) => {
     const name = industryName ?? tagsRef.current.tags.find((tag) => tag.id === industryId)?.name ?? industryId;
     setRequested({ id: industryId, name });
     setWindowDays(90);
@@ -43,6 +46,16 @@ export function IndustryResearch() {
         }
         setResponse(value);
         setLoading(false);
+        if (userInitiated && typeof window !== "undefined") {
+          const hashId = window.location.hash.slice(1);
+          if (REPORT_SECTIONS.some(([id]) => id === hashId)) {
+            window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}`);
+          }
+          requestAnimationFrame(() => {
+            const reportTop = reportTopRef.current;
+            if (typeof reportTop?.scrollIntoView === "function") reportTop.scrollIntoView({ block: "start" });
+          });
+        }
       },
     }).catch((failure) => {
       setLoading(false);
@@ -54,7 +67,9 @@ export function IndustryResearch() {
     const active = tags.activeTag;
     if (!active || loading) return;
     if (requested === null || (response?.displayedIndustryId === requested.id && active.id !== requested.id)) {
-      loadReport(active.id, active.name);
+      const userInitiated = pendingUserIndustryRef.current === active.id;
+      if (userInitiated) pendingUserIndustryRef.current = null;
+      loadReport(active.id, active.name, userInitiated);
     }
   }, [loadReport, loading, requested?.id, response?.displayedIndustryId, tags.activeTag]);
 
@@ -67,14 +82,15 @@ export function IndustryResearch() {
     <div>
       <PageHeader title="行业研究" subtitle="连续产业研究报告；结论、依据、来源、更新时间和失效条件同时呈现" />
       <div className="sticky top-0 z-30 mb-5 rounded-xl border border-border/60 bg-background/95 px-2 backdrop-blur">
-        <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={(id) => loadReport(id)}
+        <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={(id) => loadReport(id, undefined, true)}
           onRemove={tags.remove} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
         {report && <IndustryReportAnchors />}
       </div>
       {tags.errorMessage && !selectorOpen && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{tags.errorMessage}</div>}
       {error && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{error}</div>}
       {response && <div role="status" className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/70 bg-muted/10 px-4 py-3 text-xs"><span>最近一次刷新状态：{response.refreshRun.phase === "trusted_published" ? "可信快照已发布" : response.refreshRun.phase === "failed" ? "来源失败" : response.refreshRun.phase === "collecting" ? "正在采集" : response.refreshRun.phase === "verifying" ? "正在核验" : "空闲"}</span><span className="font-mono text-muted-foreground">run {response.refreshRun.runId ?? "—"}</span></div>}
-      {loading ? <div role="status" className="flex min-h-[360px] flex-col items-center justify-center rounded-2xl border border-border/70"><LoaderCircle className="h-6 w-6 animate-spin text-primary motion-reduce:animate-none" /><p className="mt-3 text-sm">正在读取{requested?.name ?? "当前行业"}的完整可信报告</p><p className="mt-1 text-xs text-muted-foreground">原报告已隐藏，避免切换期间串用行业数据。</p></div>
+      <div ref={reportTopRef} data-industry-report-top>
+      {loading ? <div role="status" className="flex min-h-[360px] flex-col items-center justify-center rounded-2xl border border-border/70"><LoaderCircle className="h-6 w-6 animate-spin text-primary motion-reduce:animate-none" /><p className="mt-3 text-sm">正在读取{requested?.name ?? "当前行业"}的完整可信报告</p><p className="mt-1 text-xs leading-5 text-muted-foreground">原报告已隐藏，避免切换期间串用行业数据。</p></div>
         : report && response ? <IndustryReport report={report} candidate={response.candidateEvidence} industryName={displayedName} refreshRun={response.refreshRun} windowDays={windowDays} onWindowDaysChange={setWindowDays} />
           : response?.templateStatus === "building" ? (
         <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center">
@@ -82,8 +98,13 @@ export function IndustryResearch() {
           <p className="mt-2 text-sm text-muted-foreground">{displayedName}已进入共享标签库；当前状态为建设中。</p>
         </div>
       ) : !error && <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center"><p className="text-lg font-semibold">暂无可靠数据</p><p className="mt-2 text-sm text-muted-foreground">当前行业尚无可显示的可信快照。</p></div>}
+      </div>
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags}
-        externalError={tags.errorMessage} onCreate={tags.create} onCancel={() => setSelectorOpen(false)}
+        externalError={tags.errorMessage} onCreate={(name) => {
+          const result = tags.create(name);
+          pendingUserIndustryRef.current = result.tag.id;
+          return result;
+        }} onCancel={() => setSelectorOpen(false)}
         onConfirm={(ids) => { if (tags.replace(ids)) setSelectorOpen(false); }} />
     </div>
   );

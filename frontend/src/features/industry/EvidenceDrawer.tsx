@@ -38,7 +38,7 @@ export function EvidenceDrawer({ metric }: { metric: IndustryMetric }) {
       </button>
       {open && <div className="fixed inset-0 z-50 flex justify-end bg-black/55" onMouseDown={(event) => { if (event.currentTarget === event.target) closeAndRestoreFocus(); }}>
         <aside ref={drawerRef} role="dialog" aria-modal="true" aria-label={`${metric.label}证据`} className="h-full w-full max-w-lg overflow-y-auto border-l border-border bg-card p-6 shadow-2xl motion-reduce:transition-none">
-          <div className="flex items-start justify-between gap-4"><div><p className="font-mono text-[10px] uppercase tracking-[0.22em] text-primary">Evidence trail</p><h2 className="mt-2 text-xl font-bold">{metric.label}证据</h2></div>
+          <div className="flex items-start justify-between gap-4"><div><p className="font-mono text-xs uppercase leading-5 tracking-[0.22em] text-primary">Evidence trail</p><h2 className="mt-2 text-xl font-bold">{metric.label}证据</h2></div>
             <button ref={closeRef} type="button" aria-label="关闭证据" onClick={closeAndRestoreFocus} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg border border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"><X className="h-4 w-4" /></button></div>
           <dl className="mt-6 grid gap-3 rounded-xl border border-border/70 p-4 text-xs">
             <div><dt className="text-muted-foreground">原始快照</dt><dd className="mt-1 font-mono">{metric.rawSnapshotId}</dd></div>
