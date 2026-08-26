@@ -2,10 +2,10 @@
   "schema_version": 1,
   "work": "PP03 V0.2-W3 industry research",
   "status": "PASS",
-  "tested_implementation_commit": "2f8a4da10cd5e5ac80b7f51988eb60a3d6943b80",
-  "tested_implementation_tree": "e372ebd7aa947aee899d6560597baf766e3c44d3",
+  "tested_implementation_commit": "14d0413e823bc92c25f51de1398a758a702955bb",
+  "tested_implementation_tree": "3804e019ae8e15994eca458b496dc8be05e5b1ff",
   "evidence_commit": "SELF: the Git commit containing this manifest and generated evidence",
-  "commit_relationship": "The clean implementation commit above was tested first; this later evidence commit only adds the report, manifest, and screenshot.",
+  "commit_relationship": "The clean implementation commit above was tested first; this later evidence commit updates only the report and manifest. The same run regenerated the formal screenshot, whose bytes matched the already tracked screenshot.",
   "commands": [
     {
       "label": "runner-self-test",
@@ -18,8 +18,8 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
       "exit_code": 0,
-      "duration_seconds": 2.547,
-      "summary": "37 passed, 1 warning in 1.74s"
+      "duration_seconds": 2.984,
+      "summary": "37 passed, 1 warning in 2.14s"
     },
     {
       "label": "backend-offline-full",
@@ -36,8 +36,8 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
       "exit_code": 0,
-      "duration_seconds": 141.047,
-      "summary": "2838 passed, 31 skipped, 14 deselected, 1 warning in 139.79s (0:02:19)"
+      "duration_seconds": 125.719,
+      "summary": "2909 passed, 31 skipped, 14 deselected, 1 warning in 124.51s (0:02:04)"
     },
     {
       "label": "frontend-main-tests",
@@ -48,8 +48,8 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\frontend",
       "exit_code": 0,
-      "duration_seconds": 19.203,
-      "summary": "Test Files 37 passed (37) | Tests 638 passed (638)"
+      "duration_seconds": 20.234,
+      "summary": "Test Files 37 passed (37) | Tests 646 passed (646)"
     },
     {
       "label": "frontend-legacy-tests",
@@ -72,8 +72,8 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\frontend",
       "exit_code": 0,
-      "duration_seconds": 15.438,
-      "summary": "✓ built in 7.99s"
+      "duration_seconds": 13.812,
+      "summary": "✓ built in 7.01s"
     },
     {
       "label": "playwright-pinned-install",
@@ -87,8 +87,8 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
       "exit_code": 0,
-      "duration_seconds": 4.531,
-      "summary": "added 2 packages in 4s"
+      "duration_seconds": 5.782,
+      "summary": "added 2 packages in 5s"
     },
     {
       "label": "playwright-chromium-install",
@@ -99,8 +99,8 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
       "exit_code": 0,
-      "duration_seconds": 54.719,
-      "summary": "|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ | 70% of 0.1 MiB | |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ | 89% of 0.1 MiB | |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 0.1 MiB | Winldd (playwright winldd v1007) downloaded to D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\playwright-browsers\\winldd-1007"
+      "duration_seconds": 83.093,
+      "summary": "|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ | 75% of 0.1 MiB | |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ | 88% of 0.1 MiB | |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 0.1 MiB | Winldd (playwright winldd v1007) downloaded to D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\playwright-browsers\\winldd-1007"
     },
     {
       "label": "playwright-preflight",
@@ -111,7 +111,7 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
       "exit_code": 0,
-      "duration_seconds": 0.344,
+      "duration_seconds": 0.328,
       "summary": "{\"phase\":\"preflight\",\"playwrightVersion\":\"1.62.1\",\"toolsRoot\":\"D:\\\\AI_Workspace\\\\AI_Projects\\\\PP03-AI-Jiyan-worktrees\\\\codex-pp03-v0.2-w3-industry-research-impl\\\\.tmp\\\\acceptance\\\\v0.2-w3\\\\tools\",\"browsersRoot\":\"D:\\\\AI_Workspace\\\\AI_Projects\\\\PP03-AI-Jiyan-worktrees\\\\codex-pp03-v0.2-w3-industry-research-impl\\\\.tmp\\\\acceptance\\\\v0.2-w3\\\\playwright-browsers\",\"executablePath\":\"D:\\\\AI_Workspace\\\\AI_Projects\\\\PP03-AI-Jiyan-worktrees\\\\codex-pp03-v0.2-w3-industry-research-impl\\\\.tmp\\\\acceptance\\\\v0.2-w3\\\\playwright-browsers\\\\chromium-1234\\\\chrome-win64\\\\chrome.exe\"}"
     },
     {
@@ -123,30 +123,30 @@
       ],
       "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
       "exit_code": 0,
-      "duration_seconds": 5.719,
+      "duration_seconds": 5.953,
       "summary": ""
     }
   ],
   "test_counts": {
-    "runner_self_tests": "37 passed, 1 warning in 1.74s",
-    "backend_offline": "2838 passed, 31 skipped, 14 deselected, 1 warning in 139.79s (0:02:19)",
-    "frontend_main": "Test Files 37 passed (37) | Tests 638 passed (638)",
+    "runner_self_tests": "37 passed, 1 warning in 2.14s",
+    "backend_offline": "2909 passed, 31 skipped, 14 deselected, 1 warning in 124.51s (0:02:04)",
+    "frontend_main": "Test Files 37 passed (37) | Tests 646 passed (646)",
     "frontend_legacy": "16 tests, 16 pass, 0 fail, 0 skipped",
-    "production_build": "✓ built in 7.99s"
+    "production_build": "✓ built in 7.01s"
   },
   "browser": {
     "playwright_version": "1.62.1",
     "chromium_version": "151.0.7922.34",
     "chromium_executable": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\playwright-browsers\\chromium-1234\\chrome-win64\\chrome.exe",
-    "backend_pid": 38156,
-    "backend_listener_pid": 42336,
-    "frontend_pid": 43372,
-    "frontend_listener_pid": 43372,
-    "browser_runner_pid": 24040,
-    "backend_port": 51501,
-    "frontend_port": 51502,
-    "backend_url": "http://127.0.0.1:51501",
-    "frontend_url": "http://127.0.0.1:51502",
+    "backend_pid": 37768,
+    "backend_listener_pid": 18476,
+    "frontend_pid": 40132,
+    "frontend_listener_pid": 40132,
+    "browser_runner_pid": 39328,
+    "backend_port": 58473,
+    "frontend_port": 58474,
+    "backend_url": "http://127.0.0.1:58473",
+    "frontend_url": "http://127.0.0.1:58474",
     "checks": [
       {
         "name": "storage-normal-partial-candidate-conflict-old-snapshot-no-holdings",
@@ -230,6 +230,31 @@
         ]
       },
       {
+        "name": "browser-back-forward-reload",
+        "status": "pass",
+        "back": {
+          "label": "browser-back-storage",
+          "targetIndustryId": "storage",
+          "successorStatus": 200,
+          "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
+          "successorArticleIndustryId": "storage"
+        },
+        "forward": {
+          "label": "browser-forward-semiconductor",
+          "targetIndustryId": "semiconductor",
+          "successorStatus": 200,
+          "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+          "successorArticleIndustryId": "semiconductor"
+        },
+        "reload": {
+          "label": "browser-reload-semiconductor",
+          "targetIndustryId": "semiconductor",
+          "successorStatus": 200,
+          "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+          "successorArticleIndustryId": "semiconductor"
+        }
+      },
+      {
         "name": "robotics-differential-isolation",
         "status": "pass",
         "title": "机器人行业研究",
@@ -254,7 +279,7 @@
         "label": "rapid-three-industry-switch",
         "targetIndustryId": "robotics",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
         "successorArticleIndustryId": "robotics"
       },
       {
@@ -264,11 +289,11 @@
       {
         "name": "keyboard-tag-reorder-focus",
         "status": "pass",
-        "customTagId": "custom-425d386f7679104aa1cbcc065f3a14fc",
+        "customTagId": "custom-7c2895a5cede004adac4b20b9cf79707",
         "prepareCustomMoveRight": {
           "required": true,
           "initialOrder": [
-            "custom-425d386f7679104aa1cbcc065f3a14fc",
+            "custom-7c2895a5cede004adac4b20b9cf79707",
             "semiconductor",
             "storage",
             "robotics"
@@ -276,7 +301,7 @@
           "initialIndex": 0,
           "preparedOrder": [
             "semiconductor",
-            "custom-425d386f7679104aa1cbcc065f3a14fc",
+            "custom-7c2895a5cede004adac4b20b9cf79707",
             "storage",
             "robotics"
           ],
@@ -284,12 +309,12 @@
         },
         "beforeOrder": [
           "semiconductor",
-          "custom-425d386f7679104aa1cbcc065f3a14fc",
+          "custom-7c2895a5cede004adac4b20b9cf79707",
           "storage",
           "robotics"
         ],
         "afterOrder": [
-          "custom-425d386f7679104aa1cbcc065f3a14fc",
+          "custom-7c2895a5cede004adac4b20b9cf79707",
           "semiconductor",
           "storage",
           "robotics"
@@ -315,7 +340,7 @@
             "label": "final-storage-screenshot",
             "targetIndustryId": "storage",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
             "successorArticleIndustryId": "storage"
           },
           "stickyBottom": 131,
@@ -330,13 +355,13 @@
       {
         "name": "console-pageerror-requestfailed-classified",
         "status": "pass",
-        "expectedCancellationCount": 2,
+        "expectedCancellationCount": 3,
         "expectedCancellationActions": [
           {
             "label": "initial-goto-storage",
             "targetIndustryId": "storage",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
             "successorArticleIndustryId": "storage",
             "expectedCancellationCount": 1
           },
@@ -344,15 +369,39 @@
             "label": "switch-semiconductor",
             "targetIndustryId": "semiconductor",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/semiconductor?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
             "successorArticleIndustryId": "semiconductor",
             "expectedCancellationCount": 0
+          },
+          {
+            "label": "browser-back-storage",
+            "targetIndustryId": "storage",
+            "successorStatus": 200,
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
+            "successorArticleIndustryId": "storage",
+            "expectedCancellationCount": 0
+          },
+          {
+            "label": "browser-forward-semiconductor",
+            "targetIndustryId": "semiconductor",
+            "successorStatus": 200,
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+            "successorArticleIndustryId": "semiconductor",
+            "expectedCancellationCount": 0
+          },
+          {
+            "label": "browser-reload-semiconductor",
+            "targetIndustryId": "semiconductor",
+            "successorStatus": 200,
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+            "successorArticleIndustryId": "semiconductor",
+            "expectedCancellationCount": 1
           },
           {
             "label": "switch-robotics",
             "targetIndustryId": "robotics",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
             "successorArticleIndustryId": "robotics",
             "expectedCancellationCount": 0
           },
@@ -360,7 +409,7 @@
             "label": "rapid-three-industry-switch",
             "targetIndustryId": "robotics",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
             "successorArticleIndustryId": "robotics",
             "expectedCancellationCount": 0
           },
@@ -368,7 +417,7 @@
             "label": "reload-restored-storage",
             "targetIndustryId": "storage",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
             "successorArticleIndustryId": "storage",
             "expectedCancellationCount": 1
           },
@@ -376,14 +425,14 @@
             "label": "final-storage-screenshot",
             "targetIndustryId": "storage",
             "successorStatus": 200,
-            "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+            "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
             "successorArticleIndustryId": "storage",
             "expectedCancellationCount": 0
           }
         ],
         "responseStatusCounts": {
-          "200": 245,
-          "304": 88
+          "200": 358,
+          "304": 87
         },
         "unexpectedNon2xxResponses": [],
         "blockingRequestFailureCount": 0
@@ -394,13 +443,19 @@
     "request_failures": [
       {
         "method": "GET",
-        "url": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "url": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "failure": "net::ERR_ABORTED",
         "actionLabel": "initial-goto-storage"
       },
       {
         "method": "GET",
-        "url": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "url": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+        "failure": "net::ERR_ABORTED",
+        "actionLabel": "browser-reload-semiconductor"
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "failure": "net::ERR_ABORTED",
         "actionLabel": "reload-restored-storage"
       }
@@ -408,21 +463,27 @@
     "expected_cancelled_requests": [
       {
         "method": "GET",
-        "url": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "url": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "failure": "net::ERR_ABORTED",
         "actionLabel": "initial-goto-storage"
       },
       {
         "method": "GET",
-        "url": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "url": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+        "failure": "net::ERR_ABORTED",
+        "actionLabel": "browser-reload-semiconductor"
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "failure": "net::ERR_ABORTED",
         "actionLabel": "reload-restored-storage"
       }
     ],
     "blocking_request_failures": [],
     "response_status_counts": {
-      "200": 245,
-      "304": 88
+      "200": 358,
+      "304": 87
     },
     "unexpected_non_2xx_responses": [],
     "expected_cancellation_actions": [
@@ -430,7 +491,7 @@
         "label": "initial-goto-storage",
         "targetIndustryId": "storage",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "successorArticleIndustryId": "storage",
         "expectedCancellationCount": 1
       },
@@ -438,15 +499,39 @@
         "label": "switch-semiconductor",
         "targetIndustryId": "semiconductor",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/semiconductor?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
         "successorArticleIndustryId": "semiconductor",
         "expectedCancellationCount": 0
+      },
+      {
+        "label": "browser-back-storage",
+        "targetIndustryId": "storage",
+        "successorStatus": 200,
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
+        "successorArticleIndustryId": "storage",
+        "expectedCancellationCount": 0
+      },
+      {
+        "label": "browser-forward-semiconductor",
+        "targetIndustryId": "semiconductor",
+        "successorStatus": 200,
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+        "successorArticleIndustryId": "semiconductor",
+        "expectedCancellationCount": 0
+      },
+      {
+        "label": "browser-reload-semiconductor",
+        "targetIndustryId": "semiconductor",
+        "successorStatus": 200,
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+        "successorArticleIndustryId": "semiconductor",
+        "expectedCancellationCount": 1
       },
       {
         "label": "switch-robotics",
         "targetIndustryId": "robotics",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
         "successorArticleIndustryId": "robotics",
         "expectedCancellationCount": 0
       },
@@ -454,7 +539,7 @@
         "label": "rapid-three-industry-switch",
         "targetIndustryId": "robotics",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
         "successorArticleIndustryId": "robotics",
         "expectedCancellationCount": 0
       },
@@ -462,7 +547,7 @@
         "label": "reload-restored-storage",
         "targetIndustryId": "storage",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "successorArticleIndustryId": "storage",
         "expectedCancellationCount": 1
       },
@@ -470,7 +555,7 @@
         "label": "final-storage-screenshot",
         "targetIndustryId": "storage",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "successorArticleIndustryId": "storage",
         "expectedCancellationCount": 0
       }
@@ -480,48 +565,69 @@
         "label": "initial-goto-storage",
         "targetIndustryId": "storage",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "successorArticleIndustryId": "storage"
       },
       {
         "label": "switch-semiconductor",
         "targetIndustryId": "semiconductor",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/semiconductor?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+        "successorArticleIndustryId": "semiconductor"
+      },
+      {
+        "label": "browser-back-storage",
+        "targetIndustryId": "storage",
+        "successorStatus": 200,
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
+        "successorArticleIndustryId": "storage"
+      },
+      {
+        "label": "browser-forward-semiconductor",
+        "targetIndustryId": "semiconductor",
+        "successorStatus": 200,
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
+        "successorArticleIndustryId": "semiconductor"
+      },
+      {
+        "label": "browser-reload-semiconductor",
+        "targetIndustryId": "semiconductor",
+        "successorStatus": 200,
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/semiconductor?window_days=90",
         "successorArticleIndustryId": "semiconductor"
       },
       {
         "label": "switch-robotics",
         "targetIndustryId": "robotics",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
         "successorArticleIndustryId": "robotics"
       },
       {
         "label": "rapid-three-industry-switch",
         "targetIndustryId": "robotics",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/robotics?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/robotics?window_days=90",
         "successorArticleIndustryId": "robotics"
       },
       {
         "label": "reload-restored-storage",
         "targetIndustryId": "storage",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "successorArticleIndustryId": "storage"
       },
       {
         "label": "final-storage-screenshot",
         "targetIndustryId": "storage",
         "successorStatus": 200,
-        "successorUrl": "http://127.0.0.1:51502/api/industry-research/storage?window_days=90",
+        "successorUrl": "http://127.0.0.1:58474/api/industry-research/storage?window_days=90",
         "successorArticleIndustryId": "storage"
       }
     ],
     "network_classification": {
-      "loopback_request_count": 326,
-      "static_font_request_count": 9,
+      "loopback_request_count": 436,
+      "static_font_request_count": 12,
       "static_font_origins": [
         "https://fonts.googleapis.com",
         "https://fonts.gstatic.com"
@@ -543,6 +649,74 @@
     "user_key_used": false,
     "real_user_data_read": false,
     "real_holdings_amount_cost_account_read": false
+  },
+  "data_reality": {
+    "usable_live_industry_fields": [],
+    "qualification_only_connection": {
+      "transport_status": "HTTP 200",
+      "qualification_status": "structure_changed",
+      "approved_table_shape": false,
+      "observed_field_dates_and_units_available": false
+    },
+    "trusted_real_content": "Only previously admitted A2 facts that remain durable by raw snapshot ID; the acceptance report itself is fixture-backed.",
+    "candidate_content": "Unverified and conflicting events remain separate and never enter trusted conclusions.",
+    "source_unconfigured_fields": [
+      "dram_price",
+      "nand_price",
+      "hbm_demand",
+      "inventory_level",
+      "capacity_utilization",
+      "manufacturer_capex",
+      "server_demand",
+      "consumer_electronics_demand",
+      "sector_fund_flow",
+      "etf_shares",
+      "valuation_level",
+      "historical_percentile",
+      "fund_industry_exposure"
+    ],
+    "license_status": "UNCONFIGURED / license_unverified",
+    "production_live_executed": false
+  },
+  "security_scan": {
+    "tool": "detect-secrets",
+    "version": "1.5.0",
+    "plugin_count": 27,
+    "scope": "all Git tracked files",
+    "network_verification": "disabled",
+    "finding_count": 6,
+    "audited_false_positive_count": 6,
+    "real_secret_count": 0,
+    "finding_classes": {
+      "synthetic_test_secret_keywords": 5,
+      "labelled_generated_sha256_constant": 1
+    },
+    "raw_suspected_values_recorded": false
+  },
+  "independent_reviews": {
+    "review_round_limit": 5,
+    "review_rounds_used": 5,
+    "implementation_commit": "14d0413e823bc92c25f51de1398a758a702955bb",
+    "specification_review": "PASS",
+    "code_and_security_review": "PASS",
+    "critical_open": 0,
+    "important_open": 0,
+    "minor_open": 0,
+    "full_branch_evidence_review": "Performed after the evidence commit; Git evidence commits cannot self-reference their own SHA."
+  },
+  "task_commit_ranges": {
+    "task_0": "cda83e9..48745b0",
+    "task_1": "ea32198..b419855",
+    "task_2": "67b37da..e800650",
+    "task_3": "28ed864..7d4f766",
+    "task_4": "47d1d28..e192ebb",
+    "task_5": "d11624b..d6ef0eb",
+    "task_6": "b589077..965ba38",
+    "task_7": "7cfb781..37643fb",
+    "task_8": "571d7c6..a898128",
+    "task_9": "a96bdc0..013bcc0",
+    "task_10": "097dcc1..d9b7934",
+    "final_integration_and_review_fixes": "bf55c987..14d0413"
   },
   "cleanup": {
     "removed": [
@@ -566,14 +740,14 @@
     "processes": [
       {
         "label": "vite",
-        "pid": 43372,
+        "pid": 40132,
         "action": "taskkill_owned_tree",
         "taskkill_exit": 0,
         "exit_code": 1
       },
       {
         "label": "backend",
-        "pid": 38156,
+        "pid": 37768,
         "action": "taskkill_owned_tree",
         "taskkill_exit": 0,
         "exit_code": 1
@@ -581,7 +755,7 @@
     ]
   },
   "limitations": [
-    "A2-W1 historical Live terminal remains failed/evidence_compatibility_failed; this run is offline fixture-backed acceptance, not a new Live success.",
+    "A2-W1 historical Live terminal remains failed/evidence_compatibility_failed; this run is fixture-backed with no Live data requests, not a new Live success.",
     "Industry price, inventory, utilization, capital, funds and valuation fields without qualified sources remain explicit empty states."
   ]
 }
