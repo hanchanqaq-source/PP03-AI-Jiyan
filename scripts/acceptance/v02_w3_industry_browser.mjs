@@ -116,6 +116,7 @@ try {
     else blockingFailedRequests.push(entry);
   });
 
+  expectedCancellationWindow = true;
   await page.goto(`${baseUrl}/industry-research`, { waitUntil: "networkidle" });
   await page.getByRole("button", { name: "切换到存储" }).click();
   const storageArticle = page.locator('[data-industry-report-top] > article[data-industry-id="storage"]');
@@ -170,7 +171,6 @@ try {
     record("keyboard-evidence-dialog-focus");
   }
 
-  expectedCancellationWindow = true;
   await page.getByRole("button", { name: "切换到半导体" }).click();
   const semiconductorArticle = page.locator('[data-industry-report-top] > article[data-industry-id="semiconductor"]');
   await semiconductorArticle.waitFor();

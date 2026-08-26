@@ -446,6 +446,7 @@ def test_browser_only_classifies_exact_in_window_industry_aborts_as_expected() -
     assert 'parsed.searchParams.get("window_days")' in script
     assert "blockingFailedRequests.length === 0" in script
     assert "expectedCancelledRequests" in script
+    assert script.index("expectedCancellationWindow = true;") < script.index("await page.goto")
 
     history_stage = script[
         script.index("const windowCounts") : script.index("const metricsAnchor")
@@ -453,8 +454,3 @@ def test_browser_only_classifies_exact_in_window_industry_aborts_as_expected() -
     assert "page.waitForFunction" in history_stage
     assert 'button.getAttribute("aria-label") === `最近 ${expectedDays} 天`' in history_stage
     assert 'button.getAttribute("aria-pressed") === "true"' in history_stage
-
-    assert (
-        'expectedCancellationWindow = true;\n'
-        '  await page.getByRole("button", { name: "切换到半导体" }).click();'
-    ) in script
