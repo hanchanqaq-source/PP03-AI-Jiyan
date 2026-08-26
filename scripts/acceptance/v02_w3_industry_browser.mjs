@@ -130,7 +130,7 @@ try {
     await page.keyboard.press("Enter");
     await page.getByRole("dialog").waitFor();
     const evidenceText = await page.getByRole("dialog").innerText();
-    for (const text of ["数据来源", "数据日期", "数据口径", "判断依据", "失效条件", "evidence"])
+    for (const text of ["原始快照", "证据快照", "数据日期", "数据口径", "判断依据", "失效条件", "来源族"])
       assert(evidenceText.toLocaleLowerCase().includes(text.toLocaleLowerCase()), `evidence drawer missing ${text}`);
     await page.keyboard.press("Escape");
     await evidenceButton.waitFor({ state: "visible" });

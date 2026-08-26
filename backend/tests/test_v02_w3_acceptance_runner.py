@@ -382,3 +382,21 @@ def test_browser_report_locators_are_scoped_to_the_report_top_level() -> None:
             in script
         )
         assert f"page.locator('article[data-industry-id=\"{industry_id}\"]')" not in script
+
+
+def test_browser_evidence_drawer_contract_matches_production_labels() -> None:
+    script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    for label in (
+        "原始快照",
+        "证据快照",
+        "数据日期",
+        "数据口径",
+        "判断依据",
+        "失效条件",
+        "来源族",
+    ):
+        assert f'"{label}"' in script
+    assert '"数据来源"' not in script
