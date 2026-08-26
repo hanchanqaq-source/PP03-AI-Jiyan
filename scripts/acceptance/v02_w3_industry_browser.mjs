@@ -89,7 +89,7 @@ try {
 
   await page.goto(`${baseUrl}/industry-research`, { waitUntil: "networkidle" });
   await page.getByRole("button", { name: "切换到存储" }).click();
-  const storageArticle = page.locator('article[data-industry-id="storage"]');
+  const storageArticle = page.locator('[data-industry-report-top] > article[data-industry-id="storage"]');
   await storageArticle.waitFor({ state: "visible" });
   await page.getByText("隔离演示快照 DEMO-S-TRUSTED-001", { exact: false }).waitFor();
 
@@ -138,7 +138,7 @@ try {
   }
 
   await page.getByRole("button", { name: "切换到半导体" }).click();
-  const semiconductorArticle = page.locator('article[data-industry-id="semiconductor"]');
+  const semiconductorArticle = page.locator('[data-industry-report-top] > article[data-industry-id="semiconductor"]');
   await semiconductorArticle.waitFor();
   const semiconductorText = await semiconductorArticle.innerText();
   assert(!semiconductorText.includes("DRAM 价格") && !semiconductorText.includes("DEMO-S-"), "semiconductor leaked storage data");
@@ -146,7 +146,7 @@ try {
   record("semiconductor-differential-isolation");
 
   await page.getByRole("button", { name: "切换到机器人" }).click();
-  const roboticsArticle = page.locator('article[data-industry-id="robotics"]');
+  const roboticsArticle = page.locator('[data-industry-report-top] > article[data-industry-id="robotics"]');
   await roboticsArticle.waitFor();
   const roboticsText = await roboticsArticle.innerText();
   assert(!roboticsText.includes("DRAM 价格") && !roboticsText.includes("DEMO-S-"), "robotics leaked storage data");

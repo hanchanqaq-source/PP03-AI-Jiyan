@@ -1222,7 +1222,7 @@ def _write_acceptance_evidence(
             for item in command_evidence
         ],
         "test_counts": {
-            "runner_self_tests": "24 passed",
+            "runner_self_tests": "25 passed",
             "backend_offline": next((item.summary for item in command_evidence if item.label == "backend-offline-full"), ""),
             "frontend_main": next((item.summary for item in command_evidence if item.label == "frontend-main-tests"), ""),
             "frontend_legacy": next((item.summary for item in command_evidence if item.label == "frontend-legacy-tests"), ""),

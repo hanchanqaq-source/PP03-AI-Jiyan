@@ -369,3 +369,16 @@ def test_fixture_overview_derives_evidence_and_expiry_conditions_from_basis_metr
 
     assert report.overview.evidence_ids == expected_evidence
     assert report.overview.invalidating_conditions == expected_conditions
+
+
+def test_browser_report_locators_are_scoped_to_the_report_top_level() -> None:
+    script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    for industry_id in ("storage", "semiconductor", "robotics"):
+        assert (
+            f'[data-industry-report-top] > article[data-industry-id="{industry_id}"]'
+            in script
+        )
+        assert f"page.locator('article[data-industry-id=\"{industry_id}\"]')" not in script
