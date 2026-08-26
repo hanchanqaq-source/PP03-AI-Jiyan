@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "work": "PP03 V0.2-W3 industry research",
+  "status": "PASS",
+  "tested_implementation_commit": "2bfc2286741e3f0bc387435e0a95ff46c7b89406",
+  "tested_implementation_tree": "d64390102a86026c6984804a28ce528267aa60a3",
+  "evidence_commit": "SELF: the Git commit containing this manifest and generated evidence",
+  "commit_relationship": "The clean implementation commit above was tested first; this later evidence commit only adds the report, manifest, and screenshot.",
+  "commands": [
+    {
+      "label": "runner-self-test",
+      "command": [
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\backend\\.venv\\Scripts\\python.exe",
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\scripts\\acceptance\\run_v02_w3_industry_acceptance.py",
+        "--phase",
+        "runner-self-test",
+        "--keep-runtime"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
+      "exit_code": 0,
+      "duration_seconds": 2.563,
+      "summary": "35 passed, 1 warning in 1.79s"
+    },
+    {
+      "label": "backend-offline-full",
+      "command": [
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\backend\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "backend/tests",
+        "-m",
+        "not live",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
+      "exit_code": 0,
+      "duration_seconds": 130.64,
+      "summary": "2836 passed, 31 skipped, 14 deselected, 1 warning in 129.45s (0:02:09)"
+    },
+    {
+      "label": "frontend-main-tests",
+      "command": [
+        "npm",
+        "run",
+        "test:run"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\frontend",
+      "exit_code": 0,
+      "duration_seconds": 19.109,
+      "summary": "Test Files 37 passed (37) | Tests 637 passed (637)"
+    },
+    {
+      "label": "frontend-legacy-tests",
+      "command": [
+        "npm",
+        "run",
+        "test:legacy"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\frontend",
+      "exit_code": 0,
+      "duration_seconds": 0.735,
+      "summary": "16 tests, 16 pass, 0 fail, 0 skipped"
+    },
+    {
+      "label": "frontend-production-build",
+      "command": [
+        "npm",
+        "run",
+        "build"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\frontend",
+      "exit_code": 0,
+      "duration_seconds": 14.391,
+      "summary": "✓ built in 7.39s"
+    },
+    {
+      "label": "playwright-pinned-install",
+      "command": [
+        "npm",
+        "install",
+        "--prefix",
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\tools",
+        "--no-save",
+        "playwright@1.62.1"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
+      "exit_code": 0,
+      "duration_seconds": 3.328,
+      "summary": "added 2 packages in 3s"
+    },
+    {
+      "label": "playwright-chromium-install",
+      "command": [
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\tools\\node_modules\\.bin\\playwright.cmd",
+        "install",
+        "chromium"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
+      "exit_code": 0,
+      "duration_seconds": 34.406,
+      "summary": "|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ | 70% of 0.1 MiB | |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ | 89% of 0.1 MiB | |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 0.1 MiB | Winldd (playwright winldd v1007) downloaded to D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\playwright-browsers\\winldd-1007"
+    },
+    {
+      "label": "playwright-preflight",
+      "command": [
+        "node",
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\scripts\\acceptance\\v02_w3_industry_browser.mjs",
+        "--preflight"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
+      "exit_code": 0,
+      "duration_seconds": 0.344,
+      "summary": "{\"phase\":\"preflight\",\"playwrightVersion\":\"1.62.1\",\"toolsRoot\":\"D:\\\\AI_Workspace\\\\AI_Projects\\\\PP03-AI-Jiyan-worktrees\\\\codex-pp03-v0.2-w3-industry-research-impl\\\\.tmp\\\\acceptance\\\\v0.2-w3\\\\tools\",\"browsersRoot\":\"D:\\\\AI_Workspace\\\\AI_Projects\\\\PP03-AI-Jiyan-worktrees\\\\codex-pp03-v0.2-w3-industry-research-impl\\\\.tmp\\\\acceptance\\\\v0.2-w3\\\\playwright-browsers\",\"executablePath\":\"D:\\\\AI_Workspace\\\\AI_Projects\\\\PP03-AI-Jiyan-worktrees\\\\codex-pp03-v0.2-w3-industry-research-impl\\\\.tmp\\\\acceptance\\\\v0.2-w3\\\\playwright-browsers\\\\chromium-1234\\\\chrome-win64\\\\chrome.exe\"}"
+    },
+    {
+      "label": "browser-matrix",
+      "command": [
+        "node",
+        "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\scripts\\acceptance\\v02_w3_industry_browser.mjs",
+        "--run"
+      ],
+      "cwd": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl",
+      "exit_code": 0,
+      "duration_seconds": 6.172,
+      "summary": ""
+    }
+  ],
+  "test_counts": {
+    "runner_self_tests": "35 passed, 1 warning in 1.79s",
+    "backend_offline": "2836 passed, 31 skipped, 14 deselected, 1 warning in 129.45s (0:02:09)",
+    "frontend_main": "Test Files 37 passed (37) | Tests 637 passed (637)",
+    "frontend_legacy": "16 tests, 16 pass, 0 fail, 0 skipped",
+    "production_build": "✓ built in 7.39s"
+  },
+  "browser": {
+    "playwright_version": "1.62.1",
+    "chromium_version": "151.0.7922.34",
+    "chromium_executable": "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\playwright-browsers\\chromium-1234\\chrome-win64\\chrome.exe",
+    "backend_pid": 38580,
+    "backend_listener_pid": 18524,
+    "frontend_pid": 7428,
+    "frontend_listener_pid": 7428,
+    "browser_runner_pid": 30392,
+    "backend_port": 63235,
+    "frontend_port": 63236,
+    "backend_url": "http://127.0.0.1:63235",
+    "frontend_url": "http://127.0.0.1:63236",
+    "checks": [
+      {
+        "name": "storage-normal-partial-candidate-conflict-old-snapshot-no-holdings",
+        "status": "pass",
+        "sectionIds": [
+          "overview",
+          "cycle",
+          "chain",
+          "metrics",
+          "capital",
+          "companies",
+          "funds",
+          "news-risk"
+        ]
+      },
+      {
+        "name": "history-7-30-90",
+        "status": "pass",
+        "windowCounts": {
+          "7": 4,
+          "30": 9,
+          "90": 11
+        }
+      },
+      {
+        "name": "sticky-anchor-hash",
+        "status": "pass"
+      },
+      {
+        "name": "keyboard-evidence-dialog-focus",
+        "status": "pass"
+      },
+      {
+        "name": "semiconductor-differential-isolation",
+        "status": "pass"
+      },
+      {
+        "name": "robotics-differential-isolation",
+        "status": "pass"
+      },
+      {
+        "name": "rapid-three-industry-switch",
+        "status": "pass"
+      },
+      {
+        "name": "custom-tag-immediate-building-state",
+        "status": "pass"
+      },
+      {
+        "name": "keyboard-tag-reorder-focus",
+        "status": "pass"
+      },
+      {
+        "name": "no-trusted-snapshot-empty-state",
+        "status": "pass"
+      },
+      {
+        "name": "desktop-1440x1100-readability-screenshot",
+        "status": "pass",
+        "bodyFont": 16,
+        "paragraphFont": 12
+      },
+      {
+        "name": "responsive-1024-and-390",
+        "status": "pass"
+      },
+      {
+        "name": "console-pageerror-requestfailed-classified",
+        "status": "pass",
+        "expectedCancellationCount": 2
+      }
+    ],
+    "console_errors_or_warnings": [],
+    "page_errors": [],
+    "request_failures": [
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:63236/api/industry-research/storage?window_days=90",
+        "failure": "net::ERR_ABORTED"
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:63236/api/industry-research/storage?window_days=90",
+        "failure": "net::ERR_ABORTED"
+      }
+    ],
+    "expected_cancelled_requests": [
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:63236/api/industry-research/storage?window_days=90",
+        "failure": "net::ERR_ABORTED"
+      },
+      {
+        "method": "GET",
+        "url": "http://127.0.0.1:63236/api/industry-research/storage?window_days=90",
+        "failure": "net::ERR_ABORTED"
+      }
+    ],
+    "blocking_request_failures": [],
+    "network_classification": {
+      "loopback_request_count": 327,
+      "static_font_request_count": 9,
+      "static_font_origins": [
+        "https://fonts.googleapis.com",
+        "https://fonts.gstatic.com"
+      ]
+    }
+  },
+  "hashes": {
+    "source_fixture_sha256": "0a1e44ac55f78cf83c76edf04dcba0deb5b7efd1e20e508f4c75e518e172901b",
+    "formal_screenshot_sha256": "299883f60bafa64a43451fa59e596a3b054d9f801936da2afbcb8ce322da7fff",
+    "frontend_package_lock_before": "3b5d77fe477432ea6d4ac2d33b098942c64eb5b4b71c373bd71dbe03b5c356ef",
+    "frontend_package_lock_after": "3b5d77fe477432ea6d4ac2d33b098942c64eb5b4b71c373bd71dbe03b5c356ef"
+  },
+  "truth_boundary": {
+    "fixture_demo": true,
+    "production_demo_rejected": true,
+    "production_live_refresh_called": false,
+    "paid_provider_called": false,
+    "enterprise_provider_called": false,
+    "user_key_used": false,
+    "real_user_data_read": false,
+    "real_holdings_amount_cost_account_read": false
+  },
+  "cleanup": {
+    "removed": [
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\acceptance",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\cache",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\data",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\evidence",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\logs",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\news",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\playwright-browsers",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\profile",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\reports",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\results",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\run",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\temp",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\tmp",
+      "D:\\AI_Workspace\\AI_Projects\\PP03-AI-Jiyan-worktrees\\codex-pp03-v0.2-w3-industry-research-impl\\.tmp\\acceptance\\v0.2-w3\\tools"
+    ],
+    "already_absent": [],
+    "remaining": [],
+    "processes": [
+      {
+        "label": "vite",
+        "pid": 7428,
+        "action": "taskkill_owned_tree",
+        "taskkill_exit": 0,
+        "exit_code": 1
+      },
+      {
+        "label": "backend",
+        "pid": 38580,
+        "action": "taskkill_owned_tree",
+        "taskkill_exit": 0,
+        "exit_code": 1
+      }
+    ]
+  },
+  "limitations": [
+    "A2-W1 historical Live terminal remains failed/evidence_compatibility_failed; this run is offline fixture-backed acceptance, not a new Live success.",
+    "Industry price, inventory, utilization, capital, funds and valuation fields without qualified sources remain explicit empty states."
+  ]
+}
