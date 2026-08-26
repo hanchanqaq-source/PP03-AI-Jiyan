@@ -1,6 +1,7 @@
-import type { IndustryReportTemplate } from "../types";
-import { FieldGrid, ReportSection } from "./shared";
+import type { CandidateIndustryEvidence, IndustryMetric } from "@/lib/api";
+import { VerificationBadge } from "../IndustryTruthBadge";
+import { MetricRows, ReportSection } from "./shared";
 
-export function MetricsSection({ template }: { template: IndustryReportTemplate }) {
-  return <ReportSection id="metrics" index="04" title="核心数据" eyebrow="Key metrics"><p className="mb-5 text-sm text-muted-foreground">指标按行业模板区分；未接可靠数据源前只展示指标定义。</p><FieldGrid fields={template.metrics} /></ReportSection>;
+export function MetricsSection({ metrics, candidate }: { metrics: IndustryMetric[]; candidate: CandidateIndustryEvidence | null }) {
+  return <ReportSection id="metrics" index="04" title="核心数据" eyebrow="Key metrics"><p className="mb-5 text-sm text-muted-foreground">可信指标与候选证据分层展示；待核验和冲突不会进入行业结论。</p><MetricRows metrics={metrics} />{candidate && (candidate.unverified.length > 0 || candidate.conflicting.length > 0) && <aside aria-label="候选数据与冲突" className="mt-7 border-l-2 border-warning/50 pl-4"><h3 className="text-sm font-semibold">候选证据旁路</h3><div className="mt-3">{candidate.unverified.length > 0 && <><div className="mb-2"><VerificationBadge status="unverified" /></div><MetricRows metrics={candidate.unverified} compact /></>}{candidate.conflicting.length > 0 && <div className="mt-5 space-y-3"><VerificationBadge status="conflicting" />{candidate.conflicting.map((item) => <article key={item.metricId} role="alert" className="rounded-xl border border-destructive/40 p-4"><p className="font-semibold">{item.metricId} · 冲突值并列</p><ul className="mt-2 space-y-1 text-sm text-muted-foreground">{item.sourceValues.map((source) => <li key={source.evidenceId}>{source.sourceFamilyId} · {source.value}{source.unit ? ` ${source.unit}` : ""}</li>)}</ul><p className="mt-2 text-xs text-destructive">无综合值，未进入可信结论</p></article>)}</div>}</div></aside>}</ReportSection>;
 }

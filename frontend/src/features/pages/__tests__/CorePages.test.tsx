@@ -6,6 +6,7 @@ import { directEvent, marketNewsResponse, translatedEnglishEvent } from "@/featu
 import type { MarketNewsEvent, MarketNewsQuery, MarketNewsResponse, MarketNewsTranslationResponse, NewsPipelineStarted } from "@/features/market-news/types";
 import { cacheMarketNewsResponse, MarketNews, readMarketNewsCache } from "@/pages/MarketNews";
 import { IndustryResearch } from "@/pages/IndustryResearch";
+import { researchResponse } from "@/features/industry/__tests__/fixtures";
 
 const now = Math.floor(Date.now() / 1000);
 const radar: RadarData = {
@@ -64,6 +65,10 @@ describe("PP03 core pages", () => {
     localStorage.clear();
     vi.restoreAllMocks();
     vi.spyOn(api, "radar").mockResolvedValue(radar);
+    vi.spyOn(api, "industryResearchReport").mockImplementation(async (industryId) => {
+      const response = researchResponse(industryId);
+      return { ...response, refreshRun: { ...response.refreshRun, phase: "idle", errorCode: null } };
+    });
     vi.spyOn(api, "fundPortfolio").mockResolvedValue({ schema_version: 2, holdings: [], total_cost: 0, updated: null, migration: null, data_status: "ok" });
   });
 
@@ -669,9 +674,9 @@ describe("PP03 core pages", () => {
     const user = userEvent.setup();
     render(<IndustryResearch />);
 
-    expect(screen.getByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
-    expect(screen.getByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
+    expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
     expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
   });
 
@@ -687,7 +692,7 @@ describe("PP03 core pages", () => {
     expect(screen.getByRole("dialog", { name: "添加投研标签" })).toBeInTheDocument();
     expect(within(screen.getByRole("dialog", { name: "添加投研标签" })).getByRole("alert"))
       .toHaveTextContent("页面标签存储已损坏，无法安全修改");
-    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(within(screen.getByRole("dialog", { name: "添加投研标签" })).getAllByRole("alert")).toHaveLength(1);
   });
 
   it("keeps the MarketNews selector open and shows its storage error when confirm is refused", async () => {

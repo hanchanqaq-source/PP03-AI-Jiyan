@@ -1,6 +1,6 @@
-import type { IndustryReportTemplate } from "../types";
-import { EmptyEvidence, ReportSection } from "./shared";
+import { FundRelationResolver } from "../FundRelationResolver";
+import { ReportSection } from "./shared";
 
-export function FundSection({ template }: { template: IndustryReportTemplate }) {
-  return <ReportSection id="funds" index="07" title="相关基金" eyebrow="Related funds">{template.funds.length === 0 ? <EmptyEvidence>尚未接入可核验的基金净值、规模、经理、持仓、回撤和波动率来源，因此不生成候选排行榜。</EmptyEvidence> : null}<p className="mt-4 text-xs text-muted-foreground">候选规则将解释进入原因、优势、风险、持仓重合和失效条件，不提供唯一推荐。</p></ReportSection>;
+export function FundSection({ industryId }: { industryId: string }) {
+  return <ReportSection id="funds" index="07" title="相关基金" eyebrow="Related funds"><FundRelationResolver industryId={industryId} /><p className="mt-4 text-xs text-muted-foreground">只解析本次显式基金代码选择；不会读取或保存用户资产明细、私人记录或账户信息，也不生成排行或投资建议。</p></ReportSection>;
 }
