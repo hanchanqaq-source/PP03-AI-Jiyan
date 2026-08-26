@@ -3,6 +3,15 @@ import { ExternalLink, FileSearch, X } from "lucide-react";
 import type { IndustryMetric } from "@/lib/api";
 import { VerificationBadge } from "./IndustryTruthBadge";
 
+function safeExternalUrl(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 export function EvidenceDrawer({ metric, triggerLabel }: { metric: IndustryMetric; triggerLabel?: string }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -50,11 +59,15 @@ export function EvidenceDrawer({ metric, triggerLabel }: { metric: IndustryMetri
             <div><dt className="text-muted-foreground">判断依据</dt><dd className="mt-1">{metric.judgmentBasis.join("；") || "暂无可靠数据"}</dd></div>
             <div><dt className="text-muted-foreground">失效条件</dt><dd className="mt-1">{metric.invalidatingConditions.join("；") || "暂无可靠数据"}</dd></div>
           </dl>
-          <div className="mt-5 space-y-3">{metric.evidence.map((evidence) => <article key={evidence.evidenceId} className="rounded-xl border border-border/70 p-4 text-xs">
+          <div className="mt-5 space-y-3">{metric.evidence.map((evidence) => {
+            const safeUrl = safeExternalUrl(evidence.finalUrl);
+            return <article key={evidence.evidenceId} className="rounded-xl border border-border/70 p-4 text-xs">
             <div className="flex items-start justify-between gap-3"><div><p className="font-semibold">{evidence.contentSource}</p><p className="mt-1 font-mono text-muted-foreground">{evidence.evidenceId}</p></div><span className="rounded-full border border-border px-2 py-1">{evidence.contradictsClaim ? "反驳" : "支持"}</span></div>
             <dl className="mt-3 space-y-2 text-muted-foreground"><div><dt className="inline">来源族：</dt><dd className="inline">{evidence.sourceFamilyId}</dd></div><div><dt className="inline">起源集群：</dt><dd className="inline">{evidence.originCluster}</dd></div><div><dt className="inline">数据日期：</dt><dd className="inline">{evidence.asOfDate ?? "暂无可靠数据"}</dd></div><div><dt className="inline">核验时间：</dt><dd className="inline">{evidence.verifiedAt}</dd></div></dl>
-            <a href={evidence.finalUrl} target="_blank" rel="noreferrer" className="mt-3 inline-flex min-h-11 items-center gap-2 text-primary">打开原始引用<ExternalLink className="h-3 w-3" /></a>
-          </article>)}</div>
+            {safeUrl ? <a href={safeUrl} target="_blank" rel="noopener noreferrer" className="mt-3 inline-flex min-h-11 items-center gap-2 text-primary">打开原始引用<ExternalLink className="h-3 w-3" /></a>
+              : <p className="mt-3 text-xs leading-5 text-muted-foreground">原始引用不可安全打开</p>}
+          </article>;
+          })}</div>
         </aside>
       </div>}
     </>

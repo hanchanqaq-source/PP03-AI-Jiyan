@@ -272,6 +272,43 @@ describe("industry report navigation and evidence dismissal", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([
+    "javascript:alert(document.domain)",
+    "file:///C:/private.txt",
+    "data:text/html,unsafe",
+    "not a valid URL",
+  ])("does not render an actionable original-reference link for unsafe URL %s", async (finalUrl) => {
+    const user = userEvent.setup();
+    const original = researchResponse().displayedTrustedReport!.cycle[0];
+    const metric = {
+      ...original,
+      evidence: original.evidence.map((item) => ({ ...item, finalUrl })),
+    };
+    render(<EvidenceDrawer metric={metric} />);
+
+    await user.click(screen.getByRole("button", { name: "查看 DRAM 价格证据" }));
+
+    expect(screen.queryByRole("link", { name: "打开原始引用" })).not.toBeInTheDocument();
+    expect(screen.getByText("原始引用不可安全打开")).toBeInTheDocument();
+  });
+
+  it("renders a parsed HTTPS original reference with safe new-tab attributes", async () => {
+    const user = userEvent.setup();
+    const original = researchResponse().displayedTrustedReport!.cycle[0];
+    const metric = {
+      ...original,
+      evidence: original.evidence.map((item) => ({ ...item, finalUrl: "https://evidence.example/path?q=1" })),
+    };
+    render(<EvidenceDrawer metric={metric} />);
+
+    await user.click(screen.getByRole("button", { name: "查看 DRAM 价格证据" }));
+
+    const link = screen.getByRole("link", { name: "打开原始引用" });
+    expect(link).toHaveAttribute("href", "https://evidence.example/path?q=1");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
   it("restores trigger focus for overlay, Escape, and close-button dismissal", async () => {
     const user = userEvent.setup();
     const metric = researchResponse().displayedTrustedReport!.cycle[0];

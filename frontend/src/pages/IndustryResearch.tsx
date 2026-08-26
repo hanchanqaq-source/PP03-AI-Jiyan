@@ -21,7 +21,6 @@ export function IndustryResearch() {
   const tagsRef = useRef(tags);
   tagsRef.current = tags;
   const reportTopRef = useRef<HTMLDivElement>(null);
-  const pendingUserIndustryRef = useRef<string | null>(null);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [response, setResponse] = useState<IndustryResearchResponse | null>(null);
   const [requested, setRequested] = useState<{ id: string; name: string } | null>(null);
@@ -43,7 +42,6 @@ export function IndustryResearch() {
 
   const clearForEmptySelection = useCallback(() => {
     coordinator.cancel();
-    pendingUserIndustryRef.current = null;
     setResponse(null);
     setRequested(null);
     setLoading(false);
@@ -112,9 +110,7 @@ export function IndustryResearch() {
     const active = tags.activeTag;
     if (!active || loading) return;
     if (requested === null || (response?.displayedIndustryId === requested.id && active.id !== requested.id)) {
-      const userInitiated = pendingUserIndustryRef.current === active.id;
-      if (userInitiated) pendingUserIndustryRef.current = null;
-      loadReport(active.id, active.name, userInitiated);
+      loadReport(active.id, active.name);
     }
   }, [loadReport, loading, requested?.id, response?.displayedIndustryId, tags.activeTag]);
 
@@ -146,14 +142,14 @@ export function IndustryResearch() {
           : response?.templateStatus === "building" ? (
         <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center">
           <p className="text-lg font-semibold">{INCOMPLETE_REPORT_MESSAGE}</p>
-          <p className="mt-2 text-sm text-muted-foreground">{displayedName}已进入共享标签库；当前状态为建设中。</p>
+          <p className="mt-2 text-sm text-muted-foreground">{displayedName}已进入共享标签库；当前状态为建设中；系统不会根据标签名称自动补造行业数据。</p>
         </div>
       ) : <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center"><p className="text-lg font-semibold">暂无可靠数据</p><p className="mt-2 text-sm text-muted-foreground">{tags.state.ids.length === 0 ? "当前未选择行业标签；暂无可显示的可信快照。" : `当前已选择${tags.activeTag?.name ?? displayedName}，但暂无可信快照。`}</p></div>}
       </div>
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags}
         externalError={tags.errorMessage} onCreate={(name) => {
           const result = tags.create(name);
-          pendingUserIndustryRef.current = result.tag.id;
+          loadReport(result.tag.id, result.tag.name, true, true);
           return result;
         }} onCancel={() => setSelectorOpen(false)}
         onConfirm={confirmTags} />

@@ -1,6 +1,6 @@
 import type { IndustryReportTemplate } from "./types";
 
-export const INCOMPLETE_REPORT_MESSAGE = "标签已保存，报告模板建设中；系统不会根据标签名称自动补造行业数据";
+export const INCOMPLETE_REPORT_MESSAGE = "该行业报告正在建设";
 
 const capitalLabels = ["板块资金", "ETF 份额", "估值水平", "历史分位"];
 const templates: IndustryReportTemplate[] = [

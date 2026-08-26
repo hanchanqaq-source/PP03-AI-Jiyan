@@ -7,8 +7,16 @@ import { industryResponseWire, jsonResponse } from "./fixtures";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+async function createCustomTag(user: ReturnType<typeof userEvent.setup>, name: string) {
+  await user.click(screen.getByRole("button", { name: "添加标签" }));
+  const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
+  await user.type(within(dialog).getByRole("textbox", { name: "自定义行业名称" }), name);
+  await user.click(within(dialog).getByRole("button", { name: "创建并激活" }));
 }
 
 function candidateOnlyWire() {
@@ -337,16 +345,116 @@ describe("industry research page data boundary", () => {
     render(<IndustryResearch />);
     await screen.findByRole("article", { name: "存储行业研究报告" });
     history.replaceState(null, "", "/industry-research#metrics");
-    await user.click(screen.getByRole("button", { name: "添加标签" }));
-    const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
-    await user.type(within(dialog).getByRole("textbox", { name: "自定义行业名称" }), "先进封装观察");
-    await user.click(within(dialog).getByRole("button", { name: "创建并激活" }));
-    await user.click(within(dialog).getByRole("button", { name: "确认添加" }));
+    await createCustomTag(user, "先进封装观察");
 
-    expect(await screen.findByText("标签已保存，报告模板建设中；系统不会根据标签名称自动补造行业数据")).toBeInTheDocument();
+    expect(await screen.findByText("该行业报告正在建设")).toBeInTheDocument();
     expect(screen.queryByText("DRAM 价格")).not.toBeInTheDocument();
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
     expect(location.hash).toBe("");
+  });
+
+  it("immediately pre-activates a created custom tag and ignores a successful old pending response", async () => {
+    const user = userEvent.setup();
+    const storage = deferred<Response>();
+    const custom = deferred<Response>();
+    let storageSignal: AbortSignal | undefined;
+    let customIndustryId = "";
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.includes("/storage?")) {
+        storageSignal = init?.signal ?? undefined;
+        return storage.promise;
+      }
+      customIndustryId = decodeURIComponent(url.match(/industry-research\/([^?]+)/)?.[1] ?? "");
+      return custom.promise;
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByText(/正在读取存储/)).toBeInTheDocument();
+
+    await createCustomTag(user, "量子传感观察");
+
+    expect(storageSignal?.aborted).toBe(true);
+    expect(customIndustryId).toMatch(/^custom-/);
+    expect(screen.getByRole("button", { name: "切换到量子传感观察" })).toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByText(/正在读取量子传感观察/)).toBeInTheDocument();
+    await act(async () => storage.resolve(jsonResponse(industryResponseWire("storage"))));
+    expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+    expect(screen.getByText(/正在读取量子传感观察/)).toBeInTheDocument();
+    await act(async () => custom.resolve(jsonResponse(industryResponseWire(customIndustryId))));
+    expect(await screen.findByText("该行业报告正在建设")).toBeInTheDocument();
+  });
+
+  it("keeps a completed custom building state when the cancelled old response arrives late", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    history.replaceState(null, "", "/industry-research#metrics");
+    const storage = deferred<Response>();
+    const custom = deferred<Response>();
+    let customIndustryId = "";
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.includes("/storage?")) return storage.promise;
+      customIndustryId = decodeURIComponent(url.match(/industry-research\/([^?]+)/)?.[1] ?? "");
+      return custom.promise;
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByText(/正在读取存储/)).toBeInTheDocument();
+    await createCustomTag(user, "低空经济观察");
+
+    await act(async () => custom.resolve(jsonResponse(industryResponseWire(customIndustryId))));
+    expect(await screen.findByText("该行业报告正在建设")).toBeInTheDocument();
+    expect(location.hash).toBe("");
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+    await act(async () => storage.resolve(jsonResponse(industryResponseWire("storage"))));
+    expect(screen.getByText("该行业报告正在建设")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到低空经济观察" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("keeps a failed custom target active and empty while cancelling its initial pending predecessor", async () => {
+    const user = userEvent.setup();
+    const storage = deferred<Response>();
+    let storageSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      if (String(input).includes("/storage?")) {
+        storageSignal = init?.signal ?? undefined;
+        return storage.promise;
+      }
+      return Promise.reject(new Error("custom unavailable"));
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByText(/正在读取存储/)).toBeInTheDocument();
+
+    await createCustomTag(user, "工业软件观察");
+
+    expect(storageSignal?.aborted).toBe(true);
+    expect(await screen.findByText(/行业报告读取失败/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到工业软件观察" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("当前已选择工业软件观察，但暂无可信快照。")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: /行业研究报告/ })).not.toBeInTheDocument();
+  });
+
+  it("does not restore an already displayed trusted report when the created custom target fails", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).includes("/storage?")) return jsonResponse(industryResponseWire("storage"));
+      throw new Error("custom unavailable");
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    history.replaceState(null, "", "/industry-research#metrics");
+
+    await createCustomTag(user, "商业航天观察");
+
+    expect(await screen.findByText(/行业报告读取失败/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到商业航天观察" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+    expect(screen.getByText("当前已选择商业航天观察，但暂无可信快照。")).toBeInTheDocument();
+    expect(location.hash).toBe("#metrics");
+    expect(scrollIntoView).not.toHaveBeenCalled();
   });
 
   it("exposes the four truth axes and opens evidence from the keyboard", async () => {

@@ -24,6 +24,6 @@ describe("industry report templates", () => {
 
   it("returns the explicit incomplete-template state for other tags", () => {
     expect(getIndustryTemplate("healthcare")).toBeUndefined();
-    expect(INCOMPLETE_REPORT_MESSAGE).toContain("报告模板建设中");
+    expect(INCOMPLETE_REPORT_MESSAGE).toBe("该行业报告正在建设");
   });
 });
