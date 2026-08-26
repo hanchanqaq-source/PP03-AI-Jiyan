@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ExternalLink, FileSearch, X } from "lucide-react";
 import type { IndustryMetric } from "@/lib/api";
+import { VerificationBadge } from "./IndustryTruthBadge";
 
-export function EvidenceDrawer({ metric }: { metric: IndustryMetric }) {
+export function EvidenceDrawer({ metric, triggerLabel }: { metric: IndustryMetric; triggerLabel?: string }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -32,7 +33,7 @@ export function EvidenceDrawer({ metric }: { metric: IndustryMetric }) {
   if (metric.evidence.length === 0) return <span className="text-xs text-muted-foreground">无可展开证据</span>;
   return (
     <>
-      <button ref={triggerRef} type="button" aria-label={`查看 ${metric.label}证据`} onClick={() => setOpen(true)}
+      <button ref={triggerRef} type="button" aria-label={triggerLabel ?? `查看 ${metric.label}证据`} onClick={() => setOpen(true)}
         className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-border px-3 text-xs text-foreground hover:border-primary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
         <FileSearch className="h-4 w-4" aria-hidden="true" />查看证据
       </button>
@@ -43,11 +44,15 @@ export function EvidenceDrawer({ metric }: { metric: IndustryMetric }) {
           <dl className="mt-6 grid gap-3 rounded-xl border border-border/70 p-4 text-xs">
             <div><dt className="text-muted-foreground">原始快照</dt><dd className="mt-1 font-mono">{metric.rawSnapshotId}</dd></div>
             <div><dt className="text-muted-foreground">证据快照</dt><dd className="mt-1 font-mono">{metric.evidenceSnapshotId}</dd></div>
+            <div><dt className="text-muted-foreground">数据日期</dt><dd className="mt-1 font-mono">{metric.asOfDate ?? metric.fetchedAt ?? "暂无可靠数据"}</dd></div>
+            <div><dt className="text-muted-foreground">可信状态</dt><dd className="mt-1"><VerificationBadge status={metric.verificationStatus} /></dd></div>
             <div><dt className="text-muted-foreground">数据口径</dt><dd className="mt-1">{metric.methodology}</dd></div>
+            <div><dt className="text-muted-foreground">判断依据</dt><dd className="mt-1">{metric.judgmentBasis.join("；") || "暂无可靠数据"}</dd></div>
+            <div><dt className="text-muted-foreground">失效条件</dt><dd className="mt-1">{metric.invalidatingConditions.join("；") || "暂无可靠数据"}</dd></div>
           </dl>
           <div className="mt-5 space-y-3">{metric.evidence.map((evidence) => <article key={evidence.evidenceId} className="rounded-xl border border-border/70 p-4 text-xs">
             <div className="flex items-start justify-between gap-3"><div><p className="font-semibold">{evidence.contentSource}</p><p className="mt-1 font-mono text-muted-foreground">{evidence.evidenceId}</p></div><span className="rounded-full border border-border px-2 py-1">{evidence.contradictsClaim ? "反驳" : "支持"}</span></div>
-            <dl className="mt-3 space-y-2 text-muted-foreground"><div><dt className="inline">来源族：</dt><dd className="inline">{evidence.sourceFamilyId}</dd></div><div><dt className="inline">起源集群：</dt><dd className="inline">{evidence.originCluster}</dd></div><div><dt className="inline">核验时间：</dt><dd className="inline">{evidence.verifiedAt}</dd></div></dl>
+            <dl className="mt-3 space-y-2 text-muted-foreground"><div><dt className="inline">来源族：</dt><dd className="inline">{evidence.sourceFamilyId}</dd></div><div><dt className="inline">起源集群：</dt><dd className="inline">{evidence.originCluster}</dd></div><div><dt className="inline">数据日期：</dt><dd className="inline">{evidence.asOfDate ?? "暂无可靠数据"}</dd></div><div><dt className="inline">核验时间：</dt><dd className="inline">{evidence.verifiedAt}</dd></div></dl>
             <a href={evidence.finalUrl} target="_blank" rel="noreferrer" className="mt-3 inline-flex min-h-11 items-center gap-2 text-primary">打开原始引用<ExternalLink className="h-3 w-3" /></a>
           </article>)}</div>
         </aside>

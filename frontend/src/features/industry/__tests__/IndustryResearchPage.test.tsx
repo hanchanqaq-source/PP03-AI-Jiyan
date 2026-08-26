@@ -39,6 +39,105 @@ describe("industry research page data boundary", () => {
     expect(location.hash).toBe("");
   });
 
+  it("treats deleting the active tag bar item as user navigation", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    history.replaceState(null, "", "/industry-research#metrics");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/semiconductor?") ? "semiconductor" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+    render(<IndustryResearch />);
+    await screen.findByRole("article", { name: "存储行业研究报告" });
+
+    await user.click(screen.getByRole("button", { name: "删除存储" }));
+
+    expect(await screen.findByRole("article", { name: "半导体行业研究报告" })).toBeInTheDocument();
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+    expect(location.hash).toBe("");
+  });
+
+  it("treats selector removal of the active tag as user navigation", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    history.replaceState(null, "", "/industry-research#metrics");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/semiconductor?") ? "semiconductor" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+    render(<IndustryResearch />);
+    await screen.findByRole("article", { name: "存储行业研究报告" });
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
+    await user.click(within(dialog).getByRole("checkbox", { name: "存储" }));
+    await user.click(within(dialog).getByRole("button", { name: "确认添加" }));
+
+    expect(await screen.findByRole("article", { name: "半导体行业研究报告" })).toBeInTheDocument();
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+    expect(location.hash).toBe("");
+  });
+
+  it("cancels the coordinator and clears all report state when the user deletes the final tag", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    localStorage.setItem("vr-page-tags:industry_research", JSON.stringify({ version: 2, ids: ["storage"], activeId: "storage", order: ["storage"] }));
+    history.replaceState(null, "", "/industry-research#metrics");
+    const pending = deferred<Response>();
+    let signal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
+      signal = init?.signal ?? undefined;
+      return pending.promise;
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByText(/正在读取存储/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "删除存储" }));
+
+    expect(signal?.aborted).toBe(true);
+    expect(screen.queryByText(/正在读取存储/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: /行业研究报告/ })).not.toBeInTheDocument();
+    expect(screen.getByText("当前未选择行业标签；暂无可显示的可信快照。")).toBeInTheDocument();
+    expect(location.hash).toBe("");
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+  });
+
+  it("preserves a legal hash and does not scroll for an initial empty selection", () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    localStorage.setItem("vr-page-tags:industry_research", JSON.stringify({ version: 2, ids: [], activeId: "", order: [] }));
+    history.replaceState(null, "", "/industry-research#metrics");
+    const load = vi.spyOn(globalThis, "fetch");
+
+    render(<IndustryResearch />);
+
+    expect(screen.getByText("当前未选择行业标签；暂无可显示的可信快照。")).toBeInTheDocument();
+    expect(load).not.toHaveBeenCalled();
+    expect(location.hash).toBe("#metrics");
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("keeps the current report, hash, and scroll position when active-tag deletion persistence fails", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(industryResponseWire()));
+    render(<IndustryResearch />);
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    history.replaceState(null, "", "/industry-research#metrics");
+    localStorage.setItem("vr-page-tags:industry_research", "{broken");
+
+    await user.click(screen.getByRole("button", { name: "删除存储" }));
+
+    expect(screen.getByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByRole("alert").find((node) => node.textContent?.includes("页面标签存储已损坏，无法安全修改"))).toBeDefined();
+    expect(location.hash).toBe("#metrics");
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
   it("still completes a user switch when the host has no scrollIntoView capability", async () => {
     const user = userEvent.setup();
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: undefined });

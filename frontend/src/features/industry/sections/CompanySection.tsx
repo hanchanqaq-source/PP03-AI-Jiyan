@@ -22,7 +22,7 @@ export function CompanySection({ companies }: { companies: DisplayedIndustryRepo
             <td className="p-3"><p className="font-semibold">{company.companyName}</p><p className="font-mono text-xs leading-5 text-muted-foreground">{company.securityCode}</p></td>
             <td className="p-3">{company.chainNodeId}</td>
             <td className="p-3"><p className="text-xs leading-5 text-muted-foreground">与当前结论的关系</p><p>{company.keyMetricIds.length ? company.keyMetricIds.join(" · ") : "暂无可靠数据"}</p></td>
-            <td className="p-3"><p className="text-xs leading-5 text-muted-foreground">关系类型</p><p>{relationLabel(company)}</p><p className="mt-2 text-xs leading-5 text-muted-foreground">数据来源</p><p>来源未配置</p></td>
+            <td className="p-3"><p className="text-xs leading-5 text-muted-foreground">关系类型</p><p>{relationLabel(company)}</p><p className="mt-2 text-xs leading-5 text-muted-foreground">数据来源</p><p>来源名称未随关系投影返回</p></td>
             <td className="p-3"><p>{company.asOfDate}</p><p className="mt-1 font-mono text-xs leading-5 text-muted-foreground">{evidenceLabel(company)}</p></td>
           </tr>)}</tbody>
         </table>
@@ -30,7 +30,7 @@ export function CompanySection({ companies }: { companies: DisplayedIndustryRepo
       <div className="space-y-3 md:hidden">{companies.map((company) => <article key={company.securityCode} data-testid={`company-mobile-${company.securityCode}`} data-industry-id={company.industryId} className="rounded-xl border border-border/70 p-4 text-sm">
         <div data-mobile-field-group><p className="font-semibold">{company.companyName}</p><p className="font-mono text-xs leading-5 text-muted-foreground">{company.securityCode}</p><p className="mt-2 text-xs leading-5">产业链位置：{company.chainNodeId}</p></div>
         <div data-mobile-field-group className="mt-3 border-t border-border/50 pt-3"><p className="text-xs leading-5 text-muted-foreground">与当前结论的关系</p><p>{company.keyMetricIds.length ? company.keyMetricIds.join(" · ") : "暂无可靠数据"}</p><p className="mt-2 text-xs leading-5 text-muted-foreground">关系类型</p><p>{relationLabel(company)}</p></div>
-        <div data-mobile-field-group className="mt-3 border-t border-border/50 pt-3"><p className="text-xs leading-5 text-muted-foreground">数据来源</p><p>来源未配置</p><p className="mt-2">{company.asOfDate}</p><p className="mt-1 font-mono text-xs leading-5 text-muted-foreground">{evidenceLabel(company)}</p></div>
+        <div data-mobile-field-group className="mt-3 border-t border-border/50 pt-3"><p className="text-xs leading-5 text-muted-foreground">数据来源</p><p>来源名称未随关系投影返回</p><p className="mt-2">{company.asOfDate}</p><p className="mt-1 font-mono text-xs leading-5 text-muted-foreground">{evidenceLabel(company)}</p></div>
       </article>)}</div>
     </>}
   </ReportSection>;

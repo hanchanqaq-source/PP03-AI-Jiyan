@@ -28,10 +28,18 @@ export function ReportSection({ id, index, title, eyebrow, children }: PropsWith
 }
 
 const emptyReasonLabel: Record<string, string> = {
-  source_unconfigured: "来源未配置", source_unavailable: "暂无可靠数据", source_failed: "暂无可靠数据",
-  verifying: "待核验", not_applicable: "不适用", not_disclosed: "尚未披露",
-  user_key_not_configured: "来源未配置", license_required: "来源未配置", expired: "已失效",
-  conflicting: "数据冲突", no_reliable_data: "暂无可靠数据", insufficient_history: "历史样本不足",
+  source_unconfigured: "来源未配置",
+  source_unavailable: "来源不可用",
+  source_failed: "来源当前失败",
+  verifying: "数据正在核验",
+  not_applicable: "当前行业不适用",
+  not_disclosed: "暂无最新披露",
+  user_key_not_configured: "用户未配置 Key",
+  license_required: "需要许可证",
+  expired: "数据已失效",
+  conflicting: "存在冲突",
+  no_reliable_data: "暂无可靠数据",
+  insufficient_history: "历史样本不足",
 };
 
 export function formatEmptyReason(metric: IndustryMetric): string {

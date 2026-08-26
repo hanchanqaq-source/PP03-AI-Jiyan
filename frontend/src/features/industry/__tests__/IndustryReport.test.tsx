@@ -1,11 +1,12 @@
 /// <reference types="vite/client" />
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderToString } from "react-dom/server";
 import { vi } from "vitest";
 import { decodeIndustryResearchResponse, type IndustryResearchResponse } from "@/lib/api";
 import { EvidenceDrawer } from "../EvidenceDrawer";
 import { IndustryReport, IndustryReportAnchors } from "../IndustryReport";
+import { formatEmptyReason } from "../sections/shared";
 import { industryResponseWire, researchResponse } from "./fixtures";
 
 const industryUiSources = import.meta.glob(["../**/*.tsx", "../../../pages/IndustryResearch.tsx"], {
@@ -19,6 +20,29 @@ function reportView(response: IndustryResearchResponse = researchResponse(), day
 }
 
 describe("continuous evidence-bound industry report", () => {
+  it.each([
+    ["source_unconfigured", "来源未配置"],
+    ["source_unavailable", "来源不可用"],
+    ["source_failed", "来源当前失败"],
+    ["verifying", "数据正在核验"],
+    ["not_applicable", "当前行业不适用"],
+    ["not_disclosed", "暂无最新披露"],
+    ["user_key_not_configured", "用户未配置 Key"],
+    ["license_required", "需要许可证"],
+    ["expired", "数据已失效"],
+    ["conflicting", "存在冲突"],
+    ["no_reliable_data", "暂无可靠数据"],
+    ["insufficient_history", "历史样本不足"],
+    ["future_unknown_reason", "暂无可靠数据"],
+  ] as const)("maps the Task 7 empty reason %s without collapsing its meaning", (reason, expected) => {
+    const metric = {
+      ...researchResponse().displayedTrustedReport!.cycle[0],
+      currentValue: null,
+      emptyReason: reason,
+    };
+    expect(formatEmptyReason(metric)).toBe(expected);
+  });
+
   it("decodes complete differentiated layouts before rendering them", () => {
     const storage = researchResponse("storage");
     const semiconductor = researchResponse("semiconductor");
@@ -137,10 +161,49 @@ describe("continuous evidence-bound industry report", () => {
     expect(company).toHaveTextContent("与当前结论的关系");
     expect(company).toHaveTextContent("dram_price");
     expect(company).toHaveTextContent("数据来源");
-    expect(company).toHaveTextContent("来源未配置");
+    expect(company).toHaveTextContent("来源名称未随关系投影返回");
+    expect(company).not.toHaveTextContent("数据来源来源未配置");
     expect(company).toHaveTextContent("E-COMPANY-1");
     const mobile = screen.getByTestId("company-mobile-DEMO-SEC-001");
     expect(mobile.querySelectorAll("[data-mobile-field-group]")).toHaveLength(3);
+  });
+
+  it("gives every overview basis metric a keyboard evidence trail and fails closed when association is absent", async () => {
+    const user = userEvent.setup();
+    const response = researchResponse();
+    const { rerender } = render(reportView(response, 90));
+    const overview = screen.getByRole("region", { name: "行业总览" });
+    const dramTrigger = within(overview).getByRole("button", { name: "查看 DRAM 价格总览证据" });
+    expect(within(overview).getByRole("button", { name: "查看 NAND 价格总览证据" })).toBeInTheDocument();
+
+    dramTrigger.focus();
+    await user.keyboard("{Enter}");
+    const drawer = screen.getByRole("dialog", { name: "DRAM 价格证据" });
+    expect(drawer).toHaveTextContent("source-official.example");
+    expect(drawer).toHaveTextContent("2026-08-24");
+    expect(drawer).toHaveTextContent("同口径公开快照；隔离测试值");
+    expect(drawer).toHaveTextContent("dram_price 已有准入证据支持");
+    expect(drawer).toHaveTextContent("已核验");
+    expect(drawer).toHaveTextContent("dram_price 来源撤回或口径变化");
+    expect(drawer).toHaveTextContent("E-dram_price-official");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(dramTrigger).toHaveFocus());
+
+    const incomplete = researchResponse();
+    incomplete.displayedTrustedReport!.overview.basisMetricIds = ["missing_metric"];
+    rerender(reportView(incomplete, 90));
+    const missing = within(screen.getByRole("region", { name: "行业总览" })).getByText("missing_metric").closest("li")!;
+    expect(missing).toHaveTextContent("暂无可靠数据：未关联可信指标证据");
+    expect(within(missing).queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("renders conflict event time, Chinese roles, and parallel evidence inside its local window", () => {
+    render(reportView(researchResponse(), 30));
+    const conflict = screen.getByText("STORAGE-CONFLICT-30").closest("li")!;
+    expect(conflict).toHaveTextContent("2026-08-05T00:00:00+00:00");
+    expect(conflict).toHaveTextContent("风险");
+    expect(conflict).toHaveTextContent("支持证据 E-CONFLICT-A");
+    expect(conflict).toHaveTextContent("反驳证据 E-CONFLICT-B");
   });
 
   it("marks companies as observations and does not turn them into recommendations", () => {

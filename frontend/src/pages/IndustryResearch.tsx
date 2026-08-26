@@ -24,6 +24,29 @@ export function IndustryResearch() {
   const [error, setError] = useState<string | null>(null);
   const [windowDays, setWindowDays] = useState<IndustryWindowDays>(90);
 
+  const completeUserNavigation = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const hashId = window.location.hash.slice(1);
+    if (REPORT_SECTIONS.some(([id]) => id === hashId)) {
+      window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}`);
+    }
+    window.requestAnimationFrame(() => {
+      const reportTop = reportTopRef.current;
+      if (typeof reportTop?.scrollIntoView === "function") reportTop.scrollIntoView({ block: "start" });
+    });
+  }, []);
+
+  const clearForEmptySelection = useCallback(() => {
+    coordinator.cancel();
+    pendingUserIndustryRef.current = null;
+    setResponse(null);
+    setRequested(null);
+    setLoading(false);
+    setError(null);
+    setWindowDays(90);
+    completeUserNavigation();
+  }, [completeUserNavigation, coordinator]);
+
   const loadReport = useCallback((industryId: string, industryName?: string, userInitiated = false) => {
     const name = industryName ?? tagsRef.current.tags.find((tag) => tag.id === industryId)?.name ?? industryId;
     setRequested({ id: industryId, name });
@@ -46,22 +69,34 @@ export function IndustryResearch() {
         }
         setResponse(value);
         setLoading(false);
-        if (userInitiated && typeof window !== "undefined") {
-          const hashId = window.location.hash.slice(1);
-          if (REPORT_SECTIONS.some(([id]) => id === hashId)) {
-            window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}`);
-          }
-          requestAnimationFrame(() => {
-            const reportTop = reportTopRef.current;
-            if (typeof reportTop?.scrollIntoView === "function") reportTop.scrollIntoView({ block: "start" });
-          });
-        }
+        if (userInitiated) completeUserNavigation();
       },
     }).catch((failure) => {
       setLoading(false);
       setError(failure instanceof Error ? `行业报告读取失败：${failure.message}` : "行业报告读取失败；暂无可靠数据");
     });
-  }, [coordinator]);
+  }, [completeUserNavigation, coordinator]);
+
+  const removeTag = useCallback((id: string) => {
+    const current = tagsRef.current;
+    const wasActive = current.state.activeId === id;
+    const remaining = current.state.order.filter((tagId) => tagId !== id);
+    if (!current.remove(id)) return false;
+    if (!wasActive) return true;
+    if (remaining.length === 0) clearForEmptySelection();
+    else pendingUserIndustryRef.current = remaining[0];
+    return true;
+  }, [clearForEmptySelection]);
+
+  const confirmTags = useCallback((ids: string[]) => {
+    const current = tagsRef.current;
+    const activeRemoved = current.state.activeId !== "" && !ids.includes(current.state.activeId);
+    if (!current.replace(ids)) return;
+    setSelectorOpen(false);
+    if (!activeRemoved) return;
+    if (ids.length === 0) clearForEmptySelection();
+    else pendingUserIndustryRef.current = ids[0];
+  }, [clearForEmptySelection]);
 
   useEffect(() => {
     const active = tags.activeTag;
@@ -83,7 +118,7 @@ export function IndustryResearch() {
       <PageHeader title="行业研究" subtitle="连续产业研究报告；结论、依据、来源、更新时间和失效条件同时呈现" />
       <div className="sticky top-0 z-30 mb-5 rounded-xl border border-border/60 bg-background/95 px-2 backdrop-blur">
         <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={(id) => loadReport(id, undefined, true)}
-          onRemove={tags.remove} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
+          onRemove={removeTag} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
         {report && <IndustryReportAnchors />}
       </div>
       {tags.errorMessage && !selectorOpen && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{tags.errorMessage}</div>}
@@ -97,7 +132,7 @@ export function IndustryResearch() {
           <p className="text-lg font-semibold">{INCOMPLETE_REPORT_MESSAGE}</p>
           <p className="mt-2 text-sm text-muted-foreground">{displayedName}已进入共享标签库；当前状态为建设中。</p>
         </div>
-      ) : !error && <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center"><p className="text-lg font-semibold">暂无可靠数据</p><p className="mt-2 text-sm text-muted-foreground">当前行业尚无可显示的可信快照。</p></div>}
+      ) : !error && <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center"><p className="text-lg font-semibold">暂无可靠数据</p><p className="mt-2 text-sm text-muted-foreground">{tags.state.ids.length === 0 ? "当前未选择行业标签；暂无可显示的可信快照。" : "当前行业尚无可显示的可信快照。"}</p></div>}
       </div>
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags}
         externalError={tags.errorMessage} onCreate={(name) => {
@@ -105,7 +140,7 @@ export function IndustryResearch() {
           pendingUserIndustryRef.current = result.tag.id;
           return result;
         }} onCancel={() => setSelectorOpen(false)}
-        onConfirm={(ids) => { if (tags.replace(ids)) setSelectorOpen(false); }} />
+        onConfirm={confirmTags} />
     </div>
   );
 }
