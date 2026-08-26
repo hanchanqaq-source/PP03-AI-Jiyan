@@ -311,6 +311,137 @@ def test_cleanup_removes_discovered_children_but_preserves_outside_files(
     assert outside.read_text(encoding="utf-8") == "preserve"
 
 
+@pytest.mark.parametrize("blocked_part", ("root", "ancestor"))
+def test_acceptance_root_rejects_reparse_chain_before_any_write(
+    monkeypatch, tmp_path, blocked_part
+) -> None:
+    runner = _load_runner()
+    allowed_base = tmp_path / ".tmp" / "acceptance"
+    root = allowed_base / "v0.2-w3"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("preserve", encoding="utf-8")
+    blocked = root if blocked_part == "root" else allowed_base
+    original_reparse = runner._path_is_reparse
+
+    monkeypatch.setattr(
+        runner,
+        "_path_is_reparse",
+        lambda path: Path(path) == blocked or original_reparse(Path(path)),
+    )
+    monkeypatch.setattr(
+        runner.os,
+        "mkdir",
+        lambda path, *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"write attempted before reparse rejection: {path}")
+        ),
+    )
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="reparse"):
+        runner._prepare_acceptance_root(root, allowed_base=allowed_base, create=True)
+
+    assert outside.read_text(encoding="utf-8") == "preserve"
+
+
+def test_acceptance_root_identity_swap_before_mkdir_fails_without_a_write(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    allowed_base = tmp_path / ".tmp" / "acceptance"
+    allowed_base.mkdir(parents=True)
+    root = allowed_base / "v0.2-w3"
+    original_identity = runner._directory_identity
+    base_identity = original_identity(allowed_base)
+    calls = 0
+
+    def swapped_identity(path: Path):
+        nonlocal calls
+        identity = original_identity(Path(path))
+        if Path(path) == allowed_base:
+            calls += 1
+            if calls > 1:
+                return (*base_identity[:-1], base_identity[-1] + 1)
+        return identity
+
+    monkeypatch.setattr(runner, "_directory_identity", swapped_identity)
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="identity"):
+        runner._prepare_acceptance_root(root, allowed_base=allowed_base, create=True)
+
+    assert not root.exists()
+
+
+class _StableTestGuard:
+    def assert_current(self) -> None:
+        return None
+
+
+def test_cleanup_refuses_root_identity_swap_before_enumeration(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    (root / "owned").mkdir()
+    original_directory_identity = runner._directory_identity
+    expected = original_directory_identity(root)
+
+    monkeypatch.setattr(
+        runner,
+        "_directory_identity",
+        lambda path: (*expected[:-1], expected[-1] + 1)
+        if Path(path) == root
+        else original_directory_identity(Path(path)),
+    )
+    monkeypatch.setattr(
+        Path,
+        "iterdir",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError(f"enumeration attempted after identity swap: {path}")
+        ),
+    )
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="identity"):
+        runner._list_owned_children(root, expected, _StableTestGuard())
+
+    assert (root / "owned").is_dir()
+
+
+def test_cleanup_refuses_target_identity_swap_before_destructive_removal(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    root = tmp_path / "acceptance"
+    target = root / "owned"
+    target.mkdir(parents=True)
+    (target / "entry").write_text("preserve", encoding="utf-8")
+    root_identity = runner._directory_identity(root)
+    original_path_identity = runner._path_identity
+    target_identity = original_path_identity(target)
+    calls = 0
+
+    def swapped_target_identity(path: Path):
+        nonlocal calls
+        identity = original_path_identity(Path(path))
+        if Path(path) == target:
+            calls += 1
+            if calls > 1:
+                return (*target_identity[:-1], target_identity[-1] + 1)
+        return identity
+
+    monkeypatch.setattr(runner, "_path_identity", swapped_target_identity)
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="identity"):
+        runner._remove_owned_target(
+            target,
+            root=root,
+            root_identity=root_identity,
+            guard=_StableTestGuard(),
+        )
+
+    assert (target / "entry").read_text(encoding="utf-8") == "preserve"
+
+
 def test_fixture_reports_keep_three_differential_templates_and_chinese_labels() -> None:
     runner = _load_runner()
     service = runner.build_fixture_service()
