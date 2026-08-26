@@ -50,7 +50,9 @@ describe("industry research page data boundary", () => {
     expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
     expect(location.hash).toBe("#metrics");
     expect(scrollIntoView).not.toHaveBeenCalled();
-    expect(container.querySelector("[data-industry-report-top]")).toBeInTheDocument();
+    const reportTop = container.querySelector("[data-industry-report-top]");
+    expect(reportTop).toBeInTheDocument();
+    expect(reportTop).toHaveClass("scroll-mt-40");
 
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
     expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();

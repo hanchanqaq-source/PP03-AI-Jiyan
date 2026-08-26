@@ -477,21 +477,101 @@ def test_browser_evidence_drawer_contract_matches_production_labels() -> None:
     assert '"数据来源"' not in script
 
 
-def test_browser_only_classifies_exact_in_window_industry_aborts_as_expected() -> None:
+def test_browser_uses_action_scoped_cancellation_and_rejects_unexpected_http_failures() -> None:
     script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
         encoding="utf-8"
     )
+    runner_source = RUNNER_PATH.read_text(encoding="utf-8")
 
-    assert "expectedCancellationWindow" in script
+    assert "expectedCancellationWindow" not in script
+    assert "activeCancellationAction" in script
+    assert "requestActionLabels" in script
+    assert "runIndustryAction" in script
+    for label in (
+        "initial-goto-storage",
+        "switch-semiconductor",
+        "switch-robotics",
+        "rapid-three-industry-switch",
+        "reload-restored-storage",
+    ):
+        assert f'"{label}"' in script
+    assert "actionLabel" in script
     assert 'entry.method !== "GET"' in script
     assert 'entry.failure !== "net::ERR_ABORTED"' in script
     assert "parsed.origin === baseUrl" in script
     for industry_id in ("storage", "semiconductor", "robotics"):
         assert f'"/api/industry-research/{industry_id}"' in script
     assert 'parsed.searchParams.get("window_days")' in script
+    assert 'parsed.searchParams.getAll("window_days").length === 1' in script
     assert "blockingFailedRequests.length === 0" in script
     assert "expectedCancelledRequests" in script
-    assert script.index("expectedCancellationWindow = true;") < script.index("await page.goto")
+    assert "expectedCancellationActions" in script
+    assert "unexpectedNon2xxResponses" in script
+    assert "responseStatusCounts" in script
+    assert "response.status() >= 400" in script
+    assert "unexpectedNon2xxResponses.length === 0" in script
+    assert "successorStatus" in script
+    assert "successorArticleIndustryId" in script
+    for manifest_key in (
+        '"response_status_counts": browser_results["responseStatusCounts"]',
+        '"unexpected_non_2xx_responses": browser_results["unexpectedNon2xxResponses"]',
+        '"expected_cancellation_actions": browser_results["expectedCancellationActions"]',
+        '"industry_action_evidence": browser_results["industryActionEvidence"]',
+    ):
+        assert manifest_key in runner_source
+
+
+def test_browser_asserts_truth_partitions_lineage_history_and_template_identity() -> None:
+    script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    for token in (
+        "trustedBasisIds",
+        "trustedConclusion",
+        "storage_candidate_signal",
+        "隔离演示候选值",
+        "DEMO-S-PENDING-EVIDENCE-001",
+        "DEMO-S-CONFLICT-A",
+        "DEMO-S-CONFLICT-B",
+        "conflictAggregatePresent",
+        "oldBannerSnapshotId",
+        "headerSnapshotId",
+        "demoBannerSnapshotId",
+        "oldestOccurredAt",
+        "DEMO-H-TRUSTED-001",
+        "DEMO-R-TRUSTED-001",
+        "articleIndustryIds",
+    ):
+        assert token in script
+    assert "冲突综合值" in script
+    assert "windowCounts[7] < windowCounts[30]" in script
+    assert "oldestOccurredAt[7] > oldestOccurredAt[30]" in script
+    assert "oldestOccurredAt[30] > oldestOccurredAt[90]" in script
+    assert script.count("section[id]") >= 2
+
+
+def test_browser_proves_focus_real_reorder_and_uncovered_sticky_banners() -> None:
+    script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    for token in (
+        "document.activeElement === button",
+        "beforeOrder",
+        "afterOrder",
+        "beforeIndex",
+        "afterIndex",
+        "focusedControlLabel",
+        "stickyBottom",
+        "oldBannerTop",
+        "demoBannerTop",
+    ):
+        assert token in script
+    assert "afterIndex === beforeIndex - 1" in script
+    assert "window.scrollTo(0, 0)" in script
+    assert "await oldSnapshotBanner.isVisible()" in script
+    assert "await demoSnapshotBanner.isVisible()" in script
 
     history_stage = script[
         script.index("const windowCounts") : script.index("const metricsAnchor")

@@ -1308,6 +1308,10 @@ def _write_acceptance_evidence(
             "request_failures": browser_results["failedRequests"],
             "expected_cancelled_requests": browser_results["expectedCancelledRequests"],
             "blocking_request_failures": browser_results["blockingFailedRequests"],
+            "response_status_counts": browser_results["responseStatusCounts"],
+            "unexpected_non_2xx_responses": browser_results["unexpectedNon2xxResponses"],
+            "expected_cancellation_actions": browser_results["expectedCancellationActions"],
+            "industry_action_evidence": browser_results["industryActionEvidence"],
             "network_classification": browser["network_classification"],
         },
         "hashes": {
