@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNNER_PATH = REPO_ROOT / "scripts" / "acceptance" / "run_v02_w3_industry_acceptance.py"
+
+
+def _load_runner():
+    spec = importlib.util.spec_from_file_location("v02_w3_acceptance_runner", RUNNER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_bootstrap_places_every_runtime_path_under_the_absolute_acceptance_root() -> None:
+    runner = _load_runner()
+
+    assert runner.ACCEPTANCE_ROOT.is_absolute()
+    assert runner.ACCEPTANCE_ROOT == (
+        REPO_ROOT / ".tmp" / "acceptance" / "v0.2-w3"
+    ).resolve()
+    for name in runner.ISOLATED_ENVIRONMENT_VARIABLES:
+        value = Path(os.environ[name]).resolve()
+        assert value.is_relative_to(runner.ACCEPTANCE_ROOT)
+    assert os.environ["VR_ALLOW_PAID_PROVIDER_TESTS"] == "0"
+    assert os.environ["VR_OFFLINE"] == "1"
+    assert os.environ["VR_SOURCE_HEALTH_STARTUP"] == "0"
+
+
+def test_child_environment_rejects_any_nonempty_credential_like_variable() -> None:
+    runner = _load_runner()
+    unsafe = runner.clean_child_environment()
+    unsafe["PROVIDER_API_KEY"] = "must-not-be-read-or-forwarded"
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="credential"):
+        runner.validate_child_environment(unsafe)
+
+
+def test_runtime_fixture_copy_must_be_inside_acceptance_root() -> None:
+    runner = _load_runner()
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="fixture"):
+        runner.copy_source_fixture(REPO_ROOT / ".tmp" / "outside-task10-fixture.json")
+
+
+def test_source_fixture_is_tracked_input_and_can_never_be_a_cleanup_target() -> None:
+    runner = _load_runner()
+    source = runner.SOURCE_FIXTURE.resolve()
+
+    assert source.is_file()
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(source.relative_to(REPO_ROOT))],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    # During RED/GREEN the source may be uncommitted, but it must be a repository
+    # input and never under the disposable acceptance root.
+    assert tracked.returncode in {0, 1}
+    assert not source.is_relative_to(runner.ACCEPTANCE_ROOT)
+    with pytest.raises(runner.AcceptanceBoundaryError, match="source fixture"):
+        runner.validate_cleanup_targets([source])
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"url": "https://enterprise.example/api", "method": "GET"},
+        {"url": "https://paid.example/prices", "method": "GET"},
+        {"url": "http://127.0.0.1:49152/api/industry-research/storage/refresh", "method": "POST"},
+    ],
+)
+def test_network_gate_rejects_enterprise_paid_or_live_refresh_requests(entry: dict[str, str]) -> None:
+    runner = _load_runner()
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="network"):
+        runner.validate_network_log([entry], allowed_origins={"http://127.0.0.1:49152"})
+
+
+def test_network_gate_allows_only_loopback_frontend_and_api_reads() -> None:
+    runner = _load_runner()
+    runner.validate_network_log(
+        [
+            {"url": "http://127.0.0.1:49152/industry-research", "method": "GET"},
+            {"url": "http://127.0.0.1:49152/api/industry-research/storage?window_days=90", "method": "GET"},
+            {"url": "http://127.0.0.1:49153/api/industry-research/robotics?window_days=30", "method": "GET"},
+        ],
+        allowed_origins={"http://127.0.0.1:49152", "http://127.0.0.1:49153"},
+    )
+
+
+def test_cleanup_rejects_outside_paths_and_accepts_owned_disposable_descendants() -> None:
+    runner = _load_runner()
+    owned = runner.ACCEPTANCE_ROOT / "results" / "owned.json"
+
+    assert runner.validate_cleanup_targets([owned]) == (owned.resolve(),)
+    with pytest.raises(runner.AcceptanceBoundaryError, match="cleanup"):
+        runner.validate_cleanup_targets([REPO_ROOT / ".tmp" / "outside-task10-cleanup.json"])
+
+
+def test_default_app_rejects_demo_and_only_explicit_fixture_service_allows_it(monkeypatch) -> None:
+    runner = _load_runner()
+    service = runner.build_fixture_service()
+
+    import app as app_module
+    import industry_research.api as industry_api
+
+    monkeypatch.setattr(
+        industry_api,
+        "create_production_industry_research_service",
+        lambda: service,
+    )
+    production = TestClient(
+        app_module.create_app(),
+        base_url="http://127.0.0.1:49153",
+    ).get("/api/industry-research/storage?window_days=90")
+    acceptance = TestClient(
+        app_module.create_app(industry_research_service=service),
+        base_url="http://127.0.0.1:49153",
+    ).get("/api/industry-research/storage?window_days=90")
+
+    assert production.status_code == 503
+    assert production.json() == {"detail": "demo_fixture_rejected"}
+    assert acceptance.status_code == 200
+    assert acceptance.json()["displayed_trusted_report"]["demo"] is True
+
+
+def test_fixture_loader_uses_storage_publication_api_and_preserves_lineage() -> None:
+    runner = _load_runner()
+    service = runner.build_fixture_service()
+
+    response = service.read_report("storage", 90)
+
+    assert service.storage.load_current("storage") == response.displayed_trusted_report
+    assert response.displayed_trusted_report is not None
+    assert response.displayed_trusted_report.demo is True
+    assert response.displayed_trusted_report.trusted_snapshot_id == "DEMO-S-TRUSTED-001"
+    assert response.refresh_run.displayed_trusted_snapshot_id == "DEMO-S-TRUSTED-001"
+
+
+def test_fixture_document_contains_no_private_financial_fields() -> None:
+    runner = _load_runner()
+    document = json.loads(runner.SOURCE_FIXTURE.read_text(encoding="utf-8"))
+    forbidden = {"amount", "cost", "account", "notes", "note", "password", "api_key", "token"}
+
+    def keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | set().union(*(keys(item) for item in value.values()), set())
+        if isinstance(value, list):
+            return set().union(*(keys(item) for item in value), set())
+        return set()
+
+    assert not (keys(document) & forbidden)
+
+
+def test_dynamic_ports_are_reserved_by_the_os_on_distinct_loopback_sockets() -> None:
+    runner = _load_runner()
+
+    backend, frontend = runner.reserve_loopback_ports()
+    try:
+        assert backend.host == frontend.host == "127.0.0.1"
+        assert backend.port != frontend.port
+        assert backend.port > 0 and frontend.port > 0
+        assert backend.socket.getsockname() == (backend.host, backend.port)
+        assert frontend.socket.getsockname() == (frontend.host, frontend.port)
+    finally:
+        backend.close()
+        frontend.close()
+
+
+def test_playwright_commands_are_pinned_project_local_and_lockfile_neutral() -> None:
+    runner = _load_runner()
+    install, browser_install = runner.playwright_install_commands()
+
+    assert install == [
+        "npm", "install", "--prefix", str(runner.PLAYWRIGHT_TOOLS),
+        "--no-save", "playwright@1.62.1",
+    ]
+    assert browser_install == [
+        str(runner.PLAYWRIGHT_TOOLS / "node_modules" / ".bin" / "playwright.cmd"),
+        "install", "chromium",
+    ]
+    assert runner.PLAYWRIGHT_TOOLS.is_relative_to(runner.ACCEPTANCE_ROOT)
+    assert runner.PLAYWRIGHT_BROWSERS.is_relative_to(runner.ACCEPTANCE_ROOT)
+
+
+def test_browser_script_has_exact_preflight_loader_and_single_browser_lifecycle() -> None:
+    runner = _load_runner()
+    source = runner.BROWSER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "createRequire(path.join(toolsRoot, \"package.json\"))" in source
+    assert 'packageJson.version !== "1.62.1"' in source
+    assert "PLAYWRIGHT_BROWSERS_PATH" in source
+    assert source.count("chromium.launchPersistentContext") == 1
+    assert "--preflight" in source
+    assert "route(" not in source
+
+
+def test_backend_and_frontend_phases_use_only_the_approved_child_commands() -> None:
+    runner = _load_runner()
+
+    assert runner.backend_test_command() == [
+        sys.executable, "-m", "pytest", "backend/tests", "-m", "not live",
+        "-q", "-p", "no:cacheprovider",
+    ]
+    assert runner.frontend_test_commands() == [
+        ["npm", "run", "test:run"],
+        ["npm", "run", "test:legacy"],
+        ["npm", "run", "build"],
+    ]
+
+
+def test_cleanup_plan_contains_only_disposable_acceptance_descendants() -> None:
+    runner = _load_runner()
+    targets = runner.cleanup_targets()
+
+    assert targets
+    assert runner.SOURCE_FIXTURE not in targets
+    assert runner.PLAYWRIGHT_TOOLS in targets
+    assert runner.PLAYWRIGHT_BROWSERS in targets
+    assert all(target.is_relative_to(runner.ACCEPTANCE_ROOT) for target in targets)
+    assert all(not target.is_relative_to(REPO_ROOT / "docs") for target in targets)
+
+
+def test_fixture_reports_keep_three_differential_templates_and_chinese_labels() -> None:
+    runner = _load_runner()
+    service = runner.build_fixture_service()
+
+    storage = service.read_report("storage", 90).displayed_trusted_report
+    semiconductor = service.read_report("semiconductor", 90).displayed_trusted_report
+    robotics = service.read_report("robotics", 90).displayed_trusted_report
+    assert storage is not None and semiconductor is not None and robotics is not None
+    assert [row.label for row in storage.cycle] == [
+        "DRAM 价格", "NAND 价格", "HBM 需求", "库存水平", "产能利用率",
+        "厂商资本开支", "服务器需求", "消费电子需求",
+    ]
+    assert [row.label for row in semiconductor.cycle] == [
+        "设备订单与出货", "晶圆厂利用率", "晶圆代工收入", "芯片设计活跃度",
+        "封装测试需求", "终端需求",
+    ]
+    assert [row.label for row in robotics.cycle] == ["样机进展", "订单", "交付", "量产进度"]
+    assert semiconductor.trusted_snapshot_id.startswith("DEMO-H-")
+    assert robotics.trusted_snapshot_id.startswith("DEMO-R-")
+    assert all("DRAM" not in row.label and "NAND" not in row.label for row in semiconductor.cycle + robotics.cycle)
