@@ -21,6 +21,18 @@ class AcceptanceBoundaryError(RuntimeError):
     pass
 
 
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_IDENTITY_FILE_ATTRIBUTE_MASK = (
+    _FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_REPARSE_POINT
+)
+
+
+def _identity_file_attributes(attributes: int) -> int:
+    """Keep only file-type security bits; hydration/archive bits are mutable."""
+    return int(attributes) & _IDENTITY_FILE_ATTRIBUTE_MASK
+
+
 def _lexical_absolute(path: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
 
@@ -40,7 +52,10 @@ def _path_is_reparse(path: Path) -> bool:
     return (
         stat.S_ISLNK(info.st_mode)
         or bool(getattr(info, "st_reparse_tag", 0))
-        or bool(getattr(info, "st_file_attributes", 0) & 0x00000400)
+        or bool(
+            getattr(info, "st_file_attributes", 0)
+            & _FILE_ATTRIBUTE_REPARSE_POINT
+        )
     )
 
 
@@ -49,9 +64,9 @@ def _path_identity(path: Path) -> tuple[int, int, int, int, int]:
     return (
         int(info.st_dev),
         int(info.st_ino),
-        int(info.st_mode),
+        int(stat.S_IFMT(info.st_mode)),
         int(getattr(info, "st_reparse_tag", 0)),
-        int(getattr(info, "st_file_attributes", 0)),
+        _identity_file_attributes(getattr(info, "st_file_attributes", 0)),
     )
 
 
@@ -162,11 +177,11 @@ class _DirectoryGuard:
             info = _ByHandleFileInformation()
             if not _KERNEL32.GetFileInformationByHandle(self._handle, ctypes.byref(info)):
                 raise ctypes.WinError(ctypes.get_last_error())
-            if info.attributes & 0x00000400:
+            if info.attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
                 raise AcceptanceBoundaryError(
                     f"reparse acceptance handle rejected: {self.path}"
                 )
-            if not info.attributes & 0x00000010:
+            if not info.attributes & _FILE_ATTRIBUTE_DIRECTORY:
                 raise AcceptanceBoundaryError(
                     f"guarded acceptance handle is not a directory: {self.path}"
                 )
@@ -174,7 +189,7 @@ class _DirectoryGuard:
                 int(info.volume_serial_number),
                 int(info.file_index_high),
                 int(info.file_index_low),
-                int(info.attributes),
+                _identity_file_attributes(info.attributes),
             )
         if self._fd is None:
             raise RuntimeError("directory guard is closed")
@@ -183,7 +198,12 @@ class _DirectoryGuard:
             raise AcceptanceBoundaryError(
                 f"guarded acceptance handle is not a directory: {self.path}"
             )
-        return (int(info.st_dev), int(info.st_ino), int(info.st_mode), 0)
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(stat.S_IFMT(info.st_mode)),
+            0,
+        )
 
     def assert_current(self) -> None:
         if self.identity() != self.saved_identity:

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -451,6 +452,135 @@ def test_directory_guard_assert_current_rejects_handle_identity_change(
             guard.assert_current()
     finally:
         guard.close()
+
+
+def test_directory_identity_ignores_mutable_windows_attributes(monkeypatch) -> None:
+    runner = _load_runner()
+    stable = {
+        "st_dev": 7,
+        "st_ino": 11,
+        "st_mode": 0o40755,
+        "st_reparse_tag": 0,
+    }
+    observations = iter(
+        (
+            SimpleNamespace(**stable, st_file_attributes=0x10000010),
+            SimpleNamespace(**stable, st_file_attributes=0x10000010),
+            SimpleNamespace(**stable, st_file_attributes=0x00000010),
+        )
+    )
+    monkeypatch.setattr(runner.os, "lstat", lambda _path: next(observations))
+
+    assert runner._directory_identity(Path("mutable-attributes")) == (
+        7,
+        11,
+        0o40000,
+        0,
+        0x00000010,
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle identity contract")
+def test_directory_guard_handle_identity_ignores_mutable_windows_attributes(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    target = tmp_path / "guarded-mutable-attributes"
+    target.mkdir()
+    guard = runner._DirectoryGuard(target)
+    saved = guard.saved_identity
+    attributes = iter((0x10000010, 0x00000010))
+
+    def mutable_attributes(_handle, pointer):
+        info = pointer._obj
+        info.attributes = next(attributes)
+        info.volume_serial_number = saved[0]
+        info.file_index_high = saved[1]
+        info.file_index_low = saved[2]
+        return 1
+
+    monkeypatch.setattr(
+        runner._KERNEL32,
+        "GetFileInformationByHandle",
+        mutable_attributes,
+    )
+
+    try:
+        assert guard.identity() == guard.identity()
+    finally:
+        guard.close()
+
+
+def test_directory_identity_rejects_file_id_change(monkeypatch) -> None:
+    runner = _load_runner()
+    observations = iter(
+        (
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=11,
+                st_mode=0o40755,
+                st_reparse_tag=0,
+                st_file_attributes=0x00000010,
+            ),
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=11,
+                st_mode=0o40755,
+                st_reparse_tag=0,
+                st_file_attributes=0x00000010,
+            ),
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=12,
+                st_mode=0o40755,
+                st_reparse_tag=0,
+                st_file_attributes=0x00000010,
+            ),
+        )
+    )
+    monkeypatch.setattr(runner.os, "lstat", lambda _path: next(observations))
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="identity changed"):
+        runner._directory_identity(Path("changed-file-id"))
+
+
+@pytest.mark.parametrize(
+    ("after_mode", "after_attributes"),
+    ((0o100644, 0x00000000), (0o40755, 0x00000410)),
+)
+def test_directory_identity_rejects_type_or_reparse_identity_bit_change(
+    monkeypatch, after_mode, after_attributes
+) -> None:
+    runner = _load_runner()
+    observations = iter(
+        (
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=11,
+                st_mode=0o40755,
+                st_reparse_tag=0,
+                st_file_attributes=0x00000010,
+            ),
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=11,
+                st_mode=0o40755,
+                st_reparse_tag=0,
+                st_file_attributes=0x00000010,
+            ),
+            SimpleNamespace(
+                st_dev=7,
+                st_ino=11,
+                st_mode=after_mode,
+                st_reparse_tag=0,
+                st_file_attributes=after_attributes,
+            ),
+        )
+    )
+    monkeypatch.setattr(runner.os, "lstat", lambda _path: next(observations))
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="identity changed"):
+        runner._directory_identity(Path("changed-security-bits"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory share-mode contract")
