@@ -52,6 +52,7 @@ _ERROR_CODES = frozenset({
     "admission_failed",
     "all_sources_failed",
     "assembly_failed",
+    "canonical_news_unavailable",
     "conflicting_evidence",
     "evidence_verification_failed",
     "internal_error",
@@ -380,6 +381,101 @@ def _candidate_from_dict(
     )
 
 
+def _canonical_a2_lineage(snapshot: EvidenceSnapshot) -> CandidateExternalLineage:
+    if type(snapshot) is not EvidenceSnapshot:
+        raise TypeError("canonical A2 lineage requires an EvidenceSnapshot")
+    return CandidateExternalLineage(
+        kind="a2_news",
+        candidate_snapshot_id=snapshot.snapshot_id,
+        raw_snapshot_id=snapshot.raw_snapshot_id,
+        evidence_snapshot_id=snapshot.snapshot_id,
+    )
+
+
+def _canonical_a2_lineages_from_dict(value: object) -> tuple[CandidateExternalLineage, ...]:
+    if type(value) is not list:
+        raise ValueError("invalid canonical A2 lineage schema")
+    parsed: list[CandidateExternalLineage] = []
+    for item in value:
+        if type(item) is not dict or set(item) != {
+            "kind", "candidate_snapshot_id", "raw_snapshot_id", "evidence_snapshot_id",
+        }:
+            raise ValueError("invalid canonical A2 lineage schema")
+        parsed.append(CandidateExternalLineage(**item))
+    lineages = tuple(parsed)
+    identities = {
+        (item.candidate_snapshot_id, item.raw_snapshot_id, item.evidence_snapshot_id)
+        for item in lineages
+    }
+    if len(identities) != len(lineages):
+        raise ValueError("duplicate canonical A2 lineage")
+    return lineages
+
+
+def _validate_canonical_a2_candidate(
+    candidate: CandidateEvidencePanel | None,
+    lineages: tuple[CandidateExternalLineage, ...],
+    canonical_snapshot_lookup: Callable[[str], EvidenceSnapshot | None] | None,
+) -> None:
+    if candidate is None:
+        if lineages:
+            raise ValueError("canonical A2 lineage requires candidate state")
+        return
+    if len(lineages) != 1:
+        raise ValueError("candidate state requires exactly one canonical A2 lineage")
+    if canonical_snapshot_lookup is None:
+        raise ValueError("candidate state requires canonical durable A2 lookup")
+    lineage = lineages[0]
+    try:
+        snapshot = canonical_snapshot_lookup(lineage.raw_snapshot_id)
+    except Exception as error:
+        raise ValueError("canonical A2 lineage lookup failed") from error
+    if (
+        type(snapshot) is not EvidenceSnapshot
+        or snapshot.raw_snapshot_id != lineage.raw_snapshot_id
+        or snapshot.snapshot_id != lineage.evidence_snapshot_id
+        or snapshot.snapshot_id != lineage.candidate_snapshot_id
+    ):
+        raise ValueError("candidate state canonical A2 lineage is invalid")
+    from .service import _canonical_candidate_events
+
+    expected_unverified, expected_conflicting = _canonical_candidate_events(
+        candidate.industry_id,
+        snapshot,
+    )
+    actual_unverified = tuple(
+        item for item in candidate.unverified_events
+        if (
+            item.candidate_snapshot_id,
+            item.raw_snapshot_id,
+            item.evidence_snapshot_id,
+        ) == (
+            lineage.candidate_snapshot_id,
+            lineage.raw_snapshot_id,
+            lineage.evidence_snapshot_id,
+        )
+    )
+    actual_conflicting = tuple(
+        item for item in candidate.conflicting_events
+        if (
+            item.candidate_snapshot_id,
+            item.raw_snapshot_id,
+            item.evidence_snapshot_id,
+        ) == (
+            lineage.candidate_snapshot_id,
+            lineage.raw_snapshot_id,
+            lineage.evidence_snapshot_id,
+        )
+    )
+    if (
+        actual_unverified != expected_unverified
+        or actual_conflicting != expected_conflicting
+        or len(actual_unverified) != len(candidate.unverified_events)
+        or len(actual_conflicting) != len(candidate.conflicting_events)
+    ):
+        raise ValueError("candidate A2 projection is not canonical and complete")
+
+
 @dataclass(frozen=True, slots=True)
 class _PublicationProof:
     phase: str
@@ -414,6 +510,7 @@ class _PublicationProof:
 class _PersistedState:
     run: RefreshRun
     candidate: CandidateEvidencePanel | None
+    canonical_a2_lineages: tuple[CandidateExternalLineage, ...]
     generation: int
     publication: _PublicationProof | None
 
@@ -551,6 +648,7 @@ class _RefreshStateStore:
         run: RefreshRun,
         candidate: CandidateEvidencePanel | None,
         *,
+        canonical_a2_lineages: tuple[CandidateExternalLineage, ...] = (),
         publication: _PublicationProof | None = None,
         expected_generation: int | None = None,
     ) -> int:
@@ -570,6 +668,15 @@ class _RefreshStateStore:
             run.evidence_snapshot_id,
         ):
             raise ValueError("candidate state does not match refresh lineage")
+        if type(canonical_a2_lineages) is not tuple or any(
+            type(item) is not CandidateExternalLineage for item in canonical_a2_lineages
+        ):
+            raise TypeError("canonical_a2_lineages must be a lineage tuple")
+        _validate_canonical_a2_candidate(
+            candidate,
+            canonical_a2_lineages,
+            self._canonical_snapshot_lookup,
+        )
         if publication is not None and not _proof_matches_run(publication, run):
             raise ValueError("publication proof does not match refresh run")
         if publication is None and run.phase is RefreshPhase.TRUSTED_PUBLISHED:
@@ -606,10 +713,13 @@ class _RefreshStateStore:
                 "generation": generation,
                 "run": run.to_dict(),
                 "candidate": candidate.to_dict() if candidate is not None else None,
+                "canonical_a2_lineages": [
+                    lineage.to_dict() for lineage in canonical_a2_lineages
+                ],
                 "publication": publication.to_dict() if publication is not None else None,
             }
             document = {
-                "schema_version": 5,
+                "schema_version": 6,
                 "checksum": hashlib.sha256(_canonical(state)).hexdigest(),
                 "state": state,
             }
@@ -660,13 +770,20 @@ class _RefreshStateStore:
             document = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
             if type(document) is not dict or set(document) != {"schema_version", "checksum", "state"}:
                 return None
-            if document["schema_version"] not in {1, 2, 3, 4, 5} or type(document["checksum"]) is not str:
+            if document["schema_version"] not in {1, 2, 3, 4, 5, 6} or type(document["checksum"]) is not str:
                 return None
             state = document["state"]
             expected_keys = (
                 {"run", "candidate"}
                 if document["schema_version"] == 1
-                else {"generation", "run", "candidate", "publication"}
+                else (
+                    {
+                        "generation", "run", "candidate", "canonical_a2_lineages",
+                        "publication",
+                    }
+                    if document["schema_version"] == 6
+                    else {"generation", "run", "candidate", "publication"}
+                )
             )
             if type(state) is not dict or set(state) != expected_keys:
                 return None
@@ -676,7 +793,14 @@ class _RefreshStateStore:
             if type(generation) is not int or generation <= 0:
                 return None
             run = _run_from_dict(state["run"])
+            canonical_a2_lineages = (
+                _canonical_a2_lineages_from_dict(state["canonical_a2_lineages"])
+                if document["schema_version"] == 6
+                else ()
+            )
             if state["candidate"] is not None:
+                if document["schema_version"] < 6:
+                    return None
                 candidate_row = state["candidate"]
                 if type(candidate_row) is not dict or (
                     candidate_row.get("industry_id"),
@@ -691,7 +815,7 @@ class _RefreshStateStore:
                 ):
                     return None
                 if (
-                    document["schema_version"] == 5
+                    document["schema_version"] == 6
                     and "external_lineages" not in candidate_row
                 ):
                     return None
@@ -699,12 +823,17 @@ class _RefreshStateStore:
                     candidate_row,
                     canonical_snapshot_lookup=(
                         self._canonical_snapshot_lookup
-                        if document["schema_version"] == 5
+                        if document["schema_version"] == 6
                         else None
                     ),
                 )
             else:
                 candidate = None
+            _validate_canonical_a2_candidate(
+                candidate,
+                canonical_a2_lineages,
+                self._canonical_snapshot_lookup,
+            )
             if run.industry_id != industry_id:
                 return None
             if (run.candidate_snapshot_id is None) != (candidate is None):
@@ -728,7 +857,7 @@ class _RefreshStateStore:
             elif document["schema_version"] == 3 and state["publication"] is not None:
                 if not _legacy_v3_publication_is_valid(state["publication"]):
                     return None
-            elif document["schema_version"] in {4, 5} and state["publication"] is not None:
+            elif document["schema_version"] in {4, 5, 6} and state["publication"] is not None:
                 publication = _publication_from_dict(state["publication"])
             if publication is not None:
                 if not _proof_matches_run(publication, run):
@@ -747,11 +876,17 @@ class _RefreshStateStore:
                     or publication.prepared_generation != generation - 1
                 ):
                     return None
-            if document["schema_version"] in {4, 5} and (
+            if document["schema_version"] in {4, 5, 6} and (
                 run.phase is RefreshPhase.TRUSTED_PUBLISHED
             ) != (publication is not None and publication.phase == "committed"):
                 return None
-            return _PersistedState(run, candidate, generation, publication)
+            return _PersistedState(
+                run=run,
+                candidate=candidate,
+                canonical_a2_lineages=canonical_a2_lineages,
+                generation=generation,
+                publication=publication,
+            )
         except (
             AttributeError, FileNotFoundError, OSError, OverflowError, RecursionError,
             UnicodeDecodeError, ValueError, TypeError, KeyError, json.JSONDecodeError,
@@ -914,6 +1049,7 @@ class IndustryResearchRefreshOrchestrator:
         self._run_id_factory = run_id_factory
         self._attempt_token_factory = attempt_token_factory
         self._canonical_news_snapshot_loader = canonical_news_snapshot_loader
+        self._canonical_news_snapshot_lookup = canonical_news_snapshot_lookup
         self._company_candidate_loader = company_candidate_loader
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -1038,6 +1174,7 @@ class IndustryResearchRefreshOrchestrator:
                 return self._write_state(
                     completed,
                     record.candidate,
+                    canonical_a2_lineages=record.canonical_a2_lineages,
                     publication=self._committed_proof(proof),
                     expected_generation=record.generation,
                 )
@@ -1047,7 +1184,12 @@ class IndustryResearchRefreshOrchestrator:
             return record.run
         with self._lock:
             self._generations[record.run.industry_id] = record.generation
-        return self._failed(record.run, "refresh_interrupted", record.candidate)
+        return self._failed(
+            record.run,
+            "refresh_interrupted",
+            record.candidate,
+            canonical_a2_lineages=record.canonical_a2_lineages,
+        )
 
     @staticmethod
     def _completed_run(run: RefreshRun, proof: _PublicationProof) -> RefreshRun:
@@ -1084,6 +1226,7 @@ class IndustryResearchRefreshOrchestrator:
         run: RefreshRun,
         candidate: CandidateEvidencePanel | None = None,
         *,
+        canonical_a2_lineages: tuple[CandidateExternalLineage, ...] = (),
         publication: _PublicationProof | None = None,
         expected_generation: int | None = None,
     ) -> RefreshRun:
@@ -1096,6 +1239,7 @@ class IndustryResearchRefreshOrchestrator:
         generation = self._state.write(
             run,
             candidate,
+            canonical_a2_lineages=canonical_a2_lineages,
             publication=publication,
             expected_generation=expected,
         )
@@ -1108,6 +1252,8 @@ class IndustryResearchRefreshOrchestrator:
         run: RefreshRun,
         error_code: str,
         candidate: CandidateEvidencePanel | None = None,
+        *,
+        canonical_a2_lineages: tuple[CandidateExternalLineage, ...] = (),
     ) -> RefreshRun:
         failed = RefreshRun(
             industry_id=run.industry_id,
@@ -1123,7 +1269,11 @@ class IndustryResearchRefreshOrchestrator:
             displayed_evidence_snapshot_id=run.displayed_evidence_snapshot_id,
         )
         try:
-            return self._write_state(failed, candidate)
+            return self._write_state(
+                failed,
+                candidate,
+                canonical_a2_lineages=canonical_a2_lineages,
+            )
         except (OSError, ValueError):
             return failed
 
@@ -1179,6 +1329,7 @@ class IndustryResearchRefreshOrchestrator:
                     record.run,
                     "refresh_interrupted",
                     record.candidate,
+                    canonical_a2_lineages=record.canonical_a2_lineages,
                 )
                 lease.release()
                 completed: Future[RefreshRun] = Future()
@@ -1237,7 +1388,12 @@ class IndustryResearchRefreshOrchestrator:
                 if record is not None and record.run.run_id == initial.run_id:
                     with self._lock:
                         self._generations[industry_id] = record.generation
-                    self._failed(record.run, "refresh_cancelled", record.candidate)
+                    self._failed(
+                        record.run,
+                        "refresh_cancelled",
+                        record.candidate,
+                        canonical_a2_lineages=record.canonical_a2_lineages,
+                    )
             with self._lock:
                 if self._inflight.get(industry_id) is expected:
                     self._inflight.pop(industry_id, None)
@@ -1263,7 +1419,12 @@ class IndustryResearchRefreshOrchestrator:
                         return self._reconcile_prepared(record, owns_lease=True)
                     with self._lock:
                         self._generations[industry_id] = record.generation
-                    return self._failed(record.run, "refresh_interrupted", record.candidate)
+                    return self._failed(
+                        record.run,
+                        "refresh_interrupted",
+                        record.candidate,
+                        canonical_a2_lineages=record.canonical_a2_lineages,
+                    )
                 return self.current_run(industry_id) or record.run
             finally:
                 lease.release()
@@ -1326,6 +1487,9 @@ class IndustryResearchRefreshOrchestrator:
     def _execute(self, initial: RefreshRun, attempt_token: str) -> RefreshRun:
         run = initial
         candidate: CandidateEvidencePanel | None = None
+        metric_candidate: CandidateEvidencePanel | None = None
+        canonical_a2_lineages: tuple[CandidateExternalLineage, ...] = ()
+        news_snapshot: EvidenceSnapshot | None = None
         try:
             values, failures, eligible_count, industry_mismatches = self._provider_values(
                 initial.industry_id
@@ -1385,6 +1549,35 @@ class IndustryResearchRefreshOrchestrator:
                 )
                 return self._write_state(run)
 
+            try:
+                news_snapshot = self._canonical_news_snapshot_loader(initial.industry_id)
+                if type(news_snapshot) is not EvidenceSnapshot:
+                    raise ValueError("canonical A2 news snapshot is unavailable")
+                durable_news = self._canonical_news_snapshot_lookup(
+                    news_snapshot.raw_snapshot_id
+                )
+                if type(durable_news) is not EvidenceSnapshot or durable_news != news_snapshot:
+                    raise ValueError("canonical A2 news snapshot is not durable")
+                canonical_a2_lineages = (_canonical_a2_lineage(news_snapshot),)
+                from .service import _canonical_candidate_events, _merge_candidates
+
+                news_events = _canonical_candidate_events(initial.industry_id, news_snapshot)
+            except Exception:
+                unavailable = RefreshRun(
+                    industry_id=initial.industry_id,
+                    run_id=initial.run_id,
+                    raw_snapshot_id=raw.raw_snapshot_id,
+                    evidence_snapshot_id=evidence_snapshot.snapshot_id,
+                    candidate_snapshot_id=None,
+                    phase=RefreshPhase.FAILED,
+                    error_code="canonical_news_unavailable",
+                    displayed_trusted_snapshot_id=initial.displayed_trusted_snapshot_id,
+                    published_trusted_snapshot_id=None,
+                    displayed_raw_snapshot_id=initial.displayed_raw_snapshot_id,
+                    displayed_evidence_snapshot_id=initial.displayed_evidence_snapshot_id,
+                )
+                return self._write_state(unavailable)
+
             run = RefreshRun(
                 industry_id=initial.industry_id,
                 run_id=initial.run_id,
@@ -1398,7 +1591,7 @@ class IndustryResearchRefreshOrchestrator:
                 displayed_raw_snapshot_id=initial.displayed_raw_snapshot_id,
                 displayed_evidence_snapshot_id=initial.displayed_evidence_snapshot_id,
             )
-            candidate = CandidateEvidencePanel(
+            metric_candidate = CandidateEvidencePanel(
                 industry_id=initial.industry_id,
                 candidate_snapshot_id=candidate_id,
                 counts=CandidateEvidenceCounts(0, 0, 0, 0),
@@ -1409,9 +1602,23 @@ class IndustryResearchRefreshOrchestrator:
                 raw_snapshot_id=raw.raw_snapshot_id,
                 evidence_snapshot_id=evidence_snapshot.snapshot_id,
             )
-            self._write_state(run, candidate)
+            candidate = _merge_candidates(
+                metric_candidate,
+                news_snapshot=news_snapshot,
+                news_events=news_events,
+            )
+            self._write_state(
+                run,
+                candidate,
+                canonical_a2_lineages=canonical_a2_lineages,
+            )
             if self._stop.is_set():
-                return self._failed(run, "refresh_shutdown", candidate)
+                return self._failed(
+                    run,
+                    "refresh_shutdown",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             try:
                 projection = admit_metric_observations(
                     industry_id=initial.industry_id,
@@ -1422,28 +1629,56 @@ class IndustryResearchRefreshOrchestrator:
                     observations=raw.observations,
                     now=self._clock(),
                 )
-                candidate = projection.candidate
-                self._write_state(run, candidate)
+                metric_candidate = projection.candidate
+                candidate = _merge_candidates(
+                    metric_candidate,
+                    news_snapshot=news_snapshot,
+                    news_events=news_events,
+                )
+                self._write_state(
+                    run,
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             except Exception:
-                return self._failed(run, "admission_failed", candidate)
+                return self._failed(
+                    run,
+                    "admission_failed",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
 
-            if candidate.conflicting or candidate.conflicting_events:
-                return self._failed(run, "conflicting_evidence", candidate)
+            if metric_candidate.conflicting or metric_candidate.conflicting_events:
+                return self._failed(
+                    run,
+                    "conflicting_evidence",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             if failures:
-                return self._failed(run, "partial_source_failure", candidate)
+                return self._failed(
+                    run,
+                    "partial_source_failure",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             if not projection.trusted:
-                return self._failed(run, "no_trusted_observations", candidate)
+                return self._failed(
+                    run,
+                    "no_trusted_observations",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             if self._stop.is_set():
-                return self._failed(run, "refresh_shutdown", candidate)
+                return self._failed(
+                    run,
+                    "refresh_shutdown",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
 
             trusted_id = f"trusted-{initial.run_id}"
             try:
-                try:
-                    news_snapshot = self._canonical_news_snapshot_loader(initial.industry_id)
-                except Exception:
-                    news_snapshot = None
-                if news_snapshot is not None and type(news_snapshot) is not EvidenceSnapshot:
-                    news_snapshot = None
                 try:
                     company_candidates = tuple(
                         self._company_candidate_loader(initial.industry_id, evidence_snapshot)
@@ -1459,7 +1694,7 @@ class IndustryResearchRefreshOrchestrator:
                     generated_at=self._clock(),
                     trusted_observations=projection.trusted,
                     expired_observations=projection.expired,
-                    metric_candidates=candidate,
+                    metric_candidates=metric_candidate,
                     candidate_evidence_storage=evidence_storage,
                     news_snapshot=news_snapshot,
                     company_candidates=company_candidates,
@@ -1481,14 +1716,28 @@ class IndustryResearchRefreshOrchestrator:
                 )
                 report_checksum = storage_prepared.metadata.report_checksum
                 candidate = assembly.candidate_evidence
-                self._write_state(run, candidate)
+                self._write_state(
+                    run,
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             except Exception:
-                return self._failed(run, "assembly_failed", candidate)
+                return self._failed(
+                    run,
+                    "assembly_failed",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
 
             with self._lock:
                 current_generation = self._generations.get(initial.industry_id)
             if current_generation is None:
-                return self._failed(run, "storage_error", candidate)
+                return self._failed(
+                    run,
+                    "storage_error",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             prepared = _PublicationProof(
                 phase="prepared",
                 run_id=initial.run_id or "",
@@ -1506,34 +1755,65 @@ class IndustryResearchRefreshOrchestrator:
                 self._write_state(
                     run,
                     candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
                     publication=prepared,
                     expected_generation=current_generation,
                 )
             except (OSError, ValueError):
-                return self._failed(run, "storage_error", candidate)
+                return self._failed(
+                    run,
+                    "storage_error",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
 
             with self._publish_gate:
                 if self._stop.is_set():
-                    return self._failed(run, "refresh_shutdown", candidate)
+                    return self._failed(
+                        run,
+                        "refresh_shutdown",
+                        candidate,
+                        canonical_a2_lineages=canonical_a2_lineages,
+                    )
                 publication = self._report_storage.publish_prepared(storage_prepared)
             if publication.error_code is not None:
-                return self._failed(run, publication.error_code, candidate)
+                return self._failed(
+                    run,
+                    publication.error_code,
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             visible = self._report_storage.load_current_publication(initial.industry_id)
             if (
                 publication.published_trusted_snapshot_id != trusted_id
                 or not self._display_matches_proof(visible, prepared)
             ):
-                return self._failed(run, "publication_failed", candidate)
+                return self._failed(
+                    run,
+                    "publication_failed",
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                )
             completed = self._completed_run(run, prepared)
             committed = self._committed_proof(prepared)
             try:
-                return self._write_state(completed, candidate, publication=committed)
+                return self._write_state(
+                    completed,
+                    candidate,
+                    canonical_a2_lineages=canonical_a2_lineages,
+                    publication=committed,
+                )
             except (OSError, ValueError):
                 # The exact checksum-bound PREPARED proof remains durable and permits
                 # deterministic recovery of this already-visible report.
                 return completed
         except Exception:
-            return self._failed(run, "internal_error", candidate)
+            return self._failed(
+                run,
+                "internal_error",
+                candidate,
+                canonical_a2_lineages=canonical_a2_lineages,
+            )
 
     def shutdown(self) -> None:
         with self._lock:

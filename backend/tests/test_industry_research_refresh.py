@@ -24,7 +24,7 @@ from evidence_verification.models import (
 from evidence_verification.storage import EvidenceStorage
 from industry_research.admission import EvidenceDecision, RawMetricObservation, SourceIdentity
 from industry_research.api import ProductionIndustryResearchService
-from industry_research.models import RefreshPhase, RefreshRun
+from industry_research.models import CandidateExternalLineage, RefreshPhase, RefreshRun
 from industry_research.refresh import (
     IndustryResearchRefreshOrchestrator,
     RefreshRawSnapshot,
@@ -391,7 +391,13 @@ def _orchestrator(
         if tokens is not None
         else {}
     )
-    if canonical_news_snapshot_loader is not None:
+    if canonical_news_snapshot_loader is None and canonical_news_snapshot_lookup is None:
+        canonical_snapshot = _zero_candidate_news_snapshot()
+        kwargs["canonical_news_snapshot_loader"] = lambda _industry_id: canonical_snapshot
+        kwargs["canonical_news_snapshot_lookup"] = lambda raw_id: (
+            canonical_snapshot if raw_id == canonical_snapshot.raw_snapshot_id else None
+        )
+    elif canonical_news_snapshot_loader is not None:
         kwargs["canonical_news_snapshot_loader"] = canonical_news_snapshot_loader
     if canonical_news_snapshot_lookup is not None:
         kwargs["canonical_news_snapshot_lookup"] = canonical_news_snapshot_lookup
@@ -485,6 +491,17 @@ def _canonical_news_snapshot() -> EvidenceSnapshot:
             _a2_news_event("news-unverified-2", A2VerificationStatus.UNVERIFIED, 2),
             _a2_news_event("news-conflicting-40", A2VerificationStatus.CONFLICTING, 40),
         ),
+    )
+
+
+def _zero_candidate_news_snapshot(
+    *, snapshot_id: str = "news-evidence-zero", raw_snapshot_id: str = "news-raw-zero",
+) -> EvidenceSnapshot:
+    return EvidenceSnapshot(
+        snapshot_id=snapshot_id,
+        raw_snapshot_id=raw_snapshot_id,
+        generated_at=NOW,
+        events=(),
     )
 
 
@@ -715,6 +732,186 @@ def test_persisted_panel_bound_a2_candidate_accepts_exact_canonical_projection()
     )
 
     assert restored == expected
+
+
+def test_checksum_recomputed_panel_bound_a2_all_events_deleted_fails_closed(
+    tmp_path,
+) -> None:
+    snapshot = replace(
+        _canonical_news_snapshot(),
+        snapshot_id="candidate-panel-bound-deleted",
+        raw_snapshot_id="news-raw-panel-bound-deleted",
+    )
+    candidate = _panel_bound_news_candidate(snapshot)
+    run = RefreshRun(
+        industry_id="storage",
+        run_id="panel-bound-deleted",
+        raw_snapshot_id=candidate.raw_snapshot_id,
+        evidence_snapshot_id=candidate.evidence_snapshot_id,
+        candidate_snapshot_id=candidate.candidate_snapshot_id,
+        phase=RefreshPhase.VERIFYING,
+        error_code=None,
+        displayed_trusted_snapshot_id=None,
+        published_trusted_snapshot_id=None,
+    )
+    store = refresh_module._RefreshStateStore(
+        tmp_path / "panel-bound-state",
+        canonical_snapshot_lookup=(
+            lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+        ),
+    )
+    store.write(
+        run,
+        candidate,
+        canonical_a2_lineages=(CandidateExternalLineage(
+            kind="a2_news",
+            candidate_snapshot_id=snapshot.snapshot_id,
+            raw_snapshot_id=snapshot.raw_snapshot_id,
+            evidence_snapshot_id=snapshot.snapshot_id,
+        ),),
+    )
+    document = refresh_module.json.loads(
+        store._path("storage").read_text(encoding="utf-8")
+    )
+    candidate_document = document["state"]["candidate"]
+    candidate_document["unverified_events"] = []
+    candidate_document["conflicting_events"] = []
+    candidate_document["counts"]["unverified_events"] = 0
+    candidate_document["counts"]["conflicting_events"] = 0
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    store._writer._atomic_write(
+        store._path("storage"),
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert store.load_record("storage") is None
+
+
+def test_checksum_recomputed_mixed_a2_all_events_and_visible_declaration_deleted_fails_closed(
+    tmp_path,
+) -> None:
+    snapshot = _canonical_news_snapshot()
+    lookup = lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("mixed-events-deleted",),
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lookup,
+    )
+    owner.request_refresh("storage").result(5)
+    path = owner._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    candidate = document["state"]["candidate"]
+    candidate["unverified_events"] = []
+    candidate["conflicting_events"] = []
+    candidate["external_lineages"] = []
+    candidate["counts"]["unverified_events"] = 0
+    candidate["counts"]["conflicting_events"] = 0
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    owner._state._writer._atomic_write(
+        path,
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert owner.current_run("storage") is None
+    assert owner.current_candidate("storage") is None
+    owner.shutdown()
+
+
+def test_zero_event_canonical_a2_snapshot_is_declared_and_restored(tmp_path) -> None:
+    snapshot = _zero_candidate_news_snapshot()
+    lookup = lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("zero-event-canonical",),
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lookup,
+    )
+    completed = owner.request_refresh("storage").result(5)
+    expected = owner.current_candidate("storage")
+    path = owner._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    owner.shutdown()
+
+    assert expected is not None
+    assert expected.unverified_events == ()
+    assert expected.conflicting_events == ()
+    assert document["schema_version"] == 6
+    assert document["state"]["canonical_a2_lineages"] == [{
+        "kind": "a2_news",
+        "candidate_snapshot_id": snapshot.snapshot_id,
+        "raw_snapshot_id": snapshot.raw_snapshot_id,
+        "evidence_snapshot_id": snapshot.snapshot_id,
+    }]
+    reloaded = _orchestrator(tmp_path, canonical_news_snapshot_lookup=lookup)
+    assert reloaded.current_run("storage") == completed
+    assert reloaded.current_candidate("storage") == expected
+    reloaded.shutdown()
+
+
+def test_zero_event_canonical_a2_state_requires_durable_lookup(tmp_path) -> None:
+    snapshot = _zero_candidate_news_snapshot()
+    lookup = lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("zero-event-no-lookup",),
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lookup,
+    )
+    owner.request_refresh("storage").result(5)
+    owner.shutdown()
+
+    no_lookup = _orchestrator(
+        tmp_path,
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lambda _raw_id: None,
+    )
+    assert no_lookup.current_run("storage") is None
+    assert no_lookup.current_candidate("storage") is None
+    no_lookup.shutdown()
+
+
+def test_zero_event_state_rotation_uses_declared_historical_raw_lookup(tmp_path) -> None:
+    old = _zero_candidate_news_snapshot(
+        snapshot_id="news-evidence-old-zero",
+        raw_snapshot_id="news-raw-old-zero",
+    )
+    new = _zero_candidate_news_snapshot(
+        snapshot_id="news-evidence-new-zero",
+        raw_snapshot_id="news-raw-new-zero",
+    )
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("zero-event-rotation",),
+        canonical_news_snapshot_loader=lambda _industry_id: old,
+        canonical_news_snapshot_lookup=lambda raw_id: old if raw_id == old.raw_snapshot_id else None,
+    )
+    completed = owner.request_refresh("storage").result(5)
+    expected = owner.current_candidate("storage")
+    owner.shutdown()
+
+    looked_up: list[str] = []
+
+    def durable_lookup(raw_id: str) -> EvidenceSnapshot | None:
+        looked_up.append(raw_id)
+        return {
+            old.raw_snapshot_id: old,
+            new.raw_snapshot_id: new,
+        }.get(raw_id)
+
+    reloaded = _orchestrator(
+        tmp_path,
+        canonical_news_snapshot_loader=lambda _industry_id: new,
+        canonical_news_snapshot_lookup=durable_lookup,
+    )
+    assert reloaded.current_run("storage") == completed
+    assert reloaded.current_candidate("storage") == expected
+    assert looked_up and set(looked_up) == {old.raw_snapshot_id}
+    reloaded.shutdown()
 
 
 @pytest.mark.parametrize("tamper", ("raw_lineage", "event_id", "evidence_snapshot"))
