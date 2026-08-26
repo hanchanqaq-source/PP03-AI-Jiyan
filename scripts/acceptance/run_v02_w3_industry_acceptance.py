@@ -749,6 +749,48 @@ def _summary(output: str) -> str:
     return " | ".join((interesting or lines)[-4:])[-1500:]
 
 
+def write_console_output(output: str) -> None:
+    if not output:
+        return
+    console = sys.stdout
+    try:
+        console.write(output)
+    except UnicodeEncodeError:
+        encoding = getattr(console, "encoding", None) or "utf-8"
+        safe_bytes = output.encode(encoding, errors="backslashreplace")
+        buffer = getattr(console, "buffer", None)
+        if buffer is not None:
+            buffer.write(safe_bytes)
+        else:
+            console.write(safe_bytes.decode(encoding))
+    console.flush()
+
+
+def spawn_command(command: list[str], environment: dict[str, str]) -> list[str]:
+    if not command:
+        raise ValueError("child command must not be empty")
+    executable = command[0]
+    candidate = Path(executable)
+    if candidate.is_absolute():
+        resolved = str(candidate)
+    else:
+        resolved = shutil.which(executable, path=environment.get("PATH")) or executable
+    resolved_command = [resolved, *command[1:]]
+    if os.name == "nt" and Path(resolved).suffix.casefold() in {".cmd", ".bat"}:
+        node = shutil.which("node.exe", path=environment.get("PATH"))
+        if not node:
+            raise FileNotFoundError("node.exe is required to launch approved Node command shims")
+        shim = Path(resolved)
+        if shim.name.casefold() == "npm.cmd":
+            cli = shim.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+        elif shim.name.casefold() == "playwright.cmd":
+            cli = shim.parent.parent / "playwright" / "cli.js"
+        else:
+            raise ValueError(f"unsupported Windows command shim: {shim.name}")
+        return [node, str(cli), *command[1:]]
+    return resolved_command
+
+
 def _run_command(
     command: list[str],
     *,
@@ -760,7 +802,7 @@ def _run_command(
     validate_child_environment(environment)
     started = time.monotonic()
     completed = subprocess.run(
-        command,
+        spawn_command(command, environment),
         cwd=cwd,
         env=environment,
         text=True,
@@ -773,9 +815,9 @@ def _run_command(
     )
     duration = time.monotonic() - started
     output = completed.stdout or ""
-    sys.stdout.write(output)
+    write_console_output(output)
     if output and not output.endswith("\n"):
-        sys.stdout.write("\n")
+        write_console_output("\n")
     evidence = CommandEvidence(
         label=label,
         command=tuple(command),
@@ -1015,7 +1057,7 @@ def _run_browser_phase(evidence: list[CommandEvidence]) -> dict[str, object]:
         browser_log.close()
         browser_log = None
         output = browser_log_path.read_text(encoding="utf-8", errors="replace")
-        sys.stdout.write(output)
+        write_console_output(output)
         evidence.append(CommandEvidence(
             label="browser-matrix", command=("node", str(BROWSER_SCRIPT), "--run"),
             cwd=str(REPO_ROOT), exit_code=browser_exit,
@@ -1098,7 +1140,7 @@ def _write_acceptance_evidence(
             for item in command_evidence
         ],
         "test_counts": {
-            "runner_self_tests": "18 passed",
+            "runner_self_tests": "21 passed",
             "backend_offline": next((item.summary for item in command_evidence if item.label == "backend-offline-full"), ""),
             "frontend_main": next((item.summary for item in command_evidence if item.label == "frontend-main-tests"), ""),
             "frontend_legacy": next((item.summary for item in command_evidence if item.label == "frontend-legacy-tests"), ""),
@@ -1221,7 +1263,9 @@ def _run_all() -> int:
             cleanup=cleanup,
             screenshot_bytes=screenshot_bytes,
         )
-        print(json.dumps({"status": "PASS", "outputs": [str(item) for item in outputs]}, ensure_ascii=False))
+        write_console_output(
+            json.dumps({"status": "PASS", "outputs": [str(item) for item in outputs]}, ensure_ascii=False) + "\n"
+        )
         return 0
     finally:
         # If any stage fails, remove all task-owned runtime state but never source

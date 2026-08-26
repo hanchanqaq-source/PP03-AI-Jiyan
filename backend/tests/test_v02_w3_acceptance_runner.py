@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -255,3 +256,65 @@ def test_fixture_reports_keep_three_differential_templates_and_chinese_labels() 
     assert semiconductor.trusted_snapshot_id.startswith("DEMO-H-")
     assert robotics.trusted_snapshot_id.startswith("DEMO-R-")
     assert all("DRAM" not in row.label and "NAND" not in row.label for row in semiconductor.cycle + robotics.cycle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows command wrapper contract")
+def test_windows_spawn_wraps_npm_and_absolute_cmd_without_using_shell_true() -> None:
+    runner = _load_runner()
+    environment = runner.clean_child_environment()
+
+    npm = runner.spawn_command(["npm", "run", "build"], environment)
+    playwright = runner.spawn_command(
+        [str(runner.PLAYWRIGHT_TOOLS / "node_modules" / ".bin" / "playwright.cmd"), "install", "chromium"],
+        environment,
+    )
+
+    assert Path(npm[0]).name.casefold() == "node.exe"
+    assert Path(npm[1]).as_posix().casefold().endswith("/node_modules/npm/bin/npm-cli.js")
+    assert npm[2:] == ["run", "build"]
+    assert Path(playwright[0]).name.casefold() == "node.exe"
+    assert Path(playwright[1]) == runner.PLAYWRIGHT_TOOLS / "node_modules" / "playwright" / "cli.js"
+    assert playwright[2:] == ["install", "chromium"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows command wrapper contract")
+def test_windows_spawn_command_really_executes_npm_cmd() -> None:
+    runner = _load_runner()
+    environment = runner.clean_child_environment()
+
+    completed = subprocess.run(
+        runner.spawn_command(["npm", "--version"], environment),
+        cwd=REPO_ROOT / "frontend",
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip().replace(".", "").isdigit()
+
+
+def test_console_output_falls_back_safely_when_host_encoding_is_gbk(monkeypatch) -> None:
+    runner = _load_runner()
+
+    class StrictGbkConsole:
+        encoding = "gbk"
+
+        def __init__(self) -> None:
+            self.buffer = io.BytesIO()
+
+        def write(self, value: str) -> int:
+            encoded = value.encode(self.encoding)
+            self.buffer.write(encoded)
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    console = StrictGbkConsole()
+    monkeypatch.setattr(runner.sys, "stdout", console)
+
+    runner.write_console_output("37 files ✔\n")
+
+    assert console.buffer.getvalue().decode("gbk") == "37 files \\u2714\n"
