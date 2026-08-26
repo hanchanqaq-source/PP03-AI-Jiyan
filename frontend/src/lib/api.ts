@@ -448,7 +448,7 @@ const INDUSTRY_EMPTY_REASONS = new Set([
 ]);
 const INDUSTRY_ERROR_CODES = new Set([
   "admission_failed", "all_sources_failed", "assembly_failed", "conflicting_evidence",
-  "evidence_verification_failed", "internal_error", "no_eligible_provider",
+  "canonical_news_unavailable", "evidence_verification_failed", "internal_error", "no_eligible_provider",
   "no_trusted_observations", "partial_source_failure", "publication_failed",
   "publication_proof_invalid", "raw_build_failed", "raw_industry_mismatch",
   "refresh_cancelled", "refresh_interrupted", "refresh_shutdown",

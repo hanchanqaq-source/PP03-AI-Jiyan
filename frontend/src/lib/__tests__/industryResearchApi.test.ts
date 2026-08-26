@@ -261,6 +261,21 @@ describe("industry research API decoder", () => {
     });
   });
 
+  it("decodes canonical A2 unavailability while preserving the old trusted report", () => {
+    const value = structuredClone(responseWire) as any;
+    value.refresh_run.phase = "failed";
+    value.refresh_run.error_code = "canonical_news_unavailable";
+
+    expect(decodeIndustryResearchResponse(value)).toMatchObject({
+      displayedTrustedReport: { trustedSnapshotId: "trusted-storage-old" },
+      refreshRun: {
+        phase: "failed",
+        errorCode: "canonical_news_unavailable",
+        displayedTrustedSnapshotId: "trusted-storage-old",
+      },
+    });
+  });
+
   it("keeps candidate events in their typed side channel and never promotes them", () => {
     const decoded = decodeIndustryResearchResponse(responseWire);
 
