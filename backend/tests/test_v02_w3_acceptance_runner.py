@@ -266,6 +266,51 @@ def test_cleanup_plan_contains_only_disposable_acceptance_descendants() -> None:
     assert all(not target.is_relative_to(REPO_ROOT / "docs") for target in targets)
 
 
+def test_cleanup_plan_discovers_every_direct_acceptance_root_child(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    acceptance_root = tmp_path / "acceptance"
+    acceptance_root.mkdir()
+    expected_children = {
+        acceptance_root / "npm-cache",
+        acceptance_root / "pip-cache",
+        acceptance_root / "diagnostic.log",
+        acceptance_root / "tmp-orphan",
+    }
+    for child in expected_children:
+        if child.suffix:
+            child.write_text("disposable", encoding="utf-8")
+        else:
+            child.mkdir()
+    monkeypatch.setattr(runner, "ACCEPTANCE_ROOT", acceptance_root)
+
+    targets = set(runner.cleanup_targets())
+
+    assert expected_children <= targets
+    assert all(target.is_relative_to(acceptance_root) for target in targets)
+
+
+def test_cleanup_removes_discovered_children_but_preserves_outside_files(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    acceptance_root = tmp_path / "acceptance"
+    acceptance_root.mkdir()
+    (acceptance_root / "npm-cache").mkdir()
+    (acceptance_root / "npm-cache" / "entry").write_text("cache", encoding="utf-8")
+    (acceptance_root / "orphan.log").write_text("log", encoding="utf-8")
+    outside = tmp_path / "source-fixture.json"
+    outside.write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(runner, "ACCEPTANCE_ROOT", acceptance_root)
+
+    cleanup = runner._remove_disposable_targets()
+
+    assert cleanup["remaining"] == []
+    assert list(acceptance_root.iterdir()) == []
+    assert outside.read_text(encoding="utf-8") == "preserve"
+
+
 def test_fixture_reports_keep_three_differential_templates_and_chinese_labels() -> None:
     runner = _load_runner()
     service = runner.build_fixture_service()
@@ -454,3 +499,42 @@ def test_browser_only_classifies_exact_in_window_industry_aborts_as_expected() -
     assert "page.waitForFunction" in history_stage
     assert 'button.getAttribute("aria-label") === `最近 ${expectedDays} 天`' in history_stage
     assert 'button.getAttribute("aria-pressed") === "true"' in history_stage
+
+
+def test_command_summary_extracts_precise_framework_counts() -> None:
+    runner = _load_runner()
+
+    assert runner._summary("31 passed, 1 warning in 1.60s\n") == (
+        "31 passed, 1 warning in 1.60s"
+    )
+    assert runner._summary(
+        " Test Files  37 passed (37)\n"
+        "      Tests  637 passed (637)\n"
+        "   Duration  9.64s\n"
+    ) == "Test Files 37 passed (37) | Tests 637 passed (637)"
+    assert runner._summary(
+        "ℹ tests 16\n"
+        "ℹ suites 0\n"
+        "ℹ pass 16\n"
+        "ℹ fail 0\n"
+        "ℹ skipped 0\n"
+        "ℹ todo 0\n"
+    ) == "16 tests, 16 pass, 0 fail, 0 skipped"
+
+
+def test_manifest_runner_self_test_count_comes_from_command_evidence() -> None:
+    runner = _load_runner()
+    commands = [
+        runner.CommandEvidence(
+            label="runner-self-test",
+            command=("python", "-m", "pytest"),
+            cwd=str(REPO_ROOT),
+            exit_code=0,
+            duration_seconds=1.6,
+            summary="31 passed, 1 warning in 1.60s",
+        )
+    ]
+
+    assert runner._command_summary(commands, "runner-self-test") == (
+        "31 passed, 1 warning in 1.60s"
+    )

@@ -120,13 +120,16 @@ def frontend_test_commands() -> list[list[str]]:
 
 
 def cleanup_targets() -> tuple[Path, ...]:
+    names = {
+        "acceptance", "cache", "data", "evidence", "logs", "news",
+        "playwright-browsers", "profile", "reports", "results", "run",
+        "temp", "tmp", "tools",
+    }
+    if ACCEPTANCE_ROOT.exists():
+        names.update(child.name for child in ACCEPTANCE_ROOT.iterdir())
     return validate_cleanup_targets([
         ACCEPTANCE_ROOT / name
-        for name in (
-            "acceptance", "cache", "data", "evidence", "logs", "news",
-            "playwright-browsers", "profile", "reports", "results", "run",
-            "temp", "tmp", "tools",
-        )
+        for name in sorted(names)
     ])
 
 
@@ -778,12 +781,37 @@ def _git(*args: str) -> str:
 
 
 def _summary(output: str) -> str:
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    lines = [re.sub(r"\s+", " ", line.strip()) for line in output.splitlines() if line.strip()]
+    vitest_files = next((line for line in lines if line.startswith("Test Files ")), None)
+    vitest_tests = next((line for line in lines if line.startswith("Tests ")), None)
+    if vitest_files and vitest_tests:
+        return f"{vitest_files} | {vitest_tests}"[-1500:]
+    node_counts: dict[str, int] = {}
+    for key in ("tests", "pass", "fail", "skipped"):
+        match = next(
+            (
+                re.fullmatch(rf"(?:ℹ|#)\s*{key}\s+(\d+)", line)
+                for line in lines
+                if re.fullmatch(rf"(?:ℹ|#)\s*{key}\s+(\d+)", line)
+            ),
+            None,
+        )
+        if match is not None:
+            node_counts[key] = int(match.group(1))
+    if set(node_counts) == {"tests", "pass", "fail", "skipped"}:
+        return (
+            f"{node_counts['tests']} tests, {node_counts['pass']} pass, "
+            f"{node_counts['fail']} fail, {node_counts['skipped']} skipped"
+        )
     interesting = [
         line for line in lines
         if any(token in line for token in ("passed", "failed", "skipped", "deselected", "Tests", "# pass", "built in"))
     ]
     return " | ".join((interesting or lines)[-4:])[-1500:]
+
+
+def _command_summary(command_evidence: list[CommandEvidence], label: str) -> str:
+    return next((item.summary for item in command_evidence if item.label == label), "")
 
 
 def write_console_output(output: str) -> None:
@@ -1255,11 +1283,11 @@ def _write_acceptance_evidence(
             for item in command_evidence
         ],
         "test_counts": {
-            "runner_self_tests": "25 passed",
-            "backend_offline": next((item.summary for item in command_evidence if item.label == "backend-offline-full"), ""),
-            "frontend_main": next((item.summary for item in command_evidence if item.label == "frontend-main-tests"), ""),
-            "frontend_legacy": next((item.summary for item in command_evidence if item.label == "frontend-legacy-tests"), ""),
-            "production_build": next((item.summary for item in command_evidence if item.label == "frontend-production-build"), ""),
+            "runner_self_tests": _command_summary(command_evidence, "runner-self-test"),
+            "backend_offline": _command_summary(command_evidence, "backend-offline-full"),
+            "frontend_main": _command_summary(command_evidence, "frontend-main-tests"),
+            "frontend_legacy": _command_summary(command_evidence, "frontend-legacy-tests"),
+            "production_build": _command_summary(command_evidence, "frontend-production-build"),
         },
         "browser": {
             "playwright_version": browser["preflight"]["playwrightVersion"],
