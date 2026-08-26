@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -16,16 +16,20 @@ import pytest
 import app as app_module
 from industry_research import api as industry_api
 from industry_research.models import (
+    CandidateExternalLineage,
     FundResolutionEmptyReason,
     FundSelectionScope,
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
+    CandidateIndustryEvidenceEvent,
     ConflictingObservation,
     ConflictingSourceValue,
     IndustryFundRelationResolution,
     IndustryReportResponse,
     RefreshPhase,
     RefreshRun,
+    VerificationStatus,
+    _candidate_panel_with_canonical_a2_lineage,
 )
 from industry_research.relationships import FundRelationProjection
 from industry_research.service import IndustryResearchService
@@ -438,6 +442,106 @@ def test_default_public_fund_adapter_builds_exact_dynamic_mapping_from_disclosed
     relation = response.json()["resolutions"][0]["relation"]
     assert relation["relation_layer"] == "disclosed_lookthrough"
     assert relation["exposure_value"] == 12.5
+    assert tuple(root.iterdir()) == ()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("extra_undisclosed", "missing_disclosed", "duplicate", "weight_mismatch"),
+)
+def test_default_public_fund_adapter_rejects_nonexact_classification_code_set(
+    tmp_path, monkeypatch, failure: str,
+) -> None:
+    class FakeCache:
+        def __init__(self, _path) -> None:
+            return None
+
+    class FakeFundDataService:
+        def __init__(self, *, cache) -> None:
+            assert isinstance(cache, FakeCache)
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            assert force_refresh is False
+            holdings = [{"stock_code": "688001", "weight_pct": 12.5}]
+            evidence = [{
+                "stock_code": "688001",
+                "weight_pct": 12.5,
+                "primary_industry": "制造业",
+                "detail_industry": "存储芯片制造",
+                "source_reference": "https://public.example/classification/688001",
+                "holding_disclosure_date": "2026-06-30",
+            }]
+            if failure == "extra_undisclosed":
+                evidence.append({
+                    "stock_code": "688999",
+                    "weight_pct": 1.0,
+                    "primary_industry": "制造业",
+                    "detail_industry": "存储芯片制造",
+                    "source_reference": "https://public.example/classification/688999",
+                    "holding_disclosure_date": "2026-06-30",
+                })
+            elif failure == "missing_disclosed":
+                holdings.append({"stock_code": "688002", "weight_pct": 5.0})
+            elif failure == "duplicate":
+                evidence.append(dict(evidence[0]))
+            else:
+                evidence[0]["weight_pct"] = 11.0
+            return {
+                "code": code,
+                "holdings": {
+                    "data": {
+                        "fund_code": code,
+                        "holdings": holdings,
+                        "disclosure_date": "2026-06-30",
+                    },
+                    "meta": {
+                        "status": "disclosed",
+                        "source_reference": "https://public.example/holdings/900001",
+                    },
+                },
+                "industry_exposure": {
+                    "data": {
+                        "fund_code": code,
+                        "lookthrough": {
+                            "status": "disclosed",
+                            "disclosure_date": "2026-06-30",
+                        },
+                        "industry_chain_tags": [{
+                            "id": "storage",
+                            "name": "存储",
+                            "weight_pct": 12.5,
+                            "evidence_level": "disclosed_stock_classification",
+                        }],
+                        "holding_industry_evidence": evidence,
+                        "official_allocation": {"exposure": []},
+                    },
+                    "meta": {"status": "disclosed"},
+                },
+            }
+
+    monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
+    monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    root.mkdir(parents=True)
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        now=lambda: NOW,
+        fund_acceptance_root=root,
+    )
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["resolutions"][0] == {
+        "selection_id": "selection-1",
+        "fund_code": "900001",
+        "relation": None,
+        "empty_reason": "unknown",
+    }
     assert tuple(root.iterdir()) == ()
 
 
@@ -885,6 +989,96 @@ def test_conflicting_snapshot_stays_in_candidate_side_channel() -> None:
     )
     assert all(metric["verification_status"] != "conflicting" for metric in trusted_metrics)
     assert all(metric["current_value"] not in {1.0, -1.0} for metric in trusted_metrics)
+
+
+def test_production_get_trims_unreferenced_external_lineage_after_window_filter() -> None:
+    report = _report_response().displayed_trusted_report
+    assert report is not None
+    external = CandidateExternalLineage(
+        "a2_news", "a2-evidence", "a2-raw", "a2-evidence"
+    )
+    pending = CandidateIndustryEvidenceEvent(
+        "storage",
+        "a2-pending-20d",
+        VerificationStatus.UNVERIFIED,
+        (NOW - timedelta(days=20)).isoformat(),
+        ("ev-pending",),
+        ("ev-pending",),
+        (),
+        ("news",),
+        external.candidate_snapshot_id,
+        external.raw_snapshot_id,
+        external.evidence_snapshot_id,
+    )
+    conflict = CandidateIndustryEvidenceEvent(
+        "storage",
+        "a2-conflict-40d",
+        VerificationStatus.CONFLICTING,
+        (NOW - timedelta(days=40)).isoformat(),
+        ("ev-support", "ev-conflict"),
+        ("ev-support",),
+        ("ev-conflict",),
+        ("risk",),
+        external.candidate_snapshot_id,
+        external.raw_snapshot_id,
+        external.evidence_snapshot_id,
+    )
+    candidate = _candidate_panel_with_canonical_a2_lineage(
+        industry_id="storage",
+        candidate_snapshot_id="metric-candidate",
+        counts=CandidateEvidenceCounts(0, 0, 1, 1),
+        unverified=(),
+        conflicting=(),
+        unverified_events=(pending,),
+        conflicting_events=(conflict,),
+        raw_snapshot_id="metric-raw",
+        evidence_snapshot_id="metric-evidence",
+        external_lineages=(external,),
+    )
+    refresh = RefreshRun(
+        industry_id="storage",
+        run_id="window-lineage",
+        raw_snapshot_id="metric-raw",
+        evidence_snapshot_id="metric-evidence",
+        candidate_snapshot_id="metric-candidate",
+        phase=RefreshPhase.VERIFYING,
+        error_code=None,
+        displayed_trusted_snapshot_id=report.trusted_snapshot_id,
+        published_trusted_snapshot_id=None,
+        displayed_raw_snapshot_id=report.raw_snapshot_id,
+        displayed_evidence_snapshot_id=report.evidence_snapshot_id,
+    )
+    reader = SimpleNamespace(
+        current_run=lambda _industry_id: refresh,
+        current_candidate=lambda _industry_id: candidate,
+    )
+    service = industry_api.ProductionIndustryResearchService(
+        storage=SimpleNamespace(load_current=lambda _industry_id: report),
+        now=lambda: NOW,
+        refresh_state_reader=reader,
+    )
+    client = _client(service)
+
+    seven = client.get("/api/industry-research/storage?window_days=7")
+    thirty = client.get("/api/industry-research/storage?window_days=30")
+
+    assert seven.status_code == 200
+    seven_candidate = seven.json()["candidate_evidence"]
+    assert seven_candidate["external_lineages"] == []
+    assert seven_candidate["unverified_events"] == []
+    assert seven_candidate["conflicting_events"] == []
+    assert seven_candidate["counts"]["unverified_events"] == 0
+    assert seven_candidate["counts"]["conflicting_events"] == 0
+    assert thirty.status_code == 200
+    thirty_candidate = thirty.json()["candidate_evidence"]
+    assert thirty_candidate["candidate_snapshot_id"] == "metric-candidate"
+    assert thirty_candidate["external_lineages"] == [external.to_dict()]
+    assert [row["event_id"] for row in thirty_candidate["unverified_events"]] == [
+        "a2-pending-20d"
+    ]
+    assert thirty_candidate["conflicting_events"] == []
+    assert thirty_candidate["counts"]["unverified_events"] == 1
+    assert thirty_candidate["counts"]["conflicting_events"] == 0
 
 
 @pytest.mark.parametrize(

@@ -668,6 +668,55 @@ def test_persisted_external_a2_candidate_requires_canonical_durable_lookup(tmp_p
     reloaded.shutdown()
 
 
+def _panel_bound_news_candidate(snapshot: EvidenceSnapshot):
+    return IndustryResearchService(now=lambda: NOW).assemble_storage_report(
+        trusted_snapshot_id="trusted-panel-bound",
+        raw_snapshot_id="report-raw-panel-bound",
+        evidence_snapshot_id="report-evidence-panel-bound",
+        generated_at=NOW,
+        trusted_observations=(),
+        metric_candidates=None,
+        news_snapshot=snapshot,
+    ).candidate_evidence
+
+
+def test_persisted_panel_bound_a2_candidate_requires_canonical_durable_lookup() -> None:
+    snapshot = _canonical_news_snapshot()
+    candidate = _panel_bound_news_candidate(snapshot)
+    assert candidate.external_lineages == ()
+
+    with pytest.raises(ValueError, match="canonical durable lookup"):
+        refresh_module._candidate_from_dict(candidate.to_dict())
+
+
+def test_persisted_panel_bound_a2_candidate_rejects_forged_event_with_lookup() -> None:
+    snapshot = _canonical_news_snapshot()
+    document = _panel_bound_news_candidate(snapshot).to_dict()
+    document["unverified_events"][0]["event_id"] = "forged-panel-bound-event"
+
+    with pytest.raises(ValueError, match="canonical and complete"):
+        refresh_module._candidate_from_dict(
+            document,
+            canonical_snapshot_lookup=(
+                lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+            ),
+        )
+
+
+def test_persisted_panel_bound_a2_candidate_accepts_exact_canonical_projection() -> None:
+    snapshot = _canonical_news_snapshot()
+    expected = _panel_bound_news_candidate(snapshot)
+
+    restored = refresh_module._candidate_from_dict(
+        expected.to_dict(),
+        canonical_snapshot_lookup=(
+            lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+        ),
+    )
+
+    assert restored == expected
+
+
 @pytest.mark.parametrize("tamper", ("raw_lineage", "event_id", "evidence_snapshot"))
 def test_checksum_recomputed_forged_external_a2_state_still_fails_closed(
     tmp_path, tamper: str,

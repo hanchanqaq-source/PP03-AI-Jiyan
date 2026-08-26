@@ -140,6 +140,33 @@ def _filter_report_window(
             if (occurred_at := _parse_timestamp(event.occurred_at)) is not None
             and cutoff <= occurred_at <= now
         )
+        retained_events = unverified_events + conflicting_events
+        panel_lineage = (
+            candidate.candidate_snapshot_id,
+            candidate.raw_snapshot_id,
+            candidate.evidence_snapshot_id,
+        )
+        retained_external_lineages = {
+            (
+                event.candidate_snapshot_id,
+                event.raw_snapshot_id,
+                event.evidence_snapshot_id,
+            )
+            for event in retained_events
+            if (
+                event.candidate_snapshot_id,
+                event.raw_snapshot_id,
+                event.evidence_snapshot_id,
+            ) != panel_lineage
+        }
+        external_lineages = tuple(
+            lineage for lineage in candidate.external_lineages
+            if (
+                lineage.candidate_snapshot_id,
+                lineage.raw_snapshot_id,
+                lineage.evidence_snapshot_id,
+            ) in retained_external_lineages
+        )
         candidate = replace(
             candidate,
             counts=CandidateEvidenceCounts(
@@ -150,6 +177,7 @@ def _filter_report_window(
             ),
             unverified_events=unverified_events,
             conflicting_events=conflicting_events,
+            external_lineages=external_lineages,
         )
     return replace(
         response,
@@ -237,7 +265,7 @@ class _RequestScopedFundDataAdapter:
                 or _FUND_CODE.fullmatch(stock_code) is None
                 or stock_code not in disclosed
             ):
-                continue
+                return
             source_reference = item.get("source_reference")
             evidence_weight = decimal_percent(item.get("weight_pct"))
             if (
@@ -253,6 +281,8 @@ class _RequestScopedFundDataAdapter:
             tags = _industry_chain_tags(dict(item))
             if tags:
                 captured.setdefault(stock_code, set()).update(tag_id for tag_id, _ in tags)
+        if seen_evidence_codes != set(disclosed):
+            return
         for stock_code, tag_ids in captured.items():
             self._security_industry_ids[stock_code] = frozenset(tag_ids)
 
