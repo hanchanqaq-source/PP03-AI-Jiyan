@@ -335,3 +335,16 @@ def test_listener_pid_must_equal_or_descend_from_the_owned_process_root() -> Non
     assert runner.pid_is_owned_by(43904, 40988, {40988: 40000, 40000: 40988}) is False
     with pytest.raises(RuntimeError, match="no unique loopback listener"):
         runner.listening_pid_for_port(netstat, 60787)
+
+
+def test_browser_failure_diagnostics_are_written_without_route_mocks() -> None:
+    script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "browser-failure.json" in script
+    assert 'page.on("response"' in script
+    assert "pageText" in script
+    assert "consoleMessages" in script
+    assert "failedRequests" in script
+    assert ".route(" not in script

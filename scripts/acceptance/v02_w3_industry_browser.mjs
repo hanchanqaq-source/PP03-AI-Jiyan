@@ -55,6 +55,7 @@ const consoleMessages = [];
 const pageErrors = [];
 const failedRequests = [];
 const network = [];
+const responses = [];
 const checks = [];
 const record = (name, details = {}) => checks.push({ name, status: "pass", ...details });
 
@@ -67,10 +68,11 @@ const context = await chromium.launchPersistentContext(profileDir, {
   reducedMotion: "reduce",
 });
 const chromiumVersion = context.browser()?.version() ?? "unknown";
+let page;
 
 try {
   const pages = context.pages();
-  const page = pages[0] ?? await context.newPage();
+  page = pages[0] ?? await context.newPage();
   page.on("console", (message) => {
     if (["error", "warning"].includes(message.type())) {
       consoleMessages.push({ type: message.type(), text: message.text() });
@@ -78,6 +80,7 @@ try {
   });
   page.on("pageerror", (error) => pageErrors.push(String(error)));
   page.on("request", (request) => network.push({ method: request.method(), url: request.url() }));
+  page.on("response", (response) => responses.push({ status: response.status(), url: response.url() }));
   page.on("requestfailed", (request) => failedRequests.push({
     method: request.method(),
     url: request.url(),
@@ -229,7 +232,30 @@ try {
     pageErrors,
     failedRequests,
     network,
+    responses,
   }, null, 2)}\n`, "utf8");
+} catch (error) {
+  const pageText = page
+    ? await page.locator("body").innerText({ timeout: 2000 }).catch(() => "<body unavailable>")
+    : "<page unavailable>";
+  const failure = {
+    status: "fail",
+    error: error instanceof Error ? (error.stack ?? error.message) : String(error),
+    pageUrl: page?.url() ?? "<page unavailable>",
+    pageText: pageText.slice(0, 20000),
+    consoleMessages,
+    pageErrors,
+    failedRequests,
+    network,
+    responses,
+  };
+  fs.writeFileSync(
+    path.join(outputDir, "browser-failure.json"),
+    `${JSON.stringify(failure, null, 2)}\n`,
+    "utf8",
+  );
+  process.stderr.write(`${JSON.stringify(failure)}\n`);
+  throw error;
 } finally {
   await context.close();
 }
