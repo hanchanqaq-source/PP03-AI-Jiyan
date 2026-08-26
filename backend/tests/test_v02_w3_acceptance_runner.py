@@ -446,3 +446,12 @@ def test_browser_only_classifies_exact_in_window_industry_aborts_as_expected() -
     assert 'parsed.searchParams.get("window_days")' in script
     assert "blockingFailedRequests.length === 0" in script
     assert "expectedCancelledRequests" in script
+
+    history_stage = script[
+        script.index("const windowCounts") : script.index("const metricsAnchor")
+    ]
+    assert "page.waitForResponse" in history_stage
+    assert 'historyUrl.origin === baseUrl' in history_stage
+    assert 'historyUrl.pathname === "/api/industry-research/storage"' in history_stage
+    assert 'historyUrl.searchParams.get("window_days") === String(days)' in history_stage
+    assert "await historyResponse;" in history_stage

@@ -138,7 +138,15 @@ try {
 
   const windowCounts = {};
   for (const days of [7, 30, 90]) {
+    const historyResponse = page.waitForResponse((response) => {
+      const historyUrl = new URL(response.url());
+      return response.status() === 200
+        && historyUrl.origin === baseUrl
+        && historyUrl.pathname === "/api/industry-research/storage"
+        && historyUrl.searchParams.get("window_days") === String(days);
+    });
     await page.getByRole("button", { name: `最近 ${days} 天` }).click();
+    await historyResponse;
     const historyText = await storageArticle.locator("#news-risk").innerText();
     windowCounts[days] = new Set(historyText.match(/DEMO-S-(?:NEWS|PENDING|CONFLICT)-[A-Z0-9-]+/g) ?? []).size;
   }
