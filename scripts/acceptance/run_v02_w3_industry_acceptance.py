@@ -79,6 +79,23 @@ if os.name == "nt":
     import ctypes
     from ctypes import wintypes
 
+    class _FileTime(ctypes.Structure):
+        _fields_ = (("low", wintypes.DWORD), ("high", wintypes.DWORD))
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("attributes", wintypes.DWORD),
+            ("creation_time", _FileTime),
+            ("last_access_time", _FileTime),
+            ("last_write_time", _FileTime),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        )
+
     _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _KERNEL32.CreateFileW.argtypes = (
         wintypes.LPCWSTR,
@@ -90,6 +107,11 @@ if os.name == "nt":
         wintypes.HANDLE,
     )
     _KERNEL32.CreateFileW.restype = wintypes.HANDLE
+    _KERNEL32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    _KERNEL32.GetFileInformationByHandle.restype = wintypes.BOOL
     _KERNEL32.CloseHandle.argtypes = (wintypes.HANDLE,)
     _KERNEL32.CloseHandle.restype = wintypes.BOOL
 
@@ -97,16 +119,19 @@ if os.name == "nt":
 class _DirectoryGuard:
     """Pin one non-reparse directory and deny its rename/delete on Windows."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, deny_rename: bool = True) -> None:
         self.path = _lexical_absolute(path)
+        self._deny_rename = deny_rename
         self._handle: int | None = None
         self._fd: int | None = None
         before = _directory_identity(self.path)
         if os.name == "nt":
+            desired_access = 0x00000080 | (0x00010000 if deny_rename else 0)
+            share_mode = 0x00000001 if deny_rename else 0x00000001 | 0x00000004
             handle = _KERNEL32.CreateFileW(
                 str(self.path),
-                0x00000080,
-                0x00000001 | 0x00000002,
+                desired_access,
+                share_mode,
                 None,
                 3,
                 0x02000000 | 0x00200000,
@@ -119,20 +144,55 @@ class _DirectoryGuard:
             flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
             self._fd = os.open(self.path, flags)
         try:
+            self.saved_identity = self.identity()
             after = _directory_identity(self.path)
             if before != after:
                 raise AcceptanceBoundaryError(
                     f"acceptance ancestor identity changed while guarded: {self.path}"
                 )
-            self.identity = after
+            self.saved_path_identity = after
         except BaseException:
             self.close()
             raise
 
-    def assert_current(self) -> None:
-        if _directory_identity(self.path) != self.identity:
+    def identity(self) -> tuple[int, int, int, int]:
+        if os.name == "nt":
+            if self._handle is None:
+                raise RuntimeError("directory guard is closed")
+            info = _ByHandleFileInformation()
+            if not _KERNEL32.GetFileInformationByHandle(self._handle, ctypes.byref(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if info.attributes & 0x00000400:
+                raise AcceptanceBoundaryError(
+                    f"reparse acceptance handle rejected: {self.path}"
+                )
+            if not info.attributes & 0x00000010:
+                raise AcceptanceBoundaryError(
+                    f"guarded acceptance handle is not a directory: {self.path}"
+                )
+            return (
+                int(info.volume_serial_number),
+                int(info.file_index_high),
+                int(info.file_index_low),
+                int(info.attributes),
+            )
+        if self._fd is None:
+            raise RuntimeError("directory guard is closed")
+        info = os.fstat(self._fd)
+        if not stat.S_ISDIR(info.st_mode):
             raise AcceptanceBoundaryError(
-                f"guarded acceptance ancestor identity changed: {self.path}"
+                f"guarded acceptance handle is not a directory: {self.path}"
+            )
+        return (int(info.st_dev), int(info.st_ino), int(info.st_mode), 0)
+
+    def assert_current(self) -> None:
+        if self.identity() != self.saved_identity:
+            raise AcceptanceBoundaryError(
+                f"guarded acceptance handle identity changed: {self.path}"
+            )
+        if _directory_identity(self.path) != self.saved_path_identity:
+            raise AcceptanceBoundaryError(
+                f"guarded acceptance path identity changed: {self.path}"
             )
 
     def close(self) -> None:
@@ -189,17 +249,38 @@ def _prepare_acceptance_root(
     root: str | os.PathLike[str],
     *,
     allowed_base: str | os.PathLike[str],
+    trusted_anchor: str | os.PathLike[str] | None = None,
+    deny_rename: bool = True,
     create: bool,
 ) -> _GuardChain:
     selected = _lexical_absolute(root)
     boundary = _lexical_absolute(allowed_base)
+    anchor = _lexical_absolute(trusted_anchor or boundary)
     if not _lexically_within(selected, boundary, allow_equal=True):
         raise AcceptanceBoundaryError("acceptance root escaped lexical .tmp/acceptance boundary")
-    chain = tuple(reversed(selected.parents)) + (selected,)
+    if not _lexically_within(boundary, anchor, allow_equal=True):
+        raise AcceptanceBoundaryError("acceptance allowed base escaped trusted lexical anchor")
+    if not _lexical_exists(anchor):
+        raise AcceptanceBoundaryError("trusted acceptance anchor must be preprovisioned")
+    chain_from_selected = [selected]
+    cursor = selected
+    anchor_text = os.path.normcase(str(anchor))
+    while os.path.normcase(str(cursor)) != anchor_text:
+        parent = cursor.parent
+        if parent == cursor:
+            raise AcceptanceBoundaryError("acceptance root escaped trusted lexical anchor")
+        chain_from_selected.append(parent)
+        cursor = parent
+    chain = tuple(reversed(chain_from_selected))
     guards = _GuardChain([])
     missing = False
     try:
         for candidate in chain:
+            pin_candidate = deny_rename and _lexically_within(
+                candidate,
+                boundary,
+                allow_equal=True,
+            )
             try:
                 os.lstat(candidate)
             except FileNotFoundError:
@@ -213,15 +294,19 @@ def _prepare_acceptance_root(
                     raise AcceptanceBoundaryError(
                         "acceptance root missing segment lacks a guarded parent"
                     )
+                if not guards.guards[-1]._deny_rename:
+                    raise AcceptanceBoundaryError(
+                        "acceptance boundary must be preprovisioned before strong guarding"
+                    )
                 os.mkdir(candidate)
                 guards.assert_current()
-                guards.append(_DirectoryGuard(candidate))
+                guards.append(_DirectoryGuard(candidate, deny_rename=pin_candidate))
                 continue
             if missing:
                 raise AcceptanceBoundaryError(
                     "acceptance root contains an existing descendant below a missing ancestor"
                 )
-            guards.append(_DirectoryGuard(candidate))
+            guards.append(_DirectoryGuard(candidate, deny_rename=pin_candidate))
         guards.assert_current()
         return guards
     except BaseException as error:
@@ -239,10 +324,19 @@ def _prepare_acceptance_root(
 REPO_ROOT = _lexical_absolute(Path(__file__).parents[2])
 ACCEPTANCE_BASE = _lexical_absolute(REPO_ROOT / ".tmp" / "acceptance")
 ACCEPTANCE_ROOT = _lexical_absolute(ACCEPTANCE_BASE / "v0.2-w3")
+_bootstrap_guard = _prepare_acceptance_root(
+    ACCEPTANCE_ROOT,
+    allowed_base=ACCEPTANCE_BASE,
+    trusted_anchor=REPO_ROOT,
+    create=True,
+)
+_bootstrap_guard.close()
 _ACCEPTANCE_ROOT_GUARD = _prepare_acceptance_root(
     ACCEPTANCE_ROOT,
     allowed_base=ACCEPTANCE_BASE,
-    create=True,
+    trusted_anchor=REPO_ROOT,
+    deny_rename=False,
+    create=False,
 )
 
 _ISOLATED_PATHS = {
@@ -365,6 +459,26 @@ def _list_owned_children(
     return children
 
 
+def _cleanup_targets_with_guard(
+    selected_root: Path,
+    root_identity: tuple[int, int, int, int, int],
+    guard: _GuardChain | object,
+) -> tuple[Path, ...]:
+    names = {
+        "acceptance", "cache", "data", "evidence", "logs", "news",
+        "playwright-browsers", "profile", "reports", "results", "run",
+        "temp", "tmp", "tools",
+    }
+    names.update(
+        child.name
+        for child in _list_owned_children(selected_root, root_identity, guard)
+    )
+    return validate_cleanup_targets(
+        [selected_root / name for name in sorted(names)],
+        root=selected_root,
+    )
+
+
 def cleanup_targets(*, root: Path | None = None) -> tuple[Path, ...]:
     selected_root = _lexical_absolute(root or ACCEPTANCE_ROOT)
     guard = _prepare_acceptance_root(
@@ -372,21 +486,9 @@ def cleanup_targets(*, root: Path | None = None) -> tuple[Path, ...]:
         allowed_base=selected_root.parent,
         create=False,
     )
-    names = {
-        "acceptance", "cache", "data", "evidence", "logs", "news",
-        "playwright-browsers", "profile", "reports", "results", "run",
-        "temp", "tmp", "tools",
-    }
     try:
         root_identity = _directory_identity(selected_root)
-        names.update(
-            child.name
-            for child in _list_owned_children(selected_root, root_identity, guard)
-        )
-        return validate_cleanup_targets(
-            [selected_root / name for name in sorted(names)],
-            root=selected_root,
-        )
+        return _cleanup_targets_with_guard(selected_root, root_identity, guard)
     finally:
         guard.close()
 
@@ -1224,7 +1326,7 @@ def _remove_tree_entry(
     elif stat.S_ISDIR(second[2]):
         directory_guard = _DirectoryGuard(lexical_target)
         try:
-            if directory_guard.identity != second:
+            if directory_guard.saved_path_identity != second:
                 raise AcceptanceBoundaryError(
                     f"cleanup directory identity changed before enumeration: {lexical_target}"
                 )
@@ -1300,7 +1402,7 @@ def _remove_disposable_targets(*, root: Path | None = None) -> dict[str, object]
     absent: list[str] = []
     try:
         root_identity = _directory_identity(selected_root)
-        targets = cleanup_targets(root=selected_root)
+        targets = _cleanup_targets_with_guard(selected_root, root_identity, guard)
         for target in targets:
             if _remove_owned_target(
                 target,
@@ -1313,7 +1415,7 @@ def _remove_disposable_targets(*, root: Path | None = None) -> dict[str, object]
                 absent.append(str(target))
         remaining = [
             str(target)
-            for target in cleanup_targets(root=selected_root)
+            for target in _cleanup_targets_with_guard(selected_root, root_identity, guard)
             if _lexical_exists(target)
         ]
         if remaining:

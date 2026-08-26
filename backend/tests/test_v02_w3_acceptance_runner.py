@@ -311,6 +311,115 @@ def test_cleanup_removes_discovered_children_but_preserves_outside_files(
     assert outside.read_text(encoding="utf-8") == "preserve"
 
 
+def test_prepare_acceptance_root_does_not_guard_above_existing_allowed_base(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    allowed_base = tmp_path / "acceptance"
+    allowed_base.mkdir()
+    root = allowed_base / "v0.2-w3"
+    original_guard = runner._DirectoryGuard
+
+    def accessible_guard(path: Path, *, deny_rename: bool = True):
+        selected = Path(path)
+        if selected != allowed_base and not selected.is_relative_to(allowed_base):
+            raise PermissionError(f"unrelated ancestor guard attempted: {selected}")
+        return original_guard(selected, deny_rename=deny_rename)
+
+    monkeypatch.setattr(runner, "_DirectoryGuard", accessible_guard)
+
+    guard = runner._prepare_acceptance_root(
+        root,
+        allowed_base=allowed_base,
+        create=True,
+    )
+    try:
+        assert root.is_dir()
+        guard.assert_current()
+    finally:
+        guard.close()
+
+
+def test_prepare_acceptance_root_uses_identity_chain_then_pins_existing_base(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    trusted_anchor = tmp_path / "repo"
+    trusted_anchor.mkdir()
+    allowed_base = trusted_anchor / ".tmp" / "acceptance"
+    allowed_base.mkdir(parents=True)
+    root = allowed_base / "v0.2-w3"
+    guarded_paths: list[tuple[Path, bool]] = []
+    original_guard = runner._DirectoryGuard
+
+    def recording_guard(path: Path, *, deny_rename: bool = True):
+        selected = Path(path)
+        guarded_paths.append((selected, deny_rename))
+        return original_guard(selected, deny_rename=deny_rename)
+
+    monkeypatch.setattr(runner, "_DirectoryGuard", recording_guard)
+
+    guard = runner._prepare_acceptance_root(
+        root,
+        allowed_base=allowed_base,
+        trusted_anchor=trusted_anchor,
+        create=True,
+    )
+    try:
+        assert guarded_paths[0] == (trusted_anchor, False)
+        assert (allowed_base, True) in guarded_paths
+        assert root.is_dir()
+        guard.assert_current()
+    finally:
+        guard.close()
+
+
+def test_directory_guard_assert_current_rejects_handle_identity_change(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    target = tmp_path / "guarded"
+    target.mkdir()
+    guard = runner._DirectoryGuard(target)
+    saved_identity = guard.saved_identity
+
+    monkeypatch.setattr(
+        guard,
+        "identity",
+        lambda: (*saved_identity[:-1], saved_identity[-1] + 1),
+    )
+
+    try:
+        with pytest.raises(runner.AcceptanceBoundaryError, match="handle identity"):
+            guard.assert_current()
+    finally:
+        guard.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory share-mode contract")
+def test_windows_directory_guard_blocks_rename_and_remove_until_closed(tmp_path) -> None:
+    runner = _load_runner()
+    target = tmp_path / "guarded"
+    renamed = tmp_path / "renamed"
+    target.mkdir()
+    guard = runner._DirectoryGuard(target)
+
+    try:
+        with pytest.raises(PermissionError) as rename_error:
+            target.rename(renamed)
+        assert rename_error.value.winerror in {5, 32}
+        with pytest.raises(PermissionError) as remove_error:
+            target.rmdir()
+        assert remove_error.value.winerror in {5, 32}
+        guard.assert_current()
+    finally:
+        guard.close()
+
+    target.rename(renamed)
+    renamed.rmdir()
+    assert not renamed.exists()
+
+
 @pytest.mark.parametrize("blocked_part", ("root", "ancestor"))
 def test_acceptance_root_rejects_reparse_chain_before_any_write(
     monkeypatch, tmp_path, blocked_part
