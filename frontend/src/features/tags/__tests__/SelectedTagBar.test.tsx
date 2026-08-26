@@ -76,6 +76,33 @@ describe("SelectedTagBar", () => {
       .toEqual(["semiconductor", "storage", "robotics"]);
   });
 
+  it("restores focus to the same active tag after its move control becomes disabled", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const [current, setCurrent] = useState<TagDefinition[]>([tags[0], customTag, tags[1]]);
+      return <SelectedTagBar tags={current} activeId={customTag.id}
+        onActivate={vi.fn()} onRemove={vi.fn()} onReorder={vi.fn()}
+        onMove={(id, offset) => setCurrent((value) => {
+          const source = value.findIndex((tag) => tag.id === id);
+          const target = source + offset;
+          if (source < 0 || target < 0 || target >= value.length) return value;
+          const next = [...value];
+          [next[source], next[target]] = [next[target], next[source]];
+          return next;
+        })} onAdd={vi.fn()} />;
+    }
+    render(<Harness />);
+    const moveLeft = screen.getByRole("button", { name: "将量子传感左移" });
+    moveLeft.focus();
+
+    await user.keyboard("{Enter}");
+
+    expect(within(screen.getByLabelText("已选投研标签")).getAllByRole("button", { name: /^切换到/ })
+      .map((button) => button.getAttribute("aria-label")))
+      .toEqual(["切换到量子传感", "切换到半导体", "切换到存储"]);
+    expect(screen.getByRole("button", { name: "切换到量子传感" })).toHaveFocus();
+  });
+
   it.each([
     ["first built-in", [tags[0], customTag, tags[1]], tags[0].id, customTag.name],
     ["first custom", [customTag, tags[0], tags[1]], customTag.id, tags[0].name],

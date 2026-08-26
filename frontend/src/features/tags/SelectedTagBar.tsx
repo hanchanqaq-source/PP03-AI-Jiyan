@@ -22,6 +22,10 @@ export function SelectedTagBar({ tags, activeId, onActivate, onRemove, onReorder
     nextId?: string;
     previousId?: string;
   } | null>(null);
+  const pendingMoveFocus = useRef<{
+    id: string;
+    beforeOrder: string;
+  } | null>(null);
 
   useLayoutEffect(() => {
     const pending = pendingDeleteFocus.current;
@@ -33,6 +37,28 @@ export function SelectedTagBar({ tags, activeId, onActivate, onRemove, onReorder
       || addRef.current;
     target?.focus();
   }, [activeId, tags]);
+
+  useLayoutEffect(() => {
+    const pending = pendingMoveFocus.current;
+    const currentOrder = tags.map((tag) => tag.id).join("\0");
+    if (!pending || currentOrder === pending.beforeOrder) return;
+    pendingMoveFocus.current = null;
+    activationRefs.current.get(pending.id)?.focus();
+  }, [tags]);
+
+  const moveAndRestoreFocus = (id: string, offset: -1 | 1) => {
+    const pending = { id, beforeOrder: tags.map((tag) => tag.id).join("\0") };
+    pendingMoveFocus.current = pending;
+    try {
+      onMove(id, offset);
+      requestAnimationFrame(() => {
+        if (pendingMoveFocus.current === pending) pendingMoveFocus.current = null;
+      });
+    } catch (error) {
+      pendingMoveFocus.current = null;
+      throw error;
+    }
+  };
 
   return (
     <div aria-label="已选投研标签" className="flex min-w-0 items-center gap-2 border-y border-border/50 bg-background/80 py-2 backdrop-blur">
@@ -60,12 +86,12 @@ export function SelectedTagBar({ tags, activeId, onActivate, onRemove, onReorder
               {tag.name}
             </button>
             {activeId === tag.id && <>
-              <button onClick={() => onMove(tag.id, -1)} disabled={index === 0}
+              <button onClick={() => moveAndRestoreFocus(tag.id, -1)} disabled={index === 0}
                 aria-label={`将${tag.name}左移`}
                 className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-full opacity-70 hover:bg-black/10 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-25">
                 <ChevronLeft className="h-3.5 w-3.5" />
               </button>
-              <button onClick={() => onMove(tag.id, 1)} disabled={index === tags.length - 1}
+              <button onClick={() => moveAndRestoreFocus(tag.id, 1)} disabled={index === tags.length - 1}
                 aria-label={`将${tag.name}右移`}
                 className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-full opacity-70 hover:bg-black/10 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-25">
                 <ChevronRight className="h-3.5 w-3.5" />
