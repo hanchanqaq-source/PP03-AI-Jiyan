@@ -348,3 +348,24 @@ def test_browser_failure_diagnostics_are_written_without_route_mocks() -> None:
     assert "consoleMessages" in script
     assert "failedRequests" in script
     assert ".route(" not in script
+
+
+def test_fixture_overview_derives_evidence_and_expiry_conditions_from_basis_metrics() -> None:
+    runner = _load_runner()
+    report = runner.build_fixture_service().read_report("storage", 90).displayed_trusted_report
+    assert report is not None
+    trusted_by_id = {
+        metric.metric_id: metric
+        for metric in (*report.cycle, *report.metrics, *report.capital)
+        if metric.current_value is not None
+    }
+    basis = [trusted_by_id[metric_id] for metric_id in report.overview.basis_metric_ids]
+    expected_evidence = tuple(dict.fromkeys(
+        item.evidence_id for metric in basis for item in metric.evidence
+    ))
+    expected_conditions = tuple(dict.fromkeys(
+        condition for metric in basis for condition in metric.invalidating_conditions
+    ))
+
+    assert report.overview.evidence_ids == expected_evidence
+    assert report.overview.invalidating_conditions == expected_conditions

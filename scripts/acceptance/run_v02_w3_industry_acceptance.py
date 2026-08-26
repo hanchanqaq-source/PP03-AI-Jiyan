@@ -416,6 +416,11 @@ def _build_report(industry_id: str, config: dict[str, object], document: dict[st
     evidence_ids = tuple(
         item.evidence_id for metric_id in basis for item in trusted[metric_id].evidence
     )
+    invalidating_conditions = tuple(dict.fromkeys(
+        condition
+        for metric_id in basis
+        for condition in trusted[metric_id].invalidating_conditions
+    ))
     completeness = DataCompleteness(len(basis), 2, len(basis) / 2)
     conclusion_values = dict(
         conclusion_id=f"DEMO-{industry_id.upper()}-CONCLUSION-001",
@@ -428,7 +433,7 @@ def _build_report(industry_id: str, config: dict[str, object], document: dict[st
         data_completeness=completeness,
         basis_metric_ids=basis,
         evidence_ids=evidence_ids,
-        invalidating_conditions=("任一演示依据失效时结论撤回",),
+        invalidating_conditions=invalidating_conditions,
     )
     overview = IndustryConclusion(
         **conclusion_values,
@@ -1217,7 +1222,7 @@ def _write_acceptance_evidence(
             for item in command_evidence
         ],
         "test_counts": {
-            "runner_self_tests": "23 passed",
+            "runner_self_tests": "24 passed",
             "backend_offline": next((item.summary for item in command_evidence if item.label == "backend-offline-full"), ""),
             "frontend_main": next((item.summary for item in command_evidence if item.label == "frontend-main-tests"), ""),
             "frontend_legacy": next((item.summary for item in command_evidence if item.label == "frontend-legacy-tests"), ""),
