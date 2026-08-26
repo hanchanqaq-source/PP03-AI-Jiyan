@@ -1,0 +1,3 @@
+# Preprovision only the guarded production fund-request root; ignore all runtime data.
+*
+!.gitignore

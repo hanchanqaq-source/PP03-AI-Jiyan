@@ -1,3 +1,5 @@
 # Preprovision only the safe acceptance anchor; keep all runtime data ignored.
 *
 !.gitignore
+!fund-requests/
+!fund-requests/.gitignore

@@ -372,6 +372,99 @@ def test_default_public_fund_adapter_binds_existing_service_only_to_request_temp
     assert tuple(root.iterdir()) == ()
 
 
+def test_default_production_factory_uses_preprovisioned_fund_root_without_residue(
+    monkeypatch,
+) -> None:
+    # Break caught: runner cleanup removes the default disk root, so a real
+    # production POST returns 502 before the public adapter can report no data.
+    cache_paths: list[Path] = []
+    analyzed_codes: list[str] = []
+    adapters: list[industry_api._RequestScopedFundDataAdapter] = []
+
+    class FakeCache:
+        def __init__(self, path: Path) -> None:
+            cache_paths.append(Path(path))
+
+    class FakeFundDataService:
+        def __init__(self, *, cache: FakeCache) -> None:
+            assert isinstance(cache, FakeCache)
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            assert force_refresh is False
+            analyzed_codes.append(code)
+            return {
+                "code": code,
+                "holdings": {
+                    "data": None,
+                    "meta": {
+                        "status": "error",
+                        "availability_reason": "source_unavailable",
+                    },
+                },
+                "industry_exposure": {
+                    "data": None,
+                    "meta": {
+                        "status": "error",
+                        "availability_reason": "source_unavailable",
+                    },
+                },
+            }
+
+    def adapter_factory() -> industry_api._RequestScopedFundDataAdapter:
+        adapter = industry_api._RequestScopedFundDataAdapter()
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.delenv("VR_ACCEPTANCE_DIR", raising=False)
+    monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
+    monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
+    monkeypatch.setattr(
+        industry_api,
+        "_create_request_scoped_fund_adapter",
+        adapter_factory,
+    )
+    root = Path(__file__).resolve().parents[2] / ".tmp" / "acceptance" / "fund-requests"
+    marker = root / ".gitignore"
+    service = industry_api.create_production_industry_research_service()
+    application = app_module.create_app(industry_research_service=service)
+
+    with TestClient(application, base_url="http://127.0.0.1:8900") as client:
+        response = client.post(
+            "/api/industry-research/storage/fund-relations/resolve",
+            headers=WRITE_HEADERS,
+            json={"fund_codes": ["900001"]},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "resolved",
+        "fund_selection": [
+            {
+                "selection_id": "selection-1",
+                "fund_code": "900001",
+                "selected_in_request": True,
+            }
+        ],
+        "resolutions": [
+            {
+                "selection_id": "selection-1",
+                "fund_code": "900001",
+                "relation": None,
+                "empty_reason": "source_unavailable",
+            }
+        ],
+        "pending_lookthrough_selection_ids": [],
+    }
+    assert analyzed_codes == ["900001"]
+    assert len(adapters) == 1
+    assert adapters[0]._service is None
+    assert len(cache_paths) == 1
+    assert cache_paths[0].name == "fund-cache"
+    assert cache_paths[0].parent.parent == root
+    assert not cache_paths[0].exists()
+    assert tuple(root.iterdir()) == (marker,)
+
+
 def test_default_public_fund_adapter_builds_exact_dynamic_mapping_from_disclosed_classification(
     tmp_path, monkeypatch,
 ) -> None:

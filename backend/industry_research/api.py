@@ -319,7 +319,7 @@ class ProductionIndustryResearchService:
         self._fund_acceptance_root = Path(
             fund_acceptance_root
             or os.environ.get("VR_ACCEPTANCE_DIR")
-            or Path(__file__).resolve().parents[2] / ".tmp" / "acceptance" / "v0.2-w3" / "fund-requests"
+            or Path(__file__).resolve().parents[2] / ".tmp" / "acceptance" / "fund-requests"
         ).absolute()
         self._official_industry_config = official_industry_config
         self._refresh_state_reader = refresh_state_reader

@@ -42,30 +42,40 @@ def test_bootstrap_places_every_runtime_path_under_the_absolute_acceptance_root(
 
 
 def test_git_tracks_acceptance_anchor_marker_and_ignores_runtime_descendants() -> None:
-    marker = Path(".tmp/acceptance/.gitignore")
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", marker.as_posix()],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
+    markers_and_probes = (
+        (
+            Path(".tmp/acceptance/.gitignore"),
+            Path(".tmp/acceptance/v0.2-w3/runtime-probe.json"),
+        ),
+        (
+            Path(".tmp/acceptance/fund-requests/.gitignore"),
+            Path(".tmp/acceptance/fund-requests/runtime-probe.json"),
+        ),
     )
-    ignored = subprocess.run(
-        [
-            "git",
-            "check-ignore",
-            "--quiet",
-            "--no-index",
-            ".tmp/acceptance/v0.2-w3/runtime-probe.json",
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    for marker, runtime_probe in markers_and_probes:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", marker.as_posix()],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        ignored = subprocess.run(
+            [
+                "git",
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                runtime_probe.as_posix(),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
-    assert tracked.returncode == 0, tracked.stderr
-    assert ignored.returncode == 0, ignored.stderr
+        assert tracked.returncode == 0, tracked.stderr
+        assert ignored.returncode == 0, ignored.stderr
 
 
 def test_child_environment_rejects_any_nonempty_credential_like_variable() -> None:
@@ -337,6 +347,27 @@ def test_cleanup_removes_discovered_children_but_preserves_outside_files(
     assert cleanup["remaining"] == []
     assert list(acceptance_root.iterdir()) == []
     assert outside.read_text(encoding="utf-8") == "preserve"
+
+
+def test_cleanup_of_versioned_runner_root_preserves_sibling_fund_marker(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    acceptance_base = tmp_path / "acceptance"
+    acceptance_root = acceptance_base / "v0.2-w3"
+    fund_root = acceptance_base / "fund-requests"
+    acceptance_root.mkdir(parents=True)
+    fund_root.mkdir()
+    (acceptance_root / "runtime.json").write_text("runtime", encoding="utf-8")
+    marker = fund_root / ".gitignore"
+    marker.write_text("*\n!.gitignore\n", encoding="utf-8")
+    monkeypatch.setattr(runner, "ACCEPTANCE_ROOT", acceptance_root)
+
+    cleanup = runner._remove_disposable_targets()
+
+    assert cleanup["remaining"] == []
+    assert list(acceptance_root.iterdir()) == []
+    assert marker.read_text(encoding="utf-8") == "*\n!.gitignore\n"
 
 
 def test_prepare_acceptance_root_does_not_guard_above_existing_allowed_base(
