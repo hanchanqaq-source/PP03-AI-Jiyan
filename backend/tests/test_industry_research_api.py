@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -415,6 +416,13 @@ def test_default_production_factory_uses_preprovisioned_fund_root_without_residu
         adapters.append(adapter)
         return adapter
 
+    @asynccontextmanager
+    async def forbidden_global_lifespan(_application):
+        raise AssertionError(
+            "fund-root route test must not enter global startup maintenance"
+        )
+        yield
+
     monkeypatch.delenv("VR_ACCEPTANCE_DIR", raising=False)
     monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
     monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
@@ -423,17 +431,24 @@ def test_default_production_factory_uses_preprovisioned_fund_root_without_residu
         "_create_request_scoped_fund_adapter",
         adapter_factory,
     )
+    monkeypatch.setattr(app_module, "_lifespan", forbidden_global_lifespan)
     root = Path(__file__).resolve().parents[2] / ".tmp" / "acceptance" / "fund-requests"
     marker = root / ".gitignore"
     service = industry_api.create_production_industry_research_service()
     application = app_module.create_app(industry_research_service=service)
-
-    with TestClient(application, base_url="http://127.0.0.1:8900") as client:
+    client = TestClient(application, base_url="http://127.0.0.1:8900")
+    try:
+        assert application.state.industry_research_service is service
         response = client.post(
             "/api/industry-research/storage/fund-relations/resolve",
             headers=WRITE_HEADERS,
             json={"fund_codes": ["900001"]},
         )
+    finally:
+        try:
+            client.close()
+        finally:
+            service.shutdown()
 
     assert response.status_code == 200
     assert response.json() == {
