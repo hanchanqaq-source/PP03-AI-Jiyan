@@ -40,6 +40,33 @@ def test_bootstrap_places_every_runtime_path_under_the_absolute_acceptance_root(
     assert os.environ["VR_SOURCE_HEALTH_STARTUP"] == "0"
 
 
+def test_git_tracks_acceptance_anchor_marker_and_ignores_runtime_descendants() -> None:
+    marker = Path(".tmp/acceptance/.gitignore")
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", marker.as_posix()],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    ignored = subprocess.run(
+        [
+            "git",
+            "check-ignore",
+            "--quiet",
+            "--no-index",
+            ".tmp/acceptance/v0.2-w3/runtime-probe.json",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert tracked.returncode == 0, tracked.stderr
+    assert ignored.returncode == 0, ignored.stderr
+
+
 def test_child_environment_rejects_any_nonempty_credential_like_variable() -> None:
     runner = _load_runner()
     unsafe = runner.clean_child_environment()
@@ -338,6 +365,36 @@ def test_prepare_acceptance_root_does_not_guard_above_existing_allowed_base(
         guard.assert_current()
     finally:
         guard.close()
+
+
+def test_prepare_acceptance_root_missing_trusted_anchor_fails_before_any_write(
+    monkeypatch, tmp_path
+) -> None:
+    runner = _load_runner()
+    trusted_anchor = tmp_path / "missing-repo"
+    allowed_base = trusted_anchor / ".tmp" / "acceptance"
+    root = allowed_base / "v0.2-w3"
+    mkdir_calls: list[Path] = []
+
+    monkeypatch.setattr(
+        runner.os,
+        "mkdir",
+        lambda path, *args, **kwargs: mkdir_calls.append(Path(path)),
+    )
+
+    with pytest.raises(
+        runner.AcceptanceBoundaryError,
+        match="trusted acceptance anchor must be preprovisioned",
+    ):
+        runner._prepare_acceptance_root(
+            root,
+            allowed_base=allowed_base,
+            trusted_anchor=trusted_anchor,
+            create=True,
+        )
+
+    assert mkdir_calls == []
+    assert not trusted_anchor.exists()
 
 
 def test_prepare_acceptance_root_uses_identity_chain_then_pins_existing_base(
