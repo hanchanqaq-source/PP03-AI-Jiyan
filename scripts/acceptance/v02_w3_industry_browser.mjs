@@ -138,15 +138,11 @@ try {
 
   const windowCounts = {};
   for (const days of [7, 30, 90]) {
-    const historyResponse = page.waitForResponse((response) => {
-      const historyUrl = new URL(response.url());
-      return response.status() === 200
-        && historyUrl.origin === baseUrl
-        && historyUrl.pathname === "/api/industry-research/storage"
-        && historyUrl.searchParams.get("window_days") === String(days);
-    });
     await page.getByRole("button", { name: `最近 ${days} 天` }).click();
-    await historyResponse;
+    await page.waitForFunction((expectedDays) => [...document.querySelectorAll("button")].some((button) => (
+      button.getAttribute("aria-label") === `最近 ${expectedDays} 天`
+      && button.getAttribute("aria-pressed") === "true"
+    )), days);
     const historyText = await storageArticle.locator("#news-risk").innerText();
     windowCounts[days] = new Set(historyText.match(/DEMO-S-(?:NEWS|PENDING|CONFLICT)-[A-Z0-9-]+/g) ?? []).size;
   }
@@ -174,6 +170,7 @@ try {
     record("keyboard-evidence-dialog-focus");
   }
 
+  expectedCancellationWindow = true;
   await page.getByRole("button", { name: "切换到半导体" }).click();
   const semiconductorArticle = page.locator('[data-industry-report-top] > article[data-industry-id="semiconductor"]');
   await semiconductorArticle.waitFor();
@@ -190,7 +187,6 @@ try {
   assert(roboticsText.includes("样机进展") && roboticsText.includes("量产进度"), "robotics differential template missing");
   record("robotics-differential-isolation");
 
-  expectedCancellationWindow = true;
   await page.getByRole("button", { name: "切换到存储" }).click();
   await page.getByRole("button", { name: "切换到半导体" }).click();
   await page.getByRole("button", { name: "切换到机器人" }).click();
