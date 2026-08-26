@@ -5,7 +5,7 @@ import { renderToString } from "react-dom/server";
 import { vi } from "vitest";
 import { decodeIndustryResearchResponse, type IndustryResearchResponse } from "@/lib/api";
 import { EvidenceDrawer } from "../EvidenceDrawer";
-import { IndustryReport, IndustryReportAnchors } from "../IndustryReport";
+import { CANDIDATE_REPORT_SECTIONS, IndustryReport, IndustryReportAnchors } from "../IndustryReport";
 import { formatEmptyReason } from "../sections/shared";
 import { industryResponseWire, researchResponse } from "./fixtures";
 
@@ -105,6 +105,14 @@ describe("continuous evidence-bound industry report", () => {
     expect(conflict).toHaveTextContent("family-b · 下降");
     expect(conflict).toHaveTextContent("-1.8% MOM");
     expect(screen.queryByText(/冲突综合值/)).not.toBeInTheDocument();
+  });
+
+  it("labels top candidate counts as metric-and-event totals", () => {
+    render(reportView(researchResponse(), 90));
+    const unverified = screen.getByText("待核验（指标+事件合计）").closest("div")!;
+    const conflicting = screen.getByText("冲突（指标+事件合计）").closest("div")!;
+    expect(unverified).toHaveTextContent("3");
+    expect(conflicting).toHaveTextContent("2");
   });
 
   it("uses report generatedAt as the common clock, excludes future events, and lets no candidate shift trusted thresholds", () => {
@@ -239,6 +247,7 @@ describe("industry report navigation and evidence dismissal", () => {
     let callback!: IntersectionObserverCallback;
     const disconnect = vi.fn();
     const observe = vi.fn();
+    const replaceState = vi.spyOn(window.history, "replaceState");
     vi.stubGlobal("IntersectionObserver", class {
       constructor(next: IntersectionObserverCallback) { callback = next; }
       observe = observe; disconnect = disconnect; unobserve = vi.fn(); takeRecords = () => []; root = null; rootMargin = ""; thresholds = [];
@@ -246,10 +255,20 @@ describe("industry report navigation and evidence dismissal", () => {
     const view = render(<><IndustryReportAnchors /><section id="overview" /><section id="metrics" /><section id="cycle" /></>);
     act(() => callback([{ isIntersecting: true, intersectionRatio: 1, target: document.getElementById("metrics")! } as unknown as IntersectionObserverEntry], {} as IntersectionObserver));
     expect(screen.getByRole("link", { name: "核心数据" })).toHaveAttribute("aria-current", "location");
+    expect(location.hash).toBe("#metrics");
+    expect(replaceState).toHaveBeenCalledWith(history.state, "", expect.stringMatching(/#metrics$/));
     act(() => { history.pushState(null, "", "#cycle"); window.dispatchEvent(new HashChangeEvent("hashchange")); });
     expect(screen.getByRole("link", { name: "周期" })).toHaveAttribute("aria-current", "location");
+    const previousMetrics = document.getElementById("metrics");
+    view.rerender(<><IndustryReportAnchors key="candidate" sections={CANDIDATE_REPORT_SECTIONS} /><section key="candidate-metrics" id="metrics" /><section key="candidate-news" id="news-risk" /></>);
+    const candidateMetrics = document.getElementById("metrics");
+    expect(candidateMetrics).not.toBe(previousMetrics);
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledWith(candidateMetrics);
+    expect(observe).toHaveBeenCalledWith(document.getElementById("news-risk"));
+    expect(screen.getByRole("link", { name: "核心数据" })).toHaveAttribute("aria-current", "location");
     view.unmount();
-    expect(disconnect).toHaveBeenCalled();
+    expect(disconnect).toHaveBeenCalledTimes(2);
     vi.unstubAllGlobals();
   });
 

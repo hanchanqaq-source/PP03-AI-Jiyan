@@ -2,7 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, LoaderCircle } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { api, type IndustryResearchResponse, type IndustryWindowDays } from "@/lib/api";
-import { IndustryReport, IndustryReportAnchors } from "@/features/industry/IndustryReport";
+import {
+  CANDIDATE_REPORT_SECTIONS,
+  CandidateOnlyIndustryReport,
+  IndustryReport,
+  IndustryReportAnchors,
+} from "@/features/industry/IndustryReport";
 import { REPORT_SECTIONS } from "@/features/industry/sections/shared";
 import { INCOMPLETE_REPORT_MESSAGE } from "@/features/industry/templates";
 import { SelectedTagBar } from "@/features/tags/SelectedTagBar";
@@ -47,8 +52,12 @@ export function IndustryResearch() {
     completeUserNavigation();
   }, [completeUserNavigation, coordinator]);
 
-  const loadReport = useCallback((industryId: string, industryName?: string, userInitiated = false) => {
+  const loadReport = useCallback((industryId: string, industryName?: string, userInitiated = false, preActivated = false) => {
     const name = industryName ?? tagsRef.current.tags.find((tag) => tag.id === industryId)?.name ?? industryId;
+    if (preActivated) {
+      coordinator.cancel();
+      setResponse(null);
+    }
     setRequested({ id: industryId, name });
     setWindowDays(90);
     setLoading(true);
@@ -63,7 +72,7 @@ export function IndustryResearch() {
           setLoading(false);
           return;
         }
-        if (!tagsRef.current.activate(industryId)) {
+        if (!preActivated && !tagsRef.current.activate(industryId)) {
           setLoading(false);
           return;
         }
@@ -80,23 +89,24 @@ export function IndustryResearch() {
   const removeTag = useCallback((id: string) => {
     const current = tagsRef.current;
     const wasActive = current.state.activeId === id;
-    const remaining = current.state.order.filter((tagId) => tagId !== id);
-    if (!current.remove(id)) return false;
+    const saved = current.remove(id);
+    if (saved === false) return false;
     if (!wasActive) return true;
-    if (remaining.length === 0) clearForEmptySelection();
-    else pendingUserIndustryRef.current = remaining[0];
+    if (saved.activeId === "") clearForEmptySelection();
+    else loadReport(saved.activeId, current.tags.find((tag) => tag.id === saved.activeId)?.name, true, true);
     return true;
-  }, [clearForEmptySelection]);
+  }, [clearForEmptySelection, loadReport]);
 
   const confirmTags = useCallback((ids: string[]) => {
     const current = tagsRef.current;
     const activeRemoved = current.state.activeId !== "" && !ids.includes(current.state.activeId);
-    if (!current.replace(ids)) return;
+    const saved = current.replace(ids);
+    if (saved === false) return;
     setSelectorOpen(false);
     if (!activeRemoved) return;
-    if (ids.length === 0) clearForEmptySelection();
-    else pendingUserIndustryRef.current = ids[0];
-  }, [clearForEmptySelection]);
+    if (saved.activeId === "") clearForEmptySelection();
+    else loadReport(saved.activeId, current.tags.find((tag) => tag.id === saved.activeId)?.name, true, true);
+  }, [clearForEmptySelection, loadReport]);
 
   useEffect(() => {
     const active = tags.activeTag;
@@ -112,6 +122,10 @@ export function IndustryResearch() {
     ? tags.tags.find((tag) => tag.id === response.displayedIndustryId)?.name ?? requested?.name ?? response.displayedIndustryId
     : requested?.name ?? tags.activeTag?.name ?? "当前行业";
   const report = response?.displayedTrustedReport ?? null;
+  const candidateOnly = report === null ? response?.candidateEvidence ?? null : null;
+  const anchorKey = report
+    ? `${report.industryId}:${report.displayedTrustedSnapshotId ?? "none"}`
+    : candidateOnly ? `${candidateOnly.industryId}:${candidateOnly.candidateSnapshotId}` : null;
 
   return (
     <div>
@@ -119,7 +133,8 @@ export function IndustryResearch() {
       <div className="sticky top-0 z-30 mb-5 rounded-xl border border-border/60 bg-background/95 px-2 backdrop-blur">
         <SelectedTagBar tags={tags.tags} activeId={tags.state.activeId} onActivate={(id) => loadReport(id, undefined, true)}
           onRemove={removeTag} onReorder={tags.reorder} onMove={tags.move} onAdd={() => setSelectorOpen(true)} />
-        {report && <IndustryReportAnchors />}
+        {!loading && report && <IndustryReportAnchors key={anchorKey ?? undefined} />}
+        {!loading && candidateOnly && <IndustryReportAnchors key={anchorKey ?? undefined} sections={CANDIDATE_REPORT_SECTIONS} />}
       </div>
       {tags.errorMessage && !selectorOpen && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{tags.errorMessage}</div>}
       {error && <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertCircle className="h-4 w-4" />{error}</div>}
@@ -127,12 +142,13 @@ export function IndustryResearch() {
       <div ref={reportTopRef} data-industry-report-top>
       {loading ? <div role="status" className="flex min-h-[360px] flex-col items-center justify-center rounded-2xl border border-border/70"><LoaderCircle className="h-6 w-6 animate-spin text-primary motion-reduce:animate-none" /><p className="mt-3 text-sm">正在读取{requested?.name ?? "当前行业"}的完整可信报告</p><p className="mt-1 text-xs leading-5 text-muted-foreground">原报告已隐藏，避免切换期间串用行业数据。</p></div>
         : report && response ? <IndustryReport report={report} candidate={response.candidateEvidence} industryName={displayedName} refreshRun={response.refreshRun} windowDays={windowDays} onWindowDaysChange={setWindowDays} />
+          : candidateOnly ? <CandidateOnlyIndustryReport candidate={candidateOnly} industryName={displayedName} windowDays={windowDays} onWindowDaysChange={setWindowDays} />
           : response?.templateStatus === "building" ? (
         <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center">
           <p className="text-lg font-semibold">{INCOMPLETE_REPORT_MESSAGE}</p>
           <p className="mt-2 text-sm text-muted-foreground">{displayedName}已进入共享标签库；当前状态为建设中。</p>
         </div>
-      ) : !error && <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center"><p className="text-lg font-semibold">暂无可靠数据</p><p className="mt-2 text-sm text-muted-foreground">{tags.state.ids.length === 0 ? "当前未选择行业标签；暂无可显示的可信快照。" : "当前行业尚无可显示的可信快照。"}</p></div>}
+      ) : <div className="rounded-2xl border border-dashed border-border/70 px-6 py-20 text-center"><p className="text-lg font-semibold">暂无可靠数据</p><p className="mt-2 text-sm text-muted-foreground">{tags.state.ids.length === 0 ? "当前未选择行业标签；暂无可显示的可信快照。" : `当前已选择${tags.activeTag?.name ?? displayedName}，但暂无可信快照。`}</p></div>}
       </div>
       <TagSelector open={selectorOpen} selectedIds={tags.state.ids} customTags={tags.customTags}
         externalError={tags.errorMessage} onCreate={(name) => {

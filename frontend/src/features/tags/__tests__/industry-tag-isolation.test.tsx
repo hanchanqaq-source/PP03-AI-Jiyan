@@ -103,6 +103,30 @@ describe("industry tag state and request isolation", () => {
     expect(localStorage.getItem("vr-page-tags:industry_research")).toBe("{broken");
   });
 
+  it("returns the persisted state from successful replace and remove operations", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const tags = usePageTags("industry_research");
+      const [replaceResult, setReplaceResult] = useState("not-run");
+      const [removeResult, setRemoveResult] = useState("not-run");
+      return <div>
+        <button onClick={() => setReplaceResult(JSON.stringify(tags.replace(["robotics"])))}>仅保留机器人</button>
+        <button onClick={() => setRemoveResult(JSON.stringify(tags.remove("robotics")))}>删除机器人</button>
+        <output aria-label="成功替换结果">{replaceResult}</output>
+        <output aria-label="成功删除结果">{removeResult}</output>
+      </div>;
+    }
+    render(<Harness />);
+
+    await user.click(screen.getByRole("button", { name: "仅保留机器人" }));
+    expect(screen.getByLabelText("成功替换结果")).toHaveTextContent('"activeId":"robotics"');
+    expect(screen.getByLabelText("成功替换结果")).toHaveTextContent('"order":["robotics"]');
+
+    await user.click(screen.getByRole("button", { name: "删除机器人" }));
+    expect(screen.getByLabelText("成功删除结果")).toHaveTextContent('"activeId":""');
+    expect(screen.getByLabelText("成功删除结果")).toHaveTextContent('"order":[]');
+  });
+
   it("returns false and preserves active state when activate refuses corrupt storage", async () => {
     const user = userEvent.setup();
     function Harness() {

@@ -1,13 +1,13 @@
 import { useLayoutEffect, useRef } from "react";
 import { ChevronLeft, ChevronRight, GripVertical, Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { TagDefinition } from "./types";
+import type { PageTagState, TagDefinition } from "./types";
 
 interface SelectedTagBarProps {
   tags: TagDefinition[];
   activeId: string;
   onActivate: (id: string) => void;
-  onRemove: (id: string) => boolean | void;
+  onRemove: (id: string) => boolean | PageTagState | void;
   onReorder: (sourceId: string, targetId: string) => void;
   onMove: (id: string, offset: -1 | 1) => void;
   onAdd: () => void;

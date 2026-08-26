@@ -25,12 +25,11 @@ export function usePageTags(pageKey: PageKey) {
   const replace = useCallback((ids: string[]) => {
     try {
       const unique = Array.from(new Set(ids.filter((id) => catalog.byId.has(id))));
-      update({
+      return update({
         ids: unique,
         order: unique,
         activeId: unique.includes(state.activeId) ? state.activeId : unique[0] || "",
       });
-      return true;
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "标签选择保存失败，请稍后重试");
       return false;
@@ -41,9 +40,10 @@ export function usePageTags(pageKey: PageKey) {
     try {
       if (catalog.byId.get(id)?.kind === "custom") {
         deleteCustomTag(id);
-        setState(loadPageTagState(pageKey));
+        const saved = loadPageTagState(pageKey);
+        setState(saved);
         setErrorMessage(null);
-        return true;
+        return saved;
       }
       return replace(state.order.filter((tagId) => tagId !== id));
     } catch (error) {

@@ -11,6 +11,17 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function candidateOnlyWire() {
+  const wire = industryResponseWire("storage");
+  wire.displayed_industry_id = null;
+  wire.displayed_trusted_report = null;
+  wire.refresh_run.displayed_trusted_snapshot_id = null;
+  wire.refresh_run.displayed_raw_snapshot_id = null;
+  wire.refresh_run.displayed_evidence_snapshot_id = null;
+  wire.candidate_evidence.unverified_events[1].occurred_at = "2026-06-01T00:00:00+00:00";
+  return wire;
+}
+
 describe("industry research page data boundary", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -37,6 +48,7 @@ describe("industry research page data boundary", () => {
     expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
     expect(location.hash).toBe("");
+    expect(screen.getByRole("link", { name: "总览" })).toHaveAttribute("aria-current", "location");
   });
 
   it("treats deleting the active tag bar item as user navigation", async () => {
@@ -58,6 +70,50 @@ describe("industry research page data boundary", () => {
     expect(location.hash).toBe("");
   });
 
+  it("atomically cancels an initial pending report and immediately loads the persisted next active tag", async () => {
+    const user = userEvent.setup();
+    const storage = deferred<Response>();
+    const semiconductor = deferred<Response>();
+    let storageSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      if (String(input).includes("/storage?")) {
+        storageSignal = init?.signal ?? undefined;
+        return storage.promise;
+      }
+      return semiconductor.promise;
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByText(/正在读取存储/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "删除存储" }));
+
+    expect(storageSignal?.aborted).toBe(true);
+    expect(await screen.findByText(/正在读取半导体/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到半导体" })).toHaveAttribute("aria-pressed", "true");
+    await act(async () => storage.resolve(jsonResponse(industryResponseWire("storage"))));
+    expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+    await act(async () => semiconductor.resolve(jsonResponse(industryResponseWire("semiconductor"))));
+    expect(await screen.findByRole("article", { name: "半导体行业研究报告" })).toBeInTheDocument();
+  });
+
+  it("keeps the persisted next active tag but never restores the old report when its GET fails", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).includes("/storage?")) return jsonResponse(industryResponseWire("storage"));
+      throw new Error("offline");
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "删除存储" }));
+
+    expect(await screen.findByText(/行业报告读取失败/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到半导体" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+    expect(screen.getByText("暂无可靠数据")).toBeInTheDocument();
+    expect(screen.getByText("当前已选择半导体，但暂无可信快照。")).toBeInTheDocument();
+  });
+
   it("treats selector removal of the active tag as user navigation", async () => {
     const user = userEvent.setup();
     const scrollIntoView = vi.fn();
@@ -77,6 +133,33 @@ describe("industry research page data boundary", () => {
     expect(await screen.findByRole("article", { name: "半导体行业研究报告" })).toBeInTheDocument();
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
     expect(location.hash).toBe("");
+  });
+
+  it("atomically applies selector replacement while the initial request is pending and ignores its late success", async () => {
+    const user = userEvent.setup();
+    const storage = deferred<Response>();
+    const semiconductor = deferred<Response>();
+    let storageSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      if (String(input).includes("/storage?")) {
+        storageSignal = init?.signal ?? undefined;
+        return storage.promise;
+      }
+      return semiconductor.promise;
+    });
+    render(<IndustryResearch />);
+    expect(await screen.findByText(/正在读取存储/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    const dialog = screen.getByRole("dialog", { name: "添加投研标签" });
+    await user.click(within(dialog).getByRole("checkbox", { name: "存储" }));
+    await user.click(within(dialog).getByRole("button", { name: "确认添加" }));
+
+    expect(storageSignal?.aborted).toBe(true);
+    expect(await screen.findByText(/正在读取半导体/)).toBeInTheDocument();
+    await act(async () => storage.resolve(jsonResponse(industryResponseWire("storage"))));
+    expect(screen.queryByRole("article", { name: "存储行业研究报告" })).not.toBeInTheDocument();
+    await act(async () => semiconductor.resolve(jsonResponse(industryResponseWire("semiconductor"))));
+    expect(await screen.findByRole("article", { name: "半导体行业研究报告" })).toBeInTheDocument();
   });
 
   it("cancels the coordinator and clears all report state when the user deletes the final tag", async () => {
@@ -179,11 +262,33 @@ describe("industry research page data boundary", () => {
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
     expect(screen.getByText(/正在读取机器人/)).toBeInTheDocument();
     expect(screen.queryByRole("article", { name: /行业研究报告/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "行业报告内部导航" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
 
     await act(async () => robotics.resolve(jsonResponse(industryResponseWire("robotics"))));
     expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
     expect(screen.queryByText("DRAM 价格")).not.toBeInTheDocument();
+  });
+
+  it("renders decoder-validated candidate-only evidence without inventing a trusted report", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(candidateOnlyWire()));
+    render(<IndustryResearch />);
+
+    const article = await screen.findByRole("article", { name: "存储候选证据报告" });
+    expect(article).toHaveTextContent("暂无可信快照");
+    expect(article).toHaveTextContent("待核验候选指标");
+    expect(article).toHaveTextContent("storage_conflict · 冲突值并列");
+    expect(article).toHaveTextContent("E-CONFLICT-A");
+    expect(article).toHaveTextContent("STORAGE-CANDIDATE-RECENT");
+    expect(article).toHaveTextContent("STORAGE-CANDIDATE-OLD");
+    expect(article).toHaveTextContent("STORAGE-CONFLICT-30");
+    expect(article).toHaveTextContent("支持证据 E-CONFLICT-A");
+    expect(article).toHaveTextContent("反驳证据 E-CONFLICT-B");
+    expect(article).not.toHaveTextContent("行业总览");
+    expect(article).not.toHaveTextContent("DRAM 价格");
+    expect(screen.getByRole("link", { name: "核心数据" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "新闻与风险" })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "周期" })).not.toBeInTheDocument();
   });
 
   it("uses one compound sticky region and updates the current anchor in the URL", async () => {
