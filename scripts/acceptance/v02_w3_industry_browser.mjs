@@ -410,6 +410,23 @@ try {
   const selectedTagOrder = async () => page.locator('[data-testid^="selected-tag-"]').evaluateAll(
     (nodes) => nodes.map((node) => node.getAttribute("data-testid")?.slice("selected-tag-".length) ?? ""),
   );
+  const initialOrder = await selectedTagOrder();
+  const initialIndex = initialOrder.indexOf(customTagId);
+  assert(initialIndex >= 0, "custom tag missing from the actual order");
+  let preparedIndex = initialIndex;
+  let prepareCustomMoveRight = { required: false, initialOrder, initialIndex, preparedOrder: initialOrder, preparedIndex };
+  if (initialIndex === 0) {
+    const customMoveRight = page.getByRole("button", { name: "将先进封装验收右移" });
+    await customMoveRight.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(({ tagId, expectedIndex }) => [...document.querySelectorAll('[data-testid^="selected-tag-"]')]
+      .findIndex((node) => node.getAttribute("data-testid") === `selected-tag-${tagId}`) === expectedIndex,
+    { tagId: customTagId, expectedIndex: initialIndex + 1 });
+    const preparedOrder = await selectedTagOrder();
+    preparedIndex = preparedOrder.indexOf(customTagId);
+    assert(preparedIndex === initialIndex + 1, `custom tag right-move preparation failed: ${initialIndex} -> ${preparedIndex}`);
+    prepareCustomMoveRight = { required: true, initialOrder, initialIndex, preparedOrder, preparedIndex };
+  }
   const beforeOrder = await selectedTagOrder();
   const beforeIndex = beforeOrder.indexOf(customTagId);
   assert(beforeIndex > 0, `custom tag cannot move left from index ${beforeIndex}`);
@@ -430,7 +447,7 @@ try {
   assert(focusState.focusedControlLabel?.includes("先进封装验收"), `unexpected reordered focus: ${focusState.focusedControlLabel}`);
   const focusedControlLabel = focusState.focusedControlLabel;
   record("keyboard-tag-reorder-focus", {
-    customTagId, beforeOrder, afterOrder, beforeIndex, afterIndex, focusedControlLabel,
+    customTagId, prepareCustomMoveRight, beforeOrder, afterOrder, beforeIndex, afterIndex, focusedControlLabel,
   });
 
   await page.evaluate(() => {

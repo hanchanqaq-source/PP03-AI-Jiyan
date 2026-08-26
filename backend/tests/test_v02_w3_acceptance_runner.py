@@ -562,12 +562,15 @@ def test_browser_proves_focus_real_reorder_and_uncovered_sticky_banners() -> Non
         "afterOrder",
         "beforeIndex",
         "afterIndex",
+        "prepareCustomMoveRight",
+        "preparedIndex",
         "focusedControlLabel",
         "stickyBottom",
         "oldBannerTop",
         "demoBannerTop",
     ):
         assert token in script
+    assert "preparedIndex === initialIndex + 1" in script
     assert "afterIndex === beforeIndex - 1" in script
     assert "window.scrollTo(0, 0)" in script
     assert "await oldSnapshotBanner.isVisible()" in script
