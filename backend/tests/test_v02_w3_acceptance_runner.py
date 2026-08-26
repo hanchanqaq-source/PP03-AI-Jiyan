@@ -318,3 +318,20 @@ def test_console_output_falls_back_safely_when_host_encoding_is_gbk(monkeypatch)
     runner.write_console_output("37 files ✔\n")
 
     assert console.buffer.getvalue().decode("gbk") == "37 files \\u2714\n"
+
+
+def test_listener_pid_must_equal_or_descend_from_the_owned_process_root() -> None:
+    runner = _load_runner()
+    netstat = """
+      TCP    127.0.0.1:60785        0.0.0.0:0              LISTENING       40988
+      TCP    127.0.0.1:60786        0.0.0.0:0              LISTENING       50000
+    """
+
+    assert runner.listening_pid_for_port(netstat, 60785) == 40988
+    assert runner.pid_is_owned_by(43904, 43904, {}) is True
+    assert runner.pid_is_owned_by(43904, 40988, {40988: 43904}) is True
+    assert runner.pid_is_owned_by(43904, 40988, {40988: 40000, 40000: 43904}) is True
+    assert runner.pid_is_owned_by(43904, 40988, {40988: 1}) is False
+    assert runner.pid_is_owned_by(43904, 40988, {40988: 40000, 40000: 40988}) is False
+    with pytest.raises(RuntimeError, match="no unique loopback listener"):
+        runner.listening_pid_for_port(netstat, 60787)

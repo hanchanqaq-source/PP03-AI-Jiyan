@@ -868,7 +868,81 @@ def _wait_for_http(url: str, process: subprocess.Popen[str], timeout: float = 30
     raise RuntimeError(f"owned service did not become ready: {url} ({last_error})")
 
 
-def _assert_pid_owns_port(pid: int, port: int) -> None:
+def listening_pid_for_port(netstat_output: str, port: int) -> int:
+    pattern = re.compile(
+        rf"^\s*TCP\s+127\.0\.0\.1:{port}\s+\S+\s+LISTENING\s+(\d+)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    matches = {int(match.group(1)) for match in pattern.finditer(netstat_output)}
+    if len(matches) != 1:
+        raise RuntimeError(f"no unique loopback listener for 127.0.0.1:{port}: {sorted(matches)}")
+    return matches.pop()
+
+
+def pid_is_owned_by(root_pid: int, candidate_pid: int, parent_by_pid: dict[int, int]) -> bool:
+    current = candidate_pid
+    visited: set[int] = set()
+    while current > 0 and current not in visited:
+        if current == root_pid:
+            return True
+        visited.add(current)
+        current = parent_by_pid.get(current, 0)
+    return False
+
+
+def _windows_parent_pid_map() -> dict[int, int]:
+    if os.name != "nt":
+        raise RuntimeError("Windows process ownership snapshot requested on a non-Windows host")
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    process_first = kernel32.Process32FirstW
+    process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    process_first.restype = wintypes.BOOL
+    process_next = kernel32.Process32NextW
+    process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    process_next.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    snapshot = create_snapshot(0x00000002, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    parents: dict[int, int] = {}
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not process_first(snapshot, ctypes.byref(entry)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        while True:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            if not process_next(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        close_handle(snapshot)
+    return parents
+
+
+def _assert_pid_owns_port(pid: int, port: int) -> int:
     if os.name != "nt":
         raise RuntimeError("Task10 PID ownership verifier currently requires the approved Windows host")
     completed = subprocess.run(
@@ -879,12 +953,13 @@ def _assert_pid_owns_port(pid: int, port: int) -> None:
         capture_output=True,
         check=True,
     )
-    pattern = re.compile(
-        rf"^\s*TCP\s+127\.0\.0\.1:{port}\s+\S+\s+LISTENING\s+{pid}\s*$",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    if pattern.search(completed.stdout) is None:
-        raise RuntimeError(f"PID ownership mismatch for 127.0.0.1:{port}; expected {pid}")
+    listener_pid = listening_pid_for_port(completed.stdout, port)
+    if not pid_is_owned_by(pid, listener_pid, _windows_parent_pid_map()):
+        raise RuntimeError(
+            f"PID ownership mismatch for 127.0.0.1:{port}; "
+            f"owned root {pid}, listener {listener_pid}"
+        )
+    return listener_pid
 
 
 def _terminate_owned_process(process: subprocess.Popen[str] | None, label: str) -> dict[str, object]:
@@ -1027,8 +1102,8 @@ def _run_browser_phase(evidence: list[CommandEvidence]) -> dict[str, object]:
         )
         _wait_for_http(f"{backend_url}/api/industry-research/storage?window_days=90", backend_process)
         _wait_for_http(f"{frontend_url}/industry-research", frontend_process)
-        _assert_pid_owns_port(backend_process.pid, backend_port)
-        _assert_pid_owns_port(frontend_process.pid, frontend_port)
+        backend_listener_pid = _assert_pid_owns_port(backend_process.pid, backend_port)
+        frontend_listener_pid = _assert_pid_owns_port(frontend_process.pid, frontend_port)
 
         browser_environment = dict(tools_environment)
         browser_environment.update({
@@ -1078,7 +1153,9 @@ def _run_browser_phase(evidence: list[CommandEvidence]) -> dict[str, object]:
             "browser_results": browser_results,
             "screenshot_path": screenshot,
             "backend_pid": backend_process.pid,
+            "backend_listener_pid": backend_listener_pid,
             "frontend_pid": frontend_process.pid,
+            "frontend_listener_pid": frontend_listener_pid,
             "browser_runner_pid": browser_process.pid,
             "backend_port": backend_port,
             "frontend_port": frontend_port,
@@ -1140,7 +1217,7 @@ def _write_acceptance_evidence(
             for item in command_evidence
         ],
         "test_counts": {
-            "runner_self_tests": "21 passed",
+            "runner_self_tests": "22 passed",
             "backend_offline": next((item.summary for item in command_evidence if item.label == "backend-offline-full"), ""),
             "frontend_main": next((item.summary for item in command_evidence if item.label == "frontend-main-tests"), ""),
             "frontend_legacy": next((item.summary for item in command_evidence if item.label == "frontend-legacy-tests"), ""),
@@ -1151,7 +1228,9 @@ def _write_acceptance_evidence(
             "chromium_version": browser_results["chromiumVersion"],
             "chromium_executable": browser["preflight"]["executablePath"],
             "backend_pid": browser["backend_pid"],
+            "backend_listener_pid": browser["backend_listener_pid"],
             "frontend_pid": browser["frontend_pid"],
+            "frontend_listener_pid": browser["frontend_listener_pid"],
             "browser_runner_pid": browser["browser_runner_pid"],
             "backend_port": browser["backend_port"],
             "frontend_port": browser["frontend_port"],
