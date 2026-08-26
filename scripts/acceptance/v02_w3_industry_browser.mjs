@@ -54,10 +54,34 @@ fs.mkdirSync(profileDir, { recursive: true });
 const consoleMessages = [];
 const pageErrors = [];
 const failedRequests = [];
+const expectedCancelledRequests = [];
+const blockingFailedRequests = [];
 const network = [];
 const responses = [];
 const checks = [];
 const record = (name, details = {}) => checks.push({ name, status: "pass", ...details });
+let expectedCancellationWindow = false;
+const expectedIndustryPaths = new Set([
+  "/api/industry-research/storage",
+  "/api/industry-research/semiconductor",
+  "/api/industry-research/robotics",
+]);
+
+function isExpectedIndustryCancellation(entry) {
+  if (!expectedCancellationWindow || entry.method !== "GET" || entry.failure !== "net::ERR_ABORTED") return false;
+  let parsed;
+  try {
+    parsed = new URL(entry.url);
+  } catch {
+    return false;
+  }
+  const windowDays = parsed.searchParams.get("window_days");
+  const onlyWindowDays = [...parsed.searchParams.keys()].every((key) => key === "window_days");
+  return parsed.origin === baseUrl
+    && expectedIndustryPaths.has(parsed.pathname)
+    && onlyWindowDays
+    && ["7", "30", "90"].includes(windowDays);
+}
 
 const context = await chromium.launchPersistentContext(profileDir, {
   executablePath,
@@ -81,11 +105,16 @@ try {
   page.on("pageerror", (error) => pageErrors.push(String(error)));
   page.on("request", (request) => network.push({ method: request.method(), url: request.url() }));
   page.on("response", (response) => responses.push({ status: response.status(), url: response.url() }));
-  page.on("requestfailed", (request) => failedRequests.push({
-    method: request.method(),
-    url: request.url(),
-    failure: request.failure()?.errorText ?? "unknown",
-  }));
+  page.on("requestfailed", (request) => {
+    const entry = {
+      method: request.method(),
+      url: request.url(),
+      failure: request.failure()?.errorText ?? "unknown",
+    };
+    failedRequests.push(entry);
+    if (isExpectedIndustryCancellation(entry)) expectedCancelledRequests.push(entry);
+    else blockingFailedRequests.push(entry);
+  });
 
   await page.goto(`${baseUrl}/industry-research`, { waitUntil: "networkidle" });
   await page.getByRole("button", { name: "切换到存储" }).click();
@@ -153,6 +182,7 @@ try {
   assert(roboticsText.includes("样机进展") && roboticsText.includes("量产进度"), "robotics differential template missing");
   record("robotics-differential-isolation");
 
+  expectedCancellationWindow = true;
   await page.getByRole("button", { name: "切换到存储" }).click();
   await page.getByRole("button", { name: "切换到半导体" }).click();
   await page.getByRole("button", { name: "切换到机器人" }).click();
@@ -200,6 +230,7 @@ try {
 
   await page.getByRole("button", { name: "切换到存储" }).click();
   await storageArticle.waitFor();
+  expectedCancellationWindow = false;
   await page.setViewportSize({ width: 1440, height: 1100 });
   const bodyFont = await page.locator("body").evaluate((node) => Number.parseFloat(getComputedStyle(node).fontSize));
   const paragraphFont = await storageArticle.locator("p").first().evaluate((node) => Number.parseFloat(getComputedStyle(node).fontSize));
@@ -217,8 +248,8 @@ try {
 
   assert(consoleMessages.length === 0, `console errors/warnings: ${JSON.stringify(consoleMessages)}`);
   assert(pageErrors.length === 0, `page errors: ${JSON.stringify(pageErrors)}`);
-  assert(failedRequests.length === 0, `blocking request failures: ${JSON.stringify(failedRequests)}`);
-  record("console-pageerror-requestfailed-clean");
+  assert(blockingFailedRequests.length === 0, `blocking request failures: ${JSON.stringify(blockingFailedRequests)}`);
+  record("console-pageerror-requestfailed-classified", { expectedCancellationCount: expectedCancelledRequests.length });
 
   fs.writeFileSync(path.join(outputDir, "browser-results.json"), `${JSON.stringify({
     status: "pass",
@@ -231,6 +262,8 @@ try {
     consoleMessages,
     pageErrors,
     failedRequests,
+    expectedCancelledRequests,
+    blockingFailedRequests,
     network,
     responses,
   }, null, 2)}\n`, "utf8");
@@ -246,6 +279,8 @@ try {
     consoleMessages,
     pageErrors,
     failedRequests,
+    expectedCancelledRequests,
+    blockingFailedRequests,
     network,
     responses,
   };

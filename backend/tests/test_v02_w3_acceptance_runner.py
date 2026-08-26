@@ -91,16 +91,46 @@ def test_network_gate_rejects_enterprise_paid_or_live_refresh_requests(entry: di
         runner.validate_network_log([entry], allowed_origins={"http://127.0.0.1:49152"})
 
 
-def test_network_gate_allows_only_loopback_frontend_and_api_reads() -> None:
+def test_network_gate_allows_loopback_reads_and_exact_product_font_assets() -> None:
     runner = _load_runner()
-    runner.validate_network_log(
+    summary = runner.validate_network_log(
         [
             {"url": "http://127.0.0.1:49152/industry-research", "method": "GET"},
             {"url": "http://127.0.0.1:49152/api/industry-research/storage?window_days=90", "method": "GET"},
             {"url": "http://127.0.0.1:49153/api/industry-research/robotics?window_days=30", "method": "GET"},
+            {
+                "url": "https://fonts.googleapis.com/css2?family=Inter:wght@400&display=swap",
+                "method": "GET",
+            },
+            {
+                "url": "https://fonts.gstatic.com/s/inter/v20/example.woff2",
+                "method": "GET",
+            },
         ],
         allowed_origins={"http://127.0.0.1:49152", "http://127.0.0.1:49153"},
     )
+
+    assert summary == {
+        "loopback_request_count": 3,
+        "static_font_request_count": 2,
+        "static_font_origins": ["https://fonts.googleapis.com", "https://fonts.gstatic.com"],
+    }
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"url": "https://fonts.googleapis.com/metadata/fonts", "method": "GET"},
+        {"url": "https://fonts.googleapis.com/css2?family=Inter", "method": "POST"},
+        {"url": "https://fonts.gstatic.com/s/inter/v20/example.js", "method": "GET"},
+        {"url": "https://fonts.gstatic.com/s/inter/v20/example.woff2?token=secret", "method": "GET"},
+    ],
+)
+def test_network_gate_rejects_non_font_traffic_on_static_font_origins(entry: dict[str, str]) -> None:
+    runner = _load_runner()
+
+    with pytest.raises(runner.AcceptanceBoundaryError, match="network"):
+        runner.validate_network_log([entry], allowed_origins={"http://127.0.0.1:49152"})
 
 
 def test_cleanup_rejects_outside_paths_and_accepts_owned_disposable_descendants() -> None:
@@ -400,3 +430,19 @@ def test_browser_evidence_drawer_contract_matches_production_labels() -> None:
     ):
         assert f'"{label}"' in script
     assert '"数据来源"' not in script
+
+
+def test_browser_only_classifies_exact_in_window_industry_aborts_as_expected() -> None:
+    script = (REPO_ROOT / "scripts" / "acceptance" / "v02_w3_industry_browser.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "expectedCancellationWindow" in script
+    assert 'entry.method !== "GET"' in script
+    assert 'entry.failure !== "net::ERR_ABORTED"' in script
+    assert "parsed.origin === baseUrl" in script
+    for industry_id in ("storage", "semiconductor", "robotics"):
+        assert f'"/api/industry-research/{industry_id}"' in script
+    assert 'parsed.searchParams.get("window_days")' in script
+    assert "blockingFailedRequests.length === 0" in script
+    assert "expectedCancelledRequests" in script

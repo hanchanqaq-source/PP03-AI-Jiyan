@@ -13,7 +13,7 @@ import socket
 import subprocess
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 from urllib.request import build_opener, ProxyHandler
 
 
@@ -186,8 +186,11 @@ def validate_network_log(
     entries: list[dict[str, str]],
     *,
     allowed_origins: set[str],
-) -> None:
+) -> dict[str, object]:
     normalized_origins = {origin.rstrip("/") for origin in allowed_origins}
+    loopback_count = 0
+    static_font_count = 0
+    static_font_origins: set[str] = set()
     for entry in entries:
         url = entry.get("url", "")
         method = entry.get("method", "GET").upper()
@@ -195,14 +198,43 @@ def validate_network_log(
         if parsed.scheme in {"data", "blob", "about"}:
             continue
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        if origin not in normalized_origins:
-            raise AcceptanceBoundaryError("network request left approved loopback origins")
-        if method not in {"GET", "HEAD", "OPTIONS"}:
-            raise AcceptanceBoundaryError("network request attempted a write or Live refresh")
-        if parsed.hostname != "127.0.0.1":
-            raise AcceptanceBoundaryError("network request was not loopback-only")
-        if parsed.path.endswith("/refresh"):
-            raise AcceptanceBoundaryError("network request attempted production refresh")
+        if origin in normalized_origins:
+            if method not in {"GET", "HEAD", "OPTIONS"}:
+                raise AcceptanceBoundaryError("network request attempted a write or Live refresh")
+            if parsed.hostname != "127.0.0.1":
+                raise AcceptanceBoundaryError("network approved origin was not loopback")
+            if parsed.path.endswith("/refresh"):
+                raise AcceptanceBoundaryError("network request attempted production refresh")
+            loopback_count += 1
+            continue
+
+        query_keys = [key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)]
+        google_stylesheet = (
+            origin == "https://fonts.googleapis.com"
+            and method == "GET"
+            and parsed.path == "/css2"
+            and "family" in query_keys
+            and set(query_keys).issubset({"family", "display"})
+            and not parsed.fragment
+        )
+        google_font_file = (
+            origin == "https://fonts.gstatic.com"
+            and method == "GET"
+            and parsed.path.startswith("/s/")
+            and parsed.path.endswith(".woff2")
+            and not parsed.query
+            and not parsed.fragment
+        )
+        if google_stylesheet or google_font_file:
+            static_font_count += 1
+            static_font_origins.add(origin)
+            continue
+        raise AcceptanceBoundaryError("network request left approved app and static-font boundaries")
+    return {
+        "loopback_request_count": loopback_count,
+        "static_font_request_count": static_font_count,
+        "static_font_origins": sorted(static_font_origins),
+    }
 
 
 def _load_fixture_document() -> dict[str, object]:
@@ -1146,7 +1178,7 @@ def _run_browser_phase(evidence: list[CommandEvidence]) -> dict[str, object]:
         if browser_exit != 0:
             raise RuntimeError(f"browser acceptance failed with exit {browser_exit}")
         browser_results = json.loads((result_directory / "browser-results.json").read_text(encoding="utf-8"))
-        validate_network_log(
+        network_classification = validate_network_log(
             browser_results["network"],
             allowed_origins={frontend_url, backend_url},
         )
@@ -1166,6 +1198,7 @@ def _run_browser_phase(evidence: list[CommandEvidence]) -> dict[str, object]:
             "frontend_port": frontend_port,
             "backend_url": backend_url,
             "frontend_url": frontend_url,
+            "network_classification": network_classification,
             "process_cleanup": process_cleanup,
         }
     finally:
@@ -1245,6 +1278,9 @@ def _write_acceptance_evidence(
             "console_errors_or_warnings": browser_results["consoleMessages"],
             "page_errors": browser_results["pageErrors"],
             "request_failures": browser_results["failedRequests"],
+            "expected_cancelled_requests": browser_results["expectedCancelledRequests"],
+            "blocking_request_failures": browser_results["blockingFailedRequests"],
+            "network_classification": browser["network_classification"],
         },
         "hashes": {
             "source_fixture_sha256": fixture_hash,
