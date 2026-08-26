@@ -93,6 +93,32 @@ def load_canonical_a2_news_snapshot(_industry_id: str) -> EvidenceSnapshot | Non
         return None
 
 
+def load_canonical_a2_news_snapshot_by_raw(raw_snapshot_id: str) -> EvidenceSnapshot | None:
+    """Read one durable A2 snapshot lineage by raw ID without refreshing it."""
+    if type(raw_snapshot_id) is not str or not raw_snapshot_id.strip():
+        return None
+    try:
+        from news_pipeline.models import RawSnapshot, TrustedSnapshot
+        from news_pipeline.service import get_service
+
+        storage = get_service().storage
+        raw = storage.load_raw(raw_snapshot_id)
+        evidence = storage.load_evidence(raw_snapshot_id)
+        trusted = storage.load_trusted(raw_snapshot_id)
+        if (
+            type(raw) is not RawSnapshot
+            or type(evidence) is not EvidenceSnapshot
+            or type(trusted) is not TrustedSnapshot
+            or raw.raw_snapshot_id != raw_snapshot_id
+            or evidence.raw_snapshot_id != raw_snapshot_id
+            or trusted.raw_snapshot_id != raw_snapshot_id
+        ):
+            return None
+        return evidence
+    except Exception:
+        return None
+
+
 def _no_company_candidates(
     _industry_id: str,
     _evidence_snapshot: EvidenceSnapshot,
@@ -194,7 +220,7 @@ def _run_from_dict(value: object) -> RefreshRun:
 def _candidate_from_dict(
     value: object,
     *,
-    restore_canonical_external_lineage: bool = False,
+    canonical_snapshot_lookup: Callable[[str], EvidenceSnapshot | None] | None = None,
 ) -> CandidateEvidencePanel:
     required = {
         "industry_id", "candidate_snapshot_id", "counts", "unverified", "conflicting",
@@ -205,8 +231,6 @@ def _candidate_from_dict(
     has_external = "external_lineages" in value
     if set(value) != required | ({"external_lineages"} if has_external else set()):
         raise ValueError("invalid candidate state schema")
-    if has_external and not restore_canonical_external_lineage:
-        raise ValueError("external candidate lineage requires verified state envelope")
     row = value
     counts = row["counts"]
     if type(counts) is not dict or set(counts) != {
@@ -284,6 +308,55 @@ def _candidate_from_dict(
                 raise ValueError("invalid external candidate lineage schema")
             parsed.append(CandidateExternalLineage(**item))
         external_lineages = tuple(parsed)
+    unverified_events = tuple(candidate_event(item) for item in row["unverified_events"])
+    conflicting_events = tuple(candidate_event(item) for item in row["conflicting_events"])
+    if external_lineages:
+        if canonical_snapshot_lookup is None:
+            raise ValueError("external candidate lineage requires canonical durable lookup")
+        from .service import _candidate_event
+
+        candidate_events = unverified_events + conflicting_events
+        for lineage in external_lineages:
+            try:
+                snapshot = canonical_snapshot_lookup(lineage.raw_snapshot_id)
+            except Exception as error:
+                raise ValueError("canonical external lineage lookup failed") from error
+            if (
+                type(snapshot) is not EvidenceSnapshot
+                or snapshot.raw_snapshot_id != lineage.raw_snapshot_id
+                or snapshot.snapshot_id != lineage.evidence_snapshot_id
+                or lineage.candidate_snapshot_id != snapshot.snapshot_id
+            ):
+                raise ValueError("external candidate lineage is not canonical")
+            expected: dict[str, CandidateIndustryEvidenceEvent] = {}
+            for event in snapshot.events:
+                if (
+                    event.verification_status.value not in {"unverified", "conflicting"}
+                    or not any(tag_id == row["industry_id"] for tag_id, _label in event.related_tags)
+                ):
+                    continue
+                projected = _candidate_event(
+                    row["industry_id"],
+                    event,
+                    candidate_snapshot_id=snapshot.snapshot_id,
+                    raw_snapshot_id=snapshot.raw_snapshot_id,
+                    evidence_snapshot_id=snapshot.snapshot_id,
+                )
+                expected[projected.event_id] = projected
+            actual = tuple(
+                event for event in candidate_events
+                if (
+                    event.candidate_snapshot_id,
+                    event.raw_snapshot_id,
+                    event.evidence_snapshot_id,
+                ) == (
+                    lineage.candidate_snapshot_id,
+                    lineage.raw_snapshot_id,
+                    lineage.evidence_snapshot_id,
+                )
+            )
+            if not actual or any(expected.get(event.event_id) != event for event in actual):
+                raise ValueError("external candidate event is not canonical")
     constructor = (
         _candidate_panel_with_canonical_a2_lineage
         if external_lineages
@@ -295,8 +368,8 @@ def _candidate_from_dict(
         counts=CandidateEvidenceCounts(**counts),
         unverified=tuple(IndustryMetricObservation.from_dict(item) for item in row["unverified"]),
         conflicting=tuple(conflicts),
-        unverified_events=tuple(candidate_event(item) for item in row["unverified_events"]),
-        conflicting_events=tuple(candidate_event(item) for item in row["conflicting_events"]),
+        unverified_events=unverified_events,
+        conflicting_events=conflicting_events,
         raw_snapshot_id=row["raw_snapshot_id"],
         evidence_snapshot_id=row["evidence_snapshot_id"],
         external_lineages=external_lineages,
@@ -450,9 +523,15 @@ def _proof_matches_run(proof: _PublicationProof, run: RefreshRun) -> bool:
 class _RefreshStateStore:
     """Checksum-bound latest run/candidate state, atomically replaced per industry."""
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        canonical_snapshot_lookup: Callable[[str], EvidenceSnapshot | None] | None = None,
+    ) -> None:
         self.root = Path(os.path.abspath(root))
         self._writer = IndustryResearchStorage(root=self.root, production=False)
+        self._canonical_snapshot_lookup = canonical_snapshot_lookup
         self._lock = threading.RLock()
 
     def _path(self, industry_id: str) -> Path:
@@ -614,7 +693,11 @@ class _RefreshStateStore:
                     return None
                 candidate = _candidate_from_dict(
                     candidate_row,
-                    restore_canonical_external_lineage=document["schema_version"] == 5,
+                    canonical_snapshot_lookup=(
+                        self._canonical_snapshot_lookup
+                        if document["schema_version"] == 5
+                        else None
+                    ),
                 )
             else:
                 candidate = None
@@ -802,6 +885,9 @@ class IndustryResearchRefreshOrchestrator:
         run_id_factory: Callable[[], str] = lambda: uuid4().hex,
         attempt_token_factory: Callable[[], str] = lambda: uuid4().hex,
         canonical_news_snapshot_loader: Callable[[str], EvidenceSnapshot | None] = load_canonical_a2_news_snapshot,
+        canonical_news_snapshot_lookup: Callable[
+            [str], EvidenceSnapshot | None
+        ] = load_canonical_a2_news_snapshot_by_raw,
         company_candidate_loader: Callable[
             [str, EvidenceSnapshot], Iterable[Mapping[str, object]]
         ] = _no_company_candidates,
@@ -816,7 +902,10 @@ class IndustryResearchRefreshOrchestrator:
         self._evidence_storage_factory = evidence_storage_factory
         self._report_service = report_service
         self._report_storage = report_storage
-        self._state = _RefreshStateStore(state_root)
+        self._state = _RefreshStateStore(
+            state_root,
+            canonical_snapshot_lookup=canonical_news_snapshot_lookup,
+        )
         self._now = now
         self._run_id_factory = run_id_factory
         self._attempt_token_factory = attempt_token_factory

@@ -29,6 +29,7 @@ from industry_research.refresh import (
     IndustryResearchRefreshOrchestrator,
     RefreshRawSnapshot,
     load_canonical_a2_news_snapshot,
+    load_canonical_a2_news_snapshot_by_raw,
 )
 from industry_research.service import IndustryResearchService
 from industry_research.source_qualification import SourceQualificationResult
@@ -373,6 +374,7 @@ def _orchestrator(
     run_ids=None,
     attempt_tokens=None,
     canonical_news_snapshot_loader=None,
+    canonical_news_snapshot_lookup=None,
     company_candidate_loader=None,
 ):
     descriptor = _descriptor()
@@ -391,6 +393,8 @@ def _orchestrator(
     )
     if canonical_news_snapshot_loader is not None:
         kwargs["canonical_news_snapshot_loader"] = canonical_news_snapshot_loader
+    if canonical_news_snapshot_lookup is not None:
+        kwargs["canonical_news_snapshot_lookup"] = canonical_news_snapshot_lookup
     if company_candidate_loader is not None:
         kwargs["company_candidate_loader"] = company_candidate_loader
     return IndustryResearchRefreshOrchestrator(
@@ -500,6 +504,24 @@ def test_default_a2_news_loader_requires_complete_shared_raw_lineage(monkeypatch
     assert load_canonical_a2_news_snapshot("storage") is None
 
 
+def test_default_a2_durable_lookup_reads_exact_historical_raw_lineage(monkeypatch) -> None:
+    snapshot = _canonical_news_snapshot()
+    raw = RawSnapshot(snapshot.raw_snapshot_id, NOW, ())
+    trusted = TrustedSnapshot(snapshot.raw_snapshot_id, NOW, ())
+    storage = SimpleNamespace(
+        load_raw=lambda raw_id: raw if raw_id == snapshot.raw_snapshot_id else None,
+        load_evidence=lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None,
+        load_trusted=lambda raw_id: trusted if raw_id == snapshot.raw_snapshot_id else None,
+    )
+    monkeypatch.setattr(
+        "news_pipeline.service.get_service",
+        lambda: SimpleNamespace(storage=storage),
+    )
+
+    assert load_canonical_a2_news_snapshot_by_raw(snapshot.raw_snapshot_id) is snapshot
+    assert load_canonical_a2_news_snapshot_by_raw("missing-raw") is None
+
+
 def test_get_current_history_and_construction_never_trigger_refresh(tmp_path) -> None:
     descriptor = _descriptor()
     provider = FakeProvider(
@@ -560,6 +582,7 @@ def test_refresh_publishes_canonical_a2_news_and_projected_official_companies(tm
             supports_fields=source_item.supports_fields + (
                 "metric:dram_price",
                 "security_code:688001",
+                "company_name:示例存储公司",
                 "chain_node:memory_design_manufacturing",
                 "relation_type:official_disclosure",
             ),
@@ -574,6 +597,9 @@ def test_refresh_publishes_canonical_a2_news_and_projected_official_companies(tm
         report_storage=storage,
         evidence_verifier=verify_with_company_binding,
         canonical_news_snapshot_loader=load_news,
+        canonical_news_snapshot_lookup=lambda raw_id: (
+            _canonical_news_snapshot() if raw_id == "news-raw-production" else None
+        ),
         company_candidate_loader=load_companies,
     )
     try:
@@ -615,6 +641,72 @@ def test_refresh_publishes_canonical_a2_news_and_projected_official_companies(tm
     assert {event.event_id for event in ninety.candidate_evidence.conflicting_events} == {
         "news-conflicting-40",
     }
+
+
+def test_persisted_external_a2_candidate_requires_canonical_durable_lookup(tmp_path) -> None:
+    snapshot = _canonical_news_snapshot()
+    lookup = lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("canonical-persisted",),
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lookup,
+    )
+    completed = owner.request_refresh("storage").result(5)
+    expected = owner.current_candidate("storage")
+    assert expected is not None and expected.external_lineages
+    owner.shutdown()
+
+    no_lookup = _orchestrator(tmp_path)
+    assert no_lookup.current_run("storage") is None
+    assert no_lookup.current_candidate("storage") is None
+    no_lookup.shutdown()
+
+    reloaded = _orchestrator(tmp_path, canonical_news_snapshot_lookup=lookup)
+    assert reloaded.current_run("storage") == completed
+    assert reloaded.current_candidate("storage") == expected
+    reloaded.shutdown()
+
+
+@pytest.mark.parametrize("tamper", ("raw_lineage", "event_id", "evidence_snapshot"))
+def test_checksum_recomputed_forged_external_a2_state_still_fails_closed(
+    tmp_path, tamper: str,
+) -> None:
+    snapshot = _canonical_news_snapshot()
+    lookup = lambda raw_id: snapshot if raw_id == snapshot.raw_snapshot_id else None
+    owner = _orchestrator(
+        tmp_path,
+        run_ids=("forged-external",),
+        canonical_news_snapshot_loader=lambda _industry_id: snapshot,
+        canonical_news_snapshot_lookup=lookup,
+    )
+    owner.request_refresh("storage").result(5)
+    path = owner._state._path("storage")
+    document = refresh_module.json.loads(path.read_text(encoding="utf-8"))
+    candidate = document["state"]["candidate"]
+    if tamper == "raw_lineage":
+        candidate["external_lineages"][0]["raw_snapshot_id"] = "forged-raw"
+        for event_row in candidate["unverified_events"] + candidate["conflicting_events"]:
+            event_row["raw_snapshot_id"] = "forged-raw"
+    elif tamper == "event_id":
+        candidate["unverified_events"][0]["event_id"] = "forged-event"
+    else:
+        candidate["external_lineages"][0]["evidence_snapshot_id"] = "forged-evidence"
+        candidate["external_lineages"][0]["candidate_snapshot_id"] = "forged-evidence"
+        for event_row in candidate["unverified_events"] + candidate["conflicting_events"]:
+            event_row["evidence_snapshot_id"] = "forged-evidence"
+            event_row["candidate_snapshot_id"] = "forged-evidence"
+    document["checksum"] = refresh_module.hashlib.sha256(
+        refresh_module._canonical(document["state"])
+    ).hexdigest()
+    owner._state._writer._atomic_write(
+        path,
+        refresh_module._canonical(document) + b"\n",
+    )
+
+    assert owner.current_run("storage") is None
+    assert owner.current_candidate("storage") is None
+    owner.shutdown()
 
 
 @pytest.mark.parametrize(

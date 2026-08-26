@@ -103,14 +103,37 @@ def _event_evidence(event: A2EvidenceEvent):
     )
 
 
-def _company_evidence_bindings(snapshot: EvidenceSnapshot) -> Mapping[str, CompanyEvidenceBinding]:
+def _company_evidence_bindings(
+    snapshot: EvidenceSnapshot,
+    *,
+    industry_id: str,
+    now: datetime,
+) -> Mapping[str, CompanyEvidenceBinding]:
     admitted: dict[str, CompanyEvidenceBinding] = {}
     rejected_ids: set[str] = set()
+
+    def valid_date(value: object) -> bool:
+        return (
+            isinstance(value, datetime)
+            and value.tzinfo is not None
+            and value.utcoffset() is not None
+            and value <= now
+        )
+
+    if not valid_date(snapshot.generated_at):
+        return admitted
     for event in snapshot.events:
+        if not any(tag_id == industry_id for tag_id, _label in event.related_tags):
+            continue
         if event.verification_status not in {
             A2VerificationStatus.VERIFIED,
             A2VerificationStatus.CORROBORATED,
         }:
+            continue
+        event_dates = (event.evidence_as_of, event.verified_at) + (
+            (event.published_at,) if event.published_at is not None else ()
+        )
+        if any(not valid_date(value) for value in event_dates):
             continue
         for evidence in _event_evidence(event):
             if (
@@ -118,6 +141,8 @@ def _company_evidence_bindings(snapshot: EvidenceSnapshot) -> Mapping[str, Compa
                 or not evidence.supports_claim
                 or evidence.contradicts_claim
             ):
+                continue
+            if evidence.published_at is not None and not valid_date(evidence.published_at):
                 continue
             as_of = evidence.published_at or event.evidence_as_of
             binding = CompanyEvidenceBinding(
@@ -708,7 +733,12 @@ def assemble_storage_report(
                 + template.core_metric_ids
                 + template.capital_metric_ids
             ),
-            evidence_bindings=_company_evidence_bindings(company_evidence_snapshot),
+            evidence_bindings=_company_evidence_bindings(
+                company_evidence_snapshot,
+                industry_id=industry_id,
+                now=now,
+            ),
+            report_date=now.date(),
         )
     report = DisplayedTrustedReport(
         industry_id=industry_id,

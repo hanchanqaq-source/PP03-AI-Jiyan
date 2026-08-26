@@ -23,9 +23,16 @@ from .models import (
     RefreshRun,
     TemplateStatus,
 )
-from .fund_context import FundAnalysisAdapter, TransientFundContext, validate_acceptance_root
+from .fund_context import (
+    FundAnalysisAdapter,
+    TransientFundContext,
+    prepare_acceptance_root,
+    validate_acceptance_root,
+)
 from .relationships import (
     FundRelationProjection,
+    FUND_WEIGHT_TOLERANCE,
+    decimal_percent,
     resolve_fund_relations as resolve_explicit_fund_relations,
 )
 from .storage import IndustryResearchStorage
@@ -198,35 +205,52 @@ class _RequestScopedFundDataAdapter:
             or lookthrough.get("disclosure_date") != disclosure_date
         ):
             return
-        disclosed: set[str] = set()
+        disclosed: dict[str, object] = {}
         holding_rows = holdings.get("holdings")
-        if isinstance(holding_rows, (list, tuple)):
-            for item in holding_rows:
-                if not isinstance(item, Mapping):
-                    continue
-                stock_code = item.get("stock_code")
-                if type(stock_code) is str and _FUND_CODE.fullmatch(stock_code):
-                    disclosed.add(stock_code)
+        if not isinstance(holding_rows, (list, tuple)):
+            return
+        for item in holding_rows:
+            if not isinstance(item, Mapping):
+                return
+            stock_code = item.get("stock_code")
+            weight = decimal_percent(item.get("weight_pct"))
+            if (
+                type(stock_code) is not str
+                or _FUND_CODE.fullmatch(stock_code) is None
+                or weight is None
+                or stock_code in disclosed
+            ):
+                return
+            disclosed[stock_code] = weight
         evidence_rows = exposure.get("holding_industry_evidence")
         if not isinstance(evidence_rows, (list, tuple)):
             return
         from fund_data.service import _industry_chain_tags
 
         captured: dict[str, set[str]] = {}
+        seen_evidence_codes: set[str] = set()
         for item in evidence_rows:
             if not isinstance(item, Mapping):
-                continue
+                return
             stock_code = item.get("stock_code")
-            source_reference = item.get("source_reference")
             if (
                 type(stock_code) is not str
                 or _FUND_CODE.fullmatch(stock_code) is None
                 or stock_code not in disclosed
+            ):
+                continue
+            source_reference = item.get("source_reference")
+            evidence_weight = decimal_percent(item.get("weight_pct"))
+            if (
+                stock_code in seen_evidence_codes
+                or evidence_weight is None
+                or abs(evidence_weight - disclosed[stock_code]) > FUND_WEIGHT_TOLERANCE
                 or type(source_reference) is not str
                 or not source_reference.strip()
                 or item.get("holding_disclosure_date") != disclosure_date
             ):
-                continue
+                return
+            seen_evidence_codes.add(stock_code)
             tags = _industry_chain_tags(dict(item))
             if tags:
                 captured.setdefault(stock_code, set()).update(tag_id for tag_id, _ in tags)
@@ -328,8 +352,22 @@ class ProductionIndustryResearchService:
         if not fund_codes:
             return FundRelationProjection("no_holdings", (), (), ())
         acceptance_root = validate_acceptance_root(self._fund_acceptance_root)
-        acceptance_root.mkdir(parents=True, exist_ok=True)
         adapter = self._fund_analysis_adapter_factory()
+        requires_disk = getattr(adapter, "requires_transient_disk", None)
+        if requires_disk is True:
+            try:
+                acceptance_root = prepare_acceptance_root(acceptance_root)
+            except BaseException as original:
+                closer = getattr(adapter, "close", None)
+                try:
+                    if callable(closer):
+                        closer()
+                except BaseException as close_error:
+                    raise BaseExceptionGroup(
+                        "acceptance root preparation and adapter cleanup failed",
+                        [original, close_error],
+                    )
+                raise
         context = TransientFundContext(
             adapter=adapter,
             acceptance_root=acceptance_root,

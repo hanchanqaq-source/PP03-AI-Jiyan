@@ -315,6 +315,7 @@ def test_assembly_projects_only_official_exact_code_company_candidates() -> None
         published_at=company_date,
         supports_fields=(
             "security_code:688001",
+            "company_name:示例存储公司",
             "chain_node:memory_design_manufacturing",
             "relation_type:official_disclosure",
             "metric:dram_price",
@@ -378,6 +379,59 @@ def test_assembly_projects_only_official_exact_code_company_candidates() -> None
     )
 
     assert [company.security_code for company in assembly.report.companies] == ["688001"]
+
+
+@pytest.mark.parametrize("failure", ("foreign_industry", "invented_name", "future_event", "future_candidate"))
+def test_company_evidence_rejects_unbound_identity_and_future_dates(failure: str) -> None:
+    company_item = replace(
+        evidence_item("company-proof", "a"),
+        supports_fields=(
+            "security_code:688001",
+            "company_name:示例存储公司",
+            "chain_node:memory_design_manufacturing",
+            "relation_type:official_disclosure",
+            "metric:dram_price",
+        ),
+    )
+    company_event = replace(
+        event("company-proof", A2VerificationStatus.VERIFIED, 0),
+        related_tags=(("semiconductor", "半导体"),) if failure == "foreign_industry" else (("storage", "存储"),),
+        published_at=NOW + timedelta(days=1) if failure == "future_event" else NOW,
+        evidence_as_of=NOW + timedelta(days=1) if failure == "future_event" else NOW,
+        primary_evidence=(company_item,),
+    )
+    snapshot = EvidenceSnapshot(
+        snapshot_id="evidence-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        generated_at=NOW,
+        events=(company_event,),
+    )
+    candidate = {
+        "industry_id": "storage",
+        "security_code": "688001",
+        "company_name": "伪造公司" if failure == "invented_name" else "示例存储公司",
+        "chain_node_id": "memory_design_manufacturing",
+        "relation_type": "official_disclosure",
+        "key_metric_ids": ("dram_price",),
+        "evidence_ids": ("company-proof-a",),
+        "as_of_date": "2026-08-26" if failure == "future_candidate" else "2026-08-25",
+        "official_evidence": True,
+    }
+
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        metric_candidates=None,
+        news_snapshot=None,
+        company_candidates=(candidate,),
+        company_evidence_snapshot=snapshot,
+        now=NOW,
+    )
+
+    assert assembly.report.companies == ()
 
 
 def test_company_candidate_flag_cannot_admit_irrelevant_official_core_claim() -> None:

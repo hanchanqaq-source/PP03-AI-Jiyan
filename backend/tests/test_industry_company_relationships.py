@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from industry_research.relationships import CompanyEvidenceBinding, project_company_relations
 
 
@@ -11,6 +13,7 @@ PROJECTION_SCOPE = {
             "evidence-company-1",
             frozenset({
                 "security_code:688001",
+                "company_name:示例存储公司",
                 "chain_node:memory_design_manufacturing",
                 "relation_type:official_disclosure",
                 "metric:dram_price",
@@ -21,6 +24,7 @@ PROJECTION_SCOPE = {
             "evidence-classification-1",
             frozenset({
                 "security_code:688001",
+                "company_name:示例存储公司",
                 "chain_node:memory_design_manufacturing",
                 "relation_type:public_classification",
                 "metric:dram_price",
@@ -117,6 +121,21 @@ def test_company_projection_rejects_wrong_date_and_incomplete_semantic_proof() -
         allowed_chain_node_ids=("memory_design_manufacturing",),
         allowed_metric_ids=("dram_price", "nand_price"),
         evidence_bindings=PROJECTION_SCOPE["evidence_bindings"],
+        report_date=date(2026, 8, 25),
+    )
+
+    assert result == ()
+
+
+def test_company_projection_rejects_invented_name_and_future_candidate() -> None:
+    result = project_company_relations(
+        industry_id="storage",
+        candidates=(
+            _candidate(company_name="伪造公司"),
+            _candidate(as_of_date="2026-08-26"),
+        ),
+        report_date=date(2026, 8, 25),
+        **PROJECTION_SCOPE,
     )
 
     assert result == ()

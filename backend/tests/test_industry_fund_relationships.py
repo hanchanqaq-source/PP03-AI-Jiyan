@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 import industry_research.fund_context as fund_context_module
-from industry_research.fund_context import TransientFundContext
+from industry_research.fund_context import TransientFundContext, prepare_acceptance_root
 from industry_research.models import FundResolutionEmptyReason, VerificationStatus
 from industry_research.relationships import resolve_fund_relations
 
@@ -356,6 +356,7 @@ def test_disclosed_lookthrough_uses_exact_service_tag_and_security_code_evidence
         "holding_industry_evidence": [{
             "stock_code": "688001",
             "stock_name": "示例芯片",
+            "weight_pct": 12.5,
             "source_name": "公开分类",
             "source_reference": "https://example.test/classification/688001",
             "holding_disclosure_date": "2026-06-30",
@@ -371,7 +372,7 @@ def test_disclosed_lookthrough_uses_exact_service_tag_and_security_code_evidence
         fund_codes=["900001"],
         context=TransientFundContext(adapter=MemoryAdapter({
             "900001": _analysis(
-                holdings={"holdings": [{"stock_code": "688001"}], "disclosure_date": "2026-06-30"},
+                holdings={"holdings": [{"stock_code": "688001", "weight_pct": 12.5}], "disclosure_date": "2026-06-30"},
                 exposure=exposure,
             )
         }), official_industry_config=_official_config(
@@ -438,7 +439,10 @@ def test_real_service_mixed_holding_evidence_ignores_unrelated_industries() -> N
         context=TransientFundContext(
             adapter=MemoryAdapter({"900001": _analysis(
                 holdings={
-                    "holdings": [{"stock_code": "688001"}, {"stock_code": "600000"}],
+                    "holdings": [
+                        {"stock_code": "688001", "weight_pct": 12.5},
+                        {"stock_code": "600000", "weight_pct": 5.0},
+                    ],
                     "disclosure_date": "2026-06-30",
                 },
                 exposure=exposure,
@@ -457,6 +461,57 @@ def test_real_service_mixed_holding_evidence_ignores_unrelated_industries() -> N
     assert relation.industry_id == "semiconductor-equipment"
     assert relation.exposure_value == 12.5
     assert len(relation.evidence_ids) == 2
+
+
+@pytest.mark.parametrize(
+    ("holdings_rows", "evidence_rows", "tag_weight"),
+    (
+        ([{"stock_code": "688001"}], [{"stock_code": "688001", "weight_pct": 99.0}], 99.0),
+        ([{"stock_code": "688001", "weight_pct": 12.5}], [{"stock_code": "688001"}], 12.5),
+        ([{"stock_code": "688001", "weight_pct": 12.5}], [{"stock_code": "688001", "weight_pct": 11.0}], 12.5),
+        ([{"stock_code": "688001", "weight_pct": 12.5}, {"stock_code": "688001", "weight_pct": 12.5}], [{"stock_code": "688001", "weight_pct": 12.5}], 12.5),
+        ([{"stock_code": "688001", "weight_pct": 12.5}], [{"stock_code": "688001", "weight_pct": 12.5}], 99.0),
+        ([{"stock_code": "688001", "weight_pct": float("nan")}], [{"stock_code": "688001", "weight_pct": 12.5}], 12.5),
+        ([{"stock_code": "688001", "weight_pct": -1.0}], [{"stock_code": "688001", "weight_pct": -1.0}], 0.0),
+        ([{"stock_code": "688001", "weight_pct": 101.0}], [{"stock_code": "688001", "weight_pct": 101.0}], 100.0),
+    ),
+    ids=(
+        "missing-holding-weight", "missing-evidence-weight", "wrong-evidence-weight",
+        "duplicate-code", "sum-mismatch", "nan", "negative", "over-100",
+    ),
+)
+def test_disclosed_lookthrough_rejects_unreconciled_weights(
+    holdings_rows: list[dict[str, object]],
+    evidence_rows: list[dict[str, object]],
+    tag_weight: float,
+) -> None:
+    exposure = _empty_exposure()
+    exposure.update({
+        "industry_chain_tags": [{
+            "id": "storage",
+            "weight_pct": tag_weight,
+            "evidence_level": "disclosed_stock_classification",
+        }],
+        "holding_industry_evidence": [{
+            **row,
+            "source_reference": "https://example.test/classification/688001",
+            "holding_disclosure_date": "2026-06-30",
+        } for row in evidence_rows],
+    })
+    result = resolve_fund_relations(
+        industry_id="storage",
+        fund_codes=["900001"],
+        context=TransientFundContext(
+            adapter=MemoryAdapter({"900001": _analysis(
+                holdings={"holdings": holdings_rows, "disclosure_date": "2026-06-30"},
+                exposure=exposure,
+            )}),
+            official_industry_config=_official_config(securities={"688001": ("storage",)}),
+        ),
+    )
+
+    assert result.resolutions[0].relation is None
+    assert result.resolutions[0].empty_reason is FundResolutionEmptyReason.UNKNOWN
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows guarded disk cleanup")
@@ -500,6 +555,31 @@ def test_close_is_idempotent_and_memory_mode_never_creates_a_temp_root() -> None
     assert context.closed is True
     assert context.temp_root is None
     assert adapter.closed == 1
+
+
+def test_prepare_acceptance_root_rejects_reparse_before_first_write(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    observed_writes: list[Path] = []
+    original_mkdir = Path.mkdir
+
+    def record_mkdir(path: Path, *args, **kwargs):
+        observed_writes.append(path)
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record_mkdir)
+    monkeypatch.setattr(
+        fund_context_module,
+        "_path_is_reparse",
+        lambda path: path == tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="reparse"):
+        prepare_acceptance_root(root)
+
+    assert observed_writes == []
+    assert not root.exists()
 
 
 def test_request_contract_rejects_non_code_objects_before_any_adapter_access() -> None:

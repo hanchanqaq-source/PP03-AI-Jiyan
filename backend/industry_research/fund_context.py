@@ -208,6 +208,52 @@ def validate_acceptance_root(path: str | os.PathLike[str]) -> Path:
     return root
 
 
+def _path_is_reparse(path: Path) -> bool:
+    info = os.lstat(path)
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_reparse_tag", 0))
+
+
+def _existing_directory_identity(path: Path) -> tuple[int, int]:
+    before = os.lstat(path)
+    if _path_is_reparse(path):
+        raise RuntimeError("reparse acceptance-root ancestor rejected")
+    after = os.lstat(path)
+    if (
+        (before.st_dev, before.st_ino, before.st_mode)
+        != (after.st_dev, after.st_ino, after.st_mode)
+    ):
+        raise RuntimeError("acceptance-root ancestor identity changed")
+    if not stat.S_ISDIR(after.st_mode):
+        raise RuntimeError("acceptance-root ancestor is not a directory")
+    return after.st_dev, after.st_ino
+
+
+def prepare_acceptance_root(path: str | os.PathLike[str]) -> Path:
+    """Safely create a validated request-cache root without following reparses."""
+    root = validate_acceptance_root(path)
+    chain = tuple(reversed(root.parents)) + (root,)
+    created: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for candidate in chain:
+            try:
+                _existing_directory_identity(candidate)
+                continue
+            except FileNotFoundError:
+                pass
+            candidate.mkdir()
+            identity = _existing_directory_identity(candidate)
+            created.append((candidate, identity))
+        return root
+    except BaseException:
+        for candidate, expected in reversed(created):
+            try:
+                if _existing_directory_identity(candidate) == expected:
+                    candidate.rmdir()
+            except (FileNotFoundError, OSError, RuntimeError):
+                pass
+        raise
+
+
 def _is_child(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)

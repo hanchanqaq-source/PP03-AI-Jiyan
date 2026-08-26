@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation
 import hashlib
 import math
 import re
@@ -84,6 +85,7 @@ def project_company_relations(
     allowed_chain_node_ids: Iterable[str],
     allowed_metric_ids: Iterable[str],
     evidence_bindings: Mapping[str, CompanyEvidenceBinding],
+    report_date: date | None = None,
 ) -> tuple[IndustryCompanyRelation, ...]:
     """Admit only exact-code company relations backed by official evidence."""
     chain_ids = frozenset(allowed_chain_node_ids)
@@ -130,6 +132,8 @@ def project_company_relations(
             continue
         if candidate_date.isoformat() != as_of_date:
             continue
+        if report_date is not None and candidate_date > report_date:
+            continue
         selected_bindings = tuple(evidence_bindings.get(item) for item in evidence_ids)
         if any(binding is None for binding in selected_bindings):
             continue
@@ -138,6 +142,7 @@ def project_company_relations(
             continue
         required_fields = {
             f"security_code:{security_code}",
+            f"company_name:{company_name}",
             f"chain_node:{chain_node_id}",
             f"relation_type:{relation_type}",
             *(f"metric:{metric_id}" for metric_id in key_metric_ids),
@@ -178,19 +183,42 @@ def _finite_percent(value: object) -> float | None:
     return result if math.isfinite(result) and 0 <= result <= 100 else None
 
 
+FUND_WEIGHT_TOLERANCE = Decimal("0.0001")
+
+
+def decimal_percent(value: object) -> Decimal | None:
+    if type(value) not in {int, float, Decimal}:
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not result.is_finite() or result < 0 or result > 100:
+        return None
+    return result
+
+
 def _evidence_id(*parts: str) -> str:
     digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:24]
     return f"fund-public-{digest}"
 
 
-def _holdings_codes(analysis: Mapping[str, Any]) -> set[str]:
+def _holding_weights(analysis: Mapping[str, Any]) -> dict[str, Decimal] | None:
     holdings = _mapping(_mapping(analysis.get("holdings")).get("data"))
-    codes: set[str] = set()
+    weights: dict[str, Decimal] = {}
     for row in _sequence(holdings.get("holdings")):
-        code = _nonblank(_mapping(row).get("stock_code"))
-        if code is not None and _SIX_DIGIT_CODE.fullmatch(code):
-            codes.add(code)
-    return codes
+        item = _mapping(row)
+        code = _nonblank(item.get("stock_code"))
+        weight = decimal_percent(item.get("weight_pct"))
+        if (
+            code is None
+            or _SIX_DIGIT_CODE.fullmatch(code) is None
+            or weight is None
+            or code in weights
+        ):
+            return None
+        weights[code] = weight
+    return weights
 
 
 def _section_status(section: Mapping[str, Any]) -> str:
@@ -243,20 +271,25 @@ def _lookthrough_relation(
     holdings_date = _nonblank(holdings.get("disclosure_date"))
     if disclosure_date is None or holdings_date != disclosure_date:
         return None
-    tag = next((
+    try:
+        if date.fromisoformat(disclosure_date).isoformat() != disclosure_date:
+            return None
+    except ValueError:
+        return None
+    matching_tags = tuple(
         _mapping(item)
         for item in _sequence(exposure.get("industry_chain_tags"))
         if _mapping(item).get("id") == industry_id
         and _mapping(item).get("evidence_level") == "disclosed_stock_classification"
         and _matching_optional_fund_code(_mapping(item), fund_code)
-    ), None)
-    if not tag:
+    )
+    if len(matching_tags) != 1:
         return None
-    value = _finite_percent(tag.get("weight_pct"))
-    if value is None:
+    tag_weight = decimal_percent(matching_tags[0].get("weight_pct"))
+    if tag_weight is None:
         return None
-    disclosed_codes = _holdings_codes(analysis)
-    if not disclosed_codes:
+    disclosed_weights = _holding_weights(analysis)
+    if not disclosed_weights:
         return None
     holding_meta = _mapping(holdings_section.get("meta"))
     holdings_reference = _nonblank(holding_meta.get("source_reference"))
@@ -265,7 +298,6 @@ def _lookthrough_relation(
     evidence_ids = {
         _evidence_id("holding-disclosure", holdings_reference, fund_code, disclosure_date)
     }
-    classification_references: set[str] = set()
     evidenced_codes: set[str] = set()
     evidence_rows = _sequence(exposure.get("holding_industry_evidence"))
     if not evidence_rows:
@@ -273,31 +305,35 @@ def _lookthrough_relation(
     for item in evidence_rows:
         row = _mapping(item)
         code = _nonblank(row.get("stock_code"))
-        if (
-            code is None
-            or _SIX_DIGIT_CODE.fullmatch(code) is None
-            or code not in disclosed_codes
-            or not context.security_matches(industry_id=industry_id, security_code=code)
-        ):
+        if code is None or _SIX_DIGIT_CODE.fullmatch(code) is None:
             continue
+        if not context.security_matches(industry_id=industry_id, security_code=code):
+            continue
+        evidence_weight = decimal_percent(row.get("weight_pct"))
         reference = _nonblank(row.get("source_reference"))
         evidence_date = _nonblank(row.get("holding_disclosure_date"))
         if (
-            reference is None
+            code not in disclosed_weights
+            or code in evidenced_codes
+            or evidence_weight is None
+            or abs(evidence_weight - disclosed_weights[code]) > FUND_WEIGHT_TOLERANCE
+            or reference is None
             or evidence_date != disclosure_date
             or not _matching_optional_fund_code(row, fund_code)
         ):
             return None
-        classification_references.add(reference)
         evidenced_codes.add(code)
         evidence_ids.add(_evidence_id("security-classification", reference, code, disclosure_date))
     if not evidenced_codes:
+        return None
+    computed_weight = sum((disclosed_weights[code] for code in evidenced_codes), Decimal("0"))
+    if abs(computed_weight - tag_weight) > FUND_WEIGHT_TOLERANCE:
         return None
     return IndustryFundRelation(
         industry_id=industry_id,
         fund_code=fund_code,
         relation_layer="disclosed_lookthrough",
-        exposure_value=value,
+        exposure_value=float(tag_weight),
         exposure_unit="percent",
         disclosure_date=disclosure_date,
         evidence_ids=tuple(sorted(evidence_ids)),

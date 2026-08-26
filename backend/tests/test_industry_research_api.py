@@ -386,7 +386,7 @@ def test_default_public_fund_adapter_builds_exact_dynamic_mapping_from_disclosed
                 "holdings": {
                     "data": {
                         "fund_code": code,
-                        "holdings": [{"stock_code": "688001"}],
+                            "holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
                         "disclosure_date": "2026-06-30",
                     },
                     "meta": {
@@ -404,8 +404,9 @@ def test_default_public_fund_adapter_builds_exact_dynamic_mapping_from_disclosed
                             "weight_pct": 12.5,
                             "evidence_level": "disclosed_stock_classification",
                         }],
-                        "holding_industry_evidence": [{
-                            "stock_code": "688001",
+                            "holding_industry_evidence": [{
+                                "stock_code": "688001",
+                                "weight_pct": 12.5,
                             "primary_industry": "制造业",
                             "detail_industry": "存储芯片制造",
                             "source_reference": "https://public.example/classification/688001",
@@ -514,6 +515,31 @@ def test_default_public_fund_mapping_rejects_incomplete_classification_evidence(
     assert tuple(root.iterdir()) == ()
 
 
+@pytest.mark.parametrize("failure", ("duplicate", "weight_mismatch"))
+def test_default_public_fund_mapping_rejects_ambiguous_weight_evidence(failure: str) -> None:
+    adapter = industry_api._RequestScopedFundDataAdapter()
+    evidence = {
+        "stock_code": "688001",
+        "weight_pct": 12.5 if failure == "duplicate" else 11.0,
+        "detail_industry": "存储芯片制造",
+        "source_reference": "https://public.example/classification/688001",
+        "holding_disclosure_date": "2026-06-30",
+    }
+    rows = [evidence, dict(evidence)] if failure == "duplicate" else [evidence]
+    adapter._capture_exact_classification_mappings({
+        "holdings": {"data": {
+            "holdings": [{"stock_code": "688001", "weight_pct": 12.5}],
+            "disclosure_date": "2026-06-30",
+        }},
+        "industry_exposure": {"data": {
+            "lookthrough": {"status": "disclosed", "disclosure_date": "2026-06-30"},
+            "holding_industry_evidence": rows,
+        }},
+    })
+
+    assert adapter.security_industry_ids("688001") == frozenset()
+
+
 def test_invalid_acceptance_root_is_rejected_before_adapter_creation(tmp_path) -> None:
     created = 0
 
@@ -535,34 +561,64 @@ def test_invalid_acceptance_root_is_rejected_before_adapter_creation(tmp_path) -
     assert not (tmp_path / "outside-acceptance").exists()
 
 
-def test_acceptance_root_mkdir_failure_happens_before_adapter_creation(
+def test_acceptance_root_prepare_failure_closes_disk_adapter_once_without_residue(
     tmp_path, monkeypatch,
 ) -> None:
     root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
-    created = 0
-    original_mkdir = Path.mkdir
+    class DiskAdapter:
+        storage_mode = "request_temp"
+        requires_transient_disk = True
 
-    def fail_target(path: Path, *args, **kwargs):
-        if path == root:
-            raise OSError("fixture mkdir failure")
-        return original_mkdir(path, *args, **kwargs)
+        def __init__(self) -> None:
+            self.closed = 0
 
-    def factory():
-        nonlocal created
-        created += 1
-        raise AssertionError("mkdir failure reached adapter factory")
+        def close(self) -> None:
+            self.closed += 1
 
-    monkeypatch.setattr(Path, "mkdir", fail_target)
+    adapter = DiskAdapter()
+
+    def fail_prepare(_root: Path) -> Path:
+        raise OSError("fixture prepare failure")
+
+    monkeypatch.setattr(industry_api, "prepare_acceptance_root", fail_prepare)
     service = industry_api.ProductionIndustryResearchService(
         storage=IndustryResearchStorage(tmp_path / "reports"),
-        fund_analysis_adapter_factory=factory,
+        fund_analysis_adapter_factory=lambda: adapter,
         fund_acceptance_root=root,
     )
 
-    with pytest.raises(OSError, match="fixture mkdir failure"):
+    with pytest.raises(OSError, match="fixture prepare failure"):
         service.resolve_fund_relations("storage", ("900001",))
 
-    assert created == 0
+    assert adapter.closed == 1
+    assert not root.exists()
+
+
+def test_memory_fund_adapter_never_creates_acceptance_root(tmp_path) -> None:
+    class MemoryAdapter:
+        storage_mode = "memory"
+        requires_transient_disk = False
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            return {
+                "code": code,
+                "holdings": {"data": None, "meta": {"status": "error"}},
+                "industry_exposure": {"data": None, "meta": {"status": "error"}},
+            }
+
+        def close(self) -> None:
+            return None
+
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        fund_analysis_adapter_factory=MemoryAdapter,
+        fund_acceptance_root=root,
+    )
+
+    service.resolve_fund_relations("storage", ("900001",))
+
+    assert not root.exists()
 
 
 def test_context_initialization_failure_closes_request_adapter_once(tmp_path) -> None:
