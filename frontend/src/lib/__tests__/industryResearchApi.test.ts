@@ -274,7 +274,23 @@ describe("industry research API decoder", () => {
     );
   });
 
-  it("rejects a candidate conflict whose values differ only by case", () => {
+  it("rejects a candidate event with an arbitrary foreign non-A2 lineage", () => {
+    const value = structuredClone(responseWire) as any;
+    value.candidate_evidence.unverified_events[0].raw_snapshot_id = "raw-foreign";
+
+    expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
+  });
+
+  it("accepts a canonical A2 news event with independent raw lineage", () => {
+    const value = structuredClone(responseWire) as any;
+    value.candidate_evidence.unverified_events[0].candidate_snapshot_id = "news-evidence-1";
+    value.candidate_evidence.unverified_events[0].raw_snapshot_id = "news-raw-1";
+    value.candidate_evidence.unverified_events[0].evidence_snapshot_id = "news-evidence-1";
+
+    expect(() => decodeIndustryResearchResponse(value)).not.toThrow();
+  });
+
+  it("accepts a backend-admitted conflict whose display values differ only by case", () => {
     const value = structuredClone(responseWire) as any;
     value.candidate_evidence.counts.conflicting = 1;
     value.candidate_evidence.conflicting = [{
@@ -303,7 +319,7 @@ describe("industry research API decoder", () => {
       evidence_snapshot_id: "evidence-refresh-1",
     }];
 
-    expect(() => decodeIndustryResearchResponse(value)).toThrow(ApiError);
+    expect(() => decodeIndustryResearchResponse(value)).not.toThrow();
   });
 
   it.each([
@@ -312,9 +328,14 @@ describe("industry research API decoder", () => {
     ["compatibility ligature", "office", "oﬃce"],
     ["Cyrillic historic form", "ᲀ", "в"],
     ["Greek combining ypogegrammeni", "ͅ", "ι"],
-  ])("rejects a false conflict under Python casefold: %s", (_label, left, right) => {
+  ])("accepts a canonical backend conflict even when display values casefold equally: %s", (_label, left, right) => {
     expect(() => decodeIndustryResearchResponse(responseWithConflictValues(left, right)))
-      .toThrow(ApiError);
+      .not.toThrow();
+  });
+
+  it("accepts the canonical A2 same-display-value contradiction wire contract", () => {
+    expect(() => decodeIndustryResearchResponse(responseWithConflictValues("12.5", "12.5")))
+      .not.toThrow();
   });
 
   it.each([

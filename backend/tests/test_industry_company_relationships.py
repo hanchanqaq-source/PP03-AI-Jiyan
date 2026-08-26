@@ -3,6 +3,13 @@ from __future__ import annotations
 from industry_research.relationships import project_company_relations
 
 
+PROJECTION_SCOPE = {
+    "allowed_chain_node_ids": ("memory_design_manufacturing",),
+    "allowed_metric_ids": ("dram_price",),
+    "allowed_evidence_ids": ("evidence-company-1", "evidence-classification-1"),
+}
+
+
 def _candidate(**overrides):
     value = {
         "industry_id": "storage",
@@ -31,6 +38,7 @@ def test_company_relation_requires_exact_security_code_and_official_evidence() -
             _candidate(security_code="688003", evidence_ids=()),
             _candidate(security_code="688004", industry_id="semiconductor"),
         ),
+        **PROJECTION_SCOPE,
     )
 
     assert len(result) == 1
@@ -56,7 +64,22 @@ def test_public_classification_is_admitted_only_when_officially_evidenced() -> N
                 official_evidence=False,
             ),
         ),
+        **PROJECTION_SCOPE,
     )
 
     assert [item.security_code for item in result] == ["688001"]
     assert result[0].relation_type == "public_classification"
+
+
+def test_company_projection_rejects_foreign_template_and_evidence_bindings() -> None:
+    result = project_company_relations(
+        industry_id="storage",
+        candidates=(
+            _candidate(chain_node_id="foreign-node"),
+            _candidate(security_code="688002", key_metric_ids=("foreign-metric",)),
+            _candidate(security_code="688003", evidence_ids=("foreign-evidence",)),
+        ),
+        **PROJECTION_SCOPE,
+    )
+
+    assert result == ()

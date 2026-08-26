@@ -24,7 +24,6 @@ import type {
   NewsPipelinePhase,
 } from "@/features/market-news/types";
 import type { LlmConfig } from "@/lib/llm";
-import { pythonCasefold } from "@/lib/pythonCasefold.generated";
 import type {
   SourceHealthRun,
   SourceHealthRunStarted,
@@ -615,13 +614,6 @@ function industrySameStringSet(left: string[], right: string[]): boolean {
     && left.every((item) => right.includes(item));
 }
 
-function industryPythonCasefold(value: string): string {
-  if (/[\uD800-\uDFFF]|[\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF]/u.test(value)) {
-    industryError();
-  }
-  return pythonCasefold(value);
-}
-
 function validateTrustedMetric(
   metric: IndustryMetric,
   rawSnapshotId: string,
@@ -1013,18 +1005,14 @@ function decodeCandidate(value: unknown): CandidateIndustryEvidence {
     || result.conflicting.some((item) => item.industryId !== result.industryId
       || item.rawSnapshotId !== result.rawSnapshotId
       || item.evidenceSnapshotId !== result.evidenceSnapshotId
-      || new Set(item.sourceValues.map((source) => source.evidenceId)).size !== item.sourceValues.length
-      || new Set(item.sourceValues.map((source) => JSON.stringify([
-        typeof source.value === "string" ? industryPythonCasefold(source.value) : source.value,
-        source.unit === null ? null : industryPythonCasefold(source.unit),
-        source.asOfDate,
-        source.change,
-      ]))).size < 2)
+      || new Set(item.sourceValues.map((source) => source.evidenceId)).size !== item.sourceValues.length)
     || [...result.unverifiedEvents, ...result.conflictingEvents].some(
       (item) => item.industryId !== result.industryId
-        || item.candidateSnapshotId !== result.candidateSnapshotId
-        || item.rawSnapshotId !== result.rawSnapshotId
-        || item.evidenceSnapshotId !== result.evidenceSnapshotId,
+        || (!(
+          item.candidateSnapshotId === result.candidateSnapshotId
+          && item.rawSnapshotId === result.rawSnapshotId
+          && item.evidenceSnapshotId === result.evidenceSnapshotId
+        ) && item.candidateSnapshotId !== item.evidenceSnapshotId),
     )) industryError();
   return result;
 }

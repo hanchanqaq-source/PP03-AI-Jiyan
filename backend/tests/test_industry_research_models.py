@@ -722,7 +722,7 @@ def test_candidate_panel_and_refresh_require_complete_candidate_lineage_and_boun
         raw_snapshot_id="raw-1",
         evidence_snapshot_id="evidence-1",
     )
-    with pytest.raises(ValueError, match="event raw lineage mismatch"):
+    with pytest.raises(ValueError, match="candidate event lineage"):
         replace(panel, unverified_events=(replace(event, raw_snapshot_id="raw-foreign"),))
 
     with pytest.raises(ValueError, match="candidate.*raw/evidence"):

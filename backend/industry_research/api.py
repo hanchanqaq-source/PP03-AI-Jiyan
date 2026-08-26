@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import os
+from pathlib import Path
 import re
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -14,15 +16,16 @@ from starlette.requests import ClientDisconnect
 from .models import (
     CandidateEvidenceCounts,
     CandidateEvidencePanel,
-    FundResolutionEmptyReason,
-    FundSelectionScope,
-    IndustryFundRelationResolution,
     IndustryReportResponse,
     RefreshPhase,
     RefreshRun,
     TemplateStatus,
 )
-from .relationships import FundRelationProjection
+from .fund_context import FundAnalysisAdapter, TransientFundContext
+from .relationships import (
+    FundRelationProjection,
+    resolve_fund_relations as resolve_explicit_fund_relations,
+)
 from .storage import IndustryResearchStorage
 from .templates import get_industry_template
 
@@ -147,6 +150,36 @@ def _filter_report_window(
     )
 
 
+class _RequestScopedFundDataAdapter:
+    """Bind the existing public FundDataService to a request-owned cache only."""
+
+    storage_mode = "request_temp"
+    requires_transient_disk = True
+
+    def __init__(self) -> None:
+        self._service: Any | None = None
+
+    def bind_transient_root(self, root: Path) -> None:
+        if self._service is not None:
+            raise RuntimeError("fund adapter is already bound")
+        from fund_data.cache import FundCache
+        from fund_data.service import FundDataService
+
+        self._service = FundDataService(cache=FundCache(root / "fund-cache"))
+
+    def get_fund_analysis(self, code: str, force_refresh: bool = False) -> Mapping[str, Any]:
+        if self._service is None:
+            raise RuntimeError("fund adapter has no request temp root")
+        return self._service.get_fund_analysis(code, force_refresh=force_refresh)
+
+    def close(self) -> None:
+        self._service = None
+
+
+def _create_request_scoped_fund_adapter() -> FundAnalysisAdapter:
+    return _RequestScopedFundDataAdapter()
+
+
 class ProductionIndustryResearchService:
     """Read-only production boundary; the current qualified refresh set is empty."""
 
@@ -155,21 +188,60 @@ class ProductionIndustryResearchService:
         *,
         storage: IndustryResearchStorage | None = None,
         now=lambda: datetime.now(timezone.utc),
+        fund_analysis_adapter_factory: Callable[[], FundAnalysisAdapter] | None = None,
+        fund_acceptance_root: str | os.PathLike[str] | None = None,
+        official_industry_config: Mapping[str, object] | None = None,
+        refresh_state_reader: Any | None = None,
     ) -> None:
         self._storage = storage or IndustryResearchStorage(production=True)
         self._now = now
+        self._fund_analysis_adapter_factory = (
+            fund_analysis_adapter_factory or _create_request_scoped_fund_adapter
+        )
+        self._fund_acceptance_root = Path(
+            fund_acceptance_root
+            or os.environ.get("VR_ACCEPTANCE_DIR")
+            or Path(__file__).resolve().parents[2] / ".tmp" / "acceptance" / "v0.2-w3" / "fund-requests"
+        ).absolute()
+        self._official_industry_config = official_industry_config
+        self._refresh_state_reader = refresh_state_reader
 
     def read_report(self, industry_id: str, window_days: int) -> IndustryReportResponse:
         report = self._storage.load_current(industry_id)
         if report is None:
             return _empty_response(industry_id)
         report.validate_for_mode(production=True)
+        refresh = _idle_refresh(industry_id, report)
+        candidate = None
+        if self._refresh_state_reader is not None:
+            try:
+                current = self._refresh_state_reader.current_run(industry_id)
+                current_candidate = self._refresh_state_reader.current_candidate(industry_id)
+                if (
+                    type(current) is RefreshRun
+                    and current.displayed_trusted_snapshot_id == report.trusted_snapshot_id
+                    and current.displayed_raw_snapshot_id == report.raw_snapshot_id
+                    and current.displayed_evidence_snapshot_id == report.evidence_snapshot_id
+                    and (
+                        (current.candidate_snapshot_id is None and current_candidate is None)
+                        or (
+                            type(current_candidate) is CandidateEvidencePanel
+                            and current_candidate.candidate_snapshot_id == current.candidate_snapshot_id
+                            and current_candidate.raw_snapshot_id == current.raw_snapshot_id
+                            and current_candidate.evidence_snapshot_id == current.evidence_snapshot_id
+                        )
+                    )
+                ):
+                    refresh = current
+                    candidate = current_candidate
+            except Exception:
+                pass
         response = IndustryReportResponse(
             requested_industry_id=industry_id,
             displayed_industry_id=industry_id,
             displayed_trusted_report=report,
-            candidate_evidence=None,
-            refresh_run=_idle_refresh(industry_id, report),
+            candidate_evidence=candidate,
+            refresh_run=refresh,
         )
         return _filter_report_window(response, window_days=window_days, now=self._now())
 
@@ -188,25 +260,20 @@ class ProductionIndustryResearchService:
         industry_id: str,
         fund_codes: tuple[str, ...],
     ) -> FundRelationProjection:
-        del industry_id
-        selections = tuple(
-            FundSelectionScope(f"selection-{index}", code, True)
-            for index, code in enumerate(fund_codes, start=1)
+        if not fund_codes:
+            return FundRelationProjection("no_holdings", (), (), ())
+        adapter = self._fund_analysis_adapter_factory()
+        if getattr(adapter, "requires_transient_disk", None) is True:
+            self._fund_acceptance_root.mkdir(parents=True, exist_ok=True)
+        context = TransientFundContext(
+            adapter=adapter,
+            acceptance_root=self._fund_acceptance_root,
+            official_industry_config=self._official_industry_config,
         )
-        resolutions = tuple(
-            IndustryFundRelationResolution(
-                selection_id=selection.selection_id,
-                fund_code=selection.fund_code,
-                relation=None,
-                empty_reason=FundResolutionEmptyReason.SOURCE_UNAVAILABLE,
-            )
-            for selection in selections
-        )
-        return FundRelationProjection(
-            state="resolved" if selections else "no_holdings",
-            fund_selection=selections,
-            resolutions=resolutions,
-            pending_lookthrough_selection_ids=(),
+        return resolve_explicit_fund_relations(
+            industry_id=industry_id,
+            fund_codes=fund_codes,
+            context=context,
         )
 
     def shutdown(self) -> None:

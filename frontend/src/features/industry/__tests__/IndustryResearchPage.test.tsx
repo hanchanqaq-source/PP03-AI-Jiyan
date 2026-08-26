@@ -314,7 +314,7 @@ describe("industry research page data boundary", () => {
     expect(metrics).toHaveAttribute("aria-current", "location");
   });
 
-  it("filters trusted and candidate events locally for 7/30/90 days without refresh or extra GET", async () => {
+  it("requests and displays matching 7/30/90 windows without triggering refresh", async () => {
     const user = userEvent.setup();
     const load = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(industryResponseWire()));
     const refresh = vi.spyOn(api, "industryResearchRefresh");
@@ -331,8 +331,57 @@ describe("industry research page data boundary", () => {
     await user.click(screen.getByRole("button", { name: "最近 30 天" }));
     expect(screen.getByText("STORAGE-NEWS-30")).toBeInTheDocument();
     expect(screen.getByText("STORAGE-CONFLICT-30")).toBeInTheDocument();
-    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).toHaveBeenCalledTimes(3);
+    expect(load.mock.calls.map(([input]) => String(input))).toEqual([
+      expect.stringContaining("window_days=90"),
+      expect.stringContaining("window_days=7"),
+      expect.stringContaining("window_days=30"),
+    ]);
     expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("restores industry and local news window from URL on reload without inventing tags", async () => {
+    history.replaceState(null, "", "/industry-research?industry=robotics&window=30#news-risk");
+    const load = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/robotics?") ? "robotics" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+
+    render(<IndustryResearch />);
+
+    expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到机器人" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "最近 30 天" })).toHaveAttribute("aria-pressed", "true");
+    expect(location.search).toBe("?industry=robotics&window=30");
+    expect(location.hash).toBe("#news-risk");
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(String(load.mock.calls[0][0])).toContain("window_days=30");
+  });
+
+  it("pushes user navigation and restores back-forward state through the request coordinator", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const industryId = String(input).includes("/robotics?") ? "robotics" : "storage";
+      return jsonResponse(industryResponseWire(industryId));
+    });
+    const push = vi.spyOn(history, "pushState");
+    render(<IndustryResearch />);
+    await screen.findByRole("article", { name: "存储行业研究报告" });
+
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    await screen.findByRole("article", { name: "机器人行业研究报告" });
+    expect(location.search).toBe("?industry=robotics&window=90");
+    await user.click(screen.getByRole("button", { name: "最近 7 天" }));
+    await waitFor(() => expect(location.search).toBe("?industry=robotics&window=7"));
+    expect(push).toHaveBeenCalledTimes(2);
+
+    history.replaceState(null, "", "/industry-research?industry=storage&window=30#metrics");
+    act(() => window.dispatchEvent(new PopStateEvent("popstate")));
+
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "最近 30 天" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
+    expect(location.hash).toBe("#metrics");
   });
 
   it("keeps unknown custom tags in an explicit building state without fabricated report content", async () => {

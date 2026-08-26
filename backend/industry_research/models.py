@@ -841,13 +841,26 @@ class CandidateEvidencePanel(WireModel):
             raise ValueError("candidate conflicting raw lineage mismatch")
         if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in self.conflicting):
             raise ValueError("candidate conflicting evidence lineage mismatch")
+        # Metric candidates use the panel lineage. Independently signed A2 news
+        # candidates may retain a second raw lineage, but their canonical
+        # evidence snapshot is also their candidate snapshot. No arbitrary third
+        # lineage shape is accepted.
         events = self.unverified_events + self.conflicting_events
-        if any(item.candidate_snapshot_id != self.candidate_snapshot_id for item in events):
-            raise ValueError("candidate event snapshot lineage mismatch")
-        if any(item.raw_snapshot_id != self.raw_snapshot_id for item in events):
-            raise ValueError("candidate event raw lineage mismatch")
-        if any(item.evidence_snapshot_id != self.evidence_snapshot_id for item in events):
-            raise ValueError("candidate event evidence lineage mismatch")
+        panel_lineage = (
+            self.candidate_snapshot_id,
+            self.raw_snapshot_id,
+            self.evidence_snapshot_id,
+        )
+        for item in events:
+            item_lineage = (
+                item.candidate_snapshot_id,
+                item.raw_snapshot_id,
+                item.evidence_snapshot_id,
+            )
+            if item_lineage != panel_lineage and (
+                item.candidate_snapshot_id != item.evidence_snapshot_id
+            ):
+                raise ValueError("candidate event lineage is neither panel-bound nor canonical A2")
         actual = (len(self.unverified), len(self.conflicting), len(self.unverified_events), len(self.conflicting_events))
         expected = (self.counts.unverified, self.counts.conflicting, self.counts.unverified_events, self.counts.conflicting_events)
         if actual != expected:

@@ -261,8 +261,9 @@ def test_news_only_candidate_panel_and_response_use_actual_news_lineage() -> Non
     assert response.candidate_evidence == panel
 
 
-def test_metric_and_news_candidates_from_different_lineages_fail_closed() -> None:
-    # Break caught: independently signed metric and news candidates are fabricated into one panel.
+def test_metric_and_news_candidates_keep_independent_per_item_lineage() -> None:
+    # Break caught: production assembly either rejects canonical A2 news or relabels it
+    # with the unrelated industry-metric candidate lineage.
     pending_metric = replace(
         trusted_observation("capacity_utilization"),
         verification_status=VerificationStatus.UNVERIFIED,
@@ -279,17 +280,81 @@ def test_metric_and_news_candidates_from_different_lineages_fail_closed() -> Non
         evidence_snapshot_id="evidence-storage-1",
     )
 
-    with pytest.raises(ValueError, match="cannot merge candidate lineages"):
-        assemble_storage_report(
-            trusted_snapshot_id="trusted-storage-1",
-            raw_snapshot_id="raw-storage-1",
-            evidence_snapshot_id="evidence-storage-1",
-            generated_at=NOW,
-            trusted_observations=(trusted_observation("dram_price"),),
-            metric_candidates=metric_panel,
-            news_snapshot=news_snapshot(),
-            now=NOW,
-        )
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        metric_candidates=metric_panel,
+        news_snapshot=news_snapshot(),
+        now=NOW,
+    )
+
+    panel = assembly.candidate_evidence
+    assert (panel.candidate_snapshot_id, panel.raw_snapshot_id, panel.evidence_snapshot_id) == (
+        "candidate-storage-1", "raw-storage-1", "evidence-storage-1",
+    )
+    assert panel.unverified[0].raw_snapshot_id == "raw-storage-1"
+    assert {
+        (event.candidate_snapshot_id, event.raw_snapshot_id, event.evidence_snapshot_id)
+        for event in panel.unverified_events + panel.conflicting_events
+    } == {("news-evidence-1", "news-raw-1", "news-evidence-1")}
+
+
+def test_assembly_projects_only_official_exact_code_company_candidates() -> None:
+    company_evidence = EvidenceSnapshot(
+        snapshot_id="evidence-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        generated_at=NOW,
+        events=(event("company-proof", A2VerificationStatus.VERIFIED, 1),),
+    )
+    assembly = assemble_storage_report(
+        trusted_snapshot_id="trusted-storage-1",
+        raw_snapshot_id="raw-storage-1",
+        evidence_snapshot_id="evidence-storage-1",
+        generated_at=NOW,
+        trusted_observations=(trusted_observation("dram_price"),),
+        metric_candidates=None,
+        news_snapshot=None,
+        company_candidates=(
+            {
+                "industry_id": "storage",
+                "security_code": "688001",
+                "company_name": "示例存储公司",
+                "chain_node_id": "memory_design_manufacturing",
+                "relation_type": "official_disclosure",
+                "key_metric_ids": ("dram_price",),
+                "evidence_ids": ("company-proof-a",),
+                "as_of_date": "2026-06-30",
+                "official_evidence": True,
+            },
+            {
+                "industry_id": "semiconductor",
+                "security_code": "688002",
+                "company_name": "错误行业公司",
+                "chain_node_id": "memory_design_manufacturing",
+                "relation_type": "official_disclosure",
+                "evidence_ids": ("evidence-company-2",),
+                "as_of_date": "2026-06-30",
+                "official_evidence": True,
+            },
+            {
+                "industry_id": "storage",
+                "security_code": "688003",
+                "company_name": "无官方证据公司",
+                "chain_node_id": "memory_design_manufacturing",
+                "relation_type": "public_classification",
+                "evidence_ids": ("evidence-company-3",),
+                "as_of_date": "2026-06-30",
+                "official_evidence": False,
+            },
+        ),
+        company_evidence_snapshot=company_evidence,
+        now=NOW,
+    )
+
+    assert [company.security_code for company in assembly.report.companies] == ["688001"]
 
 
 def test_forged_equal_value_conflict_cannot_set_placeholder_without_canonical_a2_proof(

@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,12 +23,18 @@ from evidence_verification.models import (
 )
 from evidence_verification.storage import EvidenceStorage
 from industry_research.admission import EvidenceDecision, RawMetricObservation, SourceIdentity
+from industry_research.api import ProductionIndustryResearchService
 from industry_research.models import RefreshPhase, RefreshRun
-from industry_research.refresh import IndustryResearchRefreshOrchestrator, RefreshRawSnapshot
+from industry_research.refresh import (
+    IndustryResearchRefreshOrchestrator,
+    RefreshRawSnapshot,
+    load_canonical_a2_news_snapshot,
+)
 from industry_research.service import IndustryResearchService
 from industry_research.source_qualification import SourceQualificationResult
 from industry_research.storage import IndustryResearchStorage
 from news_intelligence.models import NewsSourceItem
+from news_pipeline.models import RawSnapshot, TrustedSnapshot
 
 
 NOW = datetime(2026, 8, 25, 8, 0, tzinfo=timezone.utc)
@@ -365,6 +372,8 @@ def _orchestrator(
     max_workers: int = 2,
     run_ids=None,
     attempt_tokens=None,
+    canonical_news_snapshot_loader=None,
+    company_candidate_loader=None,
 ):
     descriptor = _descriptor()
     descriptors = tuple(descriptors or (descriptor,))
@@ -380,6 +389,10 @@ def _orchestrator(
         if tokens is not None
         else {}
     )
+    if canonical_news_snapshot_loader is not None:
+        kwargs["canonical_news_snapshot_loader"] = canonical_news_snapshot_loader
+    if company_candidate_loader is not None:
+        kwargs["company_candidate_loader"] = company_candidate_loader
     return IndustryResearchRefreshOrchestrator(
         catalog=FakeCatalog(*descriptors),
         provider_registry=FakeRegistry(providers),
@@ -399,6 +412,94 @@ def _orchestrator(
     )
 
 
+def _a2_news_event(event_id: str, status: A2VerificationStatus, days_ago: int) -> EvidenceEvent:
+    primary = EvidenceItem(
+        evidence_id=f"{event_id}-primary",
+        content_source="official-news.example",
+        collector_source="official-news.example",
+        canonical_url=f"https://official-news.example/{event_id}",
+        published_at=NOW - timedelta(days=days_ago),
+        source_role=SourceRole.PRIMARY,
+        origin_cluster="official-news",
+        supports_claim=True,
+        supports_fields=("core_claim",),
+        contradicts_claim=False,
+        is_official=True,
+    )
+    independent = EvidenceItem(
+        evidence_id=f"{event_id}-independent",
+        content_source="independent-news.example",
+        collector_source="independent-news.example",
+        canonical_url=f"https://independent-news.example/{event_id}",
+        published_at=NOW - timedelta(days=days_ago),
+        source_role=SourceRole.INDEPENDENT,
+        origin_cluster="independent-news",
+        supports_claim=True,
+        supports_fields=("core_claim",),
+        contradicts_claim=False,
+        is_official=False,
+    )
+    contradiction = EvidenceItem(
+        evidence_id=f"{event_id}-contradiction",
+        content_source="contradiction-news.example",
+        collector_source="contradiction-news.example",
+        canonical_url=f"https://contradiction-news.example/{event_id}",
+        published_at=NOW - timedelta(days=days_ago),
+        source_role=SourceRole.INDEPENDENT,
+        origin_cluster="contradiction-news",
+        supports_claim=False,
+        supports_fields=(),
+        contradicts_claim=True,
+        is_official=False,
+    )
+    return EvidenceEvent(
+        event_id=event_id,
+        title=event_id,
+        summary=event_id,
+        category="industry",
+        related_tags=(("storage", "存储"),),
+        published_at=NOW - timedelta(days=days_ago),
+        core_claim=event_id,
+        verification_status=status,
+        verification_reason="canonical A2 fixture",
+        verified_at=NOW,
+        evidence_as_of=NOW - timedelta(days=days_ago),
+        primary_evidence=(primary,),
+        independent_evidence=(independent,) if status is A2VerificationStatus.CORROBORATED else (),
+        contradicting_evidence=(contradiction,) if status is A2VerificationStatus.CONFLICTING else (),
+    )
+
+
+def _canonical_news_snapshot() -> EvidenceSnapshot:
+    return EvidenceSnapshot(
+        snapshot_id="news-evidence-production",
+        raw_snapshot_id="news-raw-production",
+        generated_at=NOW,
+        events=(
+            _a2_news_event("news-verified-3", A2VerificationStatus.VERIFIED, 3),
+            _a2_news_event("news-corroborated-20", A2VerificationStatus.CORROBORATED, 20),
+            _a2_news_event("news-unverified-2", A2VerificationStatus.UNVERIFIED, 2),
+            _a2_news_event("news-conflicting-40", A2VerificationStatus.CONFLICTING, 40),
+        ),
+    )
+
+
+def test_default_a2_news_loader_requires_complete_shared_raw_lineage(monkeypatch) -> None:
+    snapshot = _canonical_news_snapshot()
+    raw = RawSnapshot(snapshot.raw_snapshot_id, NOW, ())
+    trusted = TrustedSnapshot(snapshot.raw_snapshot_id, NOW, ())
+    service = SimpleNamespace(current_trusted_context=lambda: (trusted, raw, snapshot))
+    monkeypatch.setattr("news_pipeline.service.get_service", lambda: service)
+
+    assert load_canonical_a2_news_snapshot("storage") is snapshot
+
+    mismatched = SimpleNamespace(current_trusted_context=lambda: (
+        TrustedSnapshot("foreign-raw", NOW, ()), raw, snapshot,
+    ))
+    monkeypatch.setattr("news_pipeline.service.get_service", lambda: mismatched)
+    assert load_canonical_a2_news_snapshot("storage") is None
+
+
 def test_get_current_history_and_construction_never_trigger_refresh(tmp_path) -> None:
     descriptor = _descriptor()
     provider = FakeProvider(
@@ -411,6 +512,88 @@ def test_get_current_history_and_construction_never_trigger_refresh(tmp_path) ->
     assert orchestrator.current_candidate("storage") is None
     assert provider.calls == 0
     orchestrator.shutdown()
+
+
+def test_refresh_publishes_canonical_a2_news_and_projected_official_companies(tmp_path) -> None:
+    storage = RecordingStorage(root=tmp_path / "reports")
+    news_calls: list[str] = []
+    company_calls: list[tuple[str, str]] = []
+
+    def load_news(industry_id: str) -> EvidenceSnapshot:
+        news_calls.append(industry_id)
+        return _canonical_news_snapshot()
+
+    def load_companies(industry_id: str, evidence: EvidenceSnapshot):
+        company_calls.append((industry_id, evidence.snapshot_id))
+        return (
+            {
+                "industry_id": industry_id,
+                "security_code": "688001",
+                "company_name": "示例存储公司",
+                "chain_node_id": "memory_design_manufacturing",
+                "relation_type": "official_disclosure",
+                "key_metric_ids": ("dram_price",),
+                "evidence_ids": (evidence.events[0].primary_evidence[0].evidence_id,),
+                "as_of_date": "2026-06-30",
+                "official_evidence": True,
+            },
+            {
+                "industry_id": "semiconductor",
+                "security_code": "688002",
+                "company_name": "错误行业公司",
+                "chain_node_id": "memory_design_manufacturing",
+                "relation_type": "official_disclosure",
+                "evidence_ids": ("wrong-industry",),
+                "as_of_date": "2026-06-30",
+                "official_evidence": True,
+            },
+        )
+
+    orchestrator = _orchestrator(
+        tmp_path,
+        report_storage=storage,
+        canonical_news_snapshot_loader=load_news,
+        company_candidate_loader=load_companies,
+    )
+    try:
+        run = orchestrator.request_refresh("storage").result(timeout=5)
+        report = storage.load_current("storage")
+    finally:
+        orchestrator.shutdown()
+
+    assert run.phase is RefreshPhase.TRUSTED_PUBLISHED, run.error_code
+    assert news_calls == ["storage"]
+    assert company_calls == [("storage", run.evidence_snapshot_id)]
+    assert report is not None
+    assert {event.event_id for event in report.news_risk} == {
+        "news-verified-3", "news-corroborated-20",
+    }
+    assert [company.security_code for company in report.companies] == ["688001"]
+    candidate = orchestrator.current_candidate("storage")
+    assert candidate is not None
+    assert {event.event_id for event in candidate.unverified_events} == {"news-unverified-2"}
+    assert {event.event_id for event in candidate.conflicting_events} == {"news-conflicting-40"}
+    production = ProductionIndustryResearchService(
+        storage=storage,
+        now=lambda: NOW,
+        refresh_state_reader=orchestrator,
+    )
+    seven = production.read_report("storage", 7)
+    thirty = production.read_report("storage", 30)
+    ninety = production.read_report("storage", 90)
+    assert {event.event_id for event in seven.displayed_trusted_report.news_risk} == {
+        "news-verified-3",
+    }
+    assert {event.event_id for event in thirty.displayed_trusted_report.news_risk} == {
+        "news-verified-3", "news-corroborated-20",
+    }
+    assert {event.event_id for event in seven.candidate_evidence.unverified_events} == {
+        "news-unverified-2",
+    }
+    assert thirty.candidate_evidence.conflicting_events == ()
+    assert {event.event_id for event in ninety.candidate_evidence.conflicting_events} == {
+        "news-conflicting-40",
+    }
 
 
 @pytest.mark.parametrize(

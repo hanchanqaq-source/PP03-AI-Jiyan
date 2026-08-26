@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import stat
 import threading
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from data_sources.models import ProviderValue
@@ -66,6 +66,36 @@ _ERROR_CODES = frozenset({
     "source_industry_mismatch",
     "storage_error",
 })
+
+
+def load_canonical_a2_news_snapshot(_industry_id: str) -> EvidenceSnapshot | None:
+    """Read the current A2 trusted context without triggering a pipeline refresh."""
+    try:
+        from news_pipeline.models import RawSnapshot, TrustedSnapshot
+        from news_pipeline.service import get_service
+
+        context = get_service().current_trusted_context()
+        if context is None:
+            return None
+        trusted, raw, evidence = context
+        if (
+            type(trusted) is not TrustedSnapshot
+            or type(raw) is not RawSnapshot
+            or type(evidence) is not EvidenceSnapshot
+            or trusted.raw_snapshot_id != raw.raw_snapshot_id
+            or evidence.raw_snapshot_id != raw.raw_snapshot_id
+        ):
+            return None
+        return evidence
+    except Exception:
+        return None
+
+
+def _no_company_candidates(
+    _industry_id: str,
+    _evidence_snapshot: EvidenceSnapshot,
+) -> tuple[Mapping[str, object], ...]:
+    return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,6 +748,10 @@ class IndustryResearchRefreshOrchestrator:
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         run_id_factory: Callable[[], str] = lambda: uuid4().hex,
         attempt_token_factory: Callable[[], str] = lambda: uuid4().hex,
+        canonical_news_snapshot_loader: Callable[[str], EvidenceSnapshot | None] = load_canonical_a2_news_snapshot,
+        company_candidate_loader: Callable[
+            [str, EvidenceSnapshot], Iterable[Mapping[str, object]]
+        ] = _no_company_candidates,
     ) -> None:
         if type(max_workers) is not int or max_workers <= 0:
             raise ValueError("max_workers must be a positive integer")
@@ -733,6 +767,8 @@ class IndustryResearchRefreshOrchestrator:
         self._now = now
         self._run_id_factory = run_id_factory
         self._attempt_token_factory = attempt_token_factory
+        self._canonical_news_snapshot_loader = canonical_news_snapshot_loader
+        self._company_candidate_loader = company_candidate_loader
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="industry-refresh",
@@ -1256,6 +1292,20 @@ class IndustryResearchRefreshOrchestrator:
 
             trusted_id = f"trusted-{initial.run_id}"
             try:
+                try:
+                    news_snapshot = self._canonical_news_snapshot_loader(initial.industry_id)
+                except Exception:
+                    news_snapshot = None
+                if news_snapshot is not None and type(news_snapshot) is not EvidenceSnapshot:
+                    news_snapshot = None
+                try:
+                    company_candidates = tuple(
+                        self._company_candidate_loader(initial.industry_id, evidence_snapshot)
+                    )
+                    if any(not isinstance(item, Mapping) for item in company_candidates):
+                        company_candidates = ()
+                except Exception:
+                    company_candidates = ()
                 assembly = self._report_service.assemble_storage_report(
                     trusted_snapshot_id=trusted_id,
                     raw_snapshot_id=raw.raw_snapshot_id,
@@ -1265,7 +1315,9 @@ class IndustryResearchRefreshOrchestrator:
                     expired_observations=projection.expired,
                     metric_candidates=candidate,
                     candidate_evidence_storage=evidence_storage,
-                    news_snapshot=None,
+                    news_snapshot=news_snapshot,
+                    company_candidates=company_candidates,
+                    company_evidence_snapshot=evidence_snapshot,
                 )
                 if (
                     assembly.report.industry_id != initial.industry_id

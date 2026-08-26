@@ -1332,7 +1332,7 @@ def _write_acceptance_evidence(
         },
         "cleanup": cleanup,
         "limitations": [
-            "A2-W1 historical Live terminal remains failed/evidence_compatibility_failed; this run is offline fixture-backed acceptance, not a new Live success.",
+            "A2-W1 historical Live terminal remains failed/evidence_compatibility_failed; this run is fixture-backed with no Live data requests, not a new Live success.",
             "Industry price, inventory, utilization, capital, funds and valuation fields without qualified sources remain explicit empty states.",
         ],
     }

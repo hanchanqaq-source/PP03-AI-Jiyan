@@ -354,6 +354,36 @@ try {
     articleIndustryIds,
   });
 
+  const browserBack = await runIndustryAction(
+    "browser-back-storage",
+    "storage",
+    () => page.goBack({ waitUntil: "domcontentloaded" }),
+  );
+  assert(new URL(page.url()).searchParams.get("industry") === "storage", "browser Back lost storage URL state");
+  assert(new URL(page.url()).searchParams.get("window") === "90", "browser Back lost 90-day URL state");
+  assert(await browserBack.article.getAttribute("data-industry-id") === "storage", "browser Back restored wrong report");
+
+  const browserForward = await runIndustryAction(
+    "browser-forward-semiconductor",
+    "semiconductor",
+    () => page.goForward({ waitUntil: "domcontentloaded" }),
+  );
+  assert(new URL(page.url()).searchParams.get("industry") === "semiconductor", "browser Forward lost semiconductor URL state");
+  assert(await browserForward.article.getAttribute("data-industry-id") === "semiconductor", "browser Forward restored wrong report");
+
+  const browserReload = await runIndustryAction(
+    "browser-reload-semiconductor",
+    "semiconductor",
+    () => page.reload({ waitUntil: "domcontentloaded" }),
+  );
+  assert(new URL(page.url()).searchParams.get("industry") === "semiconductor", "browser reload lost industry URL state");
+  assert(await browserReload.article.getAttribute("data-industry-id") === "semiconductor", "browser reload restored wrong report");
+  record("browser-back-forward-reload", {
+    back: browserBack.evidence,
+    forward: browserForward.evidence,
+    reload: browserReload.evidence,
+  });
+
   const roboticsSwitch = await runIndustryAction(
     "switch-robotics",
     "robotics",

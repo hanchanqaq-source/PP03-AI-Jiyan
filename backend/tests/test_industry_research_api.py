@@ -232,6 +232,140 @@ def test_known_industry_empty_storage_is_200_without_network_or_refresh(tmp_path
     assert service.has_qualified_refresh("storage") is False
 
 
+def test_production_fund_post_uses_only_explicit_codes_and_closes_request_adapter(tmp_path) -> None:
+    class PublicAnalysisAdapter:
+        storage_mode = "memory"
+        requires_transient_disk = False
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.closed = 0
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            assert force_refresh is False
+            self.calls.append(code)
+            return {
+                "code": code,
+                "profile": {"data": {"name": "名称不得用于关系推断"}, "meta": {"status": "disclosed"}},
+                "holdings": {
+                    "data": {"fund_code": code, "holdings": [], "disclosure_date": "2026-06-30"},
+                    "meta": {"status": "disclosed", "source_reference": "https://public.example/holdings"},
+                },
+                "industry_exposure": {
+                    "data": {
+                        "fund_code": code,
+                        "official_allocation": {
+                            "as_of_date": "2026-06-30",
+                            "source_reference": "https://public.example/allocation",
+                            "exposure": [{"name": "官方存储分类", "weight_pct": 12.5, "fund_code": code}],
+                        },
+                        "lookthrough": {"status": "unavailable"},
+                        "industry_chain_tags": [],
+                        "holding_industry_evidence": [],
+                    },
+                    "meta": {"status": "disclosed"},
+                },
+            }
+
+        def close(self) -> None:
+            self.closed += 1
+
+    adapters: list[PublicAnalysisAdapter] = []
+
+    def factory() -> PublicAnalysisAdapter:
+        adapter = PublicAnalysisAdapter()
+        adapters.append(adapter)
+        return adapter
+
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    root.mkdir(parents=True)
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        now=lambda: NOW,
+        fund_analysis_adapter_factory=factory,
+        fund_acceptance_root=root,
+        official_industry_config={
+            "official_allocation_name_to_industry_ids": {"官方存储分类": ("storage",)},
+            "security_code_to_industry_ids": {},
+        },
+    )
+    client = _client(service)
+
+    resolved = client.post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+    empty = client.post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": []},
+    )
+
+    assert resolved.status_code == 200
+    relation = resolved.json()["resolutions"][0]["relation"]
+    assert relation["relation_layer"] == "official_allocation"
+    assert relation["exposure_value"] == 12.5
+    assert adapters[0].calls == ["900001"]
+    assert adapters[0].closed == 1
+    assert empty.json()["state"] == "no_holdings"
+    assert len(adapters) == 1
+    assert tuple(root.iterdir()) == ()
+
+
+def test_default_public_fund_adapter_binds_existing_service_only_to_request_temp(
+    tmp_path, monkeypatch,
+) -> None:
+    cache_paths = []
+    analyzed_codes: list[str] = []
+
+    class FakeCache:
+        def __init__(self, path) -> None:
+            cache_paths.append(path)
+
+    class FakeFundDataService:
+        def __init__(self, *, cache) -> None:
+            assert isinstance(cache, FakeCache)
+
+        def get_fund_analysis(self, code: str, force_refresh: bool = False):
+            assert force_refresh is False
+            analyzed_codes.append(code)
+            return {
+                "code": code,
+                "holdings": {"data": None, "meta": {"status": "error", "availability_reason": "source_unavailable"}},
+                "industry_exposure": {"data": None, "meta": {"status": "error", "availability_reason": "source_unavailable"}},
+            }
+
+    monkeypatch.setattr("fund_data.cache.FundCache", FakeCache)
+    monkeypatch.setattr("fund_data.service.FundDataService", FakeFundDataService)
+    root = tmp_path / ".tmp" / "acceptance" / "fund-requests"
+    root.mkdir(parents=True)
+    service = industry_api.ProductionIndustryResearchService(
+        storage=IndustryResearchStorage(tmp_path / "reports"),
+        now=lambda: NOW,
+        fund_acceptance_root=root,
+        official_industry_config={
+            "official_allocation_name_to_industry_ids": {},
+            "security_code_to_industry_ids": {},
+        },
+    )
+
+    response = _client(service).post(
+        "/api/industry-research/storage/fund-relations/resolve",
+        headers=WRITE_HEADERS,
+        json={"fund_codes": ["900001"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["resolutions"][0]["empty_reason"] == "source_unavailable"
+    assert analyzed_codes == ["900001"]
+    assert len(cache_paths) == 1
+    assert cache_paths[0].name == "fund-cache"
+    assert cache_paths[0].parent.parent == root
+    assert cache_paths[0].parent.name.startswith("fund-context-")
+    assert tuple(root.iterdir()) == ()
+
+
 def test_conflicting_snapshot_stays_in_candidate_side_channel() -> None:
     base = _report_response()
     candidate = CandidateEvidencePanel(

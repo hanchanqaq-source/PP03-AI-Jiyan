@@ -36,6 +36,7 @@ from .rules import (
     observation_is_current,
     select_current_trusted_observations,
 )
+from .relationships import project_company_relations
 from .templates import REPORT_SECTION_IDS, get_industry_template
 
 
@@ -240,12 +241,7 @@ def _merge_candidates(
     news_snapshot: EvidenceSnapshot | None,
     window: NewsWindowProjection,
 ) -> CandidateEvidencePanel:
-    metric_items_present = bool(
-        metric_candidates.unverified
-        or metric_candidates.conflicting
-        or metric_candidates.unverified_events
-        or metric_candidates.conflicting_events
-    )
+    metric_batch_present = metric_candidates.candidate_snapshot_id is not None
     news_items_present = bool(window.unverified or window.conflicting)
     candidate_snapshot_id = metric_candidates.candidate_snapshot_id
     raw_snapshot_id = metric_candidates.raw_snapshot_id
@@ -258,10 +254,7 @@ def _merge_candidates(
             news_snapshot.raw_snapshot_id,
             news_snapshot.snapshot_id,
         )
-        metric_lineage = (candidate_snapshot_id, raw_snapshot_id, evidence_snapshot_id)
-        if metric_items_present and metric_lineage != news_lineage:
-            raise ValueError("cannot merge candidate lineages")
-        if not metric_items_present:
+        if not metric_batch_present:
             candidate_snapshot_id, raw_snapshot_id, evidence_snapshot_id = news_lineage
     unverified_events = metric_candidates.unverified_events + window.unverified
     conflicting_events = metric_candidates.conflicting_events + window.conflicting
@@ -518,6 +511,8 @@ def assemble_storage_report(
     candidate_evidence_storage: EvidenceStorage | None = None,
     news_snapshot: EvidenceSnapshot | None,
     now: datetime,
+    company_candidates: Iterable[Mapping[str, object]] = (),
+    company_evidence_snapshot: EvidenceSnapshot | None = None,
     source_coverage: SourceCoverage | None = None,
     demo: bool = False,
 ) -> IndustryReportAssembly:
@@ -647,6 +642,32 @@ def assemble_storage_report(
         candidates=candidates,
         expired=expired_by_id,
     )
+    company_rows = tuple(company_candidates)
+    if company_evidence_snapshot is None:
+        companies = ()
+    else:
+        if (
+            type(company_evidence_snapshot) is not EvidenceSnapshot
+            or company_evidence_snapshot.raw_snapshot_id != raw_snapshot_id
+            or company_evidence_snapshot.snapshot_id != evidence_snapshot_id
+        ):
+            raise ValueError("company evidence snapshot lineage mismatch")
+        company_evidence_ids = {
+            evidence.evidence_id
+            for event in company_evidence_snapshot.events
+            for evidence in _event_evidence(event)
+        }
+        companies = project_company_relations(
+            industry_id=industry_id,
+            candidates=company_rows,
+            allowed_chain_node_ids=template.chain_node_ids,
+            allowed_metric_ids=(
+                template.cycle_metric_ids
+                + template.core_metric_ids
+                + template.capital_metric_ids
+            ),
+            allowed_evidence_ids=company_evidence_ids,
+        )
     report = DisplayedTrustedReport(
         industry_id=industry_id,
         template_status=template.status,
@@ -666,7 +687,7 @@ def assemble_storage_report(
         chain=chain,
         metrics=metric_rows,
         capital=capital_rows,
-        companies=(),
+        companies=companies,
         fund_selection=(),
         funds=(),
         news_risk=news_window.trusted,
@@ -720,6 +741,8 @@ class IndustryResearchService:
         metric_candidates: CandidateEvidencePanel | None,
         candidate_evidence_storage: EvidenceStorage | None = None,
         news_snapshot: EvidenceSnapshot | None,
+        company_candidates: Iterable[Mapping[str, object]] = (),
+        company_evidence_snapshot: EvidenceSnapshot | None = None,
         source_coverage: SourceCoverage | None = None,
         demo: bool = False,
     ) -> IndustryReportAssembly:
@@ -733,6 +756,8 @@ class IndustryResearchService:
             metric_candidates=metric_candidates,
             candidate_evidence_storage=candidate_evidence_storage,
             news_snapshot=news_snapshot,
+            company_candidates=company_candidates,
+            company_evidence_snapshot=company_evidence_snapshot,
             now=self._clock(),
             source_coverage=source_coverage,
             demo=demo,

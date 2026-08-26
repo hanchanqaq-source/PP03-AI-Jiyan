@@ -61,8 +61,16 @@ def project_company_relations(
     *,
     industry_id: str,
     candidates: Iterable[Mapping[str, object]],
+    allowed_chain_node_ids: Iterable[str],
+    allowed_metric_ids: Iterable[str],
+    allowed_evidence_ids: Iterable[str],
 ) -> tuple[IndustryCompanyRelation, ...]:
     """Admit only exact-code company relations backed by official evidence."""
+    chain_ids = frozenset(allowed_chain_node_ids)
+    metric_ids = frozenset(allowed_metric_ids)
+    evidence_allowlist = frozenset(allowed_evidence_ids)
+    if any(type(item) is not str or not item for item in chain_ids | metric_ids | evidence_allowlist):
+        raise ValueError("company projection allowlists require non-blank string IDs")
     projected: list[IndustryCompanyRelation] = []
     seen: set[tuple[str, str, str]] = set()
     for candidate in candidates:
@@ -75,15 +83,20 @@ def project_company_relations(
             continue
         relation_type = _nonblank(candidate.get("relation_type"))
         evidence_ids = _string_tuple(candidate.get("evidence_ids"))
+        key_metric_ids = _string_tuple(candidate.get("key_metric_ids"))
         company_name = _nonblank(candidate.get("company_name"))
         chain_node_id = _nonblank(candidate.get("chain_node_id"))
         as_of_date = _nonblank(candidate.get("as_of_date"))
         if (
             relation_type not in {"official_disclosure", "public_classification"}
             or not evidence_ids
+            or not key_metric_ids
             or company_name is None
             or chain_node_id is None
             or as_of_date is None
+            or chain_node_id not in chain_ids
+            or not set(key_metric_ids).issubset(metric_ids)
+            or not set(evidence_ids).issubset(evidence_allowlist)
         ):
             continue
         key = (security_code, chain_node_id, relation_type)
@@ -96,7 +109,7 @@ def project_company_relations(
             company_name=company_name,
             chain_node_id=chain_node_id,
             relation_type=relation_type,
-            key_metric_ids=_string_tuple(candidate.get("key_metric_ids")),
+            key_metric_ids=tuple(dict.fromkeys(key_metric_ids)),
             evidence_ids=tuple(dict.fromkeys(evidence_ids)),
             as_of_date=as_of_date,
             observation_only=True,
