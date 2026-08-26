@@ -103,6 +103,44 @@ describe("industry tag state and request isolation", () => {
     expect(localStorage.getItem("vr-page-tags:industry_research")).toBe("{broken");
   });
 
+  it("returns false and preserves active state when activate refuses corrupt storage", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const tags = usePageTags("industry_research");
+      const [result, setResult] = useState("not-run");
+      return <div><button onClick={() => setResult(String(tags.activate("robotics")))}>激活机器人</button>
+        <output aria-label="激活结果">{result}</output><output aria-label="激活标签">{tags.state.activeId}</output>
+        {tags.errorMessage && <p role="alert">{tags.errorMessage}</p>}</div>;
+    }
+    render(<Harness />);
+    localStorage.setItem("vr-page-tags:industry_research", "{broken");
+    await user.click(screen.getByRole("button", { name: "激活机器人" }));
+    expect(screen.getByLabelText("激活结果")).toHaveTextContent("false");
+    expect(screen.getByLabelText("激活标签")).toHaveTextContent("storage");
+    expect(screen.getByRole("alert")).toHaveTextContent("页面标签存储已损坏，无法安全修改");
+  });
+
+  it("returns false and preserves active state when activate hits quota", async () => {
+    const user = userEvent.setup();
+    const originalSet = Storage.prototype.setItem;
+    function Harness() {
+      const tags = usePageTags("industry_research");
+      const [result, setResult] = useState("not-run");
+      return <div><button onClick={() => setResult(String(tags.activate("robotics")))}>激活机器人</button>
+        <output aria-label="激活结果">{result}</output><output aria-label="激活标签">{tags.state.activeId}</output>
+        {tags.errorMessage && <p role="alert">{tags.errorMessage}</p>}</div>;
+    }
+    render(<Harness />);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+      if (key === "vr-page-tags:industry_research") throw new DOMException("quota", "QuotaExceededError");
+      return originalSet.call(this, key, value);
+    });
+    await user.click(screen.getByRole("button", { name: "激活机器人" }));
+    expect(screen.getByLabelText("激活结果")).toHaveTextContent("false");
+    expect(screen.getByLabelText("激活标签")).toHaveTextContent("storage");
+    expect(screen.getByRole("alert")).toHaveTextContent("本地标签存储写入失败，请检查浏览器存储空间");
+  });
+
   it("resolves 120 custom tags with a constant number of catalog reads", () => {
     const items = Array.from({ length: 120 }, (_, index) => ({
       id: `custom-${index}`, name: `标签${index}`, kind: "custom" as const,

@@ -2,10 +2,11 @@ import type {
   CandidateIndustryEvidence,
   DisplayedIndustryReport,
   IndustryMetric,
+  IndustryRefreshRun,
   IndustryWindowDays,
 } from "@/lib/api";
 
-export type { CandidateIndustryEvidence, DisplayedIndustryReport, IndustryMetric, IndustryWindowDays };
+export type { CandidateIndustryEvidence, DisplayedIndustryReport, IndustryMetric, IndustryRefreshRun, IndustryWindowDays };
 
 export interface IndustryReportTemplate {
   id: "semiconductor" | "storage" | "robotics";
@@ -21,6 +22,8 @@ export interface IndustryReportProps {
   report: DisplayedIndustryReport;
   candidate: CandidateIndustryEvidence | null;
   industryName: string;
+  refreshRun: IndustryRefreshRun;
   windowDays: IndustryWindowDays;
   onWindowDaysChange: (days: IndustryWindowDays) => void;
+  now?: () => Date;
 }

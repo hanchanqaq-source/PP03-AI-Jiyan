@@ -52,11 +52,13 @@ export function usePageTags(pageKey: PageKey) {
     }
   }, [catalog.byId, pageKey, replace, state.order]);
   const activate = useCallback((id: string) => {
-    if (!state.ids.includes(id)) return;
+    if (!state.ids.includes(id)) return false;
     try {
       update({ ...state, activeId: id });
+      return true;
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "标签切换失败，请稍后重试");
+      return false;
     }
   }, [state, update]);
   const reorder = useCallback((sourceId: string, targetId: string) => {

@@ -2,8 +2,8 @@ import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import { IndustryResearch } from "@/pages/IndustryResearch";
-import { api, type IndustryResearchResponse } from "@/lib/api";
-import { researchResponse } from "./fixtures";
+import { api } from "@/lib/api";
+import { industryResponseWire, jsonResponse } from "./fixtures";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -19,12 +19,13 @@ describe("industry research page data boundary", () => {
   });
 
   it("loads one atomic 90-day report and removes the Radar bypass", async () => {
-    const load = vi.spyOn(api, "industryResearchReport").mockResolvedValue(researchResponse());
+    const load = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(industryResponseWire()));
     const radar = vi.spyOn(api, "radar");
     render(<IndustryResearch />);
 
     expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
-    expect(load).toHaveBeenCalledWith("storage", 90, expect.any(AbortSignal));
+    expect(String(load.mock.calls[0][0])).toContain("/industry-research/storage?window_days=90");
+    expect(load.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
     expect(radar).not.toHaveBeenCalled();
     expect(screen.getAllByText("TRUSTED-STORAGE-1").length).toBeGreaterThan(0);
     expect(screen.getByText(/当前显示的旧可信快照/)).toBeInTheDocument();
@@ -32,26 +33,26 @@ describe("industry research page data boundary", () => {
 
   it("never relabels a previous report while a later industry request is pending", async () => {
     const user = userEvent.setup();
-    const storage = deferred<IndustryResearchResponse>();
-    const robotics = deferred<IndustryResearchResponse>();
-    vi.spyOn(api, "industryResearchReport").mockImplementation((id) => id === "storage" ? storage.promise : robotics.promise);
+    const storage = deferred<Response>();
+    const robotics = deferred<Response>();
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => String(input).includes("/storage?") ? storage.promise : robotics.promise);
     render(<IndustryResearch />);
 
-    await act(async () => storage.resolve(researchResponse("storage")));
+    await act(async () => storage.resolve(jsonResponse(industryResponseWire("storage"))));
     expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "切换到机器人" }));
     expect(screen.getByText(/正在读取机器人/)).toBeInTheDocument();
     expect(screen.queryByRole("article", { name: /行业研究报告/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
 
-    await act(async () => robotics.resolve(researchResponse("robotics")));
+    await act(async () => robotics.resolve(jsonResponse(industryResponseWire("robotics"))));
     expect(await screen.findByRole("article", { name: "机器人行业研究报告" })).toBeInTheDocument();
     expect(screen.queryByText("DRAM 价格")).not.toBeInTheDocument();
   });
 
   it("uses one compound sticky region and updates the current anchor in the URL", async () => {
     const user = userEvent.setup();
-    vi.spyOn(api, "industryResearchReport").mockResolvedValue(researchResponse());
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(industryResponseWire()));
     const { container } = render(<IndustryResearch />);
     await screen.findByRole("article", { name: "存储行业研究报告" });
 
@@ -64,7 +65,7 @@ describe("industry research page data boundary", () => {
 
   it("filters trusted and candidate events locally for 7/30/90 days without refresh or extra GET", async () => {
     const user = userEvent.setup();
-    const load = vi.spyOn(api, "industryResearchReport").mockResolvedValue(researchResponse());
+    const load = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(industryResponseWire()));
     const refresh = vi.spyOn(api, "industryResearchRefresh");
     render(<IndustryResearch />);
     await screen.findByText("STORAGE-NEWS-90");
@@ -73,7 +74,8 @@ describe("industry research page data boundary", () => {
     expect(screen.getByText("STORAGE-NEWS-7")).toBeInTheDocument();
     expect(screen.queryByText("STORAGE-NEWS-30")).not.toBeInTheDocument();
     expect(screen.queryByText("STORAGE-NEWS-90")).not.toBeInTheDocument();
-    expect(screen.getByText("STORAGE-CANDIDATE-7")).toBeInTheDocument();
+    expect(screen.getByText("STORAGE-CANDIDATE-RECENT")).toBeInTheDocument();
+    expect(screen.queryByText("STORAGE-NEWS-FUTURE")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "最近 30 天" }));
     expect(screen.getByText("STORAGE-NEWS-30")).toBeInTheDocument();
@@ -84,17 +86,10 @@ describe("industry research page data boundary", () => {
 
   it("keeps unknown custom tags in an explicit building state without fabricated report content", async () => {
     const user = userEvent.setup();
-    vi.spyOn(api, "industryResearchReport").mockImplementation(async (id) => id === "storage" ? researchResponse() : {
-      ...researchResponse(id),
-      displayedIndustryId: null,
-      displayedTrustedReport: null,
-      candidateEvidence: null,
-      refreshRun: {
-        ...researchResponse(id).refreshRun, runId: null, rawSnapshotId: null,
-        evidenceSnapshotId: null, candidateSnapshotId: null, phase: "idle", errorCode: null,
-        displayedTrustedSnapshotId: null, displayedRawSnapshotId: null, displayedEvidenceSnapshotId: null,
-      },
-      templateStatus: "building",
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const match = String(input).match(/industry-research\/([^?]+)/);
+      const industryId = match ? decodeURIComponent(match[1]) : "storage";
+      return jsonResponse(industryResponseWire(industryId));
     });
     render(<IndustryResearch />);
     await screen.findByRole("article", { name: "存储行业研究报告" });
@@ -110,17 +105,35 @@ describe("industry research page data boundary", () => {
 
   it("exposes the four truth axes and opens evidence from the keyboard", async () => {
     const user = userEvent.setup();
-    vi.spyOn(api, "industryResearchReport").mockResolvedValue(researchResponse());
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(industryResponseWire()));
     render(<IndustryResearch />);
     const button = (await screen.findAllByRole("button", { name: "查看 DRAM 价格证据" }))[0];
 
     button.focus();
     await user.keyboard("{Enter}");
     expect(await screen.findByRole("dialog", { name: "DRAM 价格证据" })).toBeInTheDocument();
-    expect(screen.getAllByText("隔离演示官方披露").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("source-official.example").length).toBeGreaterThan(0);
     expect(screen.getAllByText("已核验").length).toBeGreaterThan(0);
     expect(screen.getAllByText("数据可用").length).toBeGreaterThan(0);
     expect(screen.getAllByText("数据新鲜").length).toBeGreaterThan(0);
     expect(screen.getAllByText("来源正常").length).toBeGreaterThan(0);
+  });
+
+  it("keeps the old active tag and old report when atomic activation persistence is refused", async () => {
+    const user = userEvent.setup();
+    const robotics = deferred<Response>();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => String(input).includes("/storage?")
+      ? jsonResponse(industryResponseWire("storage")) : robotics.promise);
+    render(<IndustryResearch />);
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "切换到机器人" }));
+    localStorage.setItem("vr-page-tags:industry_research", "{broken");
+    await act(async () => robotics.resolve(jsonResponse(industryResponseWire("robotics"))));
+
+    expect(await screen.findByRole("article", { name: "存储行业研究报告" })).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "机器人行业研究报告" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换到存储" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByRole("alert").find((node) => node.textContent?.includes("页面标签存储已损坏，无法安全修改"))).toBeDefined();
   });
 });

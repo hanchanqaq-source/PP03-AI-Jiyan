@@ -43,6 +43,22 @@ function metricValue(metric: IndustryMetric) {
   return <span>{metric.currentValue}{metric.unit ? ` ${metric.unit}` : ""}</span>;
 }
 
+function commonSupportedFields(metric: IndustryMetric): string[] {
+  const supporting = metric.evidence.filter((item) => item.supportsClaim && !item.contradictsClaim);
+  if (supporting.length === 0) return [];
+  return supporting.slice(1).reduce(
+    (common, item) => common.filter((field) => item.supportsFields.includes(field)),
+    [...supporting[0].supportsFields],
+  );
+}
+
+function historicalPosition(metric: IndustryMetric): string {
+  if (metric.historicalPosition) {
+    return `${metric.historicalPosition.value}% · ${metric.historicalPosition.window} · ${metric.historicalPosition.method}`;
+  }
+  return metric.emptyReason === "insufficient_history" ? "历史样本不足" : "暂无可靠数据";
+}
+
 export function MetricRows({ metrics, compact = false }: { metrics: IndustryMetric[]; compact?: boolean }) {
   return (
     <div className="divide-y divide-border/60 overflow-hidden rounded-xl border border-border/70">
@@ -55,8 +71,14 @@ export function MetricRows({ metrics, compact = false }: { metrics: IndustryMetr
           <div className="mt-4 grid gap-4 text-xs sm:grid-cols-2 xl:grid-cols-[1fr_0.7fr_1.2fr]">
             <dl><dt className="text-muted-foreground">当前值</dt><dd className="mt-1 text-base font-semibold">{metricValue(metric)}</dd></dl>
             <dl><dt className="text-muted-foreground">环比或同比</dt><dd className={`mt-1 font-mono ${metric.change && metric.change.value > 0 ? "text-destructive" : metric.change && metric.change.value < 0 ? "text-success" : ""}`}>{metric.change ? `${metric.change.value > 0 ? "+" : ""}${metric.change.value}% · ${metric.change.basis.toUpperCase()}` : "暂无可靠数据"}</dd></dl>
-            <dl><dt className="text-muted-foreground">历史位置</dt><dd className="mt-1">{metric.historicalPosition ? `${metric.historicalPosition.value}% · ${metric.historicalPosition.window} · ${metric.historicalPosition.method}` : "历史样本不足"}</dd></dl>
+            <dl><dt className="text-muted-foreground">历史位置</dt><dd className="mt-1">{historicalPosition(metric)}</dd></dl>
           </div>
+          {metric.verificationStatus === "corroborated" && <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 rounded-lg border border-success/20 bg-success/5 px-3 py-2 text-[10px] text-muted-foreground">
+            <span>{metric.independentSourceFamilies.length} 个独立来源族</span>
+            <span>{metric.independentContentSources.length} 个独立内容来源</span>
+            <span>{metric.independentOriginClusters.length} 个独立起源集群</span>
+            <span>共同支持字段：{commonSupportedFields(metric).join(" · ") || "暂无可靠数据"}</span>
+          </div>}
           <dl className="mt-4 grid gap-x-6 gap-y-3 border-t border-border/50 pt-4 text-xs sm:grid-cols-2">
             <div><dt className="text-muted-foreground">数据来源</dt><dd className="mt-1">{metric.evidence.length ? metric.evidence.map((item) => item.contentSource).join(" · ") : formatEmptyReason(metric)}</dd></div>
             <div><dt className="text-muted-foreground">数据更新时间</dt><dd className="mt-1 font-mono">{metric.asOfDate ?? metric.fetchedAt ?? "暂无可靠数据"}</dd></div>
