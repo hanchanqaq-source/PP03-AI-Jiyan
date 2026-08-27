@@ -1,24 +1,25 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Link } from "react-router-dom";
-import { TrendingUp, FileText, Newspaper, Rss, RefreshCw, Loader2, ExternalLink, AlertCircle, Sparkles, Lightbulb, Star } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { Link, Navigate, useNavigate, useParams } from "react-router-dom";
+import { TrendingUp, FileText, Newspaper, Rss, RefreshCw, Loader2, ExternalLink, AlertCircle, Sparkles, Lightbulb, Star, Settings2 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
-import { NewsPipelineStatus, runNewsPipelineRefresh } from "@/features/market-news/NewsPipelineStatus";
-import type { NewsPipelineStatusData } from "@/features/market-news/types";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
-import { api, ApiError, isAbortError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
+import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
 import { loadWatch } from "@/lib/watchlist";
 import { hasLlm, chatStream } from "@/lib/llm";
 import { cn } from "@/lib/utils";
+import { SourceManagement } from "@/features/intel/SourceManagement";
 
+// 顺序即侧栏子栏目顺序（Layout 的 INTEL_LINKS 与此一致）
 const TABS = [
-  { key: "events", label: "事件概率", icon: TrendingUp, integrated: false, desc: "全球宏观预期概率（公开数据、免登录只读），后续接入" },
-  { key: "filings", label: "A股公告", icon: FileText, integrated: false, desc: "汇总关注列表里各个股的近期公告（东财公开披露）" },
-  { key: "news", label: "公开新闻", icon: Newspaper, integrated: false, desc: "汇总关注列表里各个股的近期新闻（公开源）" },
   { key: "investment-news", label: "Investment News", icon: Rss, integrated: true, desc: "12 赛道全球公开 RSS 资讯（集成自 investment-news 仓库）" },
+  { key: "sources", label: "资讯源管理", icon: Settings2, integrated: true, desc: "管理内置与本机自定义 RSS/API 来源" },
+  { key: "news", label: "公开新闻", icon: Newspaper, integrated: false, desc: "汇总关注列表里各个股的近期新闻（公开源）" },
+  { key: "filings", label: "A股公告", icon: FileText, integrated: false, desc: "汇总关注列表里各个股的近期公告（东财公开披露）" },
+  { key: "events", label: "事件概率", icon: TrendingUp, integrated: false, desc: "全球宏观预期概率（公开数据、免登录只读），后续接入" },
 ];
 
 interface Digest { loading?: boolean; text?: string; err?: string; needKey?: boolean }
@@ -28,89 +29,18 @@ function InvestmentNewsPanel() {
   const [err, setErr] = useState<string | null>(null);
   const [active, setActive] = useState("ai");
   const [refreshing, setRefreshing] = useState(false);
-  const [pipelineStatus, setPipelineStatus] = useState<NewsPipelineStatusData | null>(null);
-  const dataCycleRef = useRef(0);
-  const dataAbortRef = useRef<AbortController | null>(null);
-  const refreshCycleRef = useRef(0);
-  const refreshAbortRef = useRef<AbortController | null>(null);
-  const refreshInFlightRef = useRef(false);
   const [digests, setDigests] = useState<Record<string, Digest>>({});
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
 
   useEffect(() => {
-    const cycle = ++dataCycleRef.current;
-    const controller = new AbortController();
-    dataAbortRef.current = controller;
-    api.radar(controller.signal).then((next) => {
-      if (cycle === dataCycleRef.current && !controller.signal.aborted) setData(next);
-    }).catch((e) => {
-      if (cycle === dataCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
-        setErr(e instanceof ApiError ? e.message : "加载失败");
-      }
-    });
-    return () => {
-      if (dataAbortRef.current === controller) dataAbortRef.current = null;
-      controller.abort();
-    };
-  }, []);
-
-  useEffect(() => () => {
-    dataCycleRef.current += 1;
-    dataAbortRef.current?.abort();
-    refreshCycleRef.current += 1;
-    refreshAbortRef.current?.abort();
+    api.radar().then(setData).catch((e) => setErr(e instanceof ApiError ? e.message : "加载失败"));
   }, []);
 
   const refresh = async () => {
-    if (refreshInFlightRef.current) return;
-    refreshInFlightRef.current = true;
-    const cycle = ++refreshCycleRef.current;
-    const dataCycle = ++dataCycleRef.current;
-    dataAbortRef.current?.abort();
-    dataAbortRef.current = null;
-    refreshAbortRef.current?.abort();
-    const controller = new AbortController();
-    refreshAbortRef.current = controller;
     setRefreshing(true); setErr(null);
-    setPipelineStatus(null);
-    const lastPipelineStatus = { current: null as NewsPipelineStatusData | null };
-    try {
-      const terminal = await runNewsPipelineRefresh({
-        signal: controller.signal,
-        kickoff: (signal) => api.radarRefresh(signal),
-        onStatus: (next) => {
-          if (cycle === refreshCycleRef.current) {
-            lastPipelineStatus.current = next;
-            setPipelineStatus(next);
-          }
-        },
-      });
-      if (!terminal || cycle !== refreshCycleRef.current || controller.signal.aborted) return;
-      if (terminal.phase !== "trusted_published") {
-        return;
-      }
-      if (terminal.redacted_error === "radar_compatibility_failed") return;
-      try {
-        const next = await api.radar(controller.signal);
-        if (cycle === refreshCycleRef.current && dataCycle === dataCycleRef.current && !controller.signal.aborted) setData(next);
-      } catch (e) {
-        if (cycle === refreshCycleRef.current && dataCycle === dataCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
-          setErr("可信资讯已发布，但最新资讯读取失败；继续显示上一份可信快照。");
-        }
-      }
-    } catch (e) {
-      if (cycle === refreshCycleRef.current && !controller.signal.aborted && !isAbortError(e)) {
-        setErr(lastPipelineStatus.current?.displayed_trusted_snapshot_id
-          ? "资讯流水线状态连接失败；继续显示上一份可信快照。"
-          : "资讯流水线状态连接失败；当前尚无可显示的可信快照。");
-      }
-    } finally {
-      if (cycle === refreshCycleRef.current) {
-        refreshAbortRef.current = null;
-        refreshInFlightRef.current = false;
-        setRefreshing(false);
-      }
-    }
+    try { setData(await api.radarRefresh()); }
+    catch (e) { setErr(e instanceof ApiError ? e.message : "刷新失败"); }
+    finally { setRefreshing(false); }
   };
 
   const industries: Industry[] = data?.industries || [];
@@ -152,7 +82,7 @@ function InvestmentNewsPanel() {
     <div>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs text-muted-foreground">
-          {hasData ? `${data!.stats.total_sources} 个公开源 · 近 ${data!.recent_days} 天 · 更新于 ${data!.generated_at}` : "12 赛道 · 108 个公开源"}
+          {hasData ? `${data!.stats.total_sources} 个公开源 · 近 ${data!.recent_days} 天 · 更新于 ${data!.generated_at}` : "12 赛道 · 106 个公开源"}
         </span>
         <div className="flex items-center gap-2">
           {hasData && (
@@ -171,12 +101,10 @@ function InvestmentNewsPanel() {
       </div>
 
       {err && (
-        <div role="alert" aria-live="assertive" className="mb-3 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+        <div className="mb-3 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
           <AlertCircle className="h-4 w-4 shrink-0" /> {err}
         </div>
       )}
-
-      <NewsPipelineStatus status={pipelineStatus} />
 
       {!hasData && !err ? (
         <div className="rounded-lg border border-dashed border-border/70 p-8 text-center text-sm text-muted-foreground/70">
@@ -373,7 +301,13 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
 }
 
 export function Intel() {
-  const [tab, setTab] = useState("investment-news");
+  // 当前 Tab 由白名单路由驱动；未知子路由显式收敛到唯一资讯主入口。
+  const { tab: tabParam } = useParams();
+  const navigate = useNavigate();
+  if (!TABS.some((item) => item.key === tabParam)) {
+    return <Navigate to="/intel/investment-news" replace />;
+  }
+  const tab = tabParam!;
   const cur = TABS.find((t) => t.key === tab)!;
 
   return (
@@ -382,7 +316,7 @@ export function Intel() {
 
       <div className="mb-4 flex flex-wrap gap-2">
         {TABS.map(({ key, label, icon: Icon, integrated }) => (
-          <button key={key} onClick={() => setTab(key)}
+          <button key={key} aria-pressed={tab === key} onClick={() => navigate(`/intel/${key}`)}
             className={cn("inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm transition-colors",
               tab === key ? "bg-primary/15 font-medium text-primary shadow-glow" : "text-muted-foreground hover:bg-muted/50")}>
             <Icon className="h-4 w-4" /> {label}
@@ -399,6 +333,8 @@ export function Intel() {
         </div>
         {cur.key === "investment-news" ? (
           <InvestmentNewsPanel />
+        ) : cur.key === "sources" ? (
+          <SourceManagement />
         ) : cur.key === "filings" ? (
           <WatchlistFeed kind="filings" />
         ) : cur.key === "news" ? (

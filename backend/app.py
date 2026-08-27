@@ -9,106 +9,42 @@
 
 from __future__ import annotations
 
-import inspect
 import json
-import math
 import os
-import re
-from contextlib import asynccontextmanager
 from typing import Literal
-from urllib.parse import unquote_to_bytes, urlsplit
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 
 import astock
-import cache_management
 import chat as chat_layer
 import cli_runtime
 import debate as debate_layer
 import gstock
 import newsradar
-import news_translation
+import news_source_manager
 import portfolio as pf
-import fund_portfolio as fpf
-import source_health
-from data_sources.api import router as data_sources_router
-from evidence_verification import service as evidence_service
-from evidence_verification.storage import event_document, event_summary_document
-from fund_data import service as fund_service
-import industry_research.api as industry_research_api
-from industry_research.api import IndustryResearchService
-from news_intelligence import service as market_news_service
-from news_pipeline.api import router as news_pipeline_router
-from news_pipeline import service as news_pipeline_service
 import market
 import myreports as mr
 import reflection as reflect_layer
+import signals
 
 
 from version import read_version
 
 __version__ = read_version()
 
-
-def _run_startup_cache_cleanup():
-    """Startup maintenance is best-effort and must never block the local API."""
-    try:
-        return cache_management.get_manager().maybe_auto_cleanup()
-    except Exception as error:  # cache corruption/permissions are reported without leaking paths
-        return {"ran": False, "released_bytes": 0, "error": type(error).__name__}
-
-
-@asynccontextmanager
-async def _lifespan(_app: FastAPI):
-    _run_startup_cache_cleanup()
-    health_service = None
-    pipeline_service = None
-    try:
-        try:
-            health_service = source_health.get_service()
-            if os.environ.get("VR_SOURCE_HEALTH_STARTUP", "1") != "0":
-                health_service.schedule_quick_if_due()
-        except Exception:
-            pass
-        try:
-            pipeline_service = news_pipeline_service.get_service()
-            pipeline_service.recover_startup()
-        except Exception:
-            pass
-        yield
-    finally:
-        try:
-            if pipeline_service is not None:
-                pipeline_service.close()
-        finally:
-            try:
-                news_pipeline_service.reset_service()
-            finally:
-                if health_service is not None:
-                    health_service.shutdown()
-
-
-app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
-app.include_router(data_sources_router)
-app.include_router(news_pipeline_router)
-app.include_router(industry_research_api.router)
+app = FastAPI(title="Vibe-Research API", version=__version__)
 
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)
 
-# CORS defaults to loopback browser origins. Operators may supply an explicit
-# read-origin list, but the separate write middleware below remains mandatory.
-_CONFIGURED_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get("VR_ALLOW_ORIGINS", "").split(",")
-    if origin.strip()
-]
-_LOOPBACK_ORIGIN_REGEX = (
-    r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?$"
-)
+# 默认只允许本机浏览器；部署者可显式配置只读来源白名单。
+_CONFIGURED_ORIGINS = [origin.strip() for origin in os.environ.get("VR_ALLOW_ORIGINS", "").split(",") if origin.strip()]
+_LOOPBACK_ORIGIN_REGEX = r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?$"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CONFIGURED_ORIGINS,
@@ -120,59 +56,25 @@ app.add_middleware(
 # 可选鉴权：设了 VR_API_KEY 就要求所有 /api/* 带 `Authorization: Bearer <key>`
 #   （本地自托管不设=开放；公网部署务必设，否则别人能读你的持仓/调你的后端）。
 _API_KEY = os.environ.get("VR_API_KEY", "").strip()
-_DATA_SOURCE_WRITE_HEADER = "x-pp03-write-intent"
-_DATA_SOURCE_WRITE_METHODS = {"POST", "PUT", "DELETE"}
-_PIPELINE_REFRESH_PATHS = {
-    "/api/market-news/refresh",
-    "/api/evidence/refresh",
-    "/api/radar/refresh",
-}
-_MARKET_NEWS_SOURCE_RETRY_PATH = re.compile(
-    r"^/api/market-news/sources/[a-f0-9]{16}/retry$",
-    re.ASCII,
-)
-_INDUSTRY_RESEARCH_WRITE_PATH = re.compile(
-    r"^/api/industry-research/[a-z0-9][a-z0-9_-]{0,63}/(?:refresh|fund-relations/resolve)$",
-    re.ASCII,
-)
-_INDUSTRY_RESEARCH_PATH_PREFIX = "/api/industry-research/"
-_INDUSTRY_RESEARCH_FUND_COMPONENT = "fund-relations"
+_WRITE_METHODS = {"POST", "PUT", "DELETE"}
+_WRITE_HEADER = "x-pp03-write-intent"
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
-def _request_header_values(request: Request, name: str) -> tuple[str, ...]:
-    encoded_name = name.lower().encode("ascii")
-    return tuple(
-        value.decode("latin-1")
-        for key, value in request.scope.get("headers", ())
-        if key.lower() == encoded_name
-    )
+def _header_values(request: Request, name: str) -> tuple[str, ...]:
+    encoded = name.lower().encode("ascii")
+    return tuple(value.decode("latin-1") for key, value in request.scope.get("headers", ()) if key.lower() == encoded)
 
 
 def _loopback_authority(value: str | None) -> bool:
-    if (
-        type(value) is not str
-        or not value
-        or len(value) > 255
-        or value != value.strip()
-        or "," in value
-        or any(ord(char) < 33 or ord(char) == 127 for char in value)
-    ):
+    if type(value) is not str or not value or len(value) > 255 or value != value.strip() or "," in value:
         return False
     try:
         parsed = urlsplit(f"//{value}")
         port = parsed.port
     except ValueError:
         return False
-    return (
-        parsed.username is None
-        and parsed.password is None
-        and parsed.path == ""
-        and parsed.query == ""
-        and parsed.fragment == ""
-        and parsed.hostname in _LOOPBACK_HOSTS
-        and (port is None or 1 <= port <= 65535)
-    )
+    return parsed.username is None and parsed.password is None and parsed.hostname in _LOOPBACK_HOSTS and (port is None or 1 <= port <= 65535)
 
 
 def _local_browser_origin(value: str | None) -> bool:
@@ -184,75 +86,35 @@ def _local_browser_origin(value: str | None) -> bool:
     except ValueError:
         return False
     return (
-        parsed.scheme in {"http", "https"}
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.hostname in _LOOPBACK_HOSTS
-        and parsed.path == ""
-        and parsed.query == ""
-        and parsed.fragment == ""
-        and (port is None or 1 <= port <= 65535)
+        parsed.scheme in {"http", "https"} and parsed.username is None and parsed.password is None
+        and parsed.hostname in _LOOPBACK_HOSTS and parsed.path == "" and parsed.query == ""
+        and parsed.fragment == "" and (port is None or 1 <= port <= 65535)
     )
 
 
-def _protected_local_write_request(request: Request) -> bool:
-    is_source_retry = _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
-    is_industry_research_write = (
-        _INDUSTRY_RESEARCH_WRITE_PATH.fullmatch(request.url.path) is not None
-    )
-    is_protected_path = (
-        request.url.path.startswith("/api/data-sources/")
-        or request.url.path in _PIPELINE_REFRESH_PATHS
-        or is_source_retry
-        or is_industry_research_write
-    )
-    if not is_protected_path:
-        return False
-    if request.method in _DATA_SOURCE_WRITE_METHODS:
-        return True
-    if request.method != "OPTIONS":
-        return False
-    if is_source_retry or is_industry_research_write:
-        return True
-    requested_methods = _request_header_values(request, "access-control-request-method")
-    return len(requested_methods) == 1 and requested_methods[0].upper() in _DATA_SOURCE_WRITE_METHODS
-
-
-def _is_industry_fund_path(request: Request) -> bool:
-    candidates = [request.url.path]
-    raw_path = request.scope.get("raw_path")
-    if isinstance(raw_path, bytes):
-        candidates.append(raw_path.decode("latin-1"))
-        decoded_raw_path = unquote_to_bytes(raw_path)
-        try:
-            candidates.append(decoded_raw_path.decode("utf-8"))
-        except UnicodeDecodeError:
-            candidates.append(decoded_raw_path.decode("latin-1"))
-    for candidate in candidates:
-        if not candidate.startswith(_INDUSTRY_RESEARCH_PATH_PREFIX):
-            continue
-        normalized = "".join(
-            "/" if ord(character) < 32 or ord(character) == 127 else character
-            for character in candidate[len(_INDUSTRY_RESEARCH_PATH_PREFIX):]
-        )
-        segments = normalized.split("/")
-        if _INDUSTRY_RESEARCH_FUND_COMPONENT in segments[1:]:
-            return True
-    return False
-
-
-_FUND_REQUEST_TRANSPORT_ERRORS = (OSError, EOFError, ValueError)
-
-
-def _is_grouped_fund_request_transport_error(error: Exception) -> bool:
-    if isinstance(error, _FUND_REQUEST_TRANSPORT_ERRORS):
-        return True
-    if isinstance(error, ExceptionGroup):
-        return bool(error.exceptions) and all(
-            _is_grouped_fund_request_transport_error(nested)
-            for nested in error.exceptions
-        )
-    return False
+@app.middleware("http")
+async def _protect_radar_source_writes(request: Request, call_next):
+    if not request.url.path.startswith("/api/radar/sources"):
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        requested = _header_values(request, "access-control-request-method")
+        if not requested or requested[0].upper() not in _WRITE_METHODS:
+            return await call_next(request)
+    elif request.method not in _WRITE_METHODS:
+        return await call_next(request)
+    host_values = _header_values(request, "host")
+    origin_values = _header_values(request, "origin")
+    if len(host_values) != 1 or len(origin_values) != 1 or not _loopback_authority(host_values[0]) or not _local_browser_origin(origin_values[0]):
+        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+    if request.method == "OPTIONS":
+        requested_headers = ",".join(_header_values(request, "access-control-request-headers")).lower()
+        if _WRITE_HEADER not in {item.strip() for item in requested_headers.split(",")}:
+            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+        return await call_next(request)
+    write_values = _header_values(request, _WRITE_HEADER)
+    if len(write_values) != 1 or write_values[0] != "1":
+        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -267,92 +129,6 @@ async def _require_api_key(request: Request, call_next):
             return JSONResponse({"detail": "未授权：缺少或错误的 API Key（VR_API_KEY）"}, status_code=401)
     return await call_next(request)
 
-
-@app.middleware("http")
-async def _protect_data_source_writes(request: Request, call_next):
-    if not _protected_local_write_request(request):
-        return await call_next(request)
-    host_values = _request_header_values(request, "host")
-    origin_values = _request_header_values(request, "origin")
-    if len(host_values) != 1 or len(origin_values) > 1:
-        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-    host = host_values[0]
-    origin = origin_values[0] if origin_values else None
-    if not _loopback_authority(host):
-        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-    if request.method == "OPTIONS":
-        requested_methods = _request_header_values(request, "access-control-request-method")
-        requested_header_values = _request_header_values(request, "access-control-request-headers")
-        if len(requested_methods) != 1 or len(requested_header_values) != 1:
-            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-        is_source_retry = _MARKET_NEWS_SOURCE_RETRY_PATH.fullmatch(request.url.path) is not None
-        is_industry_research_write = (
-            _INDUSTRY_RESEARCH_WRITE_PATH.fullmatch(request.url.path) is not None
-        )
-        requested_method = requested_methods[0].upper()
-        if (
-            ((is_source_retry or is_industry_research_write) and requested_method != "POST")
-            or (
-                not is_source_retry
-                and not is_industry_research_write
-                and requested_method not in _DATA_SOURCE_WRITE_METHODS
-            )
-        ):
-            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-        header_names = {
-            item.strip().lower()
-            for item in requested_header_values[0].split(",")
-            if item.strip()
-        }
-        if not _local_browser_origin(origin) or _DATA_SOURCE_WRITE_HEADER not in header_names:
-            return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-        return await call_next(request)
-    write_intent_values = _request_header_values(request, _DATA_SOURCE_WRITE_HEADER)
-    if len(write_intent_values) != 1 or write_intent_values[0] != "1":
-        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-    # Browsers send Origin; an originless caller is accepted only under the
-    # already-verified loopback Host plus the non-simple custom-header gate.
-    if origin is not None and not _local_browser_origin(origin):
-        return JSONResponse({"detail": "本地写操作来源验证失败"}, status_code=403)
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def _prevent_industry_fund_response_storage(request: Request, call_next):
-    is_fund_resolution = _is_industry_fund_path(request)
-    try:
-        response = await call_next(request)
-    except _FUND_REQUEST_TRANSPORT_ERRORS:
-        if not is_fund_resolution:
-            raise
-        response = JSONResponse(
-            {"detail": "invalid_fund_relation_request"},
-            status_code=400,
-        )
-    except ExceptionGroup as error:
-        if (
-            not is_fund_resolution
-            or not _is_grouped_fund_request_transport_error(error)
-        ):
-            raise
-        response = JSONResponse(
-            {"detail": "invalid_fund_relation_request"},
-            status_code=400,
-        )
-    except RuntimeError:
-        raise
-    except Exception:
-        if not is_fund_resolution:
-            raise
-        response = JSONResponse(
-            {"detail": "fund_relation_resolution_failed"},
-            status_code=502,
-        )
-    if is_fund_resolution:
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Pragma"] = "no-cache"
-    return response
-
 _CODE_RE = r"^\d{6}$"
 
 
@@ -366,59 +142,6 @@ def _validate(code: str) -> str:
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "vibe-research-api", "version": __version__}
-
-
-@app.get("/api/cache/status")
-def cache_status():
-    return {"data": cache_management.get_manager().status()}
-
-
-@app.post("/api/cache/cleanup-expired")
-def cache_cleanup_expired():
-    return {"data": cache_management.get_manager().cleanup_expired(manual=True)}
-
-
-SourceHealthGroup = Literal["fund", "quote", "industry", "news"]
-SourceHealthRating = Literal["healthy", "usable", "degraded", "failed"]
-
-
-class SourceHealthRunRequest(BaseModel):
-    scope: Literal["full"] = "full"
-
-
-@app.get("/api/source-health/summary")
-def source_health_summary():
-    return source_health.get_service().get_summary()
-
-
-@app.get("/api/source-health/sources")
-def source_health_sources(
-    group: SourceHealthGroup | None = None,
-    rating: SourceHealthRating | None = None,
-    repair_value: str | None = None,
-):
-    return source_health.get_service().list_sources(
-        group=group,
-        rating=rating,
-        repair_value=repair_value,
-    )
-
-
-@app.post("/api/source-health/runs", status_code=202)
-def source_health_start_run(req: SourceHealthRunRequest):
-    try:
-        run = source_health.get_service().start_run(req.scope)
-    except source_health.FullRunConflict as error:
-        raise HTTPException(409, str(error)) from error
-    return {"run_id": run["run_id"]}
-
-
-@app.get("/api/source-health/runs/{run_id}")
-def source_health_run(run_id: str = ApiPath(min_length=1, max_length=64)):
-    run = source_health.get_service().get_run(run_id)
-    if run is None:
-        raise HTTPException(404, "数据源体检记录不存在")
-    return run
 
 
 class LLMConfig(BaseModel):
@@ -561,166 +284,6 @@ def portfolio_remove(code: str = Query(...)):
     return {"data": pf.remove_holding(code.strip())}
 
 
-class FundHoldingIn(BaseModel):
-    code: str = Field(pattern=r"^\d{6}$")
-    input_mode: str = Field(default="shares_cost", pattern=r"^(amount_pnl|shares_cost)$")
-    amount_snapshot: float | None = Field(default=None, allow_inf_nan=False)
-    cumulative_pnl_snapshot: float | None = Field(default=None, allow_inf_nan=False)
-    shares: float | None = Field(default=None, allow_inf_nan=False)
-    avg_unit_cost: float | None = Field(default=None, allow_inf_nan=False)
-    avg_cost: float | None = Field(default=None, allow_inf_nan=False)
-    buy_date: str = ""
-    notes: str = Field(default="", max_length=1000)
-    custom_tag_ids: list[str] = Field(default_factory=list, max_length=50)
-    verification_status: str = Field(default="verified", pattern=r"^(verified|manual_unverified)$")
-    manual_name: str | None = Field(default=None, max_length=100)
-    replace: bool = False
-
-    @field_validator("notes")
-    @classmethod
-    def _strip_text(cls, value: str) -> str:
-        return value.strip()
-
-    @field_validator("manual_name")
-    @classmethod
-    def _manual_name(cls, value: str | None) -> str | None:
-        return value.strip() if isinstance(value, str) else value
-
-    @field_validator("buy_date")
-    @classmethod
-    def _date_format(cls, value: str) -> str:
-        from datetime import date
-        if not value:
-            return ""
-        try:
-            date.fromisoformat(value)
-        except ValueError:
-            raise ValueError("买入日期格式应为 YYYY-MM-DD") from None
-        return value
-
-    @field_validator("custom_tag_ids")
-    @classmethod
-    def _tag_ids(cls, value: list[str]) -> list[str]:
-        clean = [item.strip() for item in value]
-        if any(not item for item in clean):
-            raise ValueError("标签 ID 不能为空")
-        return list(dict.fromkeys(clean))
-
-    @field_validator("manual_name")
-    @classmethod
-    def _manual_requires_name(cls, value: str | None, info):
-        if info.data.get("verification_status") == "manual_unverified" and not value:
-            raise ValueError("手动录入模式必须填写基金名称")
-        return value
-
-    @model_validator(mode="after")
-    def _mode_fields(self):
-        if self.input_mode == "amount_pnl":
-            if self.amount_snapshot is None or not math.isfinite(self.amount_snapshot) or self.amount_snapshot <= 0:
-                raise ValueError("快速模式的当前持有金额必须大于 0")
-            if self.cumulative_pnl_snapshot is not None and not math.isfinite(self.cumulative_pnl_snapshot):
-                raise ValueError("当前累计盈亏必须是有限数")
-            return self
-
-        if self.shares is None or not math.isfinite(self.shares) or self.shares <= 0:
-            raise ValueError("精确模式的持有份额必须大于 0")
-        unit_cost = self.avg_unit_cost if self.avg_unit_cost is not None else self.avg_cost
-        if unit_cost is None or not math.isfinite(unit_cost) or unit_cost < 0:
-            raise ValueError("精确模式的平均单位成本必须大于等于 0")
-        if not self.buy_date:
-            raise ValueError("精确模式必须填写买入日期")
-        self.avg_unit_cost = unit_cost
-        self.avg_cost = unit_cost
-        return self
-
-
-@app.get("/api/funds/search")
-def funds_search(q: str = Query(..., min_length=1, max_length=100)):
-    return {"data": fund_service.get_service().search_funds(q)}
-
-
-@app.get("/api/funds/{code}/analysis")
-def fund_analysis(code: str = ApiPath(..., pattern=r"^\d{6}$")):
-    return {"data": fund_service.get_service().get_fund_analysis(code)}
-
-
-@app.post("/api/funds/{code}/refresh")
-def fund_refresh(code: str = ApiPath(..., pattern=r"^\d{6}$")):
-    return {"data": fund_service.get_service().get_fund_analysis(code, force_refresh=True)}
-
-
-@app.get("/api/fund-portfolio")
-def fund_portfolio_get():
-    try:
-        return {"data": fpf.list_fund_holdings()}
-    except fpf.FundPortfolioCorrupt as error:
-        raise HTTPException(409, str(error)) from error
-
-
-@app.get("/api/fund-portfolio/analysis")
-def fund_portfolio_analysis():
-    try:
-        holdings = fpf.list_fund_holdings()["holdings"]
-    except fpf.FundPortfolioCorrupt as error:
-        raise HTTPException(409, str(error)) from error
-    return {"data": fund_service.get_service().get_portfolio_analysis(holdings)}
-
-
-@app.post("/api/fund-portfolio/holding")
-def fund_portfolio_upsert(holding: FundHoldingIn):
-    try:
-        payload = holding.model_dump(exclude={"replace"})
-        if holding.input_mode == "amount_pnl":
-            payload.update({
-                "shares": None,
-                "shares_source": None,
-                "basis_nav": None,
-                "basis_nav_date": None,
-                "shares_inference_note": None,
-            })
-            try:
-                analysis = fund_service.get_service().get_fund_analysis(holding.code)
-                latest_section = analysis.get("latest_nav") or {}
-                latest = latest_section.get("data") or {}
-                meta = latest_section.get("meta") or {}
-                nav = latest.get("unit_nav")
-                nav_date = latest.get("nav_date")
-                reliable = (
-                    meta.get("status") == "official"
-                    and not meta.get("is_stale", False)
-                    and isinstance(nav, (int, float))
-                    and math.isfinite(nav)
-                    and nav > 0
-                    and bool(nav_date)
-                )
-                if reliable:
-                    payload.update({
-                        "shares": holding.amount_snapshot / nav,
-                        "shares_source": "inferred",
-                        "basis_nav": nav,
-                        "basis_nav_date": nav_date,
-                        "shares_inference_note": f"按用户录入金额快照与 {nav_date} 正式净值推算，非用户确认份额",
-                    })
-            except Exception:
-                # Quick entry must remain writable when public NAV lookup is unavailable.
-                pass
-        else:
-            payload["shares_source"] = "user"
-        return {"data": fpf.upsert_fund_holding(payload, replace=holding.replace)}
-    except fpf.FundAlreadyExists as error:
-        raise HTTPException(409, str(error)) from error
-    except fpf.FundPortfolioCorrupt as error:
-        raise HTTPException(409, str(error)) from error
-
-
-@app.delete("/api/fund-portfolio/holding")
-def fund_portfolio_delete(code: str = Query(..., pattern=r"^\d{6}$")):
-    try:
-        return {"data": fpf.delete_fund_holding(code)}
-    except fpf.FundPortfolioCorrupt as error:
-        raise HTTPException(409, str(error)) from error
-
-
 # ---- 我的研报（用户上传自己的研报，存本地、不上传、不进开源仓库）----
 
 class ReportIn(BaseModel):
@@ -808,145 +371,113 @@ def radar():
         raise HTTPException(502, f"资讯雷达异常：{e}") from e
 
 
-MarketNewsMode = Literal["my_focus", "my_holdings", "global_tech", "domestic_policy"]
-MarketNewsCategory = Literal["all", "policy", "industry", "company", "fund_notice", "deep_content"]
-MarketNewsSort = Literal["importance", "latest", "holding_relevance"]
-MarketNewsDays = int
-EvidenceVerificationStatus = Literal["verified", "corroborated", "unverified", "conflicting", "corrected", "disproved"]
-EvidenceCategory = Literal["policy", "industry", "company", "fund_notice", "deep_content"]
-EvidenceHoldingRelevance = Literal["direct_holding", "industry_relation", "watch_tag", "none"]
-
-
-class MarketNewsTranslationItem(BaseModel):
-    event_id: str = Field(pattern=r"^[a-f0-9]{20}$")
-    title: str = Field(min_length=1, max_length=1000)
-    summary: str = Field(default="", max_length=8000)
-    source_language: str = Field(default="unknown", max_length=32)
-
-
-class MarketNewsTranslationReq(BaseModel):
-    items: list[MarketNewsTranslationItem] = Field(default_factory=list, max_length=20)
-    llm: LLMConfig | None = None
-
-
-@app.get("/api/evidence/summary")
-def evidence_summary():
-    return {"data": evidence_service.get_service().get_summary()}
-
-
-@app.get("/api/evidence/events")
-def evidence_events(
-    verification_status: EvidenceVerificationStatus | None = None,
-    tag_id: str | None = Query(default=None, max_length=120),
-    category: EvidenceCategory | None = None,
-    days: int = 7,
-    holding_relevance: EvidenceHoldingRelevance | None = None,
-):
-    service = evidence_service.get_service()
+@app.post("/api/radar/refresh")
+def radar_refresh():
+    """强制重抓全部 RSS 源（耗时约 20-40s），更新缓存。"""
     try:
-        rows = service.list_events(
-            verification_status=verification_status,
-            tag_id=tag_id,
-            category=category,
-            days=days,
-            holding_relevance=holding_relevance,
-        )
-    except ValueError as error:
-        raise HTTPException(422, str(error)) from error
-    snapshot = service.get_snapshot()
-    return {"data": {
-        "events": [event_summary_document(row) for row in rows],
-        "snapshot_id": snapshot.snapshot_id if snapshot else None,
-        "generated_at": snapshot.generated_at.isoformat() if snapshot else None,
-        "total": len(rows),
-        "filters": {
-            "verification_status": verification_status,
-            "tag_id": tag_id,
-            "category": category,
-            "days": days,
-            "holding_relevance": holding_relevance,
-        },
-    }}
+        return {"data": newsradar.fetch_radar()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"资讯雷达刷新失败：{e}") from e
 
 
-@app.get("/api/evidence/events/{event_id}")
-def evidence_event(event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$")):
-    row = evidence_service.get_service().get_event(event_id)
-    if row is None:
-        raise HTTPException(404, "证据事件不存在或尚未完成核验")
-    return {"data": event_document(row)}
+class RadarSourceInput(BaseModel):
+    source_type: Literal["rss", "api"] = "rss"
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=1, max_length=2048)
+    hint: str = Field(min_length=1, max_length=64)
+    region: str | None = Field(default=None, max_length=64)
+    api_adapter: str | None = Field(default=None, max_length=64)
 
 
-def _market_news_payload(
-    mode: MarketNewsMode,
-    tag_id: list[str],
-    category: MarketNewsCategory,
-    days: MarketNewsDays,
-    sort: MarketNewsSort,
-    refresh: bool,
-):
+class RadarSourceEnabledInput(BaseModel):
+    enabled: bool
+
+
+def get_news_source_manager() -> news_source_manager.SourceManager:
+    return news_source_manager.SourceManager()
+
+
+def _raise_news_source_error(error: Exception) -> None:
+    if isinstance(error, news_source_manager.SourceNotFoundError):
+        status_code = 404
+    elif isinstance(
+        error,
+        (
+            news_source_manager.SourceStoreCorruptError,
+            news_source_manager.DuplicateSourceError,
+            news_source_manager.BuiltinSourceDeletionError,
+        ),
+    ):
+        status_code = 409
+    else:
+        status_code = 400
+    raise HTTPException(status_code, str(error)) from error
+
+
+@app.get("/api/radar/sources")
+def radar_sources_list():
     try:
-        return {"data": market_news_service.get_service().get_events(
-            mode=mode, tag_ids=tag_id, category=category, days=days, sort=sort, refresh=refresh,
-        )}
-    except ValueError as error:
-        raise HTTPException(422, str(error)) from error
-    except (OSError, RuntimeError) as error:
-        raise HTTPException(503, "可信资讯暂时不可用") from error
+        return {"data": get_news_source_manager().list_sources()}
+    except news_source_manager.SourceManagerError as error:
+        _raise_news_source_error(error)
 
 
-@app.get("/api/market-news/events")
-def market_news_events(
-    mode: MarketNewsMode = "my_focus",
-    tag_id: list[str] = Query(default=[]),
-    category: MarketNewsCategory = "all",
-    days: MarketNewsDays = 7,
-    sort: MarketNewsSort = "importance",
-):
-    return _market_news_payload(mode, tag_id, category, days, sort, False)
-
-
-@app.post("/api/market-news/translations")
-def market_news_translations(req: MarketNewsTranslationReq):
-    """Translate only the requested visible events; model credentials are request-scoped."""
+@app.post("/api/radar/sources/test")
+def radar_sources_test(source: RadarSourceInput):
     try:
-        items = [item.model_dump() for item in req.items]
-        llm = req.llm.model_dump() if req.llm is not None else None
-        return {"data": news_translation.get_service().translate_batch(items, llm)}
-    except ValueError as error:
-        raise HTTPException(422, str(error)) from error
+        return {"data": get_news_source_manager().test_definition(source.model_dump())}
+    except news_source_manager.SourceManagerError as error:
+        _raise_news_source_error(error)
 
 
-@app.post("/api/market-news/sources/{source_id}/retry")
-def market_news_retry_source(
-    source_id: str = ApiPath(pattern=r"^[a-f0-9]{16}$"),
-    mode: MarketNewsMode = "my_focus",
-    tag_id: list[str] = Query(default=[]),
-    category: MarketNewsCategory = "all",
-    days: MarketNewsDays = 7,
-    sort: MarketNewsSort = "importance",
-):
+@app.post("/api/radar/sources", status_code=201)
+def radar_sources_add(source: RadarSourceInput):
     try:
-        result = newsradar.retry_source(source_id)
-    except ValueError as error:
-        raise HTTPException(404, str(error)) from error
-    if not result.get("ok"):
-        return {"data": {"retry_succeeded": False, "source_status": result.get("source_status")}}
-    return _market_news_payload(mode, tag_id, category, days, sort, False)
+        return {"data": get_news_source_manager().add_source(source.model_dump())}
+    except news_source_manager.SourceManagerError as error:
+        _raise_news_source_error(error)
 
 
-@app.get("/api/market-news/events/{event_id}")
-def market_news_event(
-    event_id: str = ApiPath(pattern=r"^[a-f0-9]{20}$"),
-    snapshot_id: str | None = Query(default=None, pattern=r"^[a-f0-9]{20}$"),
-):
+@app.post("/api/radar/sources/{source_id}/test")
+def radar_source_test_existing(source_id: str = ApiPath(pattern=r"^[A-Za-z0-9_-]{1,64}$")):
     try:
-        event = market_news_service.get_service().get_event(event_id, snapshot_id=snapshot_id)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise HTTPException(503, "可信资讯暂时不可用") from error
-    if event is None:
-        raise HTTPException(404, "资讯事件不存在或已不在当前缓存中")
-    return {"data": event}
+        return {"data": get_news_source_manager().test_source(source_id)}
+    except news_source_manager.SourceManagerError as error:
+        _raise_news_source_error(error)
+
+
+@app.put("/api/radar/sources/{source_id}/enabled")
+def radar_source_set_enabled(body: RadarSourceEnabledInput, source_id: str = ApiPath(pattern=r"^[A-Za-z0-9_-]{1,64}$")):
+    try:
+        return {"data": get_news_source_manager().set_enabled(source_id, body.enabled)}
+    except news_source_manager.SourceManagerError as error:
+        _raise_news_source_error(error)
+
+
+@app.delete("/api/radar/sources/{source_id}")
+def radar_source_delete(source_id: str = ApiPath(pattern=r"^[A-Za-z0-9_-]{1,64}$")):
+    try:
+        return {"data": get_news_source_manager().delete_source(source_id)}
+    except news_source_manager.SourceManagerError as error:
+        _raise_news_source_error(error)
+
+
+@app.get("/api/signals/gpu-rent")
+def signals_gpu_rent():
+    """GPU 租金信号（算力温度计）：读缓存，无缓存返回结构骨架。"""
+    try:
+        return {"data": signals.get_gpu_rent(force=False)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"GPU 租金信号异常：{e}") from e
+
+
+@app.post("/api/signals/gpu-rent/refresh")
+def signals_gpu_rent_refresh():
+    """强制重抓 Vast 现货 + Kalshi 远期（约 10-20s：远期逐档串行限流），更新缓存。"""
+    try:
+        return {"data": signals.fetch_gpu_rent()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"GPU 租金信号刷新失败：{e}") from e
 
 
 @app.get("/api/market/overview")
@@ -1314,57 +845,3 @@ def industry(top: int = Query(20, ge=5, le=50)):
         return {"data": data}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"行业排名异常：{e}") from e
-
-
-# Route decorators above populate this private template once.  Factory-created
-# apps copy those immutable route objects, middleware definitions and handlers,
-# while keeping service state and lifespan ownership per app instance.
-_legacy_route_app = app
-
-
-def create_app(
-    industry_research_service: IndustryResearchService | None = None,
-) -> FastAPI:
-    explicit_injection = industry_research_service is not None
-    service = (
-        industry_research_service
-        if explicit_injection
-        else industry_research_api.create_production_industry_research_service()
-    )
-
-    @asynccontextmanager
-    async def lifespan(application: FastAPI):
-        async with _lifespan(application):
-            try:
-                yield
-            finally:
-                shutdown = getattr(service, "shutdown", None)
-                if callable(shutdown):
-                    result = shutdown()
-                    if inspect.isawaitable(result):
-                        await result
-
-    application = FastAPI(
-        title=_legacy_route_app.title,
-        description=_legacy_route_app.description,
-        version=_legacy_route_app.version,
-        lifespan=lifespan,
-    )
-    for route in _legacy_route_app.router.routes:
-        if getattr(route, "path", "") not in {
-            "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
-        }:
-            application.router.routes.append(route)
-    for middleware in reversed(_legacy_route_app.user_middleware):
-        application.add_middleware(
-            middleware.cls,
-            *getattr(middleware, "args", ()),
-            **middleware.kwargs,
-        )
-    application.exception_handlers.update(_legacy_route_app.exception_handlers)
-    application.state.industry_research_service = service
-    application.state.industry_research_allow_demo = explicit_injection
-    return application
-
-
-app = create_app()

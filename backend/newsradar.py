@@ -10,8 +10,6 @@ AI「今日要点」不在此模块——复用 Vibe-Research 的可插拔 AI �
 from __future__ import annotations
 
 import json
-import gzip
-import hashlib
 import os
 import re
 import socket
@@ -23,11 +21,11 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from source_health.probe_errors import (
+from news_probe_errors import (
     ProbeEmptyPayloadError,
     ProbeParseError,
     classify_probe_error,
@@ -35,6 +33,14 @@ from source_health.probe_errors import (
     redact_url,
     retry_delay_seconds,
     retry_after_present,
+)
+from news_source_manager import (
+    MAX_FEED_BYTES,
+    open_public_request,
+    parse_feed_payload,
+    read_bounded_response,
+    source_identifier,
+    validate_url_shape,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,8 +52,65 @@ CACHE_WRITE_LOCK = threading.Lock()
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 BEIJING = timezone(timedelta(hours=8))
-SOURCE_ERROR_TYPES = {"timeout", "http_status", "tls", "dns", "connection", "rss_parse", "unknown"}
+SOURCE_ERROR_TYPES = {
+    "timeout", "http_status", "tls", "dns", "connection", "rss_parse",
+    "security", "response_size", "unknown",
+}
 _ORIGINAL_URLOPEN = urllib.request.urlopen
+
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
+    "spm", "share_token", "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid",
+    "_hsenc", "_hsmi",
+}
+_DUP_TITLE_WINDOW_S = 48 * 3600
+
+
+def _normalize_url(url: str) -> str:
+    """Conservatively strip tracking parameters without merging real query IDs."""
+    if not url:
+        return ""
+    value = url.strip()
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value.lower()
+    kept = [(key, item) for key, item in parse_qsl(parts.query, keep_blank_values=True) if key.lower() not in _TRACKING_PARAMS]
+    return urlunsplit((
+        parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/") or "/",
+        urlencode(kept), "",
+    ))
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r"[\W_]+", "", (title or "").lower())
+
+
+def _dedup(items: list[dict]) -> list[dict]:
+    """Keep the newest URL and only deduplicate same-title items within 48h."""
+    seen_urls: set[str] = set()
+    seen_titles: dict[str, int] = {}
+    output = []
+    for item in items:
+        url_key = _normalize_url(item.get("url", ""))
+        title_key = _normalize_title(item.get("title", ""))
+        timestamp = item.get("ts", 0)
+        duplicate_url = bool(url_key) and url_key in seen_urls
+        previous_timestamp = seen_titles.get(title_key) if title_key else None
+        duplicate_title = (
+            previous_timestamp is not None and bool(timestamp) and bool(previous_timestamp)
+            and abs(previous_timestamp - timestamp) <= _DUP_TITLE_WINDOW_S
+        )
+        if url_key:
+            seen_urls.add(url_key)
+        if duplicate_url or duplicate_title:
+            if title_key and timestamp:
+                seen_titles.setdefault(title_key, timestamp)
+            continue
+        if title_key and timestamp:
+            seen_titles[title_key] = timestamp
+        output.append(item)
+    return output
 
 
 def _utc_now() -> datetime:
@@ -55,48 +118,21 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-@dataclass(frozen=True, slots=True)
-class RadarCollection:
-    """One non-persisting radar collection prepared for pipeline storage."""
-
-    raw_events: tuple[dict, ...]
-    source_statuses: tuple[dict, ...]
-    generated_at: datetime
-    failed_source_count: int
-    radar: dict
-    current_attempt_success: bool
-    attempted_source_count: int
-
-
-class _RecordingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.statuses: list[int] = []
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        self.statuses.append(int(code))
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
 def _open_public_url(request: urllib.request.Request, timeout: float):
-    # Preserve test and embedding injection of urlopen; real requests record redirect status
-    # without changing headers, TLS verification, retry count, or response parsing.
+    # Preserve explicit test injection while enforcing the same static URL policy.
+    # Real production I/O uses the shared pinned-DNS/redirect/TLS transport.
     if urllib.request.urlopen is not _ORIGINAL_URLOPEN:
+        validate_url_shape(request.full_url)
         response = urllib.request.urlopen(request, timeout=timeout)
+        validate_url_shape(response.geturl() if hasattr(response, "geturl") else request.full_url)
         return response, tuple(getattr(response, "redirect_statuses", ()))
-    handler = _RecordingRedirectHandler()
-    response = urllib.request.build_opener(handler).open(request, timeout=timeout)
-    return response, tuple(handler.statuses)
+    response = open_public_request(request, timeout=timeout)
+    return response, tuple(getattr(response, "redirect_statuses", ()))
 
 
 def source_id(source: dict) -> str:
     """Stable non-secret identifier; retry never accepts a caller-provided URL."""
-    identity = "\0".join((
-        str(source.get("hint") or ""),
-        str(source.get("name") or ""),
-        str(source.get("url") or ""),
-    ))
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return source_identifier(source)
 
 
 def sanitize_source_error(value: object) -> str:
@@ -131,28 +167,43 @@ def classify_source_error(error: BaseException) -> tuple[str, str]:
 
 
 def _load_source_config() -> dict:
-    with open(SOURCES_FILE, encoding="utf-8") as source_file:
-        config = json.load(source_file)
-    default_region = str(config.get("default_region") or "unknown")
-    config["sources"] = [
-        {**source, "region": source.get("region") or default_region}
-        for source in config["sources"]
-    ]
-    return config
+    from news_source_manager import runtime_source_config
+
+    return runtime_source_config(SOURCES_FILE)
 
 
 def _apply_configured_regions(data: dict, sources: list[dict]) -> None:
+    by_id = {source_id(source): source for source in sources}
     by_url = {str(source.get("url") or ""): str(source.get("region") or "unknown") for source in sources}
     by_name = {str(source.get("name") or ""): str(source.get("region") or "unknown") for source in sources}
     for industry in data.get("industries") or []:
+        industry_key = str(industry.get("key") or "")
         for item in industry.get("items") or []:
-            if str(item.get("region") or "unknown").lower() != "unknown":
-                continue
-            region = by_url.get(str(item.get("source_url") or ""))
+            configured = by_id.get(str(item.get("source_id") or ""))
+            legacy_url = str(item.get("source_url") or "")
+            if configured is None:
+                candidates = [
+                    source for source in sources
+                    if str(source.get("hint") or "") == industry_key
+                    and (
+                        (legacy_url and str(source.get("url") or "") == legacy_url)
+                        or str(source.get("name") or "") == str(item.get("source_name") or item.get("source") or "")
+                    )
+                ]
+                configured = candidates[0] if len(candidates) == 1 else None
+            if configured is not None:
+                item["source_id"] = source_id(configured)
+            if str(item.get("region") or "unknown").lower() == "unknown":
+                region = str((configured or {}).get("region") or "")
+            else:
+                region = ""
+            if not region:
+                region = by_url.get(legacy_url)
             if not region:
                 region = by_name.get(str(item.get("source_name") or item.get("source") or ""))
             if region:
                 item["region"] = region
+            item.pop("source_url", None)
 
 
 def _strip_html(s: str) -> str:
@@ -183,10 +234,7 @@ def _parse_dt(s: str):
 def _decode_feed(raw: bytes, headers: object) -> str:
     content_encoding = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Encoding", "") or "").lower()
     if "gzip" in content_encoding or raw.startswith(b"\x1f\x8b"):
-        try:
-            raw = gzip.decompress(raw)
-        except Exception as error:
-            raise ProbeParseError("gzip decode failed") from error
+        raise ProbeParseError("gzip payload must be decoded by the bounded reader")
     content_type = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Type", "") or "")
     charset = None
     match = re.search(r"(?i)charset\s*=\s*['\"]?([^\s;'\"]+)", content_type)
@@ -218,7 +266,7 @@ def _parse_feed_items(
             break
         d = {
             "title": "", "url": "", "time": "", "ts": 0, "summary": "", "source": src["name"],
-            "source_name": src["name"], "source_url": src["url"], "original_url": "",
+            "source_name": src["name"], "source_id": source_id(src), "original_url": "",
             "published_at": None, "fetched_at": fetched_at, "summary_or_excerpt": "",
             "language": src.get("language") or "unknown", "region": src.get("region") or "unknown",
             "data_status": "realtime",
@@ -278,15 +326,22 @@ def _request_decode_parse_source(
             })
             response, redirect_statuses = _open_public_url(req, timeout)
             with response:
-                raw = response.read()
                 headers = getattr(response, "headers", {}) or {}
+                raw = read_bounded_response(response)
                 http_status = getattr(response, "status", None)
                 if http_status is None and hasattr(response, "getcode"):
                     http_status = response.getcode()
                 http_status = int(http_status or 200)
                 final_url = response.geturl() if hasattr(response, "geturl") else src["url"]
                 content_type = str(getattr(headers, "get", lambda _key, _default=None: _default)("Content-Type", "") or "")
-            decoded = _decode_feed(raw, headers)
+            decoded = _decode_feed(raw, {**dict(headers), "Content-Encoding": ""})
+            validation_payload = re.sub(r"^\s*<\?xml[^>]*\?>", "", decoded, count=1, flags=re.I).encode("utf-8")
+            try:
+                parse_feed_payload(validation_payload)
+            except Exception as error:
+                if "至少需要一个" in str(error) or "响应为空" in str(error):
+                    raise ProbeEmptyPayloadError("feed has no complete item") from None
+                raise ProbeParseError("feed contract validation failed") from None
             root = ET.fromstring(decoded)
             items, valid_items_before_cutoff, latest_valid_published_at = _parse_feed_items(
                 src, root, per, cutoff, redline, fetched_at,
@@ -423,9 +478,12 @@ def _cached_items_for_source(cache: dict | None, industry_key: str, src: dict) -
     if not industry:
         return []
     out = []
+    configured_id = source_id(src)
     for item in industry.get("items") or []:
-        if item.get("source_url") == src["url"] or item.get("source_name") == src["name"] or item.get("source") == src["name"]:
+        if item.get("source_id") == configured_id or item.get("source_name") == src["name"] or item.get("source") == src["name"]:
             copied = dict(item)
+            copied["source_id"] = configured_id
+            copied.pop("source_url", None)
             copied["data_status"] = "stale"
             copied["region"] = src.get("region") or copied.get("region") or "unknown"
             out.append(copied)
@@ -458,7 +516,6 @@ def _source_status(src: dict, result: dict, cached_items: list[dict], previous: 
     return {
         "source_id": source_id(src),
         "source_name": src["name"],
-        "source_url": src["url"],
         "status": result.get("status") or "failed",
         "error_type": result.get("error_type"),
         "error_reason": result.get("error_reason"),
@@ -501,7 +558,7 @@ def _normalize_cached_source_statuses(data: dict, sources: list[dict]) -> None:
             data,
             str((configured or {}).get("hint") or ""),
             configured or {"url": source_url, "name": row.get("source_name") or ""},
-        ) if source_url else []
+        ) if configured is not None or source_url else []
         failed = row.get("status") == "failed"
         used_cached_items = bool(row.get("used_cached_items")) if "used_cached_items" in row else failed and bool(cached_items)
         item_count = int(row.get("item_count") or 0)
@@ -518,7 +575,6 @@ def _normalize_cached_source_statuses(data: dict, sources: list[dict]) -> None:
         normalized.append({
             "source_id": configured_id,
             "source_name": str(row.get("source_name") or (configured or {}).get("name") or "未知来源"),
-            "source_url": source_url,
             "status": "failed" if failed else "ok",
             "error_type": error_type if failed else None,
             "error_reason": error_reason if failed else None,
@@ -529,7 +585,20 @@ def _normalize_cached_source_statuses(data: dict, sources: list[dict]) -> None:
     data["source_statuses"] = normalized
 
 
+def _sanitize_cache_document(data: dict) -> dict:
+    """Remove private feed-location fields before persistence or API exposure."""
+    def scrub(value):
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items() if key != "source_url"}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(data)
+
+
 def _write_cache(data: dict) -> None:
+    public_data = _sanitize_cache_document(data)
     with CACHE_WRITE_LOCK:
         cache_dir = os.path.dirname(CACHE_FILE)
         os.makedirs(cache_dir, exist_ok=True)
@@ -544,7 +613,7 @@ def _write_cache(data: dict) -> None:
                 delete=False,
             ) as tmp_file:
                 tmp_path = tmp_file.name
-                json.dump(data, tmp_file, ensure_ascii=False)
+                json.dump(public_data, tmp_file, ensure_ascii=False)
                 tmp_file.flush()
                 os.fsync(tmp_file.fileno())
             os.replace(tmp_path, CACHE_FILE)
@@ -595,6 +664,15 @@ def _collect_radar_data() -> dict:
         industries[idx]["items"].extend(items)
         source_statuses.append(_source_status(src, result, [], previous))
 
+    # Health is auxiliary user-local state. A corrupt custom store is never
+    # overwritten; the manager simply declines this best-effort update.
+    try:
+        from news_source_manager import record_runtime_statuses
+
+        record_runtime_statuses(source_statuses, SOURCES_FILE)
+    except OSError:
+        pass
+
     if succeeded == 0:
         if previous:
             fallback = json.loads(json.dumps(previous, ensure_ascii=False))
@@ -613,6 +691,7 @@ def _collect_radar_data() -> dict:
 
     for ind in industries:
         ind["items"].sort(key=lambda x: x.get("ts", 0), reverse=True)
+        ind["items"] = _dedup(ind["items"])
 
     data = {
         "generated_at": _utc_now().astimezone(BEIJING).isoformat(timespec="seconds"),
@@ -626,43 +705,12 @@ def _collect_radar_data() -> dict:
     return data
 
 
-def collect_radar() -> RadarCollection:
-    """Return normalized raw events without publishing the legacy radar cache."""
-    from news_intelligence.clustering import cluster_items
-    from news_intelligence.normalizer import normalize_radar
-
-    collected_at = _utc_now()
+def fetch_radar() -> dict:
+    """抓全部启用源并直接发布原生 radar 缓存。"""
     radar = _collect_radar_data()
-    events = cluster_items(normalize_radar(radar, now=collected_at))
-    source_statuses = tuple(dict(row) for row in radar.get("source_statuses") or [])
-    attempted_source_count = len(source_statuses)
-    failed_source_count = sum(row.get("status") == "failed" for row in source_statuses)
-    return RadarCollection(
-        raw_events=tuple(event.to_dict() for event in events),
-        source_statuses=source_statuses,
-        generated_at=collected_at,
-        failed_source_count=failed_source_count,
-        radar=json.loads(json.dumps(radar, ensure_ascii=False)),
-        current_attempt_success=(
-            attempted_source_count > 0 and failed_source_count < attempted_source_count
-        ),
-        attempted_source_count=attempted_source_count,
-    )
-
-
-def publish_radar_collection(collection: RadarCollection) -> dict:
-    """Publish a completed collection through the legacy cache adapter."""
-    if type(collection) is not RadarCollection:
-        raise TypeError("invalid radar collection")
-    radar = json.loads(json.dumps(collection.radar, ensure_ascii=False))
     if str(radar.get("cache_status") or "") in {"realtime", "partial"}:
         _write_cache(radar)
     return radar
-
-
-def fetch_radar() -> dict:
-    """抓全部源，返回 12 赛道数据并落盘兼容缓存。"""
-    return publish_radar_collection(collect_radar())
 
 
 def load_cache():
@@ -672,6 +720,7 @@ def load_cache():
         sources = _load_source_config()["sources"]
         _apply_configured_regions(data, sources)
         _normalize_cached_source_statuses(data, sources)
+        data = _sanitize_cache_document(data)
         generated_at = _parse_dt(str(data.get("generated_at") or ""))
         recent_days = int(data.get("recent_days") or 7)
         is_stale = bool(generated_at and _utc_now() - generated_at.astimezone(timezone.utc) > timedelta(days=recent_days))
@@ -686,7 +735,7 @@ def load_cache():
 
 def skeleton() -> dict:
     """无缓存时返回赛道骨架（空 items），前端提示点刷新。"""
-    cfg = json.load(open(SOURCES_FILE, encoding="utf-8"))
+    cfg = _load_source_config()
     byhint: dict[str, int] = {}
     for s in cfg["sources"]:
         byhint[s["hint"]] = byhint.get(s["hint"], 0) + 1
@@ -725,9 +774,11 @@ def retry_source(requested_source_id: str) -> dict:
         raise ValueError("该资讯来源的行业配置不存在")
     industry["items"] = [
         item for item in industry.get("items") or []
-        if item.get("source_url") != src["url"]
-        and item.get("source_name") != src["name"]
-        and item.get("source") != src["name"]
+        if item.get("source_id") != requested_source_id
+        and not (
+            not item.get("source_id")
+            and (item.get("source_name") == src["name"] or item.get("source") == src["name"])
+        )
     ]
     industry["items"].extend(result["items"])
     industry["items"].sort(key=lambda item: item.get("ts", 0), reverse=True)
@@ -748,7 +799,6 @@ def retry_source(requested_source_id: str) -> dict:
                 row = {
                     "source_id": configured_id,
                     "source_name": configured["name"],
-                    "source_url": configured["url"],
                     "status": "failed",
                     "error_type": "unknown",
                     "error_reason": "暂无成功缓存，本次单源重试未抓取该来源",
@@ -760,7 +810,6 @@ def retry_source(requested_source_id: str) -> dict:
                 row = {
                     "source_id": configured_id,
                     "source_name": configured["name"],
-                    "source_url": configured["url"],
                     "status": "ok",
                     "error_type": None,
                     "error_reason": None,

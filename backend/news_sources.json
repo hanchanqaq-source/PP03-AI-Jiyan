@@ -482,12 +482,6 @@
    "url": "https://www.wired.com/feed/rss"
   },
   {
-   "name": "Engadget",
-   "hint": "tech",
-   "type": "rss",
-   "url": "https://www.engadget.com/rss.xml"
-  },
-  {
    "name": "Techmeme",
    "hint": "tech",
    "type": "rss",
@@ -506,13 +500,6 @@
    "type": "rss",
    "region": "CN",
    "url": "https://www.tmtpost.com/rss.xml"
-  },
-  {
-   "name": "少数派",
-   "hint": "tech",
-   "type": "rss",
-   "region": "CN",
-   "url": "https://sspai.com/feed"
   },
   {
    "name": "IT之家",

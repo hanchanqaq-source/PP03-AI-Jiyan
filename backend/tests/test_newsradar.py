@@ -42,8 +42,8 @@ class _Response:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def read(self) -> bytes:
-        return self._payload
+    def read(self, limit: int = -1) -> bytes:
+        return self._payload if limit < 0 else self._payload[:limit]
 
     def getcode(self) -> int:
         return self.status
@@ -96,6 +96,40 @@ def _probe_source() -> dict:
         "language": "zh-CN",
         "region": "CN",
     }
+
+
+def test_production_probe_rejects_private_initial_url_before_injected_transport(monkeypatch):
+    calls = []
+
+    def fake_open(request, timeout):
+        calls.append(request.full_url)
+        return _Response(_rss("Should not load", "https://news.example.test/item"))
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", fake_open)
+    source = {**_probe_source(), "url": "http://127.0.0.1/private-feed"}
+
+    result = newsradar.probe_source_config(source)
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == "security"
+    assert calls == []
+
+
+def test_production_probe_reads_at_most_the_bounded_response_limit(monkeypatch):
+    limits = []
+
+    class OversizedResponse(_Response):
+        def read(self, limit: int = -1) -> bytes:
+            limits.append(limit)
+            return b"x" * limit
+
+    monkeypatch.setattr(newsradar.urllib.request, "urlopen", lambda request, timeout: OversizedResponse(b""))
+
+    result = newsradar.probe_source_config(_probe_source())
+
+    assert result["status"] == "failure"
+    assert result["error_type"] == "response_size"
+    assert limits == [newsradar.MAX_FEED_BYTES + 1]
 
 
 def test_probe_source_config_parses_rss_atom_and_namespaced_atom(monkeypatch):
@@ -343,7 +377,8 @@ def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch)
 
     item = data["industries"][0]["items"][0]
     assert item["source_name"] == "公开源 1"
-    assert item["source_url"] == "https://feed.example.test/rss"
+    assert item["source_id"] == newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"})
+    assert "source_url" not in item
     assert item["original_url"] == "https://news.example.test/a"
     assert item["published_at"] == "2026-08-16T10:35:00+08:00"
     assert item["fetched_at"].endswith("+08:00")
@@ -356,7 +391,6 @@ def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch)
     assert status == {
         "source_id": newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"}),
         "source_name": "公开源 1",
-        "source_url": "https://feed.example.test/rss",
         "status": "ok",
         "error_type": None,
         "error_reason": None,
@@ -365,6 +399,26 @@ def test_fetch_radar_preserves_complete_source_provenance(tmp_path, monkeypatch)
         "item_count": 1,
     }
     assert data["source_state"] == "all_success"
+
+
+def test_custom_feed_url_is_never_persisted_or_returned_by_radar(tmp_path, monkeypatch):
+    sources = tmp_path / "sources.json"
+    cache = tmp_path / "radar.json"
+    private_value = "private-query-value"
+    _write_sources(sources, [f"https://feed.example.test/rss?sig={private_value}"])
+    monkeypatch.setattr(newsradar, "SOURCES_FILE", str(sources))
+    monkeypatch.setattr(newsradar, "CACHE_FILE", str(cache))
+    monkeypatch.setattr(
+        newsradar.urllib.request,
+        "urlopen",
+        lambda request, timeout: _Response(_rss("公开资讯", "https://news.example.test/a"), url=request.full_url),
+    )
+
+    data = newsradar.fetch_radar()
+
+    assert private_value not in json.dumps(data, ensure_ascii=False)
+    assert private_value not in cache.read_text(encoding="utf-8")
+    assert "source_url" not in cache.read_text(encoding="utf-8")
 
 
 def test_fetch_radar_applies_audited_config_default_region(tmp_path, monkeypatch):
@@ -567,7 +621,6 @@ def test_load_cache_enriches_legacy_source_failures_without_inventing_error_deta
     assert data["source_statuses"] == [{
         "source_id": newsradar.source_id({"url": "https://feed.example.test/rss", "hint": "semi", "name": "公开源 1"}),
         "source_name": "公开源 1",
-        "source_url": "https://feed.example.test/rss",
         "status": "failed",
         "error_type": "unknown",
         "error_reason": "旧缓存未记录具体失败原因",
@@ -795,64 +848,13 @@ def test_retry_without_cache_does_not_invent_success_for_unfetched_sources(tmp_p
     stored = json.loads(cache.read_text(encoding="utf-8"))
     assert stored["stats"]["failed_sources"] == 1
     assert stored["source_state"] == "partial_failure"
-    statuses = {row["source_url"]: row for row in stored["source_statuses"]}
-    assert statuses[urls[0]]["status"] == "ok"
-    assert statuses[urls[1]]["status"] == "failed"
-    assert statuses[urls[1]]["error_type"] == "unknown"
-    assert statuses[urls[1]]["error_reason"] == "暂无成功缓存，本次单源重试未抓取该来源"
-
-
-@pytest.mark.parametrize(
-    ("source_state", "statuses", "expected_success", "expected_attempted", "expected_failed"),
-    [
-        (
-            "stale_cache",
-            [
-                {"source_id": "one", "status": "failed"},
-                {"source_id": "two", "status": "failed"},
-            ],
-            False,
-            2,
-            2,
-        ),
-        (
-            "all_success",
-            [{"source_id": "one", "status": "ok"}],
-            True,
-            1,
-            0,
-        ),
-    ],
-)
-def test_collect_radar_exposes_current_attempt_outcome_without_using_cached_items(
-    monkeypatch,
-    source_state,
-    statuses,
-    expected_success,
-    expected_attempted,
-    expected_failed,
-):
-    radar = {
-        "generated_at": "2026-08-20T09:00:00+00:00",
-        "recent_days": 7,
-        "industries": [],
-        "stats": {
-            "industries": 0,
-            "total_sources": len(statuses),
-            "failed_sources": expected_failed,
-        },
-        "cache_status": "stale" if source_state == "stale_cache" else "realtime",
-        "source_state": source_state,
-        "source_statuses": statuses,
-    }
-    monkeypatch.setattr(newsradar, "_collect_radar_data", lambda: radar)
-
-    result = newsradar.collect_radar()
-
-    assert result.current_attempt_success is expected_success
-    assert result.attempted_source_count == expected_attempted
-    assert result.failed_source_count == expected_failed
-    assert result.raw_events == ()
+    statuses = {row["source_id"]: row for row in stored["source_statuses"]}
+    first_id = newsradar.source_id({"url": urls[0], "hint": "semi", "name": "公开源 1"})
+    second_id = newsradar.source_id({"url": urls[1], "hint": "semi", "name": "公开源 2"})
+    assert statuses[first_id]["status"] == "ok"
+    assert statuses[second_id]["status"] == "failed"
+    assert statuses[second_id]["error_type"] == "unknown"
+    assert statuses[second_id]["error_reason"] == "暂无成功缓存，本次单源重试未抓取该来源"
 
 
 def test_fetch_radar_keeps_exact_freshness_cutoff_and_excludes_one_second_older(tmp_path, monkeypatch):

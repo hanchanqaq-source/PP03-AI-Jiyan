@@ -1,6 +1,6 @@
 # 平行模块收敛清单
 
-状态：删除前清单。最终删除以实际 caller scan 和 Git diff 为准；历史文档/截图与所有用户数据不在删除范围。
+状态：已执行。最终结果以本 Work 的 caller scan、Git diff 与全量测试为准；历史文档/截图与所有用户数据均不在删除范围。
 
 | 删除文件或目录 | 原调用方 | 原生替代 | 数据处理 | 删除理由 | 回退方式 |
 | --- | --- | --- | --- | --- | --- |
@@ -28,8 +28,8 @@
 
 - 来源启用/停用、测试连接、最近成功、最近错误、条数、耗时、配置地址、简单健康状态。
 - 来源失败继续展示既有 radar cache。
-- 新增 RSS URL 的公网地址、重定向、大小、XML/RSS/Atom 与 TLS 安全检查。
-- 敏感查询参数和错误消息脱敏。
+- 新增 RSS URL 的公网地址、固定 DNS socket、重定向、压缩/解压大小、XML/RSS/Atom 与 TLS 安全检查，并被产品刷新/重试复用。
+- Manager/Radar 统一以 canonical `source_id` 关联；敏感查询参数和错误消息脱敏，Radar cache/API 不保留 `source_url`，来源 API/UI 只展示 scheme + host。
 - 自定义来源在用户数据目录原子持久化，损坏时仍可用内置来源。
 
 ## 明确保留但不再暴露的数据
@@ -44,3 +44,19 @@
 2. `rg` 证明被删目录只有被删页面、被删 API 或被删模块互相调用；
 3. `app.py`、`frontend/src/lib/api.ts` 和 `Intel.tsx` 已切换到原生实现；
 4. 没有文件删除命令指向 `%VR_DATA_DIR%`、`%VR_REPORTS_DIR%`、用户 profile 或仓库外用户目录。
+
+## 实际删除结果（2026-08-27）
+
+- 删除 292 个仅存在于 PP03 平行运行时树、且不在当前 `upstream/main` 原生树中的已跟踪文件。
+- 覆盖五个平行页面、Catalog/Evidence/Provider/Source Health/News Pipeline/Fund/Industry 主干、对应测试与 4 个专属验收脚本。
+- `rg` 删除后 caller scan 为 0；遗留目录仅含 `.pyc` 时经边界验证后清理。
+- 原生保留：`astock.py`、`gstock.py`、`market.py`、`newsradar.py`、`signals.py`、`app.py`、`tools.py`、`chat.py`、`mcp_server.py`、`debate.py`。
+- 所有旧用户数据路径仍为 `PRESERVED_BUT_NOT_CURRENTLY_EXPOSED`，未枚举、未改写、未迁移。
+
+## Stage C 最终核对（2026-08-28）
+
+- `git diff --diff-filter=D` 仍为 292 个计划内跟踪文件，没有新增来源不明的删除。
+- 排除历史文档和负向路由测试后，生产代码对旧页面、旧 API、`data_sources`、`evidence_verification`、`source_health`、`news_pipeline`、`industry_research`、`fund_portfolio` 的活动 caller scan 为 0。
+- `/research-home`、`/market-news`、`/industry-research`、`/portfolio-analysis`、`/evidence-center`、`/provider-center`、`/data-sources` 均由负向测试与实际浏览器证明回落 `/daily-review`，不是旧模块的兼容入口。
+- 正式历史验收文档、历史截图及 upstream MIT `LICENSE` 保留；最终截图写入独立 `docs/screenshots/native-convergence/`。
+- 首轮独立复审的 1 Critical、4 Important、1 Minor及第二轮的 0 Critical、4 Important、1 Minor均在原定范围内修复；未恢复任何已移除模块或平行入口。

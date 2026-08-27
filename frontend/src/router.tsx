@@ -2,6 +2,7 @@ import { createBrowserRouter, Navigate, type RouteObject } from "react-router-do
 import { Layout } from "@/components/layout/Layout";
 import { DailyReview } from "@/pages/DailyReview";
 import { Intel } from "@/pages/Intel";
+import { Signals } from "@/pages/Signals";
 import { Sectors } from "@/pages/Sectors";
 import { SectorDetail } from "@/pages/SectorDetail";
 import { Debate } from "@/pages/Debate";
@@ -11,24 +12,17 @@ import { Watchlist } from "@/pages/Watchlist";
 import { MyReports } from "@/pages/MyReports";
 import { Notes } from "@/pages/Notes";
 import { Settings } from "@/pages/Settings";
-import { ResearchHome } from "@/pages/ResearchHome";
-import { MarketNews } from "@/pages/MarketNews";
-import { IndustryResearch } from "@/pages/IndustryResearch";
-import { PortfolioAnalysis } from "@/pages/PortfolioAnalysis";
-import { EvidenceCenter } from "@/features/evidence-center/EvidenceCenterReal";
 
 export const APP_ROUTES: RouteObject[] = [
   {
     element: <Layout />,
     children: [
-      { path: "/", element: <Navigate to="/research-home" replace /> },
-      { path: "/research-home", element: <ResearchHome /> },
-      { path: "/market-news", element: <MarketNews /> },
-      { path: "/industry-research", element: <IndustryResearch /> },
-      { path: "/portfolio-analysis", element: <PortfolioAnalysis /> },
-      { path: "/evidence-center", element: <EvidenceCenter /> },
+      { path: "/", element: <Navigate to="/daily-review" replace /> },
       { path: "/daily-review", element: <DailyReview /> },
-      { path: "/intel", element: <Intel /> },
+      { path: "/intel", element: <Navigate to="/intel/investment-news" replace /> },
+      { path: "/intel/:tab", element: <Intel /> },
+      { path: "/signals", element: <Signals /> },
+      { path: "/signals/:tab", element: <Signals /> },
       { path: "/sectors", element: <Sectors /> },
       { path: "/sectors/:key", element: <SectorDetail /> },
       { path: "/portfolio", element: <Portfolio /> },
@@ -38,6 +32,7 @@ export const APP_ROUTES: RouteObject[] = [
       { path: "/my-reports", element: <MyReports /> },
       { path: "/notes", element: <Notes /> },
       { path: "/settings", element: <Settings /> },
+      { path: "*", element: <Navigate to="/daily-review" replace /> },
     ],
   },
 ];

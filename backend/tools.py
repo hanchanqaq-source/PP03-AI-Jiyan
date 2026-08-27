@@ -17,6 +17,7 @@ import astock
 import gstock
 import market
 import newsradar
+import signals
 
 # ——— schema 简写：让 20+ 个工具定义保持一屏可读 ———
 
@@ -100,6 +101,12 @@ TOOLS: list[dict] = [
        "查资讯雷达：12 条赛道的行业资讯聚合（非个股新闻，看产业面动态用）。可传 track 只看某条赛道（如「半导体」「AI」）。",
        {"track": {"type": "string", "description": "赛道名关键词，留空看全部"},
         "per_track": {"type": "integer", "description": "每条赛道取最新几条，默认 5"}}),
+
+    # —— 产业信号 ——
+    _t("query_gpu_rent",
+       "查 GPU 租金信号：B200/H100/A100 现货中位租金、近一年逐日中位价历史，"
+       "以及公开事件合约给出的远期预期。现货与远期口径不同，不能直接相减；"
+       "数据为空时提示用户到「产业信号」页刷新。"),
 
     # —— 海外 ——
     _t("query_global_stock",
@@ -326,6 +333,70 @@ def _market(args: dict):
     return market.get_overview()
 
 
+def _gpu_rent(args: dict):
+    """为 AI 工具裁剪 GPU 租金缓存，避免逐日序列撑爆单次工具结果上限。"""
+    import time as _time_mod
+
+    data = signals.get_gpu_rent(force=False)
+
+    def _point(point):
+        return {
+            "date": _time_mod.strftime("%Y-%m-%d", _time_mod.localtime(point[0])),
+            "usd_per_gpu_hr": point[1],
+        }
+
+    def _at_days_ago(points, days):
+        target = points[-1][0] - days * 86400
+        return _point(min(points, key=lambda point: abs(point[0] - target)))
+
+    history = []
+    for gpu in data.get("history", {}).get("gpus", []):
+        row = {
+            key: gpu.get(key)
+            for key in ("gpu", "unavailable", "note", "err", "stale")
+            if gpu.get(key) is not None
+        }
+        points = gpu.get("points") or []
+        if points:
+            prices = [point[1] for point in points]
+            row.update({
+                "latest": _point(points[-1]),
+                "d30_ago": _at_days_ago(points, 30),
+                "d180_ago": _at_days_ago(points, 180),
+                "year_start": _point(points[0]),
+                "year_range": {"min": min(prices), "max": max(prices)},
+                "n_points": len(points),
+            })
+        history.append(row)
+
+    forward = data.get("forward") or {}
+    months = [
+        {
+            key: month.get(key)
+            for key in ("month", "close_date", "implied_median", "most_likely", "p_below_lowest")
+        }
+        for month in forward.get("months", [])
+    ]
+    return {
+        "generated_at": data.get("generated_at"),
+        "how_to_read": data.get("how_to_read"),
+        "spot": data.get("spot"),
+        "history_summary": history,
+        "forward": {
+            "months": months,
+            "settled_actual": (forward.get("settled") or [])[-12:],
+            "n_contracts": forward.get("n_contracts"),
+            "unavailable": forward.get("unavailable"),
+            "err": forward.get("err"),
+            "stale": forward.get("stale"),
+            "observed_at": forward.get("observed_at"),
+            "fetch_error": forward.get("fetch_error"),
+        },
+        "errors": data.get("errors"),
+        "note": "历史为关键点摘要、远期为每月结论；完整逐日序列与概率分布见「产业信号 → GPU租金」页。",
+    }
+
+
 def _radar(args: dict):
     """资讯雷达：数据按 12 条赛道分组，这里摊平成一张扁平清单（每条带赛道名）方便模型阅读。
     可传 track 只看某条赛道；每赛道取最新若干条，避免 12×几十条把上下文吃光。"""
@@ -375,6 +446,7 @@ _HANDLERS = {
         ("title", "publishDate", "orgSName", "industryName"), 20),
     "query_market": _market,
     "query_news_radar": _radar,
+    "query_gpu_rent": _gpu_rent,
     "query_global_stock": lambda a: gstock.us_hk_stock(str(a.get("symbol", ""))) or {"error": "未找到该美股/港股/韩股代码"},
     "query_hk_cashflow": lambda a: gstock.hk_cashflow(str(a.get("symbol", ""))) or {"error": "未找到该港股现金流（仅港股支持）"},
 }
