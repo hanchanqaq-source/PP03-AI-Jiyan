@@ -6,7 +6,7 @@ import { Signals } from "@/pages/Signals";
 import { Sectors } from "@/pages/Sectors";
 import { SectorDetail } from "@/pages/SectorDetail";
 import { Debate } from "@/pages/Debate";
-import { Portfolio } from "@/pages/Portfolio";
+import { Holdings } from "@/pages/Holdings";
 import { StockData } from "@/pages/StockData";
 import { Watchlist } from "@/pages/Watchlist";
 import { MyReports } from "@/pages/MyReports";
@@ -25,7 +25,10 @@ export const APP_ROUTES: RouteObject[] = [
       { path: "/signals/:tab", element: <Signals /> },
       { path: "/sectors", element: <Sectors /> },
       { path: "/sectors/:key", element: <SectorDetail /> },
-      { path: "/portfolio", element: <Portfolio /> },
+      { path: "/portfolio", element: <Navigate to="/portfolio/funds" replace /> },
+      { path: "/portfolio/funds", element: <Holdings /> },
+      { path: "/portfolio/stocks", element: <Holdings /> },
+      { path: "/portfolio-analysis", element: <Navigate to="/portfolio/funds" replace /> },
       { path: "/stock-data", element: <StockData /> },
       { path: "/debate", element: <Debate /> },
       { path: "/watchlist", element: <Watchlist /> },

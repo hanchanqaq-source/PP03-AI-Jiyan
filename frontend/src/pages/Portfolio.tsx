@@ -13,7 +13,7 @@ const fmt = (v: number) => v.toLocaleString("zh-CN", { maximumFractionDigits: 2 
 // 单价类（现价/成本/清仓价）最多 4 位小数：ETF/基金常见 3-4 位，截断成 2 位会与市值/盈亏对不上账
 const fmtPx = (v: number) => v.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
 
-export function Portfolio() {
+export function Portfolio({ embedded = false }: { embedded?: boolean } = {}) {
   const [data, setData] = useState<PortfolioData | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -98,7 +98,7 @@ export function Portfolio() {
   return (
     <div>
       <PageHeader
-        title="我的持仓"
+        title={embedded ? "股票持仓" : "我的持仓"}
         subtitle="自己录、存在本地，实时看浮动盈亏"
         actions={
           <div className="flex items-center gap-2">
@@ -143,7 +143,7 @@ export function Portfolio() {
         <div className="flex flex-wrap items-end gap-2">
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">股票代码</label>
-            <input value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位代码"
+            <input aria-label="股票代码" value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位代码"
               className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
           </div>
           <div>

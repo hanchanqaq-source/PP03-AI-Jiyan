@@ -1,6 +1,28 @@
 // Vibe-Research 后端 API 客户端。/api → vite 代理到本地 FastAPI（默认 8900）。
 // 后端未启动或数据源异常时抛 ApiError，页面据此优雅降级。
 
+import type {
+  DataSection,
+  FundAnalysis,
+  FundHoldingInput,
+  FundPortfolioAnalysisData,
+  FundPortfolioData,
+  FundSearchResult,
+} from "@/features/fund-portfolio/types";
+
+export type {
+  DataMeta,
+  DataSection,
+  FundAnalysis,
+  FundHolding,
+  FundHoldingInput,
+  FundPortfolioAnalysisData,
+  FundPortfolioData,
+  FundSearchResult,
+  PositionMetrics,
+  PortfolioHoldingAnalysis,
+} from "@/features/fund-portfolio/types";
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -331,6 +353,13 @@ export const api = {
   closePosition: (code: string, date: string, price: number, shares: number, cost: number) =>
     request<PortfolioData>("/portfolio/close", "POST", { code, date, price, shares, cost }),
   removeClosed: (index: number) => request<PortfolioData>(`/portfolio/close?index=${index}`, "DELETE"),
+  fundPortfolio: () => get<FundPortfolioData>("/fund-portfolio"),
+  upsertFundHolding: (holding: FundHoldingInput) => request<FundPortfolioData>("/fund-portfolio/holding", "POST", holding),
+  deleteFundHolding: (code: string) => request<FundPortfolioData>(`/fund-portfolio/holding?code=${encodeURIComponent(code)}`, "DELETE"),
+  fundPortfolioAnalysis: () => get<FundPortfolioAnalysisData>("/fund-portfolio/analysis"),
+  searchFunds: (query: string) => get<DataSection<FundSearchResult[]>>(`/funds/search?q=${encodeURIComponent(query)}`),
+  fundAnalysis: (code: string) => get<FundAnalysis>(`/funds/${encodeURIComponent(code)}/analysis`),
+  refreshFund: (code: string) => request<FundAnalysis>(`/funds/${encodeURIComponent(code)}/refresh`, "POST"),
   valuation: (code: string) => get<Valuation>(`/valuation?code=${code}`),
   percentile: (code: string) => get<ValPercentile>(`/valuation/percentile?code=${code}`),
   financials: (code: string) => get<Financials>(`/financials?code=${code}`),

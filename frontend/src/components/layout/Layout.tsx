@@ -28,7 +28,7 @@ const NAV = [
   { to: "/stock-data", icon: Search, label: "个股数据" },
   { to: "/debate", icon: Swords, label: "多空辩论" },
   { to: "/watchlist", icon: Star, label: "自选股" },
-  { to: "/portfolio", icon: Wallet, label: "我的持仓" },
+  { to: "/portfolio/funds", icon: Wallet, label: "我的持仓" },
   { to: "/my-reports", icon: FileText, label: "我的研报" },
   { to: "/notes", icon: NotebookPen, label: "研究记录" },
   { to: "/settings", icon: Settings, label: "接入 AI" },
@@ -108,7 +108,7 @@ export function Layout() {
         {/* Nav */}
         <nav className={cn("flex-1 space-y-1 overflow-auto", collapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
-            const active = pathname === to;
+            const active = pathname === to || (to === "/portfolio/funds" && pathname.startsWith("/portfolio/"));
             const group = NAV_GROUPS[to];
             const groupOpen = group ? openGroups[to] : false;
             return (
