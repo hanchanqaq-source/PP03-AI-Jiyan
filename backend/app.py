@@ -34,6 +34,8 @@ import market
 import myreports as mr
 import reflection as reflect_layer
 import signals
+import subscription_ai.service as subscription_ai_service
+from subscription_ai.codex_provider import LoginSwitchConfirmationRequired, public_runtime_message
 
 
 from version import read_version
@@ -147,6 +149,61 @@ def health():
     return {"ok": True, "service": "vibe-research-api", "version": __version__}
 
 
+def get_subscription_ai_service() -> subscription_ai_service.SubscriptionAIService:
+    return subscription_ai_service.get_service()
+
+
+def _subscription_local_actions_allowed(request: Request) -> bool:
+    host_values = _header_values(request, "host")
+    if len(host_values) != 1 or not _loopback_authority(host_values[0]):
+        return False
+    client_host = request.client.host if request.client is not None else ""
+    if client_host not in _LOOPBACK_HOSTS:
+        return False
+    origin_values = _header_values(request, "origin")
+    if len(origin_values) > 1:
+        return False
+    return not origin_values or _local_browser_origin(origin_values[0])
+
+
+def _require_subscription_local_action(request: Request) -> None:
+    if not _subscription_local_actions_allowed(request):
+        raise HTTPException(403, "Codex 登录和连接测试只能由本机 loopback 页面使用")
+
+
+class CodexLoginReq(BaseModel):
+    confirm_switch: bool = False
+
+
+@app.get("/api/subscription-ai/providers")
+def subscription_ai_providers(request: Request, refresh: bool = Query(False)):
+    return get_subscription_ai_service().list_providers(force=refresh)
+
+
+@app.post("/api/subscription-ai/codex/login")
+def subscription_ai_codex_login(body: CodexLoginReq, request: Request):
+    _require_subscription_local_action(request)
+    try:
+        data = get_subscription_ai_service().start_codex_login(confirm_switch=body.confirm_switch)
+    except LoginSwitchConfirmationRequired as error:
+        raise HTTPException(409, str(error)) from error
+    except OSError as error:
+        raise HTTPException(500, "无法启动 Codex 官方登录，请在本机终端运行 codex login") from error
+    return data
+
+
+@app.post("/api/subscription-ai/codex/test")
+def subscription_ai_codex_test(request: Request):
+    _require_subscription_local_action(request)
+    return get_subscription_ai_service().test_codex()
+
+
+@app.post("/api/subscription-ai/codex/cancel")
+def subscription_ai_codex_cancel(request: Request):
+    _require_subscription_local_action(request)
+    return get_subscription_ai_service().cancel_codex_test()
+
+
 class LLMConfig(BaseModel):
     provider: str = ""       # cli-* = 订阅接入（调本机 CLI）；其余 = API 接入
     baseURL: str = ""        # 订阅接入时留空
@@ -170,18 +227,8 @@ def chat(req: ChatReq):
     """
     if not req.messages:
         raise HTTPException(400, "messages 不能为空")
-    if not req.llm.model:
-        raise HTTPException(400, "缺少模型配置，请先在「接入 AI」里选择")
-
+    cfg = _check_llm(req.llm)
     is_cli = req.llm.provider.startswith("cli-")
-    if is_cli:
-        kind = req.llm.provider[4:]
-        if not cli_runtime.detect_cli(kind):
-            raise HTTPException(400, f"未检测到「{kind}」对应的本机命令。请先安装并登录该 CLI，或改用「API 接入」。")
-    elif not req.llm.apiKey or not req.llm.baseURL:
-        raise HTTPException(400, "缺少 Base URL 或 API Key，请先在「接入 AI」里填写")
-
-    cfg = req.llm.model_dump()
 
     def gen():
         try:
@@ -189,7 +236,8 @@ def chat(req: ChatReq):
             for ev in events:
                 yield json.dumps(ev, ensure_ascii=False) + "\n"
         except Exception as e:  # noqa: BLE001 — 运行时错误以流内事件上报，不中断连接
-            yield json.dumps({"type": "error", "message": f"对话失败：{e}"}, ensure_ascii=False) + "\n"
+            message = public_runtime_message(e) if cfg.get("provider") == "cli-codex" else f"对话失败：{e}"
+            yield json.dumps({"type": "error", "message": message}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
@@ -201,7 +249,17 @@ def _check_llm(llm: LLMConfig) -> dict:
     """
     if not llm.model:
         raise HTTPException(400, "缺少模型配置，请先在「接入 AI」里选择")
-    if llm.provider.startswith("cli-"):
+    if llm.provider == "cli-codex":
+        status = get_subscription_ai_service().codex_status(force=True)
+        if not status.installed:
+            raise HTTPException(400, "未检测到 Codex CLI，请先安装官方 Codex。")
+        if status.auth_status == "installed_not_logged_in":
+            raise HTTPException(400, "Codex 尚未登录，请先完成官方 ChatGPT 登录。")
+        if status.auth_status == "logged_in_api_key":
+            raise HTTPException(400, "当前 Codex 使用 API Key，不属于会员额度接入。")
+        if status.auth_status != "logged_in_chatgpt" or not status.available:
+            raise HTTPException(400, "Codex 登录方式无法安全确认，请先在「接入 AI」重新检测。")
+    elif llm.provider.startswith("cli-"):
         kind = llm.provider[4:]
         if not cli_runtime.detect_cli(kind):
             raise HTTPException(400, f"未检测到「{kind}」对应的本机命令。请先安装并登录该 CLI，或改用「API 接入」。")
@@ -210,14 +268,15 @@ def _check_llm(llm: LLMConfig) -> dict:
     return llm.model_dump()
 
 
-def _ndjson(events):
+def _ndjson(events, cfg: dict | None = None):
     """把事件生成器包成 NDJSON 流；运行时异常转成流内 error 事件，不中断连接。"""
     def gen():
         try:
             for ev in events():
                 yield json.dumps(ev, ensure_ascii=False) + "\n"
         except Exception as e:  # noqa: BLE001
-            yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
+            message = public_runtime_message(e) if cfg and cfg.get("provider") == "cli-codex" else str(e)
+            yield json.dumps({"type": "error", "message": message}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
@@ -237,7 +296,7 @@ def debate(req: DebateReq):
     code = _validate(req.code)
     cfg = _check_llm(req.llm)
     rounds = 2 if req.rounds >= 2 else 1
-    return _ndjson(lambda: debate_layer.run_debate_stream(cfg, code, rounds))
+    return _ndjson(lambda: debate_layer.run_debate_stream(cfg, code, rounds), cfg)
 
 
 class ReflectReq(BaseModel):
@@ -252,7 +311,7 @@ def reflect(req: ReflectReq):
     if not (req.source or "").strip():
         raise HTTPException(400, "source 不能为空")
     cfg = _check_llm(req.llm)
-    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.source, req.title))
+    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.source, req.title), cfg)
 
 
 class HoldingIn(BaseModel):

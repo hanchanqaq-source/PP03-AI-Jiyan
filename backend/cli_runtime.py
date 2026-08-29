@@ -12,11 +12,13 @@ from __future__ import annotations
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 
 # 提示词投递方式（各 CLI 接口不同）：
@@ -40,10 +42,15 @@ _CLI_DEFS: dict[str, dict] = {
     # longer supported for Gemini Code Assist for individuals"），故已从订阅接入中移除。
     "deepseek": {"bins": ["deepseek", "codewhale"], "delivery": "arg",
                  "build_args": lambda _: ["exec", "--auto"], "env": {}},
-    # Codex：codex exec 默认纯文本（进度走 stderr、最终答案走 stdout）；`-` 从 stdin 读提示词，
-    # --skip-git-repo-check 跳过 git 检查（我们在临时目录跑）。复用本机 `codex login` 的订阅登录态。
+    # Codex：认证只来自 PP03 产品 CODEX_HOME；忽略其中的用户配置和 rules，
+    # 在空临时目录、只读沙箱、无持久会话模式下回答页面已提供的上下文。
     "codex": {"bins": ["codex"], "delivery": "stdin",
-              "build_args": lambda _: ["exec", "--skip-git-repo-check", "-"], "env": {}},
+              "build_args": lambda _: [
+                  "--ask-for-approval", "never", "exec",
+                  "--ignore-user-config", "--ignore-rules", "--ephemeral",
+                  "--disable", "shell_tool",
+                  "--sandbox", "read-only", "--skip-git-repo-check", "-",
+              ], "env": {}},
 }
 
 _EXTRA_PATH_DIRS = [
@@ -56,11 +63,62 @@ _EXTRA_PATH_DIRS = [
 ]
 
 _CLI_TIMEOUT_S = 300  # 子进程兜底超时（秒）
+_STREAM_HEARTBEAT_S = 1.0
+_STREAM_EOF = object()
 _MAX_ARG_BYTES = 110_000  # 位置参数投递的提示词字节上限
+
+_CODEX_ENV_KEYS = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
+    "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "USERNAME",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "ALL_PROXY", "all_proxy",
+    "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CODEX_CA_CERTIFICATE",
+}
 
 
 class CliUnavailable(RuntimeError):
     """本机未检测到对应 CLI（未安装 / 不在 PATH）。"""
+
+
+def product_codex_home(env: Mapping[str, str] | None = None) -> Path:
+    """Return PP03's private Codex state root without consulting ~/.codex."""
+    source = os.environ if env is None else env
+    configured = str(source.get("VR_DATA_DIR", "") or "").strip()
+    data_root = Path(configured) if configured else Path.home() / ".vibe-research"
+    return (data_root / "codex-home").resolve()
+
+
+def codex_subprocess_env(
+    env: Mapping[str, str] | None = None,
+    codex_home: str | os.PathLike[str] | None = None,
+    runtime_home: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
+    """Build the minimal membership-mode environment for every Codex process."""
+    source = os.environ if env is None else env
+    home = Path(codex_home).resolve() if codex_home is not None else product_codex_home(source)
+    home.mkdir(parents=True, exist_ok=True)
+    clean = {
+        key: value
+        for key, value in source.items()
+        if key.upper() in _CODEX_ENV_KEYS and value is not None
+    }
+    clean["CODEX_HOME"] = str(home)
+    if runtime_home is not None:
+        runtime_root = Path(runtime_home).resolve()
+        appdata = runtime_root / "appdata"
+        local_appdata = runtime_root / "local-appdata"
+        temp_root = runtime_root / "temp"
+        for path in (runtime_root, appdata, local_appdata, temp_root):
+            path.mkdir(parents=True, exist_ok=True)
+        clean["HOME"] = str(runtime_root)
+        clean["USERPROFILE"] = str(runtime_root)
+        clean["APPDATA"] = str(appdata)
+        clean["LOCALAPPDATA"] = str(local_appdata)
+        clean["TEMP"] = clean["TMP"] = clean["TMPDIR"] = str(temp_root)
+        clean.pop("USERNAME", None)
+    return clean
 
 
 def _find_bin(name: str) -> str | None:
@@ -90,60 +148,38 @@ def supported_kinds() -> list[str]:
     return list(_CLI_DEFS.keys())
 
 
-def run_cli(kind: str, system_prompt: str, user_prompt: str) -> str:
-    """起 CLI 子进程，一次性作答，返回纯文本 stdout。失败抛异常。"""
-    d = _CLI_DEFS.get(kind)
-    bin_path = detect_cli(kind)
-    if not d or not bin_path:
-        raise CliUnavailable(
-            f"未检测到「{kind}」对应的本机命令。请先安装并登录该 CLI，或改用「API 接入」。"
-        )
-
-    combined = f"{system_prompt}\n\n{user_prompt}"
-    env = {**os.environ, **d.get("env", {})}
-    tmpdir = tempfile.mkdtemp(prefix="vibe-cli-")
+def _terminate_process_tree(process) -> None:
+    """Terminate the spawned CLI and descendants without touching unrelated processes."""
+    if process.poll() is not None:
+        return
     try:
-        stdin_payload: str | None
-        if d["delivery"] == "system-file":
-            sys_file = str(Path(tmpdir) / "system.txt")
-            Path(sys_file).write_text(system_prompt, encoding="utf-8")
-            args = d["build_args"](sys_file)
-            stdin_payload = user_prompt
-        elif d["delivery"] == "stdin":
-            args = d["build_args"](None)
-            stdin_payload = combined
-        else:  # arg
-            if len(combined.encode("utf-8")) > _MAX_ARG_BYTES:
-                raise RuntimeError(f"提示词过长，超过 {kind} 的命令行参数上限，请改用 Claude / Qwen 或 API 接入。")
-            args = [*d["build_args"](None), combined]
-            stdin_payload = None
-
+        if os.name == "nt":
+            kwargs = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "timeout": 10,
+                "check": False,
+            }
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], **kwargs)
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if process.poll() is None:
         try:
-            proc = subprocess.run(
-                [bin_path, *args],
-                input=stdin_payload,
-                capture_output=True,
-                text=True,
-                # 中文 Windows 的 locale 编码是 GBK，而这些 CLI 输出 UTF-8；
-                # 不显式指定就会 UnicodeDecodeError（issue #2）
-                encoding="utf-8",
-                errors="replace",
-                cwd=tmpdir,
-                env=env,
-                timeout=_CLI_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"{kind} 生成超时（>{_CLI_TIMEOUT_S}s）") from e
+            process.kill()
+        except OSError:
+            pass
 
-        out = (proc.stdout or "").strip()
-        # 退出码非 0 一律报错：即使已经吐了半截 stdout，那也是失败的运行，
-        # 把残缺输出当成完整答案返回会变成静默失败（旧逻辑的 `and not out`）。
-        if proc.returncode != 0:
-            err = (proc.stderr or "").strip()[-500:] or "（子进程未输出错误信息）"
-            raise RuntimeError(f"{kind} 退出码 {proc.returncode}：{err}")
-        return out
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def run_cli(kind: str, system_prompt: str, user_prompt: str) -> str:
+    """一次性兼容层；复用流式进程模型，确保取消、超时和进程树回收一致。"""
+    return "".join(
+        chunk for chunk in run_cli_stream(kind, system_prompt, user_prompt)
+        if chunk is not None
+    ).strip()
 
 
 def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
@@ -156,8 +192,8 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
         )
 
     combined = f"{system_prompt}\n\n{user_prompt}"
-    env = {**os.environ, **d.get("env", {})}
     tmpdir = tempfile.mkdtemp(prefix="vibe-cli-")
+    env = codex_subprocess_env(runtime_home=tmpdir) if kind == "codex" else {**os.environ, **d.get("env", {})}
     proc = None
     try:
         if d["delivery"] == "system-file":
@@ -174,12 +210,20 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
             args = [*d["build_args"](None), combined]
             stdin_payload = None
 
+        process_kwargs = {}
+        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            process_kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            process_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             [bin_path, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             # stderr 不能丢：CLI 的失败原因只在这里，丢了用户就只看到光秃秃的
             # 「退出码 1」（issue #16）。但必须持续排空，否则管道写满会死锁。
             stderr=subprocess.PIPE, cwd=tmpdir, env=env, text=True, bufsize=1,
             encoding="utf-8", errors="replace",
+            **process_kwargs,
         )
         err_tail: deque = deque(maxlen=40)   # 只留尾部若干行，避免长进度日志占内存
 
@@ -212,7 +256,7 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
             except Exception:
                 pass
             finally:
-                q.put(None)  # EOF 哨兵
+                q.put(_STREAM_EOF)
 
         threading.Thread(target=_pump, daemon=True).start()
         deadline = time.monotonic() + _CLI_TIMEOUT_S
@@ -221,10 +265,11 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
             if remaining <= 0:
                 raise RuntimeError(f"{kind} 生成超时（>{_CLI_TIMEOUT_S}s）")
             try:
-                line = q.get(timeout=min(remaining, 1.0))
+                line = q.get(timeout=min(remaining, _STREAM_HEARTBEAT_S))
             except queue.Empty:
+                yield None
                 continue
-            if line is None:
+            if line is _STREAM_EOF:
                 break
             yield line
         try:
@@ -240,5 +285,5 @@ def run_cli_stream(kind: str, system_prompt: str, user_prompt: str):
             raise RuntimeError(f"{kind} 退出码 {rc}：{err}")
     finally:
         if proc and proc.poll() is None:
-            proc.kill()
+            _terminate_process_tree(proc)
         shutil.rmtree(tmpdir, ignore_errors=True)

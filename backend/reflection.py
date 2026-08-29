@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import chat
 import cli_runtime
+from subscription_ai.codex_provider import public_runtime_message
 
 MAX_SOURCE_CHARS = 12000  # 待审文本上限，超出截断（反思本身不该把上下文吃光）
 
@@ -55,9 +56,12 @@ def run_reflection_stream(cfg: dict, source: str, title: str = ""):
     buf: list[str] = []
     try:
         if provider.startswith("cli-"):
-            content = cli_runtime.run_cli(provider[4:], REFLECT_PROMPT, messages[-1]["content"])
-            buf.append(content)
-            yield {"type": "delta", "text": content}
+            for piece in cli_runtime.run_cli_stream(provider[4:], REFLECT_PROMPT, messages[-1]["content"]):
+                if piece is None:
+                    yield {"type": "status", "message": "Codex 正在生成…"}
+                else:
+                    buf.append(piece)
+                    yield {"type": "delta", "text": piece}
         else:
             resp = chat._call_llm_stream(cfg, messages, use_tools=False)
             for delta in chat._iter_sse_deltas(resp):
@@ -66,7 +70,8 @@ def run_reflection_stream(cfg: dict, source: str, title: str = ""):
                     buf.append(piece)
                     yield {"type": "delta", "text": piece}
     except Exception as e:  # noqa: BLE001 — 运行时错误以流内事件上报
-        yield {"type": "error", "message": f"反思失败：{e}"}
+        safe_error = public_runtime_message(e) if provider == "cli-codex" else str(e)
+        yield {"type": "error", "message": f"反思失败：{safe_error}"}
         return
 
     yield {"type": "done", "content": "".join(buf).strip(), "truncated": truncated}

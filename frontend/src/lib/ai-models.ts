@@ -68,5 +68,7 @@ export const aiModels: ModelConfig[] = [
   { id: "custom", name: "其它 OpenAI 兼容", description: "任意兼容端点，自填 baseURL/model", provider: "openai-compatible" },
 ];
 
-export const subscriptionModels = aiModels.filter((m) => isCliProvider(m.provider));
+// W1 唯一完成官方安装/认证/连接闭环的正式会员 Provider。
+// 旧 CLI 条目仍留在 aiModels 以兼容已有本地配置，但不能再作为未经验证的可选会员接入展示。
+export const subscriptionModels = aiModels.filter((m) => m.provider === "cli-codex");
 export const apiModels = aiModels.filter((m) => !isCliProvider(m.provider));

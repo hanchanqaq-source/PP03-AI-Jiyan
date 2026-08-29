@@ -2,7 +2,9 @@
 鉴权中间件 / 持仓 CRUD 与坏文件降级 / 估值脏数据防护 / 涨停池脏数值 /
 空结果不缓存 / akshare 缺失降级 / 无 index 工具调用归位 / CLI 流式超时。
 """
+import io
 import sys
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -244,3 +246,56 @@ def test_run_cli_stream_timeout(monkeypatch):
         for line in cli_runtime.run_cli_stream("fake", "s", "u"):
             chunks.append(line)
     assert chunks and chunks[0].strip() == "x"  # 挂起前的输出已正常流出
+
+
+def test_run_cli_stream_close_terminates_the_process_tree(monkeypatch):
+    release_reader = threading.Event()
+    terminated = []
+
+    class BlockingReader:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            release_reader.wait(5)
+            raise StopIteration
+
+    class FakeInput:
+        def write(self, _value):
+            pass
+
+        def close(self):
+            pass
+
+    class BlockingProcess:
+        pid = 6262
+        returncode = None
+
+        def __init__(self):
+            self.stdin = FakeInput()
+            self.stdout = BlockingReader()
+            self.stderr = io.StringIO("")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr(cli_runtime, "_STREAM_HEARTBEAT_S", 0.01, raising=False)
+    monkeypatch.setattr(cli_runtime, "detect_cli", lambda _kind: "fake-cli")
+    monkeypatch.setitem(cli_runtime._CLI_DEFS, "fake-cancel", {
+        "bins": ["fake-cli"],
+        "delivery": "stdin",
+        "build_args": lambda _: [],
+        "env": {},
+    })
+    monkeypatch.setattr(cli_runtime.subprocess, "Popen", lambda *_args, **_kwargs: BlockingProcess())
+    monkeypatch.setattr(cli_runtime, "_terminate_process_tree", lambda proc: terminated.append(proc.pid), raising=False)
+
+    stream = cli_runtime.run_cli_stream("fake-cancel", "system", "user")
+    assert next(stream) is None
+    stream.close()
+    release_reader.set()
+
+    assert terminated == [6262]

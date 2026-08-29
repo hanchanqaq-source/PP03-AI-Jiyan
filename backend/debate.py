@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import chat
 import cli_runtime
 import tools
+from subscription_ai.codex_provider import public_runtime_message
 
 # 底稿抓取清单：覆盖「估值 / 财报 / 资金 / 事件 / 行业」五个面，与 chat.ANALYSIS_FRAMEWORK 对齐。
 # 每项 (工具名, 额外参数, 小标题, 可并行)。任何一项挂了都不阻断，缺项会如实标注。
@@ -279,9 +280,12 @@ def run_debate_stream(cfg: dict, code: str, rounds: int = 1):
         buf: list[str] = []
         try:
             if is_cli:
-                content = cli_runtime.run_cli(provider[4:], messages[0]["content"], messages[-1]["content"])
-                buf.append(content)
-                yield {"type": "delta", "stage": stage, "text": content}
+                for piece in cli_runtime.run_cli_stream(provider[4:], messages[0]["content"], messages[-1]["content"]):
+                    if piece is None:
+                        yield {"type": "status", "stage": stage, "message": "Codex 正在生成…"}
+                    else:
+                        buf.append(piece)
+                        yield {"type": "delta", "stage": stage, "text": piece}
             else:
                 # _call_llm_stream 返回的是上游 Response，需配 _iter_sse_deltas 解析 SSE
                 resp = chat._call_llm_stream(cfg, messages, use_tools=False)
@@ -291,12 +295,13 @@ def run_debate_stream(cfg: dict, code: str, rounds: int = 1):
                         buf.append(text)
                         yield {"type": "delta", "stage": stage, "text": text}
         except Exception as e:  # noqa: BLE001 — 单个角色失败不该毁掉整场辩论
+            safe_error = public_runtime_message(e) if provider == "cli-codex" else str(e)
             # 必须补一个终态事件：前端按 stage_done 把该角色标记为完成，
             # 只发 error 的话这个角色会永远停在「生成中…」，并让「全部完成」判定不成立、
             # 连带后面能正常跑完的角色也存不进沉淀。
-            yield {"type": "error", "stage": stage, "message": f"{_STAGE_LABEL[stage]}生成失败：{e}"}
+            yield {"type": "error", "stage": stage, "message": f"{_STAGE_LABEL[stage]}生成失败：{safe_error}"}
             yield {"type": "stage_done", "stage": stage, "label": _STAGE_LABEL[stage],
-                   "content": f"（本角色生成失败：{e}）", "failed": True}
+                   "content": f"（本角色生成失败：{safe_error}）", "failed": True}
             continue  # 失败内容不进 transcript——不能把错误信息当论据喂给后面的角色
 
         content = "".join(buf).strip()

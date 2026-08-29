@@ -316,5 +316,8 @@ def run_chat_cli_stream(cfg: dict, user_messages: list, context: str = ""):
     system = SYSTEM_PROMPT.format(context=context or "（无）")
     user = "\n\n".join(m.get("content", "") for m in user_messages if m.get("content")) or "（无问题）"
     for chunk in cli_runtime.run_cli_stream(kind, system, user):
-        yield {"type": "delta", "text": chunk}
+        if chunk is None:
+            yield {"type": "status", "message": "Codex 正在生成…"}
+        else:
+            yield {"type": "delta", "text": chunk}
     yield {"type": "done", "trace": [], "rounds": 1}

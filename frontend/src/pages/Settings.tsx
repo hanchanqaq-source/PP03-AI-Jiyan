@@ -1,205 +1,423 @@
-import { useState } from "react";
-import { KeyRound, Sparkles, ShieldCheck, Check, Trash2, Terminal } from "lucide-react";
-import { PageHeader } from "@/components/ui/PageHeader";
-import { GlassCard } from "@/components/ui/GlassCard";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Check,
+  CircleAlert,
+  CircleCheck,
+  KeyRound,
+  Loader2,
+  LogIn,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+  Square,
+  Terminal,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
-import { loadLlm, saveLlm, clearLlm } from "@/lib/llm";
+
+import { GlassCard } from "@/components/ui/GlassCard";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { loadAccessKey, saveAccessKey } from "@/lib/api";
-import { subscriptionModels, apiModels, PROVIDER_BASE, isCliProvider, aiModels, type ProviderId } from "@/lib/ai-models";
+import { apiModels, aiModels, PROVIDER_BASE, type ProviderId } from "@/lib/ai-models";
+import { clearLlm, loadLlm, saveLlm } from "@/lib/llm";
+import {
+  cancelCodexTest,
+  loadSubscriptionProviders,
+  startCodexLogin,
+  testCodexConnection,
+  type ConnectionTestStatus,
+  type SubscriptionAuthStatus,
+  type SubscriptionProviderStatus,
+} from "@/lib/subscription-ai";
+
+type Mode = "subscription" | "api";
+
+const authLabels: Record<SubscriptionAuthStatus, string> = {
+  not_installed: "不可登录",
+  installed_not_logged_in: "未登录",
+  logged_in_chatgpt: "已通过 ChatGPT 登录",
+  logged_in_api_key: "API Key 登录",
+  unsupported_version: "版本不支持",
+  status_failed: "状态检测失败",
+};
+
+const testLabels: Record<ConnectionTestStatus, string> = {
+  not_tested: "尚未测试",
+  running: "测试中",
+  success: "连接成功",
+  not_installed: "未安装",
+  not_logged_in: "未登录",
+  wrong_auth_mode: "不是会员登录",
+  quota_or_rate_limited: "额度或频率受限",
+  timeout: "测试超时",
+  cancelled: "测试已停止",
+  process_failed: "Codex 运行失败",
+  unexpected_output: "响应不符合预期",
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "操作失败，请稍后重试。";
+}
 
 export function Settings() {
   const existing = loadLlm();
-  const existingIsCli = existing ? isCliProvider(existing.provider) : false;
-
-  const [mode, setMode] = useState<"api" | "subscription">(existing && existingIsCli ? "subscription" : "api");
-  // 订阅：选中的 CLI model id
-  const [cliId, setCliId] = useState(existing && existingIsCli ? existing.model : "");
-  // API：选中的模型 id + 可编辑的 baseURL / model / key
   const firstApi = apiModels[0];
-  const [apiId, setApiId] = useState(existing && !existingIsCli ? existing.model : firstApi.id);
-  const [baseURL, setBaseURL] = useState(existing && !existingIsCli ? existing.baseURL : (PROVIDER_BASE[firstApi.provider] || ""));
-  const [modelName, setModelName] = useState(existing && !existingIsCli ? existing.model : firstApi.id);
-  const [apiKey, setApiKey] = useState(existing && !existingIsCli ? existing.apiKey : "");
-  // 后端访问密钥（对应部署时的 VR_API_KEY）；本机自用不设鉴权时留空
+  const existingApi = existing && !existing.provider.startsWith("cli-") ? existing : null;
+
+  const [mode, setMode] = useState<Mode>("subscription");
+  const [provider, setProvider] = useState<SubscriptionProviderStatus | null>(null);
+  const [loadingProvider, setLoadingProvider] = useState(true);
+  const [providerError, setProviderError] = useState("");
+  const [action, setAction] = useState<"login" | "test" | "refresh" | null>(null);
+  const [actionMessage, setActionMessage] = useState("");
+  const [testStatusOverride, setTestStatusOverride] = useState<ConnectionTestStatus | null>(null);
+  const [codexIsDefault, setCodexIsDefault] = useState(existing?.provider === "cli-codex");
+
+  const [apiId, setApiId] = useState(existingApi?.model || firstApi.id);
+  const [baseURL, setBaseURL] = useState(existingApi?.baseURL || PROVIDER_BASE[firstApi.provider] || "");
+  const [modelName, setModelName] = useState(existingApi?.model || firstApi.id);
+  const [apiKey, setApiKey] = useState(existingApi?.apiKey || "");
   const [accessKey, setAccessKey] = useState(loadAccessKey());
 
-  const providerOf = (id: string): ProviderId => aiModels.find((m) => m.id === id)?.provider ?? "openai-compatible";
+  const loginPollRef = useRef<number | null>(null);
+  const loginPollAttemptsRef = useRef(0);
+  const testAbortRef = useRef<AbortController | null>(null);
+
+  const stopLoginPolling = useCallback(() => {
+    if (loginPollRef.current !== null) {
+      window.clearInterval(loginPollRef.current);
+      loginPollRef.current = null;
+    }
+  }, []);
+
+  const refreshProvider = useCallback(async (force = false, initial = false) => {
+    if (initial) setLoadingProvider(true);
+    setProviderError("");
+    try {
+      const result = await loadSubscriptionProviders(force);
+      const codex = result.find((item) => item.provider_id === "codex") || null;
+      setProvider(codex);
+      if (codex?.auth_status === "logged_in_chatgpt") {
+        stopLoginPolling();
+      }
+      return codex;
+    } catch (error) {
+      setProviderError(errorMessage(error));
+      return null;
+    } finally {
+      if (initial) setLoadingProvider(false);
+    }
+  }, [stopLoginPolling]);
+
+  useEffect(() => {
+    void refreshProvider(false, true);
+    return () => {
+      stopLoginPolling();
+      testAbortRef.current?.abort();
+    };
+  }, [refreshProvider, stopLoginPolling]);
+
+  const handleRefresh = async () => {
+    setAction("refresh");
+    setActionMessage("");
+    await refreshProvider(true);
+    setAction(null);
+  };
+
+  const handleLogin = async () => {
+    if (!provider || !provider.installed) return;
+    if (provider.auth_status === "logged_in_chatgpt") return;
+    let confirmSwitch = false;
+    if (provider.auth_status === "logged_in_api_key") {
+      confirmSwitch = window.confirm("当前 Codex 使用 API Key。继续官方 ChatGPT 登录可能替换当前认证方式，是否继续？");
+      if (!confirmSwitch) return;
+    }
+    setAction("login");
+    setActionMessage("");
+    try {
+      const result = await startCodexLogin(confirmSwitch);
+      setProvider(result);
+      const refreshed = await refreshProvider(true);
+      if (refreshed?.auth_status !== "logged_in_chatgpt") {
+        stopLoginPolling();
+        loginPollAttemptsRef.current = 0;
+        loginPollRef.current = window.setInterval(() => {
+          loginPollAttemptsRef.current += 1;
+          if (loginPollAttemptsRef.current >= 300) {
+            stopLoginPolling();
+            setActionMessage("登录状态等待已结束，请完成官方登录后点击“重新检测”。");
+            return;
+          }
+          void refreshProvider(true);
+        }, 2000);
+      }
+    } catch (error) {
+      setActionMessage(errorMessage(error));
+    } finally {
+      setAction(null);
+    }
+  };
+
+  const handleTest = async () => {
+    if (!provider?.available) return;
+    const controller = new AbortController();
+    testAbortRef.current = controller;
+    setAction("test");
+    setActionMessage("");
+    setTestStatusOverride("running");
+    try {
+      const result = await testCodexConnection(controller.signal);
+      setProvider(result);
+      setTestStatusOverride(null);
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        setTestStatusOverride("process_failed");
+        setActionMessage(errorMessage(error));
+      }
+    } finally {
+      if (testAbortRef.current === controller) testAbortRef.current = null;
+      setAction(null);
+    }
+  };
+
+  const handleStopTest = async () => {
+    testAbortRef.current?.abort();
+    try {
+      const result = await cancelCodexTest();
+      setProvider(result);
+      setTestStatusOverride(null);
+    } catch (error) {
+      setTestStatusOverride("process_failed");
+      setActionMessage(errorMessage(error));
+    } finally {
+      setAction(null);
+      testAbortRef.current = null;
+    }
+  };
+
+  const setCodexDefault = () => {
+    if (provider?.auth_status !== "logged_in_chatgpt" || !provider.available || effectiveTestStatus !== "success") return;
+    saveLlm({ provider: "cli-codex", baseURL: "", apiKey: "", model: "codex" });
+    setCodexIsDefault(true);
+    toast.success("已将 Codex（ChatGPT 登录）设为默认 AI");
+  };
+
+  const providerOf = (id: string): ProviderId => aiModels.find((item) => item.id === id)?.provider ?? "openai-compatible";
 
   const pickApiModel = (id: string) => {
-    const m = apiModels.find((x) => x.id === id);
-    if (!m) return;
+    const model = apiModels.find((item) => item.id === id);
+    if (!model) return;
     setApiId(id);
     setModelName(id);
-    setBaseURL(PROVIDER_BASE[m.provider] || "");
+    setBaseURL(PROVIDER_BASE[model.provider] || "");
   };
 
   const saveApi = () => {
     if (!baseURL.trim() || !apiKey.trim() || !modelName.trim()) {
-      toast.error("请填完 Base URL、API Key、Model");
+      toast.error("请填完 Base URL、OpenAI API Key、Model");
       return;
     }
     saveLlm({ provider: providerOf(apiId), baseURL: baseURL.trim(), apiKey: apiKey.trim(), model: modelName.trim() });
-    toast.success("已保存到本地，全站「问 AI / 复盘」现在可用");
-  };
-
-  const saveSubscription = () => {
-    const m = subscriptionModels.find((x) => x.id === cliId);
-    if (!m || m.comingSoon) {
-      toast.error("请选择一个可用的订阅（暂不支持标「即将支持」的）");
-      return;
-    }
-    saveLlm({ provider: m.provider, baseURL: "", apiKey: "", model: m.id });
-    toast.success(`已选「${m.name}」订阅，全站「问 AI / 复盘」将调用本机 ${m.name}`);
+    setCodexIsDefault(false);
+    toast.success("API 高级接入已保存到本地浏览器");
   };
 
   const forget = () => {
     clearLlm();
     setApiKey("");
-    setCliId("");
-    toast.success("已清除本地配置");
+    setCodexIsDefault(false);
+    toast.success("已清除本地 AI 配置");
   };
 
   const saveAccess = () => {
-    const k = accessKey.trim();
-    saveAccessKey(k);
-    setAccessKey(k);
-    toast.success(k ? "已保存后端访问密钥（存本地）" : "已清除后端访问密钥");
+    const key = accessKey.trim();
+    saveAccessKey(key);
+    setAccessKey(key);
+    toast.success(key ? "已保存后端访问密钥（仅存本地）" : "已清除后端访问密钥");
   };
+
+  const effectiveTestStatus = testStatusOverride || provider?.test_status || "not_tested";
+  const canTest = Boolean(provider?.available && action !== "test");
+  const canSetDefault = Boolean(
+    provider?.auth_status === "logged_in_chatgpt"
+    && provider.available
+    && effectiveTestStatus === "success"
+  );
 
   return (
     <div>
-      <PageHeader title="接入 AI" subtitle="配置一次，全站的「问 AI」「复盘」都能用你自己的模型" />
+      <PageHeader title="接入 AI" subtitle="优先使用已经购买的会员或本地 AI，不必另外填写 API Key" />
 
-      <div className="mb-4 flex items-start gap-2 rounded-lg border border-success/25 bg-success/5 p-3 text-xs text-muted-foreground">
-        <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-success" />
-        <span>API key <b className="text-foreground">只存在你本地浏览器</b>，仅在你提问时发给你自己的后端去调模型，不上传、不进仓库。所有分析由你的模型给出，本产品不校准。</span>
-      </div>
-
-      {/* 两种接入方式 */}
       <div className="mb-4 grid gap-3 sm:grid-cols-2">
-        <GlassCard glow={mode === "subscription"} onClick={() => setMode("subscription")}
-          className={mode === "subscription" ? "ring-1 ring-primary/40" : "opacity-80"}>
-          <div className="flex items-center gap-2">
-            <Sparkles className="h-5 w-5 text-primary" />
-            <h3 className="font-semibold">订阅接入</h3>
-            {mode === "subscription" && <Check className="ml-auto h-4 w-4 text-primary" />}
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">调本机已登录的 AI CLI（Claude Code / Qwen / DeepSeek / Codex…），用订阅额度，<b className="text-foreground">免 API key</b>。需后端在本机跑。</p>
-        </GlassCard>
-
-        <GlassCard glow={mode === "api"} onClick={() => setMode("api")}
-          className={mode === "api" ? "ring-1 ring-primary/40" : "opacity-80"}>
-          <div className="flex items-center gap-2">
-            <KeyRound className="h-5 w-5 text-primary" />
-            <h3 className="font-semibold">API 接入</h3>
-            {mode === "api" && <Check className="ml-auto h-4 w-4 text-primary" />}
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">粘贴 API key，支持 DeepSeek / 豆包 / MiniMax / OpenAI / OpenRouter / 任意兼容端点。<b className="text-foreground">现已可用。</b></p>
-        </GlassCard>
+        <button type="button" onClick={() => setMode("subscription")} className="text-left">
+          <GlassCard glow={mode === "subscription"} className={mode === "subscription" ? "ring-1 ring-primary/40" : "opacity-75"}>
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-5 w-5 text-primary" />
+              <h3 className="font-semibold">会员 / 免费额度接入</h3>
+              {mode === "subscription" && <Check className="ml-auto h-4 w-4 text-primary" />}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">优先选择会员路径，不填写模型 API Key。</p>
+          </GlassCard>
+        </button>
+        <button type="button" onClick={() => setMode("api")} className="text-left">
+          <GlassCard glow={mode === "api"} className={mode === "api" ? "ring-1 ring-primary/40" : "opacity-75"}>
+            <div className="flex items-center gap-2">
+              <KeyRound className="h-5 w-5 text-primary" />
+              <h3 className="font-semibold">API 高级接入</h3>
+              {mode === "api" && <Check className="ml-auto h-4 w-4 text-primary" />}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">仅在你主动配置后使用，可能按量计费。</p>
+          </GlassCard>
+        </button>
       </div>
 
-      <GlassCard>
-        {mode === "subscription" ? (
-          <div className="space-y-3 text-sm">
-            <p className="text-xs text-muted-foreground">
-              选一个你本机已安装并登录的 CLI。Vibe-Research 后端会用它以你的订阅额度作答，<b className="text-foreground">不用填 key</b>。
-              <span className="text-muted-foreground/60">（仅当后端跑在你本机时可用；复盘 / 今日要点 / 个股问 AI 等场景。）</span>
-            </p>
-            <div className="grid gap-2 sm:grid-cols-2">
-              {subscriptionModels.map((m) => {
-                const on = cliId === m.id;
-                return (
-                  <button key={m.id} disabled={m.comingSoon} onClick={() => setCliId(m.id)}
-                    className={`flex items-center gap-2.5 rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                      m.comingSoon
-                        ? "cursor-not-allowed border-border/50 opacity-40"
-                        : on
-                        ? "border-primary/50 bg-primary/10"
-                        : "border-border hover:bg-muted/40"
-                    }`}>
-                    <Terminal className={`h-4 w-4 shrink-0 ${on ? "text-primary" : "text-muted-foreground"}`} />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5 font-medium">
-                        {m.name}
-                        {m.comingSoon && <span className="rounded bg-muted/60 px-1 py-0.5 text-[9px] text-muted-foreground">即将支持</span>}
-                        {on && <Check className="h-3.5 w-3.5 text-primary" />}
-                      </div>
-                      <div className="truncate text-[11px] text-muted-foreground">{m.description}</div>
-                    </div>
-                  </button>
-                );
-              })}
+      {mode === "subscription" ? (
+        <GlassCard>
+          {loadingProvider ? (
+            <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> 正在检查本机 Codex 状态…
             </div>
-            <div className="flex items-center gap-2 pt-1">
-              <button onClick={saveSubscription} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary shadow-glow hover:bg-primary/25">
-                保存
-              </button>
-              {existing && (
-                <button onClick={forget} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-muted-foreground hover:text-destructive">
-                  <Trash2 className="h-4 w-4" /> 清除
+          ) : provider ? (
+            <div className="space-y-5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="rounded-xl border border-primary/25 bg-primary/10 p-2.5">
+                    <Terminal className="h-6 w-6 text-primary" />
+                  </div>
+                  <div>
+                    <h2 className="font-semibold">Codex</h2>
+                    <p className="mt-1 text-xs text-muted-foreground">使用你的 ChatGPT/Codex 套餐额度；额度和限制由 OpenAI 官方管理。</p>
+                  </div>
+                </div>
+                <div className={`rounded-full px-2.5 py-1 text-xs ${codexIsDefault ? "bg-success/15 text-success" : "bg-muted/60 text-muted-foreground"}`}>
+                  {codexIsDefault ? "当前默认" : "尚未设为默认"}
+                </div>
+              </div>
+
+              <div className="grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
+                <StatusCell label="安装状态" value={provider.installed ? "已安装" : "未安装"} ok={provider.installed} />
+                <StatusCell label="版本" value={provider.version || "未检测到"} />
+                <StatusCell label="登录方式" value={authLabels[provider.auth_status]} ok={provider.auth_status === "logged_in_chatgpt"} />
+                <StatusCell label="连接测试" value={testLabels[effectiveTestStatus]} ok={effectiveTestStatus === "success"} />
+              </div>
+
+              <div className="rounded-lg border border-border/70 bg-black/10 p-3 text-xs text-muted-foreground">
+                <p>{provider.message}</p>
+                {provider.auth_status === "logged_in_api_key" && (
+                  <p className="mt-2 font-medium text-warning">当前 Codex 使用 API Key，不属于会员额度接入。</p>
+                )}
+                {(provider.auth_status === "installed_not_logged_in" || provider.auth_status === "status_failed") && (
+                  <div className="mt-3 rounded-md border border-border/70 bg-black/15 p-2 font-mono text-[11px] text-foreground">
+                    <p>set CODEX_HOME=%VR_DATA_DIR%\codex-home</p>
+                    <p>codex login</p>
+                  </div>
+                )}
+                {actionMessage && <p className="mt-2">{actionMessage}</p>}
+              </div>
+
+              <div className="grid gap-2 rounded-lg border border-border/60 p-3 text-xs text-muted-foreground sm:grid-cols-2">
+                <p><CircleCheck className="mr-1.5 inline h-3.5 w-3.5 text-success" />当前能力：分析页面已经提供的数据</p>
+                <p><CircleAlert className="mr-1.5 inline h-3.5 w-3.5 text-muted-foreground" />后续能力：主动查询基金、股票、公告、财务和资讯工具</p>
+                <p>可完成复盘、资讯摘要与个股页面上下文问答</p>
+                <p>测试连接会消耗极少量 Codex 会员额度。</p>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={handleRefresh} disabled={action !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-sm hover:bg-muted/40 disabled:opacity-50">
+                  <RefreshCw className={`h-4 w-4 ${action === "refresh" ? "animate-spin" : ""}`} /> 重新检测
                 </button>
-              )}
+                <button type="button" onClick={handleLogin} disabled={!provider.installed || provider.auth_status === "logged_in_chatgpt" || action !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-sm hover:bg-muted/40 disabled:opacity-50">
+                  <LogIn className="h-4 w-4" /> {provider.auth_status === "logged_in_api_key" ? "切换为 ChatGPT 登录" : "打开 Codex 官方登录"}
+                </button>
+                {action === "test" ? (
+                  <button type="button" onClick={handleStopTest}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
+                    <Square className="h-3.5 w-3.5" /> 停止测试
+                  </button>
+                ) : (
+                  <button type="button" onClick={handleTest} disabled={!canTest}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-sm font-medium text-primary hover:bg-primary/25 disabled:opacity-50">
+                    <Sparkles className="h-4 w-4" /> 测试连接
+                  </button>
+                )}
+                <button type="button" onClick={setCodexDefault} disabled={!canSetDefault}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-success/15 px-3 py-2 text-sm font-medium text-success hover:bg-success/25 disabled:opacity-40">
+                  <Check className="h-4 w-4" /> 设为默认 AI
+                </button>
+                {(codexIsDefault || existing) && (
+                  <button type="button" onClick={forget} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-muted-foreground hover:text-destructive">
+                    <Trash2 className="h-4 w-4" /> 清除
+                  </button>
+                )}
+              </div>
             </div>
+          ) : (
+            <div className="py-8 text-sm text-muted-foreground">未收到 Codex Provider 状态，请重新检测。</div>
+          )}
+          {providerError && <p className="mt-3 text-sm text-destructive">{providerError}</p>}
+        </GlassCard>
+      ) : (
+        <GlassCard>
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-warning/35 bg-warning/10 p-3 text-sm text-warning">
+            <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>API 可能按量计费；系统不会自动从会员接入切换到 API。</span>
           </div>
-        ) : (
           <div className="space-y-4 text-sm">
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">选择模型</label>
-              <select value={apiId} onChange={(e) => pickApiModel(e.target.value)}
+              <label htmlFor="api-model-preset" className="mb-1.5 block text-xs font-medium text-muted-foreground">选择模型</label>
+              <select id="api-model-preset" value={apiId} onChange={(event) => pickApiModel(event.target.value)}
                 className="w-full rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50">
-                {apiModels.map((m) => (
-                  <option key={m.id} value={m.id}>{m.name} —— {m.description}</option>
-                ))}
+                {apiModels.map((model) => <option key={model.id} value={model.id}>{model.name} —— {model.description}</option>)}
               </select>
             </div>
-
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Base URL</label>
-              <input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} placeholder="https://api.deepseek.com"
+              <label htmlFor="api-base-url" className="mb-1.5 block text-xs font-medium text-muted-foreground">Base URL</label>
+              <input id="api-base-url" value={baseURL} onChange={(event) => setBaseURL(event.target.value)} placeholder="https://api.example.com/v1"
                 className="w-full rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
             </div>
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Model</label>
-              <input value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder="模型名称（豆包填 ep-… 接入点 ID）"
+              <label htmlFor="api-model-name" className="mb-1.5 block text-xs font-medium text-muted-foreground">Model</label>
+              <input id="api-model-name" value={modelName} onChange={(event) => setModelName(event.target.value)} placeholder="模型名称"
                 className="w-full rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
             </div>
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">API Key</label>
-              <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…"
+              <label htmlFor="model-api-key" className="mb-1.5 block text-xs font-medium text-muted-foreground">OpenAI API Key</label>
+              <input id="model-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-…"
                 className="w-full rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
             </div>
-
             <div className="flex items-center gap-2">
-              <button onClick={saveApi} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary shadow-glow hover:bg-primary/25">
-                保存（存本地）
-              </button>
-              {existing && (
-                <button onClick={forget} className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-muted-foreground hover:text-destructive">
-                  <Trash2 className="h-4 w-4" /> 清除
-                </button>
-              )}
+              <button type="button" onClick={saveApi} className="rounded-lg bg-primary/15 px-4 py-2 font-medium text-primary hover:bg-primary/25">保存（存本地）</button>
+              {existing && <button type="button" onClick={forget} className="inline-flex items-center gap-1.5 px-3 py-2 text-muted-foreground hover:text-destructive"><Trash2 className="h-4 w-4" />清除</button>}
             </div>
           </div>
-        )}
-      </GlassCard>
+        </GlassCard>
+      )}
 
-      {/* 后端访问密钥：仅当后端部署时设置了 VR_API_KEY（公网防蹭用）才需要填 */}
       <GlassCard className="mt-4">
         <h3 className="mb-1 flex items-center gap-1.5 text-sm font-semibold">
-          <KeyRound className="h-4 w-4 text-primary" /> 后端访问密钥（可选）
+          <ShieldCheck className="h-4 w-4 text-primary" /> 后端访问密钥（独立鉴权）
         </h3>
-        <p className="mb-3 text-xs text-muted-foreground">
-          仅当后端部署时设置了 <code className="rounded bg-muted/50 px-1">VR_API_KEY</code>（公网部署防蹭用）才需要填，填后端同一个值；
-          本机自用没设鉴权就留空。同样只存本地浏览器。
-        </p>
-        <div className="flex items-center gap-2">
-          <input type="password" value={accessKey} onChange={(e) => setAccessKey(e.target.value)} placeholder="与后端 VR_API_KEY 保持一致"
-            className="flex-1 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
-          <button onClick={saveAccess} className="rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary hover:bg-primary/25">
-            保存
-          </button>
+        <p className="mb-3 text-xs text-muted-foreground">它只用于访问你自己的 PP03 后端，不是模型 API Key；本机未设置 VR_API_KEY 时留空。</p>
+        <div className="flex items-end gap-2">
+          <div className="flex-1">
+            <label htmlFor="backend-access-key" className="mb-1.5 block text-xs font-medium text-muted-foreground">后端访问密钥（可选）</label>
+            <input id="backend-access-key" type="password" value={accessKey} onChange={(event) => setAccessKey(event.target.value)} placeholder="与后端 VR_API_KEY 保持一致"
+              className="w-full rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+          </div>
+          <button type="button" onClick={saveAccess} className="rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary hover:bg-primary/25">保存</button>
         </div>
       </GlassCard>
+    </div>
+  );
+}
+
+function StatusCell({ label, value, ok }: { label: string; value: string; ok?: boolean }) {
+  return (
+    <div className="rounded-lg border border-border/60 bg-black/10 p-3">
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className={`mt-1 break-words font-medium ${ok ? "text-success" : "text-foreground"}`}>{value}</div>
     </div>
   );
 }
